@@ -4,5 +4,5 @@ ThisBuild / scalaVersion := "3.6.4"
 
 lazy val root = (project in file("."))
   .settings(
-    name := "atomic-flow"
+    name := "atomicflow"
   )
