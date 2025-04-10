@@ -15,6 +15,12 @@
 
 ---
 
+## Out of scope
+- Introspection / Diagram generation
+- 
+
+---
+
 ## ⚙️ **How it Works**
 
 AtomicFlow focuses on **workflow steps** that can be executed safely and deterministically. Each step can be classified into two types:
