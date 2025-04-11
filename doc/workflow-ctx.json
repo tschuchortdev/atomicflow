@@ -1,0 +1,32 @@
+{
+  "workflowId": "<uuid>",
+  "instanceId": "<uuid>",
+  "log": [
+    {
+      "stepId": "<uuid>",
+      "stepName": "read file",
+      "inputParams": {
+        "filePath": "<hash>"
+      }
+    },
+    {
+      "stepId": "<uuid>",
+      "stepName": "send file",
+      "inputParams": {
+        "filePath": "<hash>"
+      }
+    }
+  ],
+  "cache": [
+    {
+      "stepId": "<uuid>",
+      "inputParams": {
+        "filePath": "<hash>"
+      },
+      "out": {}
+    }
+  ],
+  "onceKeys": {
+    "<stepId>": "<onceId>"
+  }
+}

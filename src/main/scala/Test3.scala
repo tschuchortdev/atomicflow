@@ -1,11 +1,47 @@
 import java.nio.file.{Files, Paths}
+import scala.concurrent.duration.FiniteDuration
 
 class Test3 {
-  trait WorkflowCtx
+  case class WorkflowId(id: ValidUuid)
+  
+  trait WorkflowCtx extends StepCache {
+    def id: WorkflowId
+    
+    def name: String
 
-  trait StepCtx[Out]
+    def cacheTtl: FiniteDuration
+  }
+  
+  case class StepId(id: ValidUuid)
 
-  trait StepCache
+  trait StepCtx[Out] {
+    def id: StepId
+
+    def version: Long
+    
+    def name: Option[String]
+    
+    def description: Option[String]
+
+    def workflowCtx: WorkflowCtx
+  }
+
+  final class StepBreak[Out](val ctx: StepCtx[Out], val value: Out)
+    extends RuntimeException(
+      /*message*/ null, /*cause*/ null, /*enableSuppression=*/ false, /*writableStackTrace*/ false)
+
+  trait StepCache {
+    def get[Out](ctx: StepCtx[Out], stepInputs: Seq[StepInput[?]]): Option[Out]
+    
+    
+
+    // TODO: use ctx.workflowCtx.cacheTtl
+    def put[Out](ctx: StepCtx[Out], stepInputs: Seq[StepInput[?]], value: Out): Unit
+  }
+  
+  trait StepOnceStore {
+    def get
+  }
 
   type ValidUuid = String
 
@@ -15,6 +51,8 @@ class Test3 {
 
   given Hashable[String] = ???
 
+  given Hashable[Array[Byte]] = ???
+
   case class StepInput[A: Hashable](name: String, value: A)
 
   given [A: Hashable] => Conversion[(String, A), StepInput[A]] = { (name: String, value: A) =>
@@ -22,14 +60,46 @@ class Test3 {
   }
 
   object step {
-    def apply[Out](id: ValidUuid, version: Long, name: String | Unit = (), description: String | Unit = ())(body: StepCtx[Out] ?=> Out)(using WorkflowCtx) = ???
+    def apply[Out](
+                    id: ValidUuid,
+                    version: Long,
+                    name: String | Unit = (),
+                    description: String | Unit = ()
+                  )(
+                    body: StepCtx[Out] ?=> Out
+                  )(using WorkflowCtx): Out = {
+      given ctx: StepCtx[Out] = new StepCtx[Out] {}
 
-    def cached[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out], cache: StepCache): Nothing = {
-      ???
+      try {
+        body
+      } catch {
+        case r: StepBreak[Out] if ctx.eq(r.ctx) =>
+          r.value
+      }
     }
 
-    def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out]): Nothing = {
-      ???
+    def cached[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out], cache: StepCache): Unit = {
+      cache.get(ctx, stepInputs) match {
+        case Some(value) =>
+          throw new StepBreak[Out](ctx, value)
+
+        case None =>
+          ()
+      }
+    }
+
+    def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out], cache: StepCache): Unit = {
+      cache.get(ctx) match {
+        case Some(value) =>
+          val stepInputsMatch: Boolean = true // TODO
+          if (stepInputsMatch)
+            throw new StepBreak[Out](ctx, value)
+          else
+            throw new IllegalStateException("conflict on step") // TODO
+
+        case None =>
+          ()
+      }
     }
   }
 
