@@ -6,6 +6,7 @@ lazy val root = (project in file("."))
   .settings(
     name := "atomicflow",
     libraryDependencies ++= Seq(
-      "io.github.iltotore" %% "iron" % "3.0.0"
+      "io.github.iltotore" %% "iron" % "3.0.0",
+      "org.typelevel" %% "cats-core" % "2.13.0"
     )
   )
