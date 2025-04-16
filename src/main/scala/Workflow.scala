@@ -1,5 +1,5 @@
 import Step.{StepId, StepIdempotencyId}
-import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstance, WorkflowInstanceId}
+import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstance, WorkflowInstanceId, WorkflowMeta}
 import io.github.iltotore.iron.*
 import io.github.iltotore.iron.constraint.string.*
 
@@ -7,10 +7,7 @@ import scala.concurrent.TimeoutException
 import scala.concurrent.duration.*
 
 case class Workflow[In, Out] private(
-                                      id: WorkflowId,
-                                      name: String,
-                                      description: Option[String],
-                                      cacheTtl: FiniteDuration,
+                                      meta: WorkflowMeta,
                                       body: (WorkflowCtx[In, Out], In) => Out
                                     ) {
   def createInstance(instanceId: WorkflowInstanceId, in: In): WorkflowInstance[In, Out] = ???
@@ -30,8 +27,8 @@ object Workflow {
                       cacheTtl: FiniteDuration = defaultCacheTtl
                     )(
                       body: In => WorkflowCtx[In, Out] ?=> Out
-                    ): Workflow[In, Out] =
-    new Workflow[In, Out](
+                    ): Workflow[In, Out] = {
+    val workflowMeta = WorkflowMeta(
       id = id match {
         case workflowId: WorkflowId => workflowId
         case id: (String :| ValidUUID) => WorkflowId(id)
@@ -41,15 +38,27 @@ object Workflow {
         case () => None
         case string: String => Some(string)
       },
-      cacheTtl = cacheTtl,
+      cacheTtl = cacheTtl
+    )
+
+    Workflow[In, Out](
+      meta = workflowMeta,
       body = { (ctx: WorkflowCtx[In, Out], in: In) =>
         body(in)(using ctx)
       }
     )
+  }
 
-  def meta[In, Out](using ctx: WorkflowCtx[In, Out]): Workflow[In, Out] = ctx.workflow
+  def meta[In, Out](using ctx: WorkflowCtx[In, Out]): WorkflowMeta = ctx.workflow.meta
 
   def instanceId[In, Out](using ctx: WorkflowCtx[In, Out]): WorkflowInstanceId = ctx.instanceId
+
+  case class WorkflowMeta(
+                           id: WorkflowId,
+                           name: String,
+                           description: Option[String],
+                           cacheTtl: FiniteDuration
+                         )
 
   case class WorkflowId(id: String :| ValidUUID)
 
@@ -63,15 +72,18 @@ object Workflow {
     def stepIdempotencyStore: WorkflowStepIdempotencyStore
   }
 
-  trait WorkflowInstance[In, Out] {
-    def workflow: Workflow[In, Out]
+  case class WorkflowInstance[In, Out](
+                                        workflow: Workflow[In, Out],
+                                        instanceId: WorkflowInstanceId,
+                                        stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+                                      ) {
+    def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): WorkflowInstance[In, Out] =
+      copy(stepIdempotencyIdOverrides = stepIdempotencyIdOverrides + (stepId -> stepIdempotencyId))
 
-    def instanceId: WorkflowInstanceId
-
-    def run(using WorkflowMutex)(): Out
+    def run(using WorkflowMutex)(): Out = ???
 
     @throws[TimeoutException]
-    def runWithTimeout(using WorkflowMutex)(timeout: FiniteDuration): Out
+    def runWithTimeout(using WorkflowMutex)(timeout: FiniteDuration): Out = ???
   }
 
   case class WorkflowInstanceId(id: String :| ValidUUID)
@@ -88,6 +100,7 @@ trait StepCache {
                 workflowId: WorkflowId,
                 workflowInstanceId: WorkflowInstanceId,
                 stepIdempotencyId: StepIdempotencyId,
+                stepVersion: Long,
                 stepInputs: Seq[StepInput[?]]
               ): Option[Out]
 
@@ -95,6 +108,7 @@ trait StepCache {
                 workflowId: WorkflowId,
                 workflowInstanceId: WorkflowInstanceId,
                 stepIdempotencyId: StepIdempotencyId,
+                stepVersion: Long,
                 stepInputs: Seq[StepInput[?]],
                 value: Out,
                 ttl: FiniteDuration
@@ -106,6 +120,7 @@ trait StepIdempotencyStore {
                                     workflowId: WorkflowId,
                                     libraryVersion: Long,
                                     stepId: StepId,
+                                    stepVersion: Option[Long],
                                     workflowInstanceId: WorkflowInstanceId,
                                     stepInputs: Seq[StepInput[?]]
                                   ): StepIdempotencyId

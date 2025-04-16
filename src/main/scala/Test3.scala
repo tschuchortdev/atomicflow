@@ -6,7 +6,7 @@ import java.nio.file.{Files, Paths}
 class Test3 {
   def sendFile(bytes: Array[Byte], receiver: String): Unit = ???
 
-  val flow1: Workflow[String, Unit] = Workflow("99a2866c-99c5-49b7-b0f5-ad097a3e3a78", name = "read and send files") { (fileName: String) =>
+  val flow1: Workflow[String, Unit] = Workflow(id = "99a2866c-99c5-49b7-b0f5-ad097a3e3a78", name = "read and send files") { (fileName: String) =>
     val fileName = ""
 
     val fileBytes = Step(id = "533dddc7-d355-43b4-81d8-bd8051808ec5", version = 0, name = "read file") {

@@ -7,6 +7,7 @@ import io.github.iltotore.iron.constraint.string.*
 
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
+import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration.*
 
 object Step {
@@ -18,7 +19,7 @@ object Step {
                 )(
                   body: StepCtx[Out] ?=> Out
                 )(using workflowCtx: WorkflowCtx[?, ?]): Out = {
-    val stepMeta = new StepMeta(
+    val stepMeta = StepMeta(
       id = id match {
         case stepId: StepId => stepId
         case id: (String :| ValidUUID) => StepId(id)
@@ -41,14 +42,29 @@ object Step {
       override def meta: StepMeta = stepMeta
 
       override def workflowCtx: WorkflowCtx[?, ?] = stepWorkflowCtx
+
+      private val completeAtomic: AtomicReference[Out => Unit] = AtomicReference[Out => Unit](_ => ())
+
+      override def onComplete(f: Out => Unit): Unit =
+        completeAtomic.updateAndGet(prev => out => {
+          prev(out)
+          f(out)
+        })
+
+      override def complete(out: Out): Unit =
+        completeAtomic.get()(out)
     }
 
-    try {
+    val result = try {
       body
     } catch {
       case r: StepBreak[Out] if ctx.eq(r.ctx) =>
         r.value
     }
+
+    ctx.complete(result)
+
+    result
   }
 
   case class StepMeta(
@@ -58,6 +74,24 @@ object Step {
                        description: Option[String],
                        workflow: Workflow[?, ?]
                      )
+
+  case class StepId(id: String :| ValidUUID)
+
+  trait StepCtx[Out] {
+    def meta: StepMeta
+
+    def workflowCtx: WorkflowCtx[?, ?]
+
+    def onComplete(f: Out => Unit): Unit
+
+    private[Step] def complete(out: Out): Unit
+  }
+
+  case class StepIdempotencyId(id: String :| ValidUUID)
+
+  final class StepBreak[Out](val ctx: StepCtx[Out], val value: Out)
+    extends RuntimeException(
+      /*message*/ null, /*cause*/ null, /*enableSuppression=*/ false, /*writableStackTrace*/ false)
 
   inline def meta(using ctx: StepCtx[?]): StepMeta = ctx.meta
 
@@ -72,49 +106,39 @@ object Step {
   def cached[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out]): Unit = {
     val idempotencyId = ctx.workflowCtx.stepIdempotencyStore.getOrCreateStepIdempotencyId(
       meta.id,
+      Some(meta.version),
       stepInputs
     )
 
-    ctx.workflowCtx.stepCache.get(idempotencyId, stepInputs) match {
+    ctx.workflowCtx.stepCache.get(idempotencyId, meta.version, stepInputs) match {
       case Some(value) =>
         throw new StepBreak[Out](ctx, value)
 
       case None =>
-        // TODO: register action on ctx to save step result to cache
-        ()
+        ctx.onComplete { out =>
+          ctx.workflowCtx.stepCache.put(idempotencyId, meta.version, stepInputs, out, ttl = None)
+        }
     }
   }
 
   def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out]): Unit = {
     val idempotencyId = ctx.workflowCtx.stepIdempotencyStore.getOrCreateStepIdempotencyId(
       meta.id,
+      None,
       Seq.empty
     )
 
     // throws ConflictException if stepInputs don't match
-    ctx.workflowCtx.stepCache.get(idempotencyId, stepInputs) match {
+    ctx.workflowCtx.stepCache.get(idempotencyId, meta.version, stepInputs) match {
       case Some(value) =>
         throw new StepBreak[Out](ctx, value)
 
       case None =>
-        // TODO: register action on ctx to save step result to cache
-        ()
+        ctx.onComplete { out =>
+          ctx.workflowCtx.stepCache.put(idempotencyId, meta.version, stepInputs, out, ttl = None)
+        }
     }
   }
-
-  case class StepId(id: String :| ValidUUID)
-
-  trait StepCtx[Out] {
-    def meta: StepMeta
-
-    def workflowCtx: WorkflowCtx[?, ?]
-  }
-
-  case class StepIdempotencyId(id: String :| ValidUUID)
-
-  final class StepBreak[Out](val ctx: StepCtx[Out], val value: Out)
-    extends RuntimeException(
-      /*message*/ null, /*cause*/ null, /*enableSuppression=*/ false, /*writableStackTrace*/ false)
 }
 
 trait Hashable[A] {
@@ -163,11 +187,13 @@ trait WorkflowStepCache {
   //@throws[IllegalStateException] TODO: throw conflict exception
   def get[Out](
                 stepIdempotencyId: StepIdempotencyId,
+                stepVersion: Long,
                 stepInputs: Seq[StepInput[?]]
               ): Option[Out]
 
   def put[Out](
                 stepIdempotencyId: StepIdempotencyId,
+                stepVersion: Long,
                 stepInputs: Seq[StepInput[?]],
                 value: Out,
                 ttl: Option[FiniteDuration]
@@ -177,6 +203,7 @@ trait WorkflowStepCache {
 trait WorkflowStepIdempotencyStore {
   def getOrCreateStepIdempotencyId(
                                     stepId: StepId,
+                                    stepVersion: Option[Long],
                                     stepInputs: Seq[StepInput[?]]
                                   ): StepIdempotencyId
 
