@@ -1,5 +1,5 @@
 import Step.{StepId, StepIdempotencyId}
-import Workflow.WorkflowCtx
+import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstanceId}
 import cats.Contravariant
 import cats.syntax.all.*
 import io.github.iltotore.iron.*
@@ -8,6 +8,7 @@ import io.github.iltotore.iron.constraint.string.*
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicReference
+import scala.annotation.implicitNotFound
 import scala.concurrent.duration.*
 
 object Step {
@@ -77,6 +78,7 @@ object Step {
 
   case class StepId(id: String :| ValidUUID)
 
+  @implicitNotFound("Cannot be used outside a Step definition: `Step(...) {  }`")
   trait StepCtx[Out] {
     def meta: StepMeta
 
@@ -103,7 +105,7 @@ object Step {
     throw new UnsupportedOperationException("step compensation actions are not supported yet")
   }
 
-  def cached[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out]): Unit = {
+  def cache[Out](stepInputs: StepInput[?]*)(using ctx: StepCtx[Out]): Unit = {
     val idempotencyId = ctx.workflowCtx.stepIdempotencyStore.getOrCreateStepIdempotencyId(
       meta.id,
       Some(meta.version),
@@ -146,7 +148,7 @@ trait Hashable[A] {
 }
 
 object Hashable {
-  def apply[A](using instance: Hashable[A]): Hashable[A] = instance
+  inline def apply[A](using instance: Hashable[A]): Hashable[A] = instance
 
   given Contravariant[Hashable] = new Contravariant[Hashable] {
     override def contramap[A, B](fa: Hashable[A])(f: B => A): Hashable[B] = new Hashable[B] {
@@ -173,6 +175,11 @@ object Hashable {
   given Hashable[Double] = Hashable[String].contramap(_.toString)
 
   given Hashable[Byte] = Hashable[Array[Byte]].contramap(Array(_))
+
+  given [F[E] <: Iterable[E], A: Hashable] => Hashable[F[A]] = new Hashable[F[A]] {
+    override def hash(value: F[A]): IArray[Byte] =
+      Hashable[IArray[Byte]].hash(IArray.concat(value.map(Hashable[A].hash).toSeq *))
+  }
 }
 
 case class StepInput[A: Hashable](name: String, value: A) {
@@ -183,7 +190,7 @@ given [A: Hashable] => Conversion[(String, A), StepInput[A]] = { (name: String, 
   StepInput(name, value)
 }
 
-trait WorkflowStepCache {
+sealed trait WorkflowStepCache {
   //@throws[IllegalStateException] TODO: throw conflict exception
   def get[Out](
                 stepIdempotencyId: StepIdempotencyId,
@@ -200,7 +207,44 @@ trait WorkflowStepCache {
               ): Unit
 }
 
-trait WorkflowStepIdempotencyStore {
+extension (stepCache: StepCache) {
+  def withWorkflowInstance(
+                            workflowId: WorkflowId,
+                            workflowInstanceId: WorkflowInstanceId
+                          ): WorkflowStepCache = new WorkflowStepCache {
+    override def get[Out](
+                           stepIdempotencyId: StepIdempotencyId,
+                           stepVersion: Long,
+                           stepInputs: Seq[StepInput[?]]
+                         ): Option[Out] =
+      stepCache.get[Out](
+        workflowId = workflowId,
+        workflowInstanceId = workflowInstanceId,
+        stepIdempotencyId = stepIdempotencyId,
+        stepVersion = stepVersion,
+        stepInputs = stepInputs
+      )
+
+    override def put[Out](
+                           stepIdempotencyId: StepIdempotencyId,
+                           stepVersion: Long,
+                           stepInputs: Seq[StepInput[?]],
+                           value: Out,
+                           ttl: Option[FiniteDuration]
+                         ): Unit =
+      stepCache.put[Out](
+        workflowId = workflowId,
+        workflowInstanceId = workflowInstanceId,
+        stepIdempotencyId = stepIdempotencyId,
+        stepVersion = stepVersion,
+        stepInputs = stepInputs,
+        value = value,
+        ttl = ttl.getOrElse(???) // TODO workflow.defaultTtl
+      )
+  }
+}
+
+sealed trait WorkflowStepIdempotencyStore {
   def getOrCreateStepIdempotencyId(
                                     stepId: StepId,
                                     stepVersion: Option[Long],
@@ -211,4 +255,38 @@ trait WorkflowStepIdempotencyStore {
                                  stepId: StepId,
                                  stepIdempotencyId: StepIdempotencyId
                                ): Unit
+}
+
+extension (stepIdempotencyStore: StepIdempotencyStore) {
+  def withWorkflowInstance(
+                            workflowId: WorkflowId,
+                            libraryVersion: Long,
+                            workflowInstanceId: WorkflowInstanceId
+                          ): WorkflowStepIdempotencyStore = new WorkflowStepIdempotencyStore {
+    override def getOrCreateStepIdempotencyId(
+                                               stepId: StepId,
+                                               stepVersion: Option[Long],
+                                               stepInputs: Seq[StepInput[?]]
+                                             ): StepIdempotencyId =
+      stepIdempotencyStore.getOrCreateStepIdempotencyId(
+        workflowId = workflowId,
+        libraryVersion = libraryVersion,
+        stepId = stepId,
+        stepVersion = stepVersion,
+        workflowInstanceId = workflowInstanceId,
+        stepInputs = stepInputs
+      )
+
+    override def overrideStepIdempotencyId(
+                                            stepId: StepId,
+                                            stepIdempotencyId: StepIdempotencyId
+                                          ): Unit =
+      stepIdempotencyStore.overrideStepIdempotencyId(
+        workflowId = workflowId,
+        libraryVersion = libraryVersion,
+        stepId = stepId,
+        workflowInstanceId = workflowInstanceId,
+        stepIdempotencyId = stepIdempotencyId
+      )
+  }
 }

@@ -3,6 +3,7 @@ import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstance, WorkflowInstanceId, 
 import io.github.iltotore.iron.*
 import io.github.iltotore.iron.constraint.string.*
 
+import scala.annotation.implicitNotFound
 import scala.concurrent.TimeoutException
 import scala.concurrent.duration.*
 
@@ -10,9 +11,11 @@ case class Workflow[In, Out] private(
                                       meta: WorkflowMeta,
                                       body: (WorkflowCtx[In, Out], In) => Out
                                     ) {
-  def createInstance(instanceId: WorkflowInstanceId, in: In): WorkflowInstance[In, Out] = ???
+  def createInstance(instanceId: WorkflowInstanceId, in: In)(using runtime: WorkflowRuntime): WorkflowInstance[In, Out] =
+    runtime.createWorkflowInstance(this, instanceId, in)
 
-  def recoverInstance(instanceId: WorkflowInstanceId): WorkflowInstance[In, Out] = ???
+  def recoverInstance(instanceId: WorkflowInstanceId)(using runtime: WorkflowRuntime): WorkflowInstance[In, Out] =
+    runtime.recoverWorkflowInstance(this, instanceId)
 }
 
 object Workflow {
@@ -31,7 +34,7 @@ object Workflow {
     val workflowMeta = WorkflowMeta(
       id = id match {
         case workflowId: WorkflowId => workflowId
-        case id: (String :| ValidUUID) => WorkflowId(id)
+        case id: (String :| ValidUUID) @unchecked => WorkflowId(id)
       },
       name = name,
       description = description match {
@@ -62,6 +65,7 @@ object Workflow {
 
   case class WorkflowId(id: String :| ValidUUID)
 
+  @implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`")
   trait WorkflowCtx[In, Out] {
     def workflow: Workflow[In, Out]
 
@@ -87,13 +91,14 @@ object Workflow {
   }
 
   case class WorkflowInstanceId(id: String :| ValidUUID)
+
+  object WorkflowInstanceId {
+    def make(using runtime: WorkflowRuntime): WorkflowInstanceId =
+      runtime.makeWorkflowInstanceId
+  }
 }
 
-trait WorkflowMutex {
-  def lock(workflowId: WorkflowId, workflowInstanceId: WorkflowInstanceId): Unit
 
-  def unlock(workflowId: WorkflowId, workflowInstanceId: WorkflowInstanceId): Unit
-}
 
 trait StepCache {
   def get[Out](

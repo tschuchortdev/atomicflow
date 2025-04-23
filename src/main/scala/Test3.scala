@@ -10,7 +10,7 @@ class Test3 {
     val fileName = ""
 
     val fileBytes = Step(id = "533dddc7-d355-43b4-81d8-bd8051808ec5", version = 0, name = "read file") {
-      Step.cached(
+      Step.cache(
         "fileName" -> fileName
       )
 
