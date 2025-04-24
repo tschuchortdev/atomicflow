@@ -1,5 +1,4 @@
-import Step.StepIdempotencyId
-import Workflow.{WorkflowInstanceBuilder, WorkflowInstanceId}
+package atomicflow
 
 import scala.annotation.implicitNotFound
 import scala.concurrent.TimeoutException
@@ -13,10 +12,14 @@ trait WorkflowRuntime {
 
   def createWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Unit
 
-  @throws[TimeoutException]
+  /**
+   * - Must lock the workflow while running
+   */
   def runWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Out
 
-  // TODO: WorkflowNotFoundException
-  @throws[TimeoutException]
+  /**
+   * - Must lock the workflow while running
+   * - Must throw a WorkflowNotFoundException
+   */
   def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out
 }
