@@ -90,6 +90,11 @@ object Step {
   }
 
   case class StepIdempotencyId(id: String :| ValidUUID)
+  
+  object StepIdempotencyId {
+    def generate(using runtime: WorkflowRuntime): StepIdempotencyId =
+      runtime.generateStepIdempotencyId
+  }
 
   final class StepBreak[Out](val ctx: StepCtx[Out], val value: Out)
     extends RuntimeException(

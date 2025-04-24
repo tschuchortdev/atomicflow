@@ -1,5 +1,5 @@
 import Step.{StepId, StepIdempotencyId}
-import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstance, WorkflowInstanceId, WorkflowMeta}
+import Workflow.{WorkflowCtx, WorkflowId, WorkflowInstanceBuilder, WorkflowInstanceId, WorkflowMeta}
 import io.github.iltotore.iron.*
 import io.github.iltotore.iron.constraint.string.*
 
@@ -11,11 +11,11 @@ case class Workflow[In, Out] private(
                                       meta: WorkflowMeta,
                                       body: (WorkflowCtx[In, Out], In) => Out
                                     ) {
-  def createInstance(instanceId: WorkflowInstanceId, in: In)(using runtime: WorkflowRuntime): WorkflowInstance[In, Out] =
-    runtime.createWorkflowInstance(this, instanceId, in)
-
-  def recoverInstance(instanceId: WorkflowInstanceId)(using runtime: WorkflowRuntime): WorkflowInstance[In, Out] =
-    runtime.recoverWorkflowInstance(this, instanceId)
+  def instance(instanceId: WorkflowInstanceId): WorkflowInstanceBuilder[In, Out] =
+    WorkflowInstanceBuilder(
+      this,
+      instanceId
+    )
 }
 
 object Workflow {
@@ -76,28 +76,37 @@ object Workflow {
     def stepIdempotencyStore: WorkflowStepIdempotencyStore
   }
 
-  case class WorkflowInstance[In, Out](
-                                        workflow: Workflow[In, Out],
-                                        instanceId: WorkflowInstanceId,
-                                        stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
-                                      ) {
-    def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): WorkflowInstance[In, Out] =
+  case class WorkflowInstanceBuilder[In, Out] private[Workflow](
+                                                          workflow: Workflow[In, Out],
+                                                          instanceId: WorkflowInstanceId,
+                                                          timeout: Option[FiniteDuration] = None,
+                                                          stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
+                                                        ) {
+    def withTimeout(timeout: FiniteDuration): WorkflowInstanceBuilder[In, Out] =
+      copy(timeout = Some(timeout))
+
+    // TODO: mixing of immutable stuff like this with mutable/side-effecting stuff like createInstance
+    def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): WorkflowInstanceBuilder[In, Out] =
       copy(stepIdempotencyIdOverrides = stepIdempotencyIdOverrides + (stepId -> stepIdempotencyId))
 
-    def run(using WorkflowMutex)(): Out = ???
-
+    def create(in: In)(using runtime: WorkflowRuntime): Unit =
+      runtime.createWorkflowInstance(this, in)
+    
     @throws[TimeoutException]
-    def runWithTimeout(using WorkflowMutex)(timeout: FiniteDuration): Out = ???
+    def run(in: In)(using runtime: WorkflowRuntime): Out =
+      runtime.runWorkflowInstance(this, in)
+
+    def recover()(using runtime: WorkflowRuntime): Out =
+      runtime.recoverWorkflowInstance(this)
   }
 
   case class WorkflowInstanceId(id: String :| ValidUUID)
 
   object WorkflowInstanceId {
-    def make(using runtime: WorkflowRuntime): WorkflowInstanceId =
-      runtime.makeWorkflowInstanceId
+    def generate(using runtime: WorkflowRuntime): WorkflowInstanceId =
+      runtime.generateWorkflowInstanceId
   }
 }
-
 
 
 trait StepCache {
