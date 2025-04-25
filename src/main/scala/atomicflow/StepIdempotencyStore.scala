@@ -1,15 +1,11 @@
 package atomicflow
 
+/*
 trait StepIdempotencyStore {
   self =>
 
   def getOrCreateStepIdempotencyId(
-                                    workflowId: WorkflowId,
-                                    libraryVersion: Long,
-                                    stepId: StepId,
-                                    stepVersion: Option[Long],
-                                    workflowInstanceId: WorkflowInstanceId,
-                                    stepInputs: Seq[StepInput[?]]
+
                                   ): StepIdempotencyId
 
   def overrideStepIdempotencyId(
@@ -52,18 +48,21 @@ trait StepIdempotencyStore {
       )
   }
 }
+*/
+trait StepIdempotencyStore {
+  /**
+   * Get or create a stepIdempotencyId
+   * The stepIdempotencyId should be namespaced by the tuple
+   * (workflowId, libraryVersion, stepId, stepVersion, workflowInstanceId, stepInputs)
+   */
+  def acquireStepIdempotencyId(hashedStepInputs: HashedStepInputs): StepIdempotencyId
 
-object StepIdempotencyStore {
-  trait WithWorkflow {
-    def getOrCreateStepIdempotencyId(
-                                      stepId: StepId,
-                                      stepVersion: Option[Long],
-                                      stepInputs: Seq[StepInput[?]]
-                                    ): StepIdempotencyId
+  /**
+   * Get or create a stepIdempotencyId
+   * The stepIdempotencyId should be namespaced by the tuple
+   * (workflowId, libraryVersion, stepId, workflowInstanceId)
+   */
+  def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId
 
-    def overrideStepIdempotencyId(
-                                   stepId: StepId,
-                                   stepIdempotencyId: StepIdempotencyId
-                                 ): Unit
-  }
+  def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit
 }

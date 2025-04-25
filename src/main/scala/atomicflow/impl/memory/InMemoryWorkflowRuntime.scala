@@ -1,6 +1,7 @@
 package atomicflow.impl.memory
 
 import atomicflow.*
+import atomicflow.Hashable.Hashed
 import io.github.iltotore.iron.*
 
 import java.util.UUID
@@ -8,12 +9,70 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
 
 class InMemoryWorkflowRuntime extends WorkflowRuntime {
+  trait WorkflowIdempotencyStore {
+    val idempotencyIds: AtomicReference[Map[(StepId, Option[Long], Option[HashedStepInputs]), StepIdempotencyId]] = new AtomicReference(Map.empty)
+
+    def getIdempotencyStore(using stepCtx: StepContext[?]): StepIdempotencyStore = new StepIdempotencyStore {
+      override def acquireStepIdempotencyId(hashedStepInputs: HashedStepInputs): StepIdempotencyId = {
+        val key = (stepCtx.meta.id, Some(stepCtx.meta.version), Some(hashedStepInputs))
+        idempotencyIds.updateAndGet(ids => ids.get(key) match {
+          case Some(_) => ids
+          case None =>
+            val id = generateStepIdempotencyId
+            ids + (key -> id)
+        })(key)
+      }
+
+      override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
+        val key = (stepCtx.meta.id, None, None)
+        idempotencyIds.updateAndGet(ids => ids.get(key) match {
+          case Some(_) => ids
+          case None =>
+            val id = generateStepIdempotencyId
+            ids + (key -> id)
+        })(key)
+      }
+
+      override def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit = {
+        idempotencyIds.updateAndGet(ids => ids + ((stepCtx.meta.id, None, None) -> stepIdempotencyId))
+      }
+    }
+  }
+
+  trait WorkflowStepCache {
+    val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, HashedStepInputs, Any)]] = new AtomicReference(Map.empty)
+
+    def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
+      override def get(
+                        stepIdempotencyId: StepIdempotencyId,
+                        hashedStepInputs: HashedStepInputs
+                      ): Option[StepOut] = {
+        val stepVersion = ctx.meta.version
+        stepCache.get().get(stepIdempotencyId).map {
+          case (`stepVersion`, `hashedStepInputs`, out: StepOut) => out
+          case _ => throw new StepInputConflictException()
+        }
+      }
+
+
+      override def put(
+                        stepIdempotencyId: StepIdempotencyId,
+                        hashedStepInputs: HashedStepInputs,
+                        value: StepOut,
+                        ttl: Option[FiniteDuration]
+                      ): Unit = {
+        // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
+        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, hashedStepInputs, value)))
+      }
+    }
+  }
+
   private case class WorkflowState[In, Out](
                                              locked: AtomicBoolean,
                                              in: In,
                                              workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                             stepCache: StepCache.WithWorkflow,
-                                             stepIdempotencyStore: StepIdempotencyStore.WithWorkflow
+                                             stepCache: WorkflowStepCache,
+                                             stepIdempotencyStore: WorkflowIdempotencyStore
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
@@ -22,12 +81,18 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
 
   override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId(UUID.randomUUID().toString.refineUnsafe)
 
-  override def createWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Unit = {
+  override def createWorkflowInstance[WorkflowIn, WorkflowOut](workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut], in: WorkflowIn): Unit = {
+    given SimpleWorkflowContext {
+      override def meta: WorkflowMeta = workflowInstance.workflow.meta
+
+      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+    }
+
     workflowInstances.updateAndGet { instances =>
       instances.get(workflowInstance.instanceId) match {
         case Some(state) =>
           if (state.in != in) {
-            throw new RuntimeException("CONFLICT")
+            throw new WorkflowInputConflictException()
           } else {
             instances
           }
@@ -36,43 +101,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
             locked = new AtomicBoolean(false),
             in = in,
             workflowInstance = workflowInstance,
-            stepCache = new StepCache.WithWorkflow {
-              val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, Seq[HashedStepInput], Any)]] = new AtomicReference(Map.empty)
-
-              override def get[Out](stepIdempotencyId: StepIdempotencyId, stepVersion: Long, stepInputs: Seq[StepInput[?]]): Option[Out] = {
-                lazy val stepInputHashes = stepInputs.map(_.hash)
-                stepCache.get().get(stepIdempotencyId).map {
-                  case (`stepVersion`, `stepInputHashes`, out: Out) =>
-                    out
-                  case _ => throw new RuntimeException("CONFLICT")
-                }
-              }
-
-              override def put[Out](stepIdempotencyId: StepIdempotencyId, stepVersion: Long, stepInputs: Seq[StepInput[?]], value: Out, ttl: Option[FiniteDuration]): Unit = {
-                lazy val stepInputHashes = stepInputs.map(_.hash)
-                // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
-                stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (stepVersion, stepInputHashes, value)))
-              }
-            },
-            stepIdempotencyStore = new StepIdempotencyStore.WithWorkflow {
-              // TODO can IArray be compared?
-              val idempotencyIds: AtomicReference[Map[(StepId, Option[Long], Seq[HashedStepInput]), StepIdempotencyId]] = new AtomicReference(Map.empty)
-
-              override def getOrCreateStepIdempotencyId(stepId: StepId, stepVersion: Option[Long], stepInputs: Seq[StepInput[?]]): StepIdempotencyId = {
-                val key = (stepId, stepVersion, stepInputs.map(_.hash))
-                idempotencyIds.updateAndGet(ids => ids.get(key) match {
-                  case Some(_) => ids
-                  case None =>
-                    val id = generateStepIdempotencyId
-                    ids + (key -> id)
-                })(key)
-              }
-
-
-              override def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): Unit = {
-                idempotencyIds.updateAndGet(ids => ids + ((stepId, None, Seq.empty) -> stepIdempotencyId))
-              }
-            }
+            stepCache = new WorkflowStepCache {},
+            stepIdempotencyStore = new WorkflowIdempotencyStore {}
           ))
       }
     }
@@ -84,22 +114,30 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
   }
 
   override def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out = {
+    given SimpleWorkflowContext {
+      override def meta: WorkflowMeta = workflowInstance.workflow.meta
+
+      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+    }
+
     workflowInstances.get().get(workflowInstance.instanceId) match {
       case Some(state: WorkflowState[In, Out]) =>
         if (state.locked.getAndSet(true)) {
           // was locked before
-          throw new RuntimeException("LOCKED")
+          throw new WorkflowLockedException()
         } else {
-          // was locked before
+          // was not locked before
           try {
             val ctx = new WorkflowContext[In, Out] {
-              override def workflow: Workflow[In, Out] = workflowInstance.workflow
+              override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
               override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
 
-              override def stepCache: StepCache.WithWorkflow = state.stepCache
+              override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
+                state.stepIdempotencyStore.getIdempotencyStore
 
-              override def stepIdempotencyStore: StepIdempotencyStore.WithWorkflow = state.stepIdempotencyStore
+              override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
+                state.stepCache.getStepCache[StepOut]
             }
             state.workflowInstance.workflow.body(ctx, state.in)
           } finally {
@@ -108,7 +146,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
         }
 
       case _ =>
-        throw new RuntimeException("Workflow not found!")
+        throw new WorkflowNotFoundException()
     }
   }
 }

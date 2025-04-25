@@ -1,9 +1,8 @@
 package atomicflow
 
-import atomicflow.StepCache.WithWorkflow
-
 import scala.concurrent.duration.FiniteDuration
 
+/*
 trait StepCache {
   self =>
 
@@ -62,22 +61,27 @@ trait StepCache {
       )
   }
 }
+*/
+trait StepCache[Out] {
+  /**
+   * the output value should be retrieved by the stepIdempotencyId. The stepVersion and stepInputs should be compared on
+   * retrieval and should throw a StepInputConflictException if they don't match
+   */
+  @throws[StepInputConflictException]
+  def get(
+           stepIdempotencyId: StepIdempotencyId,
+           hashedStepInputs: HashedStepInputs
+         ): Option[Out]
 
-object StepCache {
-  trait WithWorkflow {
-    //@throws[IllegalStateException] TODO: throw conflict exception
-    def get[Out](
-                  stepIdempotencyId: StepIdempotencyId,
-                  stepVersion: Long,
-                  stepInputs: Seq[StepInput[?]]
-                ): Option[Out]
-
-    def put[Out](
-                  stepIdempotencyId: StepIdempotencyId,
-                  stepVersion: Long,
-                  stepInputs: Seq[StepInput[?]],
-                  value: Out,
-                  ttl: Option[FiniteDuration]
-                ): Unit
-  }
+  /**
+   * the output value should be cached by the stepIdempotencyId. The stepVersion and stepInputs should be compared on put
+   * and should throw a StepInputConflictException if they don't match
+   */
+  @throws[StepInputConflictException]
+  def put(
+           stepIdempotencyId: StepIdempotencyId,
+           hashedStepInputs: HashedStepInputs,
+           value: Out,
+           ttl: Option[FiniteDuration]
+         ): Unit
 }

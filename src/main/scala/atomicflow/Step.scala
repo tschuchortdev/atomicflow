@@ -1,5 +1,6 @@
 package atomicflow
 
+import atomicflow.Hashable.Hashed
 import cats.syntax.all.*
 import io.github.iltotore.iron.*
 import io.github.iltotore.iron.constraint.string.*
@@ -8,14 +9,15 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicReference
 
 object Step {
-  def apply[Out](
+  def apply[Out](using workflowCtx: WorkflowContext[?, ?])
+                (
                   id: StepId | String :| ValidUUID,
                   version: Long,
                   name: String | Unit = (),
                   description: String | Unit = ()
                 )(
                   body: StepContext[Out] ?=> Out
-                )(using workflowCtx: WorkflowContext[?, ?]): Out = {
+                ): Out = {
     val stepMeta = StepMeta(
       id = id match {
         case stepId: StepId => stepId
@@ -30,17 +32,22 @@ object Step {
         case () => None
         case string: String => Some(string)
       },
-      workflow = workflowCtx.workflow
+      workflowMeta = workflowCtx.meta,
+      workflowInstanceId = workflowCtx.instanceId
     )
 
     val stepWorkflowCtx = workflowCtx
 
-    given ctx: StepContext[Out] = new StepContext[Out] {
+    val completeAtomic: AtomicReference[Out => Unit] = AtomicReference[Out => Unit](_ => ())
+
+    given stepCtx: StepContext[Out] = new StepContext[Out] {
       override def meta: StepMeta = stepMeta
 
       override def workflowCtx: WorkflowContext[?, ?] = stepWorkflowCtx
 
-      private val completeAtomic: AtomicReference[Out => Unit] = AtomicReference[Out => Unit](_ => ())
+      override lazy val idempotencyStore: StepIdempotencyStore = stepWorkflowCtx.getStepIdempotencyStore
+
+      override def cache(using Cacheable[Out]): StepCache[Out] = stepWorkflowCtx.getStepCache
 
       override def onComplete(f: Out => Unit): Unit =
         completeAtomic.updateAndGet(prev => out => {
@@ -48,86 +55,73 @@ object Step {
           f(out)
         })
 
-      override def complete(out: Out): Unit =
-        completeAtomic.get()(out)
+      override def onCompensate(f: => Unit): Unit =
+        throw new UnsupportedOperationException("step compensation actions are not supported yet")
     }
 
     val result = try {
       body
     } catch {
-      case r: StepBreak[Out] @unchecked if ctx.eq(r.ctx) =>
-        r.value
+      case brk: StepBreak[Out] @unchecked if stepCtx.eq(brk.ctx) =>
+        brk.value
     }
 
-    ctx.complete(result)
+    completeAtomic.get()(result)
 
     result
   }
 
-  final class StepBreak[Out](val ctx: StepContext[Out], val value: Out)
+  final class StepBreak[Out](val value: Out)(using val ctx: StepContext[Out])
     extends RuntimeException(/*message*/ null, /*cause*/ null, /*enableSuppression=*/ false, /*writableStackTrace*/ false)
 
   inline def meta(using ctx: StepContext[?]): StepMeta = ctx.meta
 
-  // TODO: throw IllegalStateException if there is no IdempotencyId
-  //def idempotencyId(using ctx: StepCtx[?]): Option[StepIdempotencyId] = ctx.idempotencyId
+  inline def compensate(using ctx: StepContext[?])(f: => Unit): Unit = ctx.onCompensate(f)
 
-  def compensate(body: => Unit)(using ctx: StepContext[?]): Unit = {
-    // TODO: register compensate action on ctx
-    throw new UnsupportedOperationException("step compensation actions are not supported yet")
-  }
+  def cache[Out: Cacheable](using ctx: StepContext[Out])(stepInputs: StepInput[?]*): Unit = {
+    val hashedStepInputs = HashedStepInputs.hash(stepInputs)
 
-  def cache[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
-    val idempotencyId = ctx.workflowCtx.stepIdempotencyStore.getOrCreateStepIdempotencyId(
-      meta.id,
-      Some(meta.version),
-      stepInputs
-    )
+    val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(hashedStepInputs)
 
-    ctx.workflowCtx.stepCache.get[Out](idempotencyId, meta.version, stepInputs) match {
-      case Some(value: Out) =>
-        throw new StepBreak[Out](ctx, value)
+    ctx.cache.get(idempotencyId, hashedStepInputs) match {
+      case Some(value) =>
+        throw new StepBreak(value)
 
       case None =>
         ctx.onComplete { out =>
-          ctx.workflowCtx.stepCache.put[Out](idempotencyId, meta.version, stepInputs, out, ttl = None)
+          ctx.cache.put(idempotencyId, hashedStepInputs, out, ttl = None /* TODO */)
         }
     }
   }
 
-  def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
-    val idempotencyId = ctx.workflowCtx.stepIdempotencyStore.getOrCreateStepIdempotencyId(
-      meta.id,
-      None,
-      Seq.empty
-    )
+  @throws[StepInputConflictException]
+  def onlyOnce[Out: Cacheable](using ctx: StepContext[Out])(stepInputs: StepInput[?]*): Unit = {
+    val hashedStepInputs = HashedStepInputs.hash(stepInputs)
 
-    // throws ConflictException if stepInputs don't match
-    ctx.workflowCtx.stepCache.get[Out](idempotencyId, meta.version, stepInputs) match {
+    val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()
+
+    ctx.cache.get(idempotencyId, hashedStepInputs) match {
       case Some(value) =>
-        throw new StepBreak[Out](ctx, value)
+        throw new StepBreak(value)
 
       case None =>
         ctx.onComplete { out =>
-          ctx.workflowCtx.stepCache.put[Out](idempotencyId, meta.version, stepInputs, out, ttl = None)
+          ctx.cache.put(idempotencyId, hashedStepInputs, out, ttl = None /* TODO */)
         }
     }
   }
 }
-
-case class StepMeta(
-                     id: StepId,
-                     version: Long,
-                     name: Option[String],
-                     description: Option[String],
-                     workflow: Workflow[?, ?]
-                   )
 
 case class StepInput[A: Hashable](name: String, value: A) {
-  lazy val hash: HashedStepInput = HashedStepInput(name, Base64.getEncoder.encodeToString(summon[Hashable[A]].hash(value).asInstanceOf[Array[Byte]]))
+  lazy val hash: Hashed = Hashable.hash(value)
 }
 
-case class HashedStepInput(name: String, hash: String)
+case class HashedStepInputs(hashedStepInputs: Map[String, Hashed])
+
+object HashedStepInputs {
+  def hash(stepInputs: Seq[StepInput[?]]): HashedStepInputs =
+    HashedStepInputs(stepInputs.map(e => e.name -> e.hash).toMap)
+}
 
 given [A: Hashable] => Conversion[(String, A), StepInput[A]] = { (name: String, value: A) =>
   StepInput(name, value)

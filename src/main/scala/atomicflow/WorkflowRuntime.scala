@@ -10,16 +10,19 @@ trait WorkflowRuntime {
 
   def generateStepIdempotencyId: StepIdempotencyId
 
+  @throws[WorkflowInputConflictException]
   def createWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Unit
 
   /**
    * - Must lock the workflow while running
    */
+  @throws[WorkflowInputConflictException]
   def runWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Out
 
   /**
    * - Must lock the workflow while running
    * - Must throw a WorkflowNotFoundException
    */
+  @throws[WorkflowNotFoundException]
   def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out
 }
