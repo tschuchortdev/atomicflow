@@ -10,11 +10,17 @@ import scala.concurrent.duration.FiniteDuration
 
 class InMemoryWorkflowRuntime extends WorkflowRuntime {
   trait WorkflowIdempotencyStore {
-    val idempotencyIds: AtomicReference[Map[(StepId, Option[Long], Option[HashedStepInputs]), StepIdempotencyId]] = new AtomicReference(Map.empty)
+    sealed trait IdempotencyIdKey
+
+    case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: HashedStepInputs) extends IdempotencyIdKey
+
+    case class OnceStepIdempotencyIdKey(stepId: StepId) extends IdempotencyIdKey
+
+    val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
     def getIdempotencyStore(using stepCtx: StepContext[?]): StepIdempotencyStore = new StepIdempotencyStore {
       override def acquireStepIdempotencyId(hashedStepInputs: HashedStepInputs): StepIdempotencyId = {
-        val key = (stepCtx.meta.id, Some(stepCtx.meta.version), Some(hashedStepInputs))
+        val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, hashedStepInputs)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
           case Some(_) => ids
           case None =>
@@ -24,7 +30,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
       }
 
       override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
-        val key = (stepCtx.meta.id, None, None)
+        val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
           case Some(_) => ids
           case None =>
@@ -34,7 +40,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
       }
 
       override def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit = {
-        idempotencyIds.updateAndGet(ids => ids + ((stepCtx.meta.id, None, None) -> stepIdempotencyId))
+        val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
+        idempotencyIds.updateAndGet(ids => ids + (key -> stepIdempotencyId))
       }
     }
   }

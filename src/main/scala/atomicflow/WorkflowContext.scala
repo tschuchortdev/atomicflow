@@ -7,7 +7,7 @@ trait SimpleWorkflowContext {
 
   def instanceId: WorkflowInstanceId
 
-  override def toString: String = s"workflow:${meta.id}(${meta.name})/$instanceId"
+  override def toString: String = s"workflow:${meta.id}#${meta.name}/$instanceId"
 }
 
 object SimpleWorkflowContext {

@@ -8,7 +8,7 @@ trait StepContext[Out] {
 
   def workflowCtx: WorkflowContext[?, ?]
 
-  override def toString: String = s"$workflowCtx/step:${meta.id}(${meta.name})"
+  override def toString: String = s"$workflowCtx/step:${meta.id}#${meta.name}"
 
   def idempotencyStore: StepIdempotencyStore
 

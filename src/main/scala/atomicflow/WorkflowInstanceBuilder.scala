@@ -28,7 +28,9 @@ case class WorkflowInstanceBuilder[In, Out] private[atomicflow](
   @throws[WorkflowInputConflictException]
   @throws[TimeoutException]
   def runWithTimeout(in: In, timeout: FiniteDuration)(using runtime: WorkflowRuntime): Out =
-    run(in) // TODO: timeout
+    ox.timeout(timeout) {
+      run(in)
+    }
 
   @throws[WorkflowNotFoundException]
   def recover()(using runtime: WorkflowRuntime): Out =
@@ -37,5 +39,7 @@ case class WorkflowInstanceBuilder[In, Out] private[atomicflow](
   @throws[WorkflowNotFoundException]
   @throws[TimeoutException]
   def recoverWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime): Out =
-    recover() // TODO: timeout
+    ox.timeout(timeout) {
+      recover()
+    }
 }
