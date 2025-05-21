@@ -1,6 +1,7 @@
 package atomicflow
 
-import atomicflow.Hashable.Hashed
+import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 import cats.syntax.all.*
 import io.github.iltotore.iron.*
 import io.github.iltotore.iron.constraint.string.*
@@ -44,6 +45,13 @@ object Step {
 
       override def workflowCtx: WorkflowContext[?, ?] = stepWorkflowCtx
 
+      override def fingerprint(inputs: Seq[StepInput[?]]): StepInputFingerprints = {
+        val fingerprinter = stepWorkflowCtx.getFingerprinter
+        StepInputFingerprints(inputs.map { input =>
+          input.name -> input.fingerprint(fingerprinter)
+        }.toMap)
+      }
+
       override lazy val idempotencyStore: StepIdempotencyStore = stepWorkflowCtx.getStepIdempotencyStore
 
       override def cache(using Cacheable[Out]): StepCache[Out] = stepWorkflowCtx.getStepCache
@@ -78,50 +86,36 @@ object Step {
   inline def compensate(f: => Unit)(using ctx: StepContext[?]): Unit = ctx.onCompensate(f)
 
   def cache[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
-    val hashedStepInputs = HashedStepInputs.hash(stepInputs)
+    val inputFingerprints = ctx.fingerprint(stepInputs)
 
-    val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(hashedStepInputs)
+    val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(inputFingerprints)
 
-    ctx.cache.get(idempotencyId, hashedStepInputs) match {
+    ctx.cache.get(idempotencyId, inputFingerprints) match {
       case Some(value) =>
         throw new StepBreak(value)
 
       case None =>
         ctx.onComplete { out =>
-          ctx.cache.put(idempotencyId, hashedStepInputs, out, ttl = None /* TODO */)
+          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl = None /* TODO */)
         }
     }
   }
 
   @throws[StepInputConflictException]
   def onlyOnce[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
-    val hashedStepInputs = HashedStepInputs.hash(stepInputs)
+    val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()
 
-    ctx.cache.get(idempotencyId, hashedStepInputs) match {
+    ctx.cache.get(idempotencyId, inputFingerprints) match {
       case Some(value) =>
         throw new StepBreak(value)
 
       case None =>
         ctx.onComplete { out =>
-          ctx.cache.put(idempotencyId, hashedStepInputs, out, ttl = None /* TODO */)
+          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl = None /* TODO */)
         }
     }
   }
 }
 
-case class StepInput[A: Hashable](name: String, value: A) {
-  lazy val hash: Hashed = Hashable.hash(value)
-}
-
-case class HashedStepInputs(hashedStepInputs: Map[String, Hashed])
-
-object HashedStepInputs {
-  def hash(stepInputs: Seq[StepInput[?]]): HashedStepInputs =
-    HashedStepInputs(stepInputs.map(e => e.name -> e.hash).toMap)
-}
-
-given [A: Hashable] => Conversion[(String, A), StepInput[A]] = { (name: String, value: A) =>
-  StepInput(name, value)
-}

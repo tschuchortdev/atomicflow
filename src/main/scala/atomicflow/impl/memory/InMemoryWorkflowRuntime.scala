@@ -1,7 +1,9 @@
 package atomicflow.impl.memory
 
 import atomicflow.*
-import atomicflow.Hashable.Hashed
+import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.impl.Sha256Fingerprinter
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 import io.github.iltotore.iron.*
 
 import java.util.UUID
@@ -12,15 +14,15 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   trait WorkflowIdempotencyStore {
     sealed trait IdempotencyIdKey
 
-    case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: HashedStepInputs) extends IdempotencyIdKey
+    case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: StepInputFingerprints) extends IdempotencyIdKey
 
     case class OnceStepIdempotencyIdKey(stepId: StepId) extends IdempotencyIdKey
 
     val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
     def getIdempotencyStore(using stepCtx: StepContext[?]): StepIdempotencyStore = new StepIdempotencyStore {
-      override def acquireStepIdempotencyId(hashedStepInputs: HashedStepInputs): StepIdempotencyId = {
-        val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, hashedStepInputs)
+      override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
+        val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, inputFingerprints)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
           case Some(_) => ids
           case None =>
@@ -47,16 +49,16 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   }
 
   trait WorkflowStepCache {
-    val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, HashedStepInputs, Any)]] = new AtomicReference(Map.empty)
+    val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
 
     def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
       override def get(
                         stepIdempotencyId: StepIdempotencyId,
-                        hashedStepInputs: HashedStepInputs
+                        inputFingerprints: StepInputFingerprints
                       ): Option[StepOut] = {
         val stepVersion = ctx.meta.version
         stepCache.get().get(stepIdempotencyId).map {
-          case (`stepVersion`, `hashedStepInputs`, out: StepOut) => out
+          case (`stepVersion`, hashedStepInputs, out: StepOut) => out
           case _ => throw new StepInputConflictException()
         }
       }
@@ -64,12 +66,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
       override def put(
                         stepIdempotencyId: StepIdempotencyId,
-                        hashedStepInputs: HashedStepInputs,
+                        inputFingerprints: StepInputFingerprints,
                         value: StepOut,
                         ttl: Option[FiniteDuration]
                       ): Unit = {
         // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
-        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, hashedStepInputs, value)))
+        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, inputFingerprints, value)))
       }
     }
   }
@@ -135,6 +137,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
               override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
               override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+
+              override protected[atomicflow] def getFingerprinter: Fingerprinter.Aux[String] = Sha256Fingerprinter
 
               override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
                 state.stepIdempotencyStore.getIdempotencyStore

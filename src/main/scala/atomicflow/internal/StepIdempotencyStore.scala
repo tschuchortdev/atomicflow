@@ -1,4 +1,6 @@
-package atomicflow
+package atomicflow.internal
+
+import atomicflow.StepIdempotencyId
 
 /*
 trait StepIdempotencyStore {
@@ -55,7 +57,7 @@ trait StepIdempotencyStore {
    * The stepIdempotencyId should be namespaced by the tuple
    * (workflowId, libraryVersion, stepId, stepVersion, workflowInstanceId, stepInputs)
    */
-  def acquireStepIdempotencyId(hashedStepInputs: HashedStepInputs): StepIdempotencyId
+  def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId
 
   /**
    * Get or create a stepIdempotencyId

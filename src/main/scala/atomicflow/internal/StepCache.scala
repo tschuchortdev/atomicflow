@@ -1,4 +1,7 @@
-package atomicflow
+package atomicflow.internal
+
+import atomicflow.internal.StepInputFingerprints
+import atomicflow.{StepIdempotencyId, StepInputConflictException}
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -70,7 +73,7 @@ trait StepCache[Out] {
   @throws[StepInputConflictException]
   def get(
            stepIdempotencyId: StepIdempotencyId,
-           hashedStepInputs: HashedStepInputs
+           inputFingerprints: StepInputFingerprints
          ): Option[Out]
 
   /**
@@ -80,7 +83,7 @@ trait StepCache[Out] {
   @throws[StepInputConflictException]
   def put(
            stepIdempotencyId: StepIdempotencyId,
-           hashedStepInputs: HashedStepInputs,
+           inputFingerprints: StepInputFingerprints,
            value: Out,
            ttl: Option[FiniteDuration]
          ): Unit
