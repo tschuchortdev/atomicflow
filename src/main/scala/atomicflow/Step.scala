@@ -9,15 +9,14 @@ import java.util.Base64
 import java.util.concurrent.atomic.AtomicReference
 
 object Step {
-  def apply[Out](using workflowCtx: WorkflowContext[?, ?])
-                (
+  def apply[Out](
                   id: StepId | String :| ValidUUID,
                   version: Long,
                   name: String | Unit = (),
                   description: String | Unit = ()
                 )(
                   body: StepContext[Out] ?=> Out
-                ): Out = {
+                )(using workflowCtx: WorkflowContext[?, ?]): Out = {
     val stepMeta = StepMeta(
       id = id match {
         case stepId: StepId => stepId
@@ -76,9 +75,9 @@ object Step {
 
   inline def meta(using ctx: StepContext[?]): StepMeta = ctx.meta
 
-  inline def compensate(using ctx: StepContext[?])(f: => Unit): Unit = ctx.onCompensate(f)
+  inline def compensate(f: => Unit)(using ctx: StepContext[?]): Unit = ctx.onCompensate(f)
 
-  def cache[Out: Cacheable](using ctx: StepContext[Out])(stepInputs: StepInput[?]*): Unit = {
+  def cache[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
     val hashedStepInputs = HashedStepInputs.hash(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(hashedStepInputs)
@@ -95,7 +94,7 @@ object Step {
   }
 
   @throws[StepInputConflictException]
-  def onlyOnce[Out: Cacheable](using ctx: StepContext[Out])(stepInputs: StepInput[?]*): Unit = {
+  def onlyOnce[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
     val hashedStepInputs = HashedStepInputs.hash(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()

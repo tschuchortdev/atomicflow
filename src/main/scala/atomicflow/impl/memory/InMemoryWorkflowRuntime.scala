@@ -8,7 +8,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
 
-class InMemoryWorkflowRuntime extends WorkflowRuntime {
+class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
   trait WorkflowIdempotencyStore {
     sealed trait IdempotencyIdKey
 
@@ -83,10 +83,6 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime {
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
-
-  override def generateWorkflowInstanceId: WorkflowInstanceId = WorkflowInstanceId(UUID.randomUUID().toString.refineUnsafe)
-
-  override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId(UUID.randomUUID().toString.refineUnsafe)
 
   override def createWorkflowInstance[WorkflowIn, WorkflowOut](workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut], in: WorkflowIn): Unit = {
     given SimpleWorkflowContext {

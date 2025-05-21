@@ -1,8 +1,9 @@
 package atomicflow
 
+import io.github.iltotore.iron.*
+
+import java.util.UUID
 import scala.annotation.implicitNotFound
-import scala.concurrent.TimeoutException
-import scala.concurrent.duration.FiniteDuration
 
 @implicitNotFound("No WorkflowRuntime available.\nAdd a using clause `(using WorkflowRuntime)` to the definition of the enclosing method.")
 trait WorkflowRuntime {
@@ -25,4 +26,14 @@ trait WorkflowRuntime {
    */
   @throws[WorkflowNotFoundException]
   def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out
+}
+
+object WorkflowRuntime {
+  trait GenerateIds extends WorkflowRuntime {
+
+    override def generateWorkflowInstanceId: WorkflowInstanceId = WorkflowInstanceId(UUID.randomUUID().toString.refineUnsafe)
+
+    override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId(UUID.randomUUID().toString.refineUnsafe)
+
+  }
 }
