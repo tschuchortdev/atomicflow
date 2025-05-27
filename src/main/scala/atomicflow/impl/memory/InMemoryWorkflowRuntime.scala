@@ -19,7 +19,11 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
     val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
-    def getIdempotencyStore(using stepCtx: StepContext[?]): StepIdempotencyStore = new StepIdempotencyStore {
+    def getIdempotencyStore(
+                             stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+                           )(
+                             using stepCtx: StepContext[?]
+                           ): StepIdempotencyStore = new StepIdempotencyStore {
       override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
         val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, inputFingerprints)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
@@ -32,19 +36,19 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
       override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
         val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
-        idempotencyIds.updateAndGet(ids => ids.get(key) match {
-          case Some(_) => ids
+        stepIdempotencyIdOverrides.get(stepCtx.meta.id) match {
+          case Some(idempotencyId) =>
+            idempotencyIds.updateAndGet(_ + (key -> idempotencyId))
+            idempotencyId
           case None =>
-            val id = generateStepIdempotencyId
-            ids + (key -> id)
-        })(key)
+            idempotencyIds.updateAndGet(ids => ids.get(key) match {
+              case Some(_) => ids
+              case None =>
+                val id = generateStepIdempotencyId
+                ids + (key -> id)
+            })(key)
+        }
       }
-
-      /*
-      override def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit = {
-        val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
-        idempotencyIds.updateAndGet(ids => ids + (key -> stepIdempotencyId))
-      }*/
     }
   }
 
@@ -155,7 +159,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
               override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
               override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
-                state.stepIdempotencyStore.getIdempotencyStore
+                state.stepIdempotencyStore.getIdempotencyStore(workflowInstance.stepIdempotencyIdOverrides)
 
               override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
                 state.stepCache.getStepCache[StepOut]

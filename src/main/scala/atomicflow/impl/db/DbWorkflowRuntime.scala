@@ -84,7 +84,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         atomicflow.impl.Sha256Fingerprinter
 
       override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
-        new DbStepIdempotencyStore()
+        new DbStepIdempotencyStore(workflowInstance.stepIdempotencyIdOverrides)
 
       override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
         new DbStepCache[StepOut]()
@@ -107,7 +107,11 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
   private def loadInput(id: WorkflowInstanceId): ConnectionIO[Option[Array[Byte]]] =
     sql"SELECT input FROM workflow_instance WHERE id = $id".query[Array[Byte]].option
 
-  class DbStepIdempotencyStore(using ctx: StepContext[?]) extends StepIdempotencyStore {
+  class DbStepIdempotencyStore(
+                                stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
+                              )(
+                                using ctx: StepContext[?]
+                              ) extends StepIdempotencyStore {
     override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
       val idQuery = sql"""
         SELECT id FROM step_idempotency
@@ -165,16 +169,17 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       runSync {
         idQuery.flatMap {
           case Some(existing) =>
-            /*overrideIdempotencyId match { TODO
+            stepIdempotencyIdOverrides.get(ctx.meta.id) match {
               case Some(overrideId) if overrideId != existing =>
                 updateQuery(overrideId)
-              case _ =>*/
+              case _ =>
                 Monad[ConnectionIO].pure(existing)
-            //}
+            }
           case None =>
-            val stepIdempotencyId = //overrideIdempotencyId.getOrElse {
+            val stepIdempotencyId = stepIdempotencyIdOverrides.getOrElse(
+              ctx.meta.id,
               StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
-            //}
+            )
             insertQuery(stepIdempotencyId)
         }
       }
