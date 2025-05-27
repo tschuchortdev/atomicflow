@@ -4,16 +4,18 @@ import atomicflow.Fingerprintable
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 
 import java.security.MessageDigest
+import java.util.Base64
 
 object Sha256Fingerprinter extends Fingerprinter {
-  override type Rep = String
+  override type Rep = Array[Byte]
 
-  def fromRep(rep: String): Fingerprint = Fingerprint(rep)
+  def fromRep(rep: Rep): Fingerprint =
+    Fingerprint(rep.asInstanceOf[IArray[Byte]])
 
   private def sha256(bytes: Array[Byte]): Rep = {
     val digest = MessageDigest.getInstance("SHA-256")
     digest.update(bytes)
-    digest.digest().map("%02x".format(_)).mkString
+    digest.digest()
   }
 
   def stringRep(string: String): Rep =
@@ -22,12 +24,21 @@ object Sha256Fingerprinter extends Fingerprinter {
   def bytesRep(bytes: IArray[Byte]): Rep =
     sha256(bytes.asInstanceOf[Array[Byte]])
 
+  private def encodeRep(rep: Rep): String = Base64.getEncoder.encodeToString(rep)
+
   def iterableRep(list: Iterable[Rep]): Rep =
-    stringRep(list.mkString("[", ",", "]"))
+    stringRep(list.map(encodeRep).mkString("[", ",", "]"))
 
   def objRep(obj: Iterable[(Rep, Rep)]): Rep =
     // Concatenate key:value pairs in order, surrounded by braces
-    stringRep(obj.toSeq.sortBy(_._1).map { case (k, v) => s"$k:$v" }.mkString("{", ",", "}"))
+    stringRep(
+      obj
+        .map { (k, v) => (encodeRep(k), encodeRep(v)) }
+        .toSeq
+        .sortBy(_._1)
+        .map { (k, v) => s"$k:$v" }
+        .mkString("{", ",", "}")
+    )
 
   def longRep(long: Long): Rep =
     stringRep(long.toString)

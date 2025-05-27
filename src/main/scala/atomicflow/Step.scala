@@ -3,15 +3,13 @@ package atomicflow
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 import cats.syntax.all.*
-import io.github.iltotore.iron.*
-import io.github.iltotore.iron.constraint.string.*
 
 import java.util.Base64
 import java.util.concurrent.atomic.AtomicReference
 
 object Step {
   def apply[Out](
-                  id: StepId | String :| ValidUUID,
+                  id: StepId,
                   version: Long,
                   name: String | Unit = (),
                   description: String | Unit = ()
@@ -19,10 +17,7 @@ object Step {
                   body: StepContext[Out] ?=> Out
                 )(using workflowCtx: WorkflowContext[?, ?]): Out = {
     val stepMeta = StepMeta(
-      id = id match {
-        case stepId: StepId => stepId
-        case id: (String :| ValidUUID) @unchecked => StepId(id)
-      },
+      id = id,
       version = version,
       name = name match {
         case () => None
@@ -85,7 +80,7 @@ object Step {
 
   inline def compensate(f: => Unit)(using ctx: StepContext[?]): Unit = ctx.onCompensate(f)
 
-  def cache[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
+  def cache[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(inputFingerprints)
@@ -102,7 +97,7 @@ object Step {
   }
 
   @throws[StepInputConflictException]
-  def onlyOnce[Out: Cacheable](stepInputs: StepInput[?]*)(using ctx: StepContext[Out]): Unit = {
+  def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()

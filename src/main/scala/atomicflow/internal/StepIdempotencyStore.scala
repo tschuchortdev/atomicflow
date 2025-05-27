@@ -65,6 +65,4 @@ trait StepIdempotencyStore {
    * (libraryVersion, workflowId, workflowInstanceId, stepId)
    */
   def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId
-
-  def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit
 }

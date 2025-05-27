@@ -2,16 +2,14 @@ package atomicflow
 
 import atomicflow.Constants.defaultCacheTtl
 import atomicflow.Workflow.*
-import io.github.iltotore.iron.*
-import io.github.iltotore.iron.constraint.string.*
 
 import scala.concurrent.TimeoutException
 import scala.concurrent.duration.*
 
-case class Workflow[In, Out] private(
-                                      meta: WorkflowMeta,
-                                      body: (WorkflowContext[In, Out], In) => Out
-                                    ) {
+case class Workflow[In: Cacheable, Out] private(
+                                                 meta: WorkflowMeta,
+                                                 body: (WorkflowContext[In, Out], In) => Out
+                                               ) {
   def instance(instanceId: WorkflowInstanceId): WorkflowInstanceBuilder[In, Out] =
     WorkflowInstanceBuilder(
       this,
@@ -20,18 +18,15 @@ case class Workflow[In, Out] private(
 }
 
 object Workflow {
-  def apply[In, Out](
-                      id: WorkflowId | String :| ValidUUID,
-                      name: String,
-                      description: String | Unit = ()
-                    )(
-                      body: In => WorkflowContext[In, Out] ?=> Out
-                    ): Workflow[In, Out] = {
+  def apply[In: Cacheable, Out](
+                                 id: WorkflowId,
+                                 name: String,
+                                 description: String | Unit = ()
+                               )(
+                                 body: In => WorkflowContext[In, Out] ?=> Out
+                               ): Workflow[In, Out] = {
     val workflowMeta = WorkflowMeta(
-      id = id match {
-        case workflowId: WorkflowId => workflowId
-        case id: (String :| ValidUUID) @unchecked => WorkflowId(id)
-      },
+      id = id,
       name = name,
       description = description match {
         case () => None

@@ -4,12 +4,13 @@ import atomicflow.WorkflowRuntime
 import atomicflow.impl.memory.InMemoryWorkflowRuntime
 import munit.*
 import atomicflow.{*, given}
-import io.github.iltotore.iron.*
+import upickle.default.given 
+import Cacheable.MsgPack.given
 
 class StepSuite extends FunSuite {
   given WorkflowRuntime = new InMemoryWorkflowRuntime()
 
-  private lazy val emptyWorkflow = Workflow[String, Int](id = "d9ab1884-6e83-48d7-82c4-cbc89fb32ffc", name = "read and send files") { (string: String) =>
+  private lazy val emptyWorkflow = Workflow[String, Int](WorkflowId("d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"), name = "read and send files") { (string: String) =>
     if (string == "answer")
       42
     else

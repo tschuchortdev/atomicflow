@@ -1,7 +1,5 @@
 package atomicflow
 
-import io.github.iltotore.iron.*
-
 import java.util.UUID
 import scala.annotation.implicitNotFound
 
@@ -12,28 +10,42 @@ trait WorkflowRuntime {
   def generateStepIdempotencyId: StepIdempotencyId
 
   @throws[WorkflowInputConflictException]
-  def createWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Unit
+  def createWorkflowInstance[In, Out](
+                                       workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                       in: In
+                                     )(
+                                       using Cacheable[In]
+                                     ): Unit
 
   /**
    * - Must lock the workflow while running
    */
   @throws[WorkflowInputConflictException]
-  def runWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Out
+  def runWorkflowInstance[In, Out](
+                                    workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                    in: In
+                                  )(
+                                    using Cacheable[In]
+                                  ): Out
 
   /**
    * - Must lock the workflow while running
    * - Must throw a WorkflowNotFoundException
    */
   @throws[WorkflowNotFoundException]
-  def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out
+  def recoverWorkflowInstance[In, Out](
+                                        workflowInstance: WorkflowInstanceBuilder[In, Out]
+                                      )(
+                                        using Cacheable[In]
+                                      ): Out
 }
 
 object WorkflowRuntime {
   trait GenerateIds extends WorkflowRuntime {
 
-    override def generateWorkflowInstanceId: WorkflowInstanceId = WorkflowInstanceId(UUID.randomUUID().toString.refineUnsafe)
+    override def generateWorkflowInstanceId: WorkflowInstanceId = WorkflowInstanceId.unsafeMake(UUID.randomUUID().toString)
 
-    override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId(UUID.randomUUID().toString.refineUnsafe)
+    override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
 
   }
 }

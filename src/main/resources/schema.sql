@@ -13,7 +13,7 @@ CREATE TABLE workflow_instance
 CREATE TABLE step_idempotency
 (
     id                   UUID PRIMARY KEY,
-    library_version      BIGINT      NOT NULL,
+    library_version      BIGINT,
     workflow_id          TEXT        NOT NULL,
     workflow_instance_id UUID        NOT NULL REFERENCES workflow_instance (id) ON DELETE RESTRICT,
     step_id              TEXT        NOT NULL,

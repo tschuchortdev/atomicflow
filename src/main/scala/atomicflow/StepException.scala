@@ -2,6 +2,7 @@ package atomicflow
 
 trait StepException(using stepCtx: StepContext[?]) extends WorkflowException {
   self: Exception =>
+
   def stepMeta: StepMeta = stepCtx.meta
 }
 

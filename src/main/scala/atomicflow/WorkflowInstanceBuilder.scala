@@ -5,7 +5,7 @@ import atomicflow.Constants.defaultCacheTtl
 import scala.concurrent.TimeoutException
 import scala.concurrent.duration.FiniteDuration
 
-case class WorkflowInstanceBuilder[In, Out] private[atomicflow](
+case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
                                                                  workflow: Workflow[In, Out],
                                                                  instanceId: WorkflowInstanceId,
                                                                  cacheTtl: FiniteDuration = defaultCacheTtl,

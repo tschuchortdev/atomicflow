@@ -4,7 +4,6 @@ import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
-import io.github.iltotore.iron.*
 
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
@@ -41,10 +40,11 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         })(key)
       }
 
+      /*
       override def overrideOnlyOnceStepIdempotencyId(stepIdempotencyId: StepIdempotencyId): Unit = {
         val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
         idempotencyIds.updateAndGet(ids => ids + (key -> stepIdempotencyId))
-      }
+      }*/
     }
   }
 
@@ -86,7 +86,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
 
-  override def createWorkflowInstance[WorkflowIn, WorkflowOut](workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut], in: WorkflowIn): Unit = {
+  override def createWorkflowInstance[WorkflowIn, WorkflowOut](
+                                                                workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut],
+                                                                in: WorkflowIn
+                                                              )(
+                                                                using Cacheable[WorkflowIn]
+                                                              ): Unit = {
     given SimpleWorkflowContext {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
@@ -113,12 +118,21 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     }
   }
 
-  override def runWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out], in: In): Out = {
+  override def runWorkflowInstance[In, Out](
+                                             workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                             in: In
+                                           )(
+                                             using Cacheable[In]
+                                           ): Out = {
     createWorkflowInstance(workflowInstance, in)
     recoverWorkflowInstance(workflowInstance)
   }
 
-  override def recoverWorkflowInstance[In, Out](workflowInstance: WorkflowInstanceBuilder[In, Out]): Out = {
+  override def recoverWorkflowInstance[In, Out](
+                                                 workflowInstance: WorkflowInstanceBuilder[In, Out]
+                                               )(
+                                                 using Cacheable[In]
+                                               ): Out = {
     given SimpleWorkflowContext {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
@@ -138,7 +152,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
 
-              override protected[atomicflow] def getFingerprinter: Fingerprinter.Aux[String] = Sha256Fingerprinter
+              override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
               override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
                 state.stepIdempotencyStore.getIdempotencyStore

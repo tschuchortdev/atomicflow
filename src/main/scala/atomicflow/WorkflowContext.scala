@@ -16,12 +16,21 @@ trait SimpleWorkflowContext {
 }
 
 object SimpleWorkflowContext {
+  def apply(
+             workflowMeta: WorkflowMeta,
+             workflowInstanceId: WorkflowInstanceId
+           ): SimpleWorkflowContext = new SimpleWorkflowContext {
+    override def meta: WorkflowMeta = workflowMeta
+
+    override def instanceId: WorkflowInstanceId = workflowInstanceId
+  }
+
   given (stepCtx: StepContext[?]) => SimpleWorkflowContext = stepCtx.workflowCtx
 }
 
 @implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`\nYou can require a WorkflowContext for the enclosing method by adding a using clause `(using WorkflowContext)` to its definition.")
 trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
-  protected[atomicflow] def getFingerprinter: Fingerprinter.Aux[String]
+  protected[atomicflow] def getFingerprinter: Fingerprinter
 
   protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
 

@@ -1,15 +1,19 @@
 package atomicflow
 
-import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 import cats.Contravariant
+import io.circe.Codec
 
+import java.util
+import java.util.Base64
 import scala.compiletime.*
 import scala.deriving.Mirror
+import cats.syntax.all.*
 
 trait Fingerprintable[-A] {
   def fingerprintRep(value: A, fp: Fingerprinter): fp.Rep
 
-  final def fingerprint(value: A, fp: Fingerprinter): fp.Fingerprint =
+  final def fingerprint(value: A, fp: Fingerprinter): Fingerprint =
     fp.fromRep(fingerprintRep(value, fp))
 }
 
@@ -23,33 +27,30 @@ object Fingerprintable {
     }
   }
 
-  trait Fingerprint {
-    type Rep
-
-    def value: Rep
+  case class Fingerprint(bytes: IArray[Byte]) {
+    override lazy val toString: String =
+      Base64.getEncoder.encodeToString(bytes.asInstanceOf[Array[Byte]])
 
     override def equals(obj: Any): Boolean = obj match {
-      case other: Fingerprint if value == other.value => true
+      case other: Fingerprint if util.Arrays.equals(
+        bytes.asInstanceOf[Array[Byte]],
+        other.bytes.asInstanceOf[Array[Byte]]
+      ) => true
       case _ => false
     }
   }
 
   object Fingerprint {
-    type Aux[R] = Fingerprint {type Rep = R}
+    def fromString(string: String): Fingerprint =
+      Fingerprint(Base64.getDecoder.decode(string).asInstanceOf[IArray[Byte]])
 
-    def apply[R](v: R): Fingerprint.Aux[R] = new Fingerprint {
-      type Rep = R
-
-      override val value: R = v
-    }
+    given Codec[Fingerprint] = Codec.implied[String].imap(fromString)(_.toString)
   }
 
   trait Fingerprinter {
     self =>
 
     type Rep
-
-    final type Fingerprint = Fingerprint.Aux[Rep]
 
     final def fingerprint[A](value: A)(using fingerprintable: Fingerprintable[A]): Fingerprint =
       fingerprintable.fingerprint(value, this)
@@ -71,9 +72,9 @@ object Fingerprintable {
     def bigDecimalRep(bigDecimal: BigDecimal): Rep
   }
 
-  object Fingerprinter {
+  /*object Fingerprinter {
     type Aux[R] = Fingerprinter {type Rep = R}
-  }
+  }*/
 
   given Fingerprintable[Int] with
     def fingerprintRep(value: Int, fp: Fingerprinter): fp.Rep =
