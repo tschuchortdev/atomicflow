@@ -3,7 +3,7 @@ package atomicflow.impl.db
 import atomicflow.Constants.libraryVersion
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 import atomicflow.{Cacheable, StepContext, StepIdempotencyId, StepInputConflictException, WorkflowInstanceBuilder, WorkflowInstanceId, WorkflowLockedException, WorkflowMeta, WorkflowRuntime}
-import cats.effect.Async
+import cats.effect.{Async, IO, Resource}
 import cats.effect.std.Dispatcher
 import doobie.*
 import doobie.implicits.*
@@ -17,6 +17,9 @@ import scala.concurrent.duration.FiniteDuration
 import DbWorkflowRuntime.given
 import atomicflow.Fingerprintable.Fingerprinter
 import cats.Monad
+import de.lhns.doobie.flyway.Flyway
+import de.lhns.doobie.flyway.BaselineMigrations.*
+import doobie.hikari.HikariTransactor
 import doobie.postgres.circe.jsonb.implicits.*
 
 class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
@@ -232,6 +235,52 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 }
 
 object DbWorkflowRuntime {
+  case class DbConfig(
+                       driver: Option[String],
+                       url: String,
+                       user: String,
+                       password: String,
+                       poolSize: Option[Int]
+                     ) {
+    def driverOrDefault: String = driver.getOrElse("org.postgresql.Driver")
+
+    def poolSizeOrDefault: Int = poolSize.getOrElse(32)
+  }
+
+  private def transactor(config: DbConfig): Resource[IO, Transactor[IO]] =
+    for {
+      ce <- ExecutionContexts.fixedThreadPool[IO](config.poolSizeOrDefault)
+      xa <- HikariTransactor
+        .newHikariTransactor[IO](
+          config.driverOrDefault,
+          config.url,
+          config.user,
+          config.password,
+          ce
+        )
+      _ <- Flyway(xa) { flyway =>
+        for {
+          info <- flyway.info()
+          _ <- flyway
+            .configure(_
+              .withBaselineMigrate(info)
+              .validateMigrationNaming(true)
+            )
+            .migrate()
+        } yield ()
+      }
+    } yield xa
+
+  def apply(config: DbConfig): WorkflowRuntime = {
+    (for {
+      dispatcher <- Dispatcher.parallel[IO]
+      xa <- transactor(config)
+    } yield
+      new DbWorkflowRuntime[IO](xa, dispatcher))
+      .allocated.map(_._1)
+      .unsafeRunSync()(cats.effect.unsafe.IORuntime.global)
+  }
+
   given Meta[StepIdempotencyId] = Meta[UUID].imap(uuid =>
     StepIdempotencyId.unsafeMake(uuid.toString)
   )(id =>

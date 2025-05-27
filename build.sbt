@@ -19,11 +19,13 @@ lazy val root = (project in file("."))
       "ch.qos.logback" % "logback-classic" % V.logbackClassic % Test,
       "com.lihaoyi" %% "upickle" % V.upickle,
       "com.softwaremill.ox" %% "core" % V.ox,
+      "de.lhns" %% "doobie-flyway" % "0.5.2",
       "io.github.kitlangton" %% "neotype" % V.neotype,
       "org.scalameta" %% "munit" % V.munit % Test,
       "org.tpolecat" %% "doobie-core" % V.doobie,
       "org.tpolecat" %% "doobie-postgres" % V.doobie,
       "org.tpolecat" %% "doobie-postgres-circe" % V.doobie,
+      "org.tpolecat" %% "doobie-hikari" % V.doobie,
       "org.typelevel" %% "cats-core" % V.cats,
     )
   )
