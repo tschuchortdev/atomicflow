@@ -5,6 +5,7 @@ ThisBuild / scalaVersion := "3.6.4"
 val V = new {
   val cats = "2.13.0"
   val doobie = "1.0.0-RC9"
+  val flywayPostgres = "11.9.2"
   val logbackClassic = "1.5.18"
   val munit = "1.1.1"
   val neotype = "0.3.25"
@@ -21,6 +22,7 @@ lazy val root = (project in file("."))
       "com.softwaremill.ox" %% "core" % V.ox,
       "de.lhns" %% "doobie-flyway" % "0.5.2",
       "io.github.kitlangton" %% "neotype" % V.neotype,
+      "org.flywaydb" % "flyway-database-postgresql" % V.flywayPostgres,
       "org.scalameta" %% "munit" % V.munit % Test,
       "org.tpolecat" %% "doobie-core" % V.doobie,
       "org.tpolecat" %% "doobie-postgres" % V.doobie,

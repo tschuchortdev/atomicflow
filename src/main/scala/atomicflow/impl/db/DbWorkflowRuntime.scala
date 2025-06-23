@@ -22,6 +22,8 @@ import de.lhns.doobie.flyway.BaselineMigrations.*
 import doobie.hikari.HikariTransactor
 import doobie.postgres.circe.jsonb.implicits.*
 
+import java.util
+
 class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
   override def createWorkflowInstance[In, Out](
@@ -34,14 +36,29 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     val workflowId = workflowInstance.workflow.meta.id
     val input = Cacheable[In].serialize(in).asInstanceOf[Array[Byte]]
 
-    val insert =
-      sql"""
-      INSERT INTO workflow_instance (id, workflow_id, input)
-      VALUES ($id, $workflowId, $input)
-      ON CONFLICT (id) DO NOTHING
-    """.update.run
+    def simpleWorkflowCtx = SimpleWorkflowContext(
+      workflowMeta = workflowInstance.workflow.meta,
+      workflowInstanceId = workflowInstance.instanceId
+    )
 
-    runSync(insert)
+    runSync {
+      sql"SELECT input FROM workflow_instance WHERE id = $id"
+        .query[Array[Byte]]
+        .option
+        .flatMap {
+          case Some(prevInput) if util.Arrays.equals(prevInput, input) =>
+            Monad[ConnectionIO].unit
+
+          case Some(_) =>
+            throw WorkflowInputConflictException()(using simpleWorkflowCtx)
+
+          case None =>
+            sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($id, $workflowId, $input)"
+              .update
+              .run
+              .void
+        }
+    }
   }
 
   override def runWorkflowInstance[In, Out](
@@ -65,18 +82,29 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     val now = Instant.now()
     val lockUntil = now.plus(lockDuration)
 
-    val lock =
-      sql"""
-      UPDATE workflow_instance
-      SET locked_until = $lockUntil
-      WHERE id = $id AND (locked_until IS NULL OR locked_until < $now)
-    """.update.run.map(_ > 0)
-
-    val locked = runSync(lock)
-    if (locked) throw new WorkflowLockedException()(using SimpleWorkflowContext(
+    def simpleWorkflowCtx = SimpleWorkflowContext(
       workflowMeta = workflowInstance.workflow.meta,
       workflowInstanceId = workflowInstance.instanceId
-    ))
+    )
+
+    runSync {
+      sql"SELECT id, locked_until FROM workflow_instance where id = $id"
+        .query[(WorkflowInstanceId, Option[Instant])]
+        .option
+        .flatMap {
+          case None =>
+            throw WorkflowNotFoundException()(using simpleWorkflowCtx)
+
+          case Some((_, Some(lockedUntil))) if now.isBefore(lockedUntil) =>
+            throw WorkflowLockedException()(using simpleWorkflowCtx)
+
+          case Some((_, _)) =>
+            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id"
+              .update
+              .run
+              .void
+        }
+    }
 
     val ctx = new atomicflow.WorkflowContext[In, Out] {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
@@ -94,7 +122,9 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
 
     try {
-      val inputBytes = runSync(loadInput(id)).get
+      val inputBytes = runSync(loadInput(id)).get /*TODO: .getOrElse {
+        throw WorkflowNotFoundException()(using ctx)
+      }*/
       workflowInstance.workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
     } finally {
       val unlock =
