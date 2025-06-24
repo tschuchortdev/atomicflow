@@ -1,10 +1,7 @@
 package atomicflow
 
-import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
-import cats.syntax.all.*
 
-import java.util.Base64
 import java.util.concurrent.atomic.AtomicReference
 
 object Step {

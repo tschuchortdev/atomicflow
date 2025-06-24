@@ -1,10 +1,6 @@
 package atomicflow
 
-import atomicflow.Constants.defaultCacheTtl
 import atomicflow.Workflow.*
-
-import scala.concurrent.TimeoutException
-import scala.concurrent.duration.*
 
 case class Workflow[In: Cacheable, Out] private(
                                                  meta: WorkflowMeta,

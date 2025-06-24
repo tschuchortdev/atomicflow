@@ -14,9 +14,9 @@ CREATE TABLE step_idempotency
 (
     id                   UUID PRIMARY KEY,
     library_version      BIGINT,
-    workflow_id          TEXT        NOT NULL,
+    workflow_id          UUID        NOT NULL,
     workflow_instance_id UUID        NOT NULL REFERENCES workflow_instance (id) ON DELETE RESTRICT,
-    step_id              TEXT        NOT NULL,
+    step_id              UUID        NOT NULL,
     step_version         BIGINT,
     input_fingerprints   JSONB,
     is_only_once         BOOLEAN     NOT NULL DEFAULT FALSE,
@@ -29,7 +29,7 @@ CREATE TABLE step_cache
     step_idempotency_id UUID PRIMARY KEY REFERENCES step_idempotency (id) ON DELETE CASCADE,
     step_id             UUID        NOT NULL,
     step_version        BIGINT      NOT NULL,
-    input_fingerprints  TEXT        NOT NULL,
+    input_fingerprints  JSONB       NOT NULL,
     output              BYTEA       NOT NULL,
     expiry              TIMESTAMPTZ, -- null means never expires
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
