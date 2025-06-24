@@ -62,7 +62,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                       ): Option[StepOut] = {
         val stepVersion = ctx.meta.version
         stepCache.get().get(stepIdempotencyId).map {
-          case (`stepVersion`, hashedStepInputs, out: StepOut) => out
+          case (`stepVersion`, `inputFingerprints`, out: StepOut) => out
           case _ => throw new StepInputConflictException()
         }
       }
