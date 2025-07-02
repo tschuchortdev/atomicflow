@@ -1,8 +1,8 @@
 package atomicflow.internal
 
 import atomicflow.Fingerprintable.Fingerprint
-import io.circe.Codec
 import cats.syntax.all.*
+import io.circe.Codec
 
 case class StepInputFingerprints(fingerprints: Map[String, Fingerprint])
 

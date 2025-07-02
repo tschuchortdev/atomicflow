@@ -2,13 +2,13 @@ package atomicflow
 
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
 import cats.Contravariant
+import cats.syntax.all.*
 import io.circe.Codec
 
 import java.util
 import java.util.Base64
 import scala.compiletime.*
 import scala.deriving.Mirror
-import cats.syntax.all.*
 
 trait Fingerprintable[-A] {
   def fingerprintRep(value: A, fp: Fingerprinter): fp.Rep

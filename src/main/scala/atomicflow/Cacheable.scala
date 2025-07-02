@@ -7,7 +7,7 @@ import upickle.default.*
 import java.io.ByteArrayOutputStream
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Path, Paths}
-import java.time.{Instant, LocalDate, LocalDateTime, OffsetDateTime, ZonedDateTime}
+import java.time.*
 import scala.collection.mutable.ListBuffer
 
 trait Cacheable[A] {

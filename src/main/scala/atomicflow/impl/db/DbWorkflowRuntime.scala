@@ -1,28 +1,26 @@
 package atomicflow.impl.db
 
 import atomicflow.Constants.libraryVersion
+import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.impl.db.DbWorkflowRuntime.given
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
-import atomicflow.{Cacheable, StepContext, StepIdempotencyId, StepInputConflictException, WorkflowInstanceBuilder, WorkflowInstanceId, WorkflowLockedException, WorkflowMeta, WorkflowRuntime}
-import cats.effect.{Async, IO, Resource}
-import cats.effect.std.Dispatcher
-import doobie.*
-import doobie.implicits.*
-import doobie.postgres.implicits.*
 import atomicflow.*
+import cats.Monad
+import cats.effect.std.Dispatcher
+import cats.effect.{Async, IO, Resource}
 import cats.syntax.all.*
+import de.lhns.doobie.flyway.BaselineMigrations.*
+import de.lhns.doobie.flyway.Flyway
+import doobie.*
+import doobie.hikari.HikariTransactor
+import doobie.implicits.*
+import doobie.postgres.circe.jsonb.implicits.*
+import doobie.postgres.implicits.*
 
 import java.time.Instant
+import java.util
 import java.util.UUID
 import scala.concurrent.duration.FiniteDuration
-import DbWorkflowRuntime.given
-import atomicflow.Fingerprintable.Fingerprinter
-import cats.Monad
-import de.lhns.doobie.flyway.Flyway
-import de.lhns.doobie.flyway.BaselineMigrations.*
-import doobie.hikari.HikariTransactor
-import doobie.postgres.circe.jsonb.implicits.*
-
-import java.util
 
 class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
@@ -179,7 +177,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         WHERE workflow_id = ${ctx.workflowCtx.meta.id} AND
               workflow_instance_id = ${ctx.workflowCtx.instanceId} AND
               step_id = ${ctx.meta.id} AND
-              is_only_once = true
+              is_only_once = true AND
+              is_overridden = false
       """.query[StepIdempotencyId].option
 
       def insertQuery(id: StepIdempotencyId) =
@@ -189,22 +188,24 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
           ON CONFLICT DO NOTHING
         """.update.run.as(id)
 
-      def updateQuery(id: StepIdempotencyId): ConnectionIO[StepIdempotencyId] =
+      val updateQuery: ConnectionIO[Unit] =
         sql"""
         UPDATE step_idempotency
-        SET id = ${id}
+        SET is_overridden = true
         WHERE workflow_id = ${ctx.workflowCtx.meta.id} AND
               workflow_instance_id = ${ctx.workflowCtx.instanceId} AND
               step_id = ${ctx.meta.id} AND
-              is_only_once = true
-        """.update.run.as(id)
+              is_only_once = true AND
+              is_overridden = false
+        """.update.run.void
 
       runSync {
         idQuery.flatMap {
           case Some(existing) =>
             stepIdempotencyIdOverrides.get(ctx.meta.id) match {
               case Some(overrideId) if overrideId != existing =>
-                updateQuery(overrideId)
+                updateQuery >>
+                  insertQuery(overrideId)
               case _ =>
                 Monad[ConnectionIO].pure(existing)
             }

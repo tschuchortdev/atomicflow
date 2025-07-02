@@ -5,7 +5,6 @@ import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 
-import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
 

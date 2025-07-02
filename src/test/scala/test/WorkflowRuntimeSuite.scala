@@ -171,7 +171,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       name = "workflow with once steps, changed inputs"
     ) { (string: String) =>
       val a = Step(StepId("0bc4b603-81ec-4af2-a6c5-700df0084243"), 0) {
-        answer.getAndIncrement()
+        answer.get()
       }
 
       Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), 0) {
@@ -191,12 +191,12 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
     assertEquals(workflow.instance(workflowInstanceId).run("answer"), 42)
 
+    answer.incrementAndGet()
+
     intercept[StepInputConflictException] {
       workflow.instance(workflowInstanceId).run("answer")
     }
 
-    /*
-    TODO
     assertEquals(
       workflow.instance(workflowInstanceId)
         .overrideStepIdempotencyId(
@@ -204,9 +204,12 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
           StepIdempotencyId.generate
         )
         .run("answer"),
-      44
+      43
     )
-     */
+
+    assertEquals(workflow.instance(workflowInstanceId).run("answer"), 43)
+
+    answer.incrementAndGet()
 
     assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 44)
   }
