@@ -1,10 +1,10 @@
 package atomicflow
 
-import neotype.*
+import neotype.Newtype
 
-type StepId = StepId.Type
+type SignalId = SignalId.Type
 
-object StepId extends Newtype[String] {
+object SignalId extends Newtype[String] {
   override inline def validate(input: String): Boolean | String =
     if (input.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) true
     else "Should be a UUID"

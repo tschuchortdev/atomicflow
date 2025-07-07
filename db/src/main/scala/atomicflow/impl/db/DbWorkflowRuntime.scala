@@ -4,7 +4,7 @@ import atomicflow.*
 import atomicflow.Constants.libraryVersion
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.db.DbWorkflowRuntime.given
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, WorkflowSignalStore}
 import cats.Monad
 import cats.effect.std.Dispatcher
 import cats.effect.{Async, IO, Resource}
@@ -117,6 +117,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 
       override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
         new DbStepCache[StepOut]()
+
+      override protected[atomicflow] def getSignalStore: WorkflowSignalStore = ??? // TODO
     }
 
     try {
