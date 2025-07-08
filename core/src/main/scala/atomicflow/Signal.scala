@@ -11,9 +11,9 @@ trait Signal[A] {
 
   def isEmpty(using workflowCtx: WorkflowContext[?, ?]): Boolean = option.isEmpty
 
-  @throws[EmptySignalException]
+  @throws[SignalEmptyException]
   def get(using workflowCtx: WorkflowContext[?, ?]): A =
-    option.getOrElse(throw new EmptySignalException())
+    option.getOrElse(throw new SignalEmptyException(this))
 
   // TODO: you set the signal with workflowInstance.setSignal(signal, value)
   // TODO: SignalConflictException
@@ -23,10 +23,10 @@ trait Signal[A] {
 
 object Signal {
   def apply[A](
-                  id: SignalId,
-                  name: String | Unit = (),
-                  description: String | Unit = ()
-                ): Signal[A] = {
+                id: SignalId,
+                name: String | Unit = (),
+                description: String | Unit = ()
+              ): Signal[A] = {
     new Signal[A] {
       override val meta: SignalMeta = SignalMeta(
         id = id,
