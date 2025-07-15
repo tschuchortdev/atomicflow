@@ -38,6 +38,12 @@ trait WorkflowRuntime {
                                       )(
                                         using Cacheable[In]
                                       ): Out
+
+  @throws[SignalConflictException]
+  def setSignal[A](
+                    signal: Signal[A],
+                    value: A
+                  )(using SimpleWorkflowContext): Unit
 }
 
 object WorkflowRuntime {

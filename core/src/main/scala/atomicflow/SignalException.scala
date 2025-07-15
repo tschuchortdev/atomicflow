@@ -1,7 +1,7 @@
 package atomicflow
 
 trait SignalException(signal: Signal[?])
-                     (using workflowCtx: SimpleWorkflowContext)
+                     (using SimpleWorkflowContext)
   extends WorkflowException {
   self: Exception =>
 
@@ -13,13 +13,13 @@ class SignalEmptyException(signal: Signal[?], message: String)
   extends Exception(message) with SignalException(signal) {
 
   def this(signal: Signal[?])(using workflowCtx: SimpleWorkflowContext) =
-    this(signal, s"Empty signal for workflow instance: $workflowCtx")
+    this(signal, s"Empty signal value: $workflowCtx/$signal")
 }
 
 class SignalConflictException(signal: Signal[?], message: String)
-                             (using stepCtx: StepContext[?])
+                             (using SimpleWorkflowContext)
   extends Exception(message) with SignalException(signal) {
 
-  def this(signal: Signal[?])(using stepCtx: StepContext[?]) =
-    this(signal, s"Cannot change signal value: $stepCtx)")
+  def this(signal: Signal[?])(using workflowCtx: SimpleWorkflowContext) =
+    this(signal, s"Cannot change signal value: $workflowCtx/$signal)")
 }

@@ -1,7 +1,7 @@
 package atomicflow
 
 import atomicflow.Fingerprintable.Fingerprinter
-import atomicflow.internal.{WorkflowSignalStore, StepCache, StepIdempotencyStore}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
@@ -36,5 +36,5 @@ trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
 
   protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
   
-  protected[atomicflow] def getSignalStore: WorkflowSignalStore
+  protected[atomicflow] def getSignalStore: SignalStore
 }

@@ -4,7 +4,7 @@ import atomicflow.*
 import atomicflow.Constants.libraryVersion
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.db.DbWorkflowRuntime.given
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, WorkflowSignalStore}
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, SignalStore}
 import cats.Monad
 import cats.effect.std.Dispatcher
 import cats.effect.{Async, IO, Resource}
@@ -34,10 +34,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     val workflowId = workflowInstance.workflow.meta.id
     val input = Cacheable[In].serialize(in).asInstanceOf[Array[Byte]]
 
-    def simpleWorkflowCtx = SimpleWorkflowContext(
-      workflowMeta = workflowInstance.workflow.meta,
-      workflowInstanceId = workflowInstance.instanceId
-    )
+    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
     runSync {
       sql"SELECT input FROM workflow_instance WHERE id = $id"
@@ -80,10 +77,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     val now = Instant.now()
     val lockUntil = now.plus(lockDuration)
 
-    def simpleWorkflowCtx = SimpleWorkflowContext(
-      workflowMeta = workflowInstance.workflow.meta,
-      workflowInstanceId = workflowInstance.instanceId
-    )
+    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
     runSync {
       sql"SELECT id, locked_until FROM workflow_instance where id = $id"
@@ -118,7 +112,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
         new DbStepCache[StepOut]()
 
-      override protected[atomicflow] def getSignalStore: WorkflowSignalStore = ??? // TODO
+      override protected[atomicflow] def getSignalStore: SignalStore = DbSignalStore
     }
 
     try {
@@ -257,14 +251,56 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
             input_fingerprints = $inputFingerprints,
             output = $data,
             expiry = $expiry
-      """.update.run
+      """.update.run.void
 
       runSync(query)
     }
   }
 
+  object DbSignalStore extends SignalStore {
+
+    // TODO: check expiry
+    private def select[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): ConnectionIO[Option[Array[Byte]]] =
+      sql"""
+      SELECT value FROM workflow_signals
+      WHERE id=${signal.meta.id} AND workflow_id=${workflowCtx.meta.id} AND workflow_instance_id=${workflowCtx.instanceId}
+      """.query[Array[Byte]].option
+
+    override def getSignalValue[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): Option[A] =
+      runSync {
+        select(signal)
+      }.map { bytes =>
+        signal.cacheable.deserialize(bytes.asInstanceOf[IArray[Byte]])
+      }
+
+    @throws[SignalConflictException]
+    override def setSignalValue[A](signal: Signal[A], value: A)(using workflowCtx: SimpleWorkflowContext): Unit = {
+      val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
+
+      runSync {
+        select(signal).flatMap {
+          case Some(prevBytes) if util.Arrays.equals(prevBytes, bytes) =>
+            Monad[ConnectionIO].unit
+
+          case Some(_) =>
+            throw SignalConflictException(signal)
+
+          case None =>
+            sql"""
+              INSERT INTO workflow_signals (id, workflow_id, workflow_instance_id, value, expiry)
+              VALUES (${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceId}, ${bytes}, null)
+              """.update.run.void
+        }
+      }
+    }
+  }
+
   private def runSync[A](fa: ConnectionIO[A]): A =
     dispatcher.unsafeRunSync(fa.transact(xa))
+
+  @throws[SignalConflictException]
+  override def setSignal[A](signal: Signal[A], value: A)(using SimpleWorkflowContext): Unit =
+    DbSignalStore.setSignalValue(signal, value)
 }
 
 object DbWorkflowRuntime {
@@ -336,6 +372,12 @@ object DbWorkflowRuntime {
     WorkflowInstanceId.unsafeMake(uuid.toString)
   )(id =>
     UUID.fromString(WorkflowInstanceId.unwrap(id))
+  )
+
+  given Meta[SignalId] = Meta[UUID].imap(uuid =>
+    SignalId.unsafeMake(uuid.toString)
+  )(id =>
+    UUID.fromString(SignalId.unwrap(id))
   )
 
   given Get[StepInputFingerprints] = pgDecoderGetT[StepInputFingerprints]

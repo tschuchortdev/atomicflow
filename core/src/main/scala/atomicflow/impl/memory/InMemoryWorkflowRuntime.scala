@@ -3,7 +3,7 @@ package atomicflow.impl.memory
 import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, WorkflowSignalStore}
+import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, SignalStore}
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
@@ -84,8 +84,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                              in: In,
                                              workflowInstance: WorkflowInstanceBuilder[In, Out],
                                              stepCache: WorkflowStepCache,
-                                             stepIdempotencyStore: WorkflowIdempotencyStore,
-                                             workflowSignalStore: WorkflowSignalStore
+                                             stepIdempotencyStore: WorkflowIdempotencyStore
                                            )
 
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
@@ -116,19 +115,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             in = in,
             workflowInstance = workflowInstance,
             stepCache = new WorkflowStepCache {},
-            stepIdempotencyStore = new WorkflowIdempotencyStore {},
-            workflowSignalStore = new WorkflowSignalStore {
-              val signalValues: AtomicReference[Map[(WorkflowInstanceId, SignalId), ?]] = new AtomicReference(Map.empty)
-
-              override def getSignalValue[A](signal: Signal[A]): Option[A] =
-                signalValues.get().get((workflowInstance.instanceId, signal.meta.id)).asInstanceOf[Option[A]]
-
-              override def setSignalValue[A](signal: Signal[A], value: A): Unit =
-                signalValues.updateAndGet { map =>
-                  // TODO: check prev value for conflict
-                  map + ((workflowInstance.instanceId, signal.meta.id) -> value)
-                }
-            }
+            stepIdempotencyStore = new WorkflowIdempotencyStore {}
           ))
       }
     }
@@ -176,8 +163,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
               override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
                 state.stepCache.getStepCache[StepOut]
 
-              override protected[atomicflow] def getSignalStore: WorkflowSignalStore =
-                state.workflowSignalStore
+              override protected[atomicflow] def getSignalStore: SignalStore =
+                signalStore
             }
             state.workflowInstance.workflow.body(ctx, state.in)
           } finally {
@@ -189,4 +176,28 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
         throw new WorkflowNotFoundException()
     }
   }
+
+  private val signalStore: SignalStore = new SignalStore {
+    val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceId, SignalId), ?]] = new AtomicReference(Map.empty)
+
+    override def getSignalValue[A](signal: Signal[A])(using ctx: SimpleWorkflowContext): Option[A] = {
+      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+      signalValues.get().get(key).asInstanceOf[Option[A]]
+    }
+
+    override def setSignalValue[A](signal: Signal[A], value: A)(using ctx: SimpleWorkflowContext): Unit = {
+      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+      signalValues.updateAndGet { map =>
+        if (map.get(key).exists(_ != value))
+          throw new SignalConflictException(signal)
+        map + (key -> value)
+      }
+    }
+  }
+
+  override def setSignal[A](
+                             signal: Signal[A],
+                             value: A
+                           )(using SimpleWorkflowContext): Unit =
+    signalStore.setSignalValue(signal, value)
 }
