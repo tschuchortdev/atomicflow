@@ -217,10 +217,10 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   test("Signals") {
     val signal = Signal[String](SignalId("fbf1760e-c3d4-4635-a84b-8426f2d521ef"))
 
-    val workflow = Workflow[String, String](
+    val workflow = Workflow[Unit, String](
       WorkflowId("9196475c-8973-47d1-be37-dbb080c943b9"),
       name = "workflow with signal"
-    ) { (string: String) =>
+    ) { _ =>
       val value = signal.value
       value
     }
@@ -228,12 +228,12 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val workflowInstanceId = WorkflowInstanceId.generate
 
     intercept[SignalEmptyException] {
-      workflow.instance(workflowInstanceId).run("answer")
+      workflow.instance(workflowInstanceId).run()
     }
 
     workflow.instance(workflowInstanceId).setSignal(signal, "test")
 
-    assertEquals(workflow.instance(workflowInstanceId).run("answer"), "test")
+    assertEquals(workflow.instance(workflowInstanceId).run(), "test")
 
     workflow.instance(workflowInstanceId).setSignal(signal, "test")
 

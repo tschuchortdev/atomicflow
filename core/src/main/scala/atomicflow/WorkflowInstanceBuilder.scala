@@ -27,8 +27,16 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
     runtime.createWorkflowInstance(this, in)
 
   @throws[WorkflowInputConflictException]
+  inline def create()(using runtime: WorkflowRuntime, ev: Unit =:= In): Unit =
+    create(())
+
+  @throws[WorkflowInputConflictException]
   def run(in: In)(using runtime: WorkflowRuntime): Out =
     runtime.runWorkflowInstance(this, in)
+
+  @throws[WorkflowInputConflictException]
+  inline def run()(using runtime: WorkflowRuntime, ev: Unit =:= In): Out =
+    run(())
 
   @throws[WorkflowInputConflictException]
   @throws[TimeoutException]
@@ -36,6 +44,11 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
     ox.timeout(timeout) {
       run(in)
     }
+
+  @throws[WorkflowInputConflictException]
+  @throws[TimeoutException]
+  inline def runWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime, ev: Unit =:= In): Out =
+    runWithTimeout((), timeout)
 
   @throws[WorkflowNotFoundException]
   def recover()(using runtime: WorkflowRuntime): Out =
