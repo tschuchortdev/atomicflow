@@ -39,6 +39,7 @@ trait WorkflowRuntime {
                                         using Cacheable[In]
                                       ): Out
 
+  @throws[WorkflowNotFoundException]
   @throws[SignalConflictException]
   def setSignal[A](
                     signal: Signal[A],

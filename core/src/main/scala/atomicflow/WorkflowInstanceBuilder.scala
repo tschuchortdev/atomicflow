@@ -61,10 +61,8 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
       recover()
     }
 
-  /*
-  A signal value can be set even if the workflow instance doesn't exist yet.
-  TODO: should it work like this or should the user create the workflow first? Setting a value of a non-existent workflow could lead to bugs
-   */
+  @throws[WorkflowNotFoundException]
+  @throws[SignalConflictException]
   def setSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): Unit =
     runtime.setSignal(signal, value)(using simpleWorkflowCtx)
 }

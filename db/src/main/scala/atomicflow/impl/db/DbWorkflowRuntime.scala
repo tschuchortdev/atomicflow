@@ -288,8 +288,16 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
           case None =>
             sql"""
               INSERT INTO workflow_signals (id, workflow_id, workflow_instance_id, value, expiry)
-              VALUES (${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceId}, ${bytes}, null)
-              """.update.run.void
+              SELECT ${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceId}, ${bytes}, null
+              WHERE EXISTS (
+                SELECT 1
+                FROM workflow_instance
+                WHERE id = ${workflowCtx.instanceId}
+              )
+              """.update.run.map {
+              case 0 => throw WorkflowNotFoundException()
+              case 1 => ()
+            }
         }
       }
     }

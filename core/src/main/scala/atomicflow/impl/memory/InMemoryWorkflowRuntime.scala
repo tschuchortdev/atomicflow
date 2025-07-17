@@ -187,9 +187,14 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
     override def setSignalValue[A](signal: Signal[A], value: A)(using ctx: SimpleWorkflowContext): Unit = {
       val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+
+      if (!workflowInstances.get().contains(ctx.instanceId))
+        throw new WorkflowNotFoundException()
+
       signalValues.updateAndGet { map =>
         if (map.get(key).exists(_ != value))
           throw new SignalConflictException(signal)
+
         map + (key -> value)
       }
     }

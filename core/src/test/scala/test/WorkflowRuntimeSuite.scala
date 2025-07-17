@@ -214,7 +214,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     assertEquals(workflow.instance(WorkflowInstanceId.generate).run("answer"), 44)
   }
 
-  test("Signals") {
+  test("Signals can be set but not to a different value") {
     val signal = Signal[String](SignalId("fbf1760e-c3d4-4635-a84b-8426f2d521ef"))
 
     val workflow = Workflow[Unit, String](
@@ -240,5 +240,27 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     intercept[SignalConflictException] {
       workflow.instance(workflowInstanceId).setSignal(signal, "test2")
     }
+  }
+
+  test("Signals must be set on existing workflows") {
+    val signal = Signal[String](SignalId("a6d6993a-1d27-43a2-b254-b53d164e2de3"))
+
+    val workflow = Workflow[Unit, String](
+      WorkflowId("b62a9a63-b6c6-4c05-bbf4-e994ee195437"),
+      name = "workflow with signal"
+    ) { _ =>
+      val value = signal.value
+      value
+    }
+
+    val workflowInstanceId = WorkflowInstanceId.generate
+
+    intercept[WorkflowNotFoundException] {
+      workflow.instance(workflowInstanceId).setSignal(signal, "test")
+    }
+
+    workflow.instance(workflowInstanceId).create()
+
+    workflow.instance(workflowInstanceId).setSignal(signal, "test")
   }
 }
