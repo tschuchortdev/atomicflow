@@ -3,6 +3,7 @@ package atomicflow
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 
 import java.util.concurrent.atomic.AtomicReference
+import scala.concurrent.duration.FiniteDuration
 
 object Step {
   def apply[Out](
@@ -77,7 +78,7 @@ object Step {
 
   inline def compensate(f: => Unit)(using ctx: StepContext[?]): Unit = ctx.onCompensate(f)
 
-  def cache[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
+  def cacheFor[Out](ttl: FiniteDuration)(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(inputFingerprints)
@@ -88,13 +89,16 @@ object Step {
 
       case None =>
         ctx.onComplete { out =>
-          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl = None /* TODO */)
+          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl)
         }
     }
   }
 
+  def cache[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit =
+    cacheFor[Out](ctx.workflowCtx.defaultCacheTtl)(stepInputs *)
+
   @throws[StepInputConflictException]
-  def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
+  def onlyOnceFor[Out](ttl: FiniteDuration)(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()
@@ -105,9 +109,12 @@ object Step {
 
       case None =>
         ctx.onComplete { out =>
-          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl = None /* TODO */)
+          ctx.cache.put(idempotencyId, inputFingerprints, out, ttl)
         }
     }
   }
-}
 
+  @throws[StepInputConflictException]
+  def onlyOnce[Out](stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit =
+    onlyOnceFor[Out](ctx.workflowCtx.defaultCacheTtl)(stepInputs *)
+}

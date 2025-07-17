@@ -99,9 +99,9 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
 
     val ctx = new atomicflow.WorkflowContext[In, Out] {
-      override def meta: WorkflowMeta = workflowInstance.workflow.meta
+      override val meta: WorkflowMeta = workflowInstance.workflow.meta
 
-      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+      override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
 
       override protected[atomicflow] def getFingerprinter: Fingerprinter =
         atomicflow.impl.Sha256Fingerprinter
@@ -110,9 +110,13 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
         new DbStepIdempotencyStore(workflowInstance.stepIdempotencyIdOverrides)
 
       override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
-        new DbStepCache[StepOut]()
+        new DbStepCache[StepOut]
 
-      override protected[atomicflow] def getSignalStore: SignalStore = DbSignalStore
+      override protected[atomicflow] def getSignalStore: SignalStore =
+        DbSignalStore
+
+      override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
+        workflowInstance.defaultCacheTtl
     }
 
     try {
@@ -237,9 +241,9 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
                       stepIdempotencyId: StepIdempotencyId,
                       inputFingerprints: StepInputFingerprints,
                       value: Out,
-                      ttl: Option[FiniteDuration]
+                      ttl: FiniteDuration
                     ): Unit = {
-      val expiry = ttl.map(d => java.time.Instant.now().plusMillis(d.toMillis))
+      val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
       val data = Cacheable[Out].serialize(value).asInstanceOf[Array[Byte]]
 
       val query =
@@ -274,7 +278,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       }
 
     @throws[SignalConflictException]
-    override def setSignalValue[A](signal: Signal[A], value: A)(using workflowCtx: SimpleWorkflowContext): Unit = {
+    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: SimpleWorkflowContext): Unit = {
+      val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
       val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
 
       runSync {
@@ -288,7 +293,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
           case None =>
             sql"""
               INSERT INTO workflow_signals (id, workflow_id, workflow_instance_id, value, expiry)
-              SELECT ${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceId}, ${bytes}, null
+              SELECT ${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceId}, $bytes, $expiry
               WHERE EXISTS (
                 SELECT 1
                 FROM workflow_instance
@@ -307,8 +312,8 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     dispatcher.unsafeRunSync(fa.transact(xa))
 
   @throws[SignalConflictException]
-  override def setSignal[A](signal: Signal[A], value: A)(using SimpleWorkflowContext): Unit =
-    DbSignalStore.setSignalValue(signal, value)
+  override def setSignal[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using SimpleWorkflowContext): Unit =
+    DbSignalStore.setSignalValue(signal, value, ttl)
 }
 
 object DbWorkflowRuntime {

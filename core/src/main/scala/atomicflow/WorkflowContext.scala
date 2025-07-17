@@ -6,6 +6,7 @@ import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import scala.annotation.implicitNotFound
+import scala.concurrent.duration.FiniteDuration
 
 trait SimpleWorkflowContext {
   def meta: WorkflowMeta
@@ -37,4 +38,6 @@ trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
   protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
   
   protected[atomicflow] def getSignalStore: SignalStore
+  
+  protected[atomicflow] def defaultCacheTtl: FiniteDuration
 }

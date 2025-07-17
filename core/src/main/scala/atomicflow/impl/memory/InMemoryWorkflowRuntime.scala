@@ -9,7 +9,7 @@ import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.concurrent.duration.FiniteDuration
 
 class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
-  trait WorkflowIdempotencyStore {
+  class WorkflowIdempotencyStore {
     sealed trait IdempotencyIdKey
 
     case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: StepInputFingerprints) extends IdempotencyIdKey
@@ -51,7 +51,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     }
   }
 
-  trait WorkflowStepCache {
+  class WorkflowStepCache {
     val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
 
     def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
@@ -71,7 +71,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints,
                         value: StepOut,
-                        ttl: Option[FiniteDuration]
+                        ttl: FiniteDuration
                       ): Unit = {
         // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
         stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, inputFingerprints, value)))
@@ -114,8 +114,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             locked = new AtomicBoolean(false),
             in = in,
             workflowInstance = workflowInstance,
-            stepCache = new WorkflowStepCache {},
-            stepIdempotencyStore = new WorkflowIdempotencyStore {}
+            stepCache = new WorkflowStepCache(),
+            stepIdempotencyStore = new WorkflowIdempotencyStore()
           ))
       }
     }
@@ -151,9 +151,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
           // was not locked before
           try {
             val ctx = new WorkflowContext[In, Out] {
-              override def meta: WorkflowMeta = workflowInstance.workflow.meta
+              override val meta: WorkflowMeta = workflowInstance.workflow.meta
 
-              override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+              override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
 
               override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
@@ -165,6 +165,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
               override protected[atomicflow] def getSignalStore: SignalStore =
                 signalStore
+
+              override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
+                workflowInstance.defaultCacheTtl
             }
             state.workflowInstance.workflow.body(ctx, state.in)
           } finally {
@@ -185,7 +188,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
       signalValues.get().get(key).asInstanceOf[Option[A]]
     }
 
-    override def setSignalValue[A](signal: Signal[A], value: A)(using ctx: SimpleWorkflowContext): Unit = {
+    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: SimpleWorkflowContext): Unit = {
       val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
 
       if (!workflowInstances.get().contains(ctx.instanceId))
@@ -202,7 +205,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
 
   override def setSignal[A](
                              signal: Signal[A],
-                             value: A
+                             value: A,
+                             ttl: FiniteDuration
                            )(using SimpleWorkflowContext): Unit =
-    signalStore.setSignalValue(signal, value)
+    signalStore.setSignalValue(signal, value, ttl)
 }
