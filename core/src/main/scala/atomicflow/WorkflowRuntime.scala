@@ -2,6 +2,7 @@ package atomicflow
 
 import java.util.UUID
 import scala.annotation.implicitNotFound
+import scala.concurrent.duration.FiniteDuration
 
 @implicitNotFound("No WorkflowRuntime available.\nAdd a using clause `(using WorkflowRuntime)` to the definition of the enclosing method.")
 trait WorkflowRuntime {
@@ -38,6 +39,14 @@ trait WorkflowRuntime {
                                       )(
                                         using Cacheable[In]
                                       ): Out
+
+  @throws[WorkflowNotFoundException]
+  @throws[SignalConflictException]
+  def setSignal[A](
+                    signal: Signal[A],
+                    value: A,
+                    ttl: FiniteDuration
+                  )(using SimpleWorkflowContext): Unit
 }
 
 object WorkflowRuntime {

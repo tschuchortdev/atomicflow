@@ -8,7 +8,7 @@
 
 - **Atomic Workflows**: Your workflows are guaranteed to run atomically, meaning either all steps complete successfully, or none of them do.
 - **Idempotent Execution**: Steps are idempotent, so re-executing a step with the same inputs and context will not result in side effects being performed multiple times.
-- **Fixed Point Effects**: Critical steps that have side effects (e.g., sending data to a customer) are protected by **fixed-point execution** to ensure they are only executed once, unless explicitly retried with a new UUID.
+- **Only-Once Effects**: Critical steps that have side effects (e.g., sending data to a customer) are protected by **only-once execution** to ensure they are only executed once, unless explicitly retried with a new UUID.
 - **Event Logging**: Every step is logged for traceability, enabling you to skip already executed steps during retries, providing an efficient means to recover from failures.
 - **Replayable Workflows**: If a failure occurs, you can replay the workflow from the beginning, skipping already successfully completed steps.
 - **Time-limited Steps**: Some steps (e.g., certificate validation) are only valid for a certain period and must be re-evaluated after expiration.
@@ -17,7 +17,6 @@
 
 ## Out of scope
 - Introspection / Diagram generation
-- 
 
 ---
 

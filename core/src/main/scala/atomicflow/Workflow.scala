@@ -38,6 +38,15 @@ object Workflow {
     )
   }
 
+  /*def apply[Out](
+                  id: WorkflowId,
+                  name: String,
+                  description: String | Unit = ()
+                )(
+                  body: () => WorkflowContext[Unit, Out] ?=> Out
+                ): Workflow[Unit, Out] =
+    apply[Unit, Out](id, name, description)(_ => body())*/
+
   def meta[In, Out](using ctx: WorkflowContext[In, Out]): WorkflowMeta = ctx.meta
 
   def instanceId[In, Out](using ctx: WorkflowContext[In, Out]): WorkflowInstanceId = ctx.instanceId
