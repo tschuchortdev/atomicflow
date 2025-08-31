@@ -145,4 +145,4 @@ We welcome contributions to **AtomicFlow**! If you have ideas for new features, 
 
 ## 📄 **License**
 
-TODO
+This project uses the Apache 2.0 License. See the file called LICENSE.
