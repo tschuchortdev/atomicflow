@@ -1,6 +1,8 @@
+import scala.collection.Seq
+
 ThisBuild / version := "0.1.0-SNAPSHOT"
 
-ThisBuild / scalaVersion := "3.6.4"
+ThisBuild / scalaVersion := "3.7.3"
 
 val V = new {
   val cats = "2.13.0"
@@ -49,4 +51,32 @@ lazy val db = project
       "org.tpolecat" %% "doobie-postgres-circe" % V.doobie,
       "org.tpolecat" %% "doobie-hikari" % V.doobie,
     )
+  )
+
+lazy val example = project
+  .dependsOn(core, db)
+  .settings(
+    name := "atomicflow-examples",
+    resolvers += ("gitlab-basis-consumer-lib" at "http://gitlab.zpc.bms.ads/api/v4/projects/318/packages/maven")
+      .withAllowInsecureProtocol(true),
+    libraryDependencies ++= Seq(
+      "org.business4s" %% "workflows4s-core" % "0.4.0",
+      "org.typelevel" %% "cats-effect" % "3.6.1",
+      "org.typelevel" %% "cats-core" % "2.13.0",
+      "org.typelevel" %% "cats-mtl" % "1.5.0",
+      "org.typelevel" %% "kittens" % "3.5.0",
+      "org.http4s" %% "http4s-jdk-http-client" % "0.10.0",
+      "org.http4s" %% "http4s-dsl" % "0.23.30",
+      "co.fs2" %% "fs2-core" % "3.12.0",
+      "co.fs2" %% "fs2-io" % "3.12.0",
+      "co.fs2" %% "fs2-reactive-streams" % "3.12.0",
+      "de.bitmarck" %% "basis-consumer-lib" % "0.0.7",
+      "de.lhns" %% "scala-trustmanager-utils" % "1.1.0",
+
+    ),
+    // Test dependencies
+    libraryDependencies ++= Seq(
+      "org.testcontainers" % "testcontainers" % "1.21.3",
+      "org.testcontainers" % "postgresql" % "1.21.3"
+    ).map(_ % Test)
   )
