@@ -36,5 +36,6 @@ object DocumentUploadEndpoint {
 
 class ResultReporter {
   def reportResultSuccess(): IO[Unit] = ???
+  def reportCancellation(): IO[Unit] = ???
   def reportResultError(): IO[Unit] = ???
 }

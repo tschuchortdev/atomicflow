@@ -34,7 +34,15 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
       checkUploadStatusLoop >>>
       reportResult >>>
       WIO.end
-  ).handleErrorWith(reportResult)
+  ).interruptWith(
+    WIO.interruption
+      .throughSignal(Signals.userCancelsUploadOfInputFile)
+      .handleSync { (_, _) => Event.CancelledByUser }
+      .handleEventWithError { (_, _: Event.CancelledByUser.type) => Error.CancelledByUser.asLeft }
+      .voidResponse
+      .done
+    )
+    .handleErrorWith(reportResult)
 
   private lazy val signAndUploadWithRetry: WIO[State.AllVirusChecksPassed, Error, State.PollingForUploadStatus] = {
     WIO.repeat(
@@ -54,8 +62,11 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
               }.done)
           )
     ).untilRight {
-        case s: State.PollingForUploadStatus => s.asRight
-        case s: State.InterruptedAfterSignatureValidityExceeded => State.AllVirusChecksPassed(s.documentId, s.documentWithoutSignature).asLeft
+        case s: State.PollingForUploadStatus =>
+          s.asRight
+
+        case s: State.InterruptedAfterSignatureValidityExceeded =>
+          State.AllVirusChecksPassed(s.documentId, s.documentWithoutSignature).asLeft
       }
       .onRestartContinue
       .named(
@@ -63,7 +74,7 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
         releaseBranchName = "success",
         restartBranchName = "signature validity exceeded"
       )
-      .retryIn { case NonFatal(e) => 15.minutes.toJava }
+      .retryIn { case NonFatal(e) => 15.minutes.toJava } // TODO: Only unlimited retries are possible >:O
   }
 
 
@@ -199,7 +210,10 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
     case s: State.UploadProcessedSuccessfully =>
       resultReporter.reportResultSuccess().as(Event.ResultReported)
 
-    case (s: State, e: Error) =>
+    case (_: State, _: Error.CancelledByUser.type) =>
+      resultReporter.reportCancellation().as(Event.ResultReported)
+
+    case (_: State, _: Error) =>
       resultReporter.reportResultError().as(Event.ResultReported)
   }
     .handleEvent { (_, _: Event.ResultReported.type) => State.ResultReported() }
@@ -308,6 +322,8 @@ object DocumentProcessingWorkflow4s {
       case class Released(releasedAt: Instant) extends UploadStatusCheckRetryTimer
     }
 
+    object CancelledByUser extends Event
+
     object ResultReported extends Event
   }
 
@@ -321,14 +337,15 @@ object DocumentProcessingWorkflow4s {
     case class DownstreamRejectedUpload(msg: String = "") extends Error
     case class UploadProcessedWithErrors(msg: String = "") extends Error
     object UploadStatusTimeoutExceeded extends Error
+    object CancelledByUser extends Error
   }
 
   object Signals {
     val inputFileFound: SignalDef[InputFileFound, Unit] = SignalDef()
-
     case class InputFileFound(path: Path)
 
-    case class UserCancelsUploadOfInputFile(path: Path)
+    val userCancelsUploadOfInputFile: SignalDef[UserCancelsUploadOfInputFile, Unit] = SignalDef()
+    case class UserCancelsUploadOfInputFile()
   }
 
   /*extension [Ctx <: WorkflowContext, In <: WCState[Ctx], ErrIn, Out <: WCState[Ctx]](wio: WIO[In, ErrIn, Out, Ctx])
