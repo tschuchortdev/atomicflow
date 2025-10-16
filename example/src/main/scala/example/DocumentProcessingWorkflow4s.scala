@@ -5,14 +5,18 @@ import cats.effect.syntax.all
 import cats.implicits.*
 import cats.mtl.syntax.all
 import cats.syntax.all
-import example.DocumentProcessingWorkflow4s.Event.{DocumentSigningResult, UploadStatusPollingResult, VirusCheck1Result}
+import example.DocumentProcessingWorkflow4s.Error.SignatureValidityPeriodExceeded
+import example.DocumentProcessingWorkflow4s.Event.{DocumentSigningResult, UploadResult, UploadStatusPollingResult, VirusCheck1Result}
+import example.DocumentProcessingWorkflow4s.State
 import example.DocumentUploadEndpoint.ProcessingStatus.NoInfo
 import workflows4s.wio
-import workflows4s.wio.{SignalDef, WIO, WorkflowContext}
+import workflows4s.wio.internal.WorkflowEmbedding
+import workflows4s.wio.{SignalDef, WCEvent, WCState, WIO, WorkflowContext}
 
 import java.nio.file.Path
 import java.time.Instant
-import scala.concurrent.duration.{DurationInt, FiniteDuration}
+import scala.concurrent.duration.{Duration, DurationInt, FiniteDuration}
+import scala.jdk.DurationConverters.*
 import scala.util.NotGiven
 import scala.util.control.NonFatal
 
@@ -26,23 +30,52 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
   lazy val workflow = (
     readFile >>>
       doVirusChecksInParallel >>>
-      (signFile >>>
-      uploadFile)
-        .retry(???) >>>
+      signAndUploadWithRetry >>>
       checkUploadStatusLoop >>>
       reportResult >>>
       WIO.end
   ).handleErrorWith(reportResult)
 
+  private lazy val signAndUploadWithRetry: WIO[State.AllVirusChecksPassed, Error, State.PollingForUploadStatus] = {
+    WIO.repeat(
+      signFile >>>
+        uploadFile.interruptWith(
+          // Signature is only valid for x amount of time. Interrupt and restart (signFile >> uploadFile) if the validity period is exceeded.
+            WIO.interruption
+              .throughTimeout(EncryptionService.signatureValidityPeriod)
+              .persistStartThrough(started => Event.UploadAndSignInterruption.AwaitingTimeout(started.at))(_.startedAt)
+              .persistReleaseThrough(released => Event.UploadAndSignInterruption.ReachedTimeout(released.at))(_.releasedAt)
+              .autoNamed
+              .andThen(_ >>> WIO.pure.makeFrom[State].value {
+                case s: State.DocumentSigned =>
+                  State.InterruptedAfterSignatureValidityExceeded(s.documentId, s.documentWithoutSignature)
+                    : State.PollingForUploadStatus | State.InterruptedAfterSignatureValidityExceeded
+                case _ => throw AssertionError("impossible")
+              }.done)
+          )
+    ).untilRight {
+        case s: State.PollingForUploadStatus => s.asRight
+        case s: State.InterruptedAfterSignatureValidityExceeded => State.AllVirusChecksPassed(s.documentId, s.documentWithoutSignature).asLeft
+      }
+      .onRestartContinue
+      .named(
+        conditionName = "Did signing and upload succeed?",
+        releaseBranchName = "success",
+        restartBranchName = "signature validity exceeded"
+      )
+      .retryIn { case NonFatal(e) => 15.minutes.toJava }
+  }
+
+
   private lazy val readFile: WIO[State.NotStarted.type, Error.InvalidInputFile, State.FileRead] = ???
 
   private lazy val doVirusChecksInParallel: WIO[State.FileRead, Error, State.AllVirusChecksPassed] =
     WIO.parallel.taking[State.FileRead]
-      .withInterimState[State.WaitingForVirusChecks](initial = stateBefore => State.WaitingForVirusChecks())
+      .withInterimState[State.WaitingForVirusChecks](initial = stateBefore => State.WaitingForVirusChecks(???, ???))
       .withElement(virusCheck1, incorporatedWith = (interimState, pathState) => interimState)
       .withElement(virusCheck2, incorporatedWith = (interimState, pathState) => interimState)
       .producingOutputWith {
-        case (State.VirusCheckPassed, State.VirusCheckPassed) => State.AllVirusChecksPassed()
+        case (State.VirusCheckPassed, State.VirusCheckPassed) => State.AllVirusChecksPassed(???, ???)
       }
 
   private lazy val virusCheck1: WIO[State.FileRead, Error.VirusCheck1Failed, State.VirusCheckPassed.type] =
@@ -75,30 +108,37 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
       }
       .autoNamed()
 
-  private lazy val signFile: WIO[State.AllVirusChecksPassed, Error.SigningFailed, State.FileSigned] =
+  private lazy val signFile: WIO[State.AllVirusChecksPassed, Error.SigningFailed, State.DocumentSigned] =
     WIO.runIO { (state: State.AllVirusChecksPassed) =>
-      encryptionService.signDocument(state.fileContent)
+      encryptionService.signDocument(state.documentContent)
         .map(Event.DocumentSigningResult.Signed(_))
         .recover { case NonFatal(e) => Event.DocumentSigningResult.Failed(e.toString) }
     }
       .handleEventWithError { (state, evt) =>
         evt match {
-          case DocumentSigningResult.Signed(doc) => State.FileSigned(state.fileId, doc).asRight
-          case DocumentSigningResult.Failed(msg) => Error.SigningFailed(msg).asLeft
+          case DocumentSigningResult.Signed(docWithSignature) =>
+            State.DocumentSigned(state.documentId, state.documentContent, docWithSignature).asRight
+
+          case DocumentSigningResult.Failed(msg) =>
+            Error.SigningFailed(msg).asLeft
         }
       }
       .autoNamed()
 
-  private lazy val uploadFile: WIO[State.FileSigned, Error.DownstreamRejectedUpload, State.PollingForUploadStatus] =
-    WIO.runIO { (state: State.FileSigned) =>
-      documentUploadEndpoint.uploadDocumentForProcessing(state.fileId, state.fileContentWithSignature)
+  private lazy val uploadFile: WIO[State.DocumentSigned, Error.DownstreamRejectedUpload, State.PollingForUploadStatus] =
+    WIO.runIO { (state: State.DocumentSigned) =>
+      documentUploadEndpoint.uploadDocumentForProcessing(state.documentId, state.documentContentWithSignature)
         .map {
           case Right(()) => Event.UploadResult.UploadAccepted
-          case Left(e) => Event.UploadResult.UploadRejected
+          case Left(e) => Event.UploadResult.UploadRejected(e.toString)
         }
-        //.recover { case NonFatal(e) => ??? }
     }
-      .handleEventWithError { (state, evt) => ??? }
+      .handleEventWithError { (state, evt) =>
+        evt match {
+          case UploadResult.UploadAccepted => State.PollingForUploadStatus(documentId = state.documentId, timesRetried = 0).asRight
+          case UploadResult.UploadRejected(reason) => Error.DownstreamRejectedUpload(reason).asLeft
+        }
+      }
       .autoNamed()
 
   private lazy val checkUploadStatusLoop: WIO[
@@ -132,10 +172,12 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
     if (s.timesRetried >= maxNumRetries)
       IO.pure(Event.UploadStatusPollingResult.MaxRetriesReached)
     else
-      documentUploadEndpoint.checkUploadProcessingStatus(s.uploadId).map {
+      documentUploadEndpoint.checkUploadProcessingStatus(s.documentId).map {
         case DocumentUploadEndpoint.ProcessingStatus.NoInfo => Event.UploadStatusPollingResult.NoInfo
         case DocumentUploadEndpoint.ProcessingStatus.ProcessedSuccessfully => Event.UploadStatusPollingResult.UploadProcessedSuccessfully
         case DocumentUploadEndpoint.ProcessingStatus.ProcessedWithErrors => Event.UploadStatusPollingResult.UploadProcessedWithErrors("")
+      }.recover {
+        case NonFatal(e) => Event.UploadStatusPollingResult.NoInfo
       }
   }.handleEventWithError[
     Error.UploadProcessedWithErrors | Error.UploadStatusTimeoutExceeded.type,
@@ -144,7 +186,7 @@ class DocumentProcessingWorkflow4s(virusCheckService: VirusCheckService,
     event match {
       case UploadStatusPollingResult.NoInfo => state.copy(timesRetried = state.timesRetried + 1).asRight
       case UploadStatusPollingResult.MaxRetriesReached => Error.UploadStatusTimeoutExceeded.asLeft
-      case UploadStatusPollingResult.UploadProcessedSuccessfully => State.UploadProcessedSuccessfully().asRight
+      case UploadStatusPollingResult.UploadProcessedSuccessfully => State.UploadProcessedSuccessfully(state.documentId).asRight
       case UploadStatusPollingResult.UploadProcessedWithErrors(msg) => Error.UploadProcessedWithErrors().asLeft
     }
   }.autoNamed()
@@ -170,20 +212,57 @@ object DocumentProcessingWorkflow4s {
   }
 
 
+  /*object SignUploadWorkflow {
+    object Ctx extends WorkflowContext {
+      override type State = SignUploadWorkflow.State
+      override type Event = SignUploadWorkflow.Event
+    }
 
-  sealed trait State {
-    val retryData: Option[RetryData]
-  }
+    sealed trait State
+    object State {
+      case class SigningDocument(documentId: String, documentContent: Array[Byte]) extends State
+      case class UploadingDocument(documentId: String, documentContentWithSignature: Array[Byte]) extends State
+      case class Finished(documentId: String) extends State
+    }
 
+    sealed trait Event
+    object Event {
+      object DocumentSigned extends Event
+      object UploadSucceeded extends Event
+    }
+
+    sealed trait Error
+    object Error {
+      object SignatureValidityPeriodExceeded extends Error
+    }
+
+    val embedding = new WorkflowEmbedding[
+      SignUploadWorkflow.Ctx.type,
+      DocumentProcessingWorkflow4s.Ctx.type,
+      DocumentProcessingWorkflow4s.State.AllVirusChecksPassed
+    ] {
+      override def convertEvent(e: WCEvent[Ctx.type]): WCEvent[DocumentProcessingWorkflow4s.Ctx.type] = ???
+
+      override def unconvertEvent(e: WCEvent[DocumentProcessingWorkflow4s.Ctx.type]): Option[WCEvent[Ctx.type]] = ???
+
+      override def convertState[In <: WCState[Ctx.type]](innerState: In, input: State.AllVirusChecksPassed): OutputState[In] = ???
+
+      override def unconvertState(outerState: WCState[DocumentProcessingWorkflow4s.Ctx.type]): Option[WCState[Ctx.type]] = ???
+    }
+
+  }*/
+
+  sealed trait State
   object State {
     object NotStarted extends State
-    case class FileRead(inputFile: InputFile) extends State
-    case class WaitingForVirusChecks() extends State
+    case class FileRead(inputFile: FileWithDocumentBatch) extends State
+    case class WaitingForVirusChecks(documentId: String, documentContent: Array[Byte]) extends State
     object VirusCheckPassed extends State
-    case class AllVirusChecksPassed(fileId: String, fileContent: Array[Byte]) extends State
-    case class FileSigned(fileId: String, fileContentWithSignature: Array[Byte]) extends State
-    case class PollingForUploadStatus(uploadId: String, timesRetried: Int) extends State
-    case class UploadProcessedSuccessfully() extends State
+    case class AllVirusChecksPassed(documentId: String, documentContent: Array[Byte]) extends State
+    case class DocumentSigned(documentId: String, documentWithoutSignature: Array[Byte], documentContentWithSignature: Array[Byte]) extends State
+    case class InterruptedAfterSignatureValidityExceeded(documentId: String, documentWithoutSignature: Array[Byte]) extends State
+    case class PollingForUploadStatus(documentId: String, timesRetried: Int) extends State
+    case class UploadProcessedSuccessfully(documentId: String) extends State
     case class ResultReported() extends State
   }
 
@@ -203,9 +282,16 @@ object DocumentProcessingWorkflow4s {
       case Failed(msg: String = "")
     }
 
+    // Must be a sealed trait and not enum to make type inference work
+    sealed trait UploadAndSignInterruption extends Event
+    object UploadAndSignInterruption {
+      case class AwaitingTimeout(startedAt: Instant) extends UploadAndSignInterruption
+      case class ReachedTimeout(releasedAt: Instant) extends UploadAndSignInterruption
+    }
+
     enum UploadResult extends Event {
       case UploadAccepted
-      case UploadRejected
+      case UploadRejected(reason: String = "")
     }
 
     enum UploadStatusPollingResult extends Event {
@@ -226,16 +312,15 @@ object DocumentProcessingWorkflow4s {
   }
 
   sealed trait Error
-
   object Error {
     case class InvalidInputFile(msg: String = "") extends Error
     case class VirusCheck1Failed(msg: String = "") extends Error
     case class VirusCheck2Failed(msg: String = "") extends Error
     case class SigningFailed(msg: String = "") extends Error
+    object SignatureValidityPeriodExceeded extends Error
     case class DownstreamRejectedUpload(msg: String = "") extends Error
     case class UploadProcessedWithErrors(msg: String = "") extends Error
     object UploadStatusTimeoutExceeded extends Error
-
   }
 
   object Signals {
@@ -245,19 +330,19 @@ object DocumentProcessingWorkflow4s {
 
     case class UserCancelsUploadOfInputFile(path: Path)
   }
+
+  /*extension [Ctx <: WorkflowContext, In <: WCState[Ctx], ErrIn, Out <: WCState[Ctx]](wio: WIO[In, ErrIn, Out, Ctx])
+    def retryOnError(decideDelay: (WCState[Ctx], ErrIn) => Option[FiniteDuration]) = {
+      Ctx.WIO.getState[In].flatMap { stateBefore =>
+        wio.handleErrorWith(
+          Ctx.WIO.getState[(WCState[Ctx], ErrIn)].flatMap { case (stateAfter, error: ErrIn) =>
+            decideDelay(stateAfter, error) match {
+              case Some(delay) => Ctx.WIO.await()
+            }
+            wio.provideInput(stateBefore)
+          }
+        )
+      }
+    }*/
 }
 
-trait HasRetryData {
-  val retryData: Option[RetryData]
-}
-
-case class RetryData(retryCount: Int = 0, lastRetry: Instant)
-
-extension [In <: HasRetryData, Err, Out, Ctx <: WorkflowContext](wio: WIO[In, Err, Out, Ctx])
-  def retryWithExponentialBackoff(initialDelay: FiniteDuration)(shouldRetry: Throwable => Boolean)
-    : WIO[In, Err, Out, Ctx] = wio.retry { (throwable, state, now) =>
-    if (!shouldRetry(throwable))
-      None.pure[IO]
-    else
-      ???
-  }

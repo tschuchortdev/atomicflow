@@ -2,7 +2,9 @@ package example
 
 import cats.effect.IO
 
-class InputFile(fileId: String, documentsInFile: Vector[DocumentFromInputFile])
+import scala.concurrent.duration.{DurationInt, FiniteDuration}
+
+class FileWithDocumentBatch(fileId: String, documentsInFile: Vector[DocumentFromInputFile])
 class DocumentFromInputFile(documentId: String, content: Array[Byte])
 
 class VirusCheckService {
@@ -13,11 +15,14 @@ class VirusCheckService {
 class EncryptionService {
   def signDocument(document: Array[Byte]): IO[Array[Byte]] = ???
 }
+object EncryptionService {
+  val signatureValidityPeriod = 90.minutes
+}
 
 class DocumentUploadEndpoint {
   import DocumentUploadEndpoint.*
   def uploadDocumentForProcessing(documentId: String, signedDocument: Array[Byte]): IO[Either[SignatureError.type, Unit]] = ???
-  def checkUploadProcessingStatus(documentId: String): IO[ProcessingStatus]
+  def checkUploadProcessingStatus(documentId: String): IO[ProcessingStatus] = ???
 }
 object DocumentUploadEndpoint {
   object SignatureError
