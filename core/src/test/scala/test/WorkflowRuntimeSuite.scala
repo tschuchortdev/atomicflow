@@ -11,8 +11,6 @@ import java.util.concurrent.atomic.AtomicInteger
 abstract class WorkflowRuntimeSuite extends FunSuite {
   def createWorkflowRuntime: WorkflowRuntime
 
-  given WorkflowRuntime = createWorkflowRuntime
-
   private lazy val emptyWorkflow = Workflow[String, Int](
     WorkflowId("d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"),
     name = "read and send files"
@@ -24,16 +22,19 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Unknown empty workflow should fail with WorkflowNotFoundException") {
+    given WorkflowRuntime = createWorkflowRuntime
     intercept[WorkflowNotFoundException] {
       emptyWorkflow.instance(WorkflowInstanceId.generate).recover()
     }
   }
 
   test("Empty workflow should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     assertEquals(emptyWorkflow.instance(WorkflowInstanceId.generate).run("answer"), 42)
   }
 
   test("Locked empty workflow should fail with WorkflowLockedException") {
+    given WorkflowRuntime = createWorkflowRuntime
     val instanceId = WorkflowInstanceId.generate
     lazy val workflow: Workflow[Unit, Any] = Workflow[Unit, Any](
       WorkflowId("d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"),
@@ -47,6 +48,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Empty workflow should fail with WorkflowInputConflictException if its inputs change") {
+    given WorkflowRuntime = createWorkflowRuntime
     val workflowInstanceId = WorkflowInstanceId.generate
     assertEquals(emptyWorkflow.instance(workflowInstanceId).run("answer"), 42)
     intercept[WorkflowInputConflictException] {
@@ -55,6 +57,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Workflow with step should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     val workflow = Workflow[String, Int](
       WorkflowId("15f8bf6d-a719-4958-b790-b3eb846340c1"),
       name = "workflow with steps"
@@ -75,6 +78,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Workflow with cached step should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     val answer = AtomicInteger(42)
 
     val workflow = Workflow[String, Int](
@@ -103,6 +107,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Workflow with cached step and changed inputs should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     val answer = AtomicInteger(42)
 
     val workflow = Workflow[String, Int](
@@ -136,6 +141,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Workflow with once step should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     val answer = AtomicInteger(42)
 
     val workflow = Workflow[String, Int](
@@ -164,6 +170,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Workflow with once step and changed inputs should run") {
+    given WorkflowRuntime = createWorkflowRuntime
     val answer = AtomicInteger(42)
 
     val workflow = Workflow[String, Int](
@@ -215,13 +222,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Signals can be set but not to a different value") {
+    given WorkflowRuntime = createWorkflowRuntime
     val signal = Signal[String](SignalId("fbf1760e-c3d4-4635-a84b-8426f2d521ef"))
 
     val workflow = Workflow[Unit, String](
       WorkflowId("9196475c-8973-47d1-be37-dbb080c943b9"),
       name = "workflow with signal"
     ) { _ =>
-      val value = signal.value
+      val value = signal.valueOrThrow
       value
     }
 
@@ -243,13 +251,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   }
 
   test("Signals must be set on existing workflows") {
+    given WorkflowRuntime = createWorkflowRuntime
     val signal = Signal[String](SignalId("a6d6993a-1d27-43a2-b254-b53d164e2de3"))
 
     val workflow = Workflow[Unit, String](
       WorkflowId("b62a9a63-b6c6-4c05-bbf4-e994ee195437"),
       name = "workflow with signal"
     ) { _ =>
-      val value = signal.value
+      val value = signal.valueOrThrow
       value
     }
 

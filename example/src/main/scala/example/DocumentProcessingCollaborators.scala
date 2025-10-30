@@ -48,14 +48,17 @@ class DocumentUploadEndpoint {
 
   def checkUploadProcessingStatus(documentId: String): IO[ProcessingStatus] =
     IO.pure(ProcessingStatus.ProcessedSuccessfully)
+
+  def deleteUploadedDocumentIfExists(documentId: String): IO[Unit] = IO.unit
 }
 object DocumentUploadEndpoint {
   object SignatureError
   
-  enum ProcessingStatus {
-    case NoInfo
-    case ProcessedSuccessfully
-    case ProcessedWithErrors
+  sealed trait ProcessingStatus
+  object ProcessingStatus {
+    object NoInfo extends ProcessingStatus
+    object ProcessedSuccessfully extends ProcessingStatus
+    case class ProcessedWithErrors(errorMsg: String) extends ProcessingStatus
   }
 }
 

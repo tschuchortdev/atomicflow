@@ -213,41 +213,7 @@ class PerDocumentWorkflow(virusCheckService: VirusCheckService,
       signAndUploadWithRetry >>>
       checkUploadStatusLoop
   }
-
-  private lazy val signAndUploadWithRetry: WIO[State.AllVirusChecksPassed, Error, State.PollingForUploadStatus] = {
-    WIO.repeat(
-        signFile >>>
-          uploadFile.interruptWith(
-            // Signature is only valid for x amount of time. Interrupt and restart (signFile >> uploadFile) if the validity period is exceeded.
-            WIO.interruption
-              .throughTimeout(EncryptionService.signatureValidityPeriod)
-              .persistStartThrough(started => Event.UploadAndSignInterruption.AwaitingTimeout(started.at))(_.startedAt)
-              .persistReleaseThrough(released => Event.UploadAndSignInterruption.ReachedTimeout(released.at))(_.releasedAt)
-              .autoNamed
-              .andThen(_ >>> WIO.pure.makeFrom[State].value {
-                case s: State.DocumentSigned =>
-                  State.InterruptedAfterSignatureValidityExceeded(s.documentId, s.documentWithoutSignature)
-                    : State.PollingForUploadStatus | State.InterruptedAfterSignatureValidityExceeded
-                case _ => throw AssertionError("impossible")
-              }.done)
-          )
-      ).untilRight {
-        case s: State.PollingForUploadStatus =>
-          s.asRight
-
-        case s: State.InterruptedAfterSignatureValidityExceeded =>
-          State.AllVirusChecksPassed(s.documentId, s.documentWithoutSignature).asLeft
-      }
-      .onRestartContinue
-      .named(
-        conditionName = "Did signing and upload succeed?",
-        releaseBranchName = "success",
-        restartBranchName = "signature validity exceeded"
-      )
-      .retryIn { case NonFatal(e) => 15.minutes.toJava } // TODO: Only unlimited retries are possible >:O
-  }
-
-
+  
   private lazy val doVirusChecksInParallel: WIO[DocumentFromInputFile, Error, State.AllVirusChecksPassed] =
     WIO.parallel.taking[DocumentFromInputFile]
       .withInterimState[State.WaitingForVirusChecks](initial =
@@ -293,6 +259,39 @@ class PerDocumentWorkflow(virusCheckService: VirusCheckService,
       }
       .autoNamed()
 
+  private lazy val signAndUploadWithRetry: WIO[State.AllVirusChecksPassed, Error, State.PollingForUploadStatus] = {
+    WIO.repeat(
+        signFile >>>
+          uploadFile.interruptWith(
+            // Signature is only valid for x amount of time. Interrupt and restart (signFile >> uploadFile) if the validity period is exceeded.
+            WIO.interruption
+              .throughTimeout(EncryptionService.signatureValidityPeriod)
+              .persistStartThrough(started => Event.UploadAndSignInterruption.AwaitingTimeout(started.at))(_.startedAt)
+              .persistReleaseThrough(released => Event.UploadAndSignInterruption.ReachedTimeout(released.at))(_.releasedAt)
+              .autoNamed
+              .andThen(_ >>> WIO.pure.makeFrom[State].value {
+                case s: State.DocumentSigned =>
+                  State.InterruptedAfterSignatureValidityExceeded(s.documentId, s.documentWithoutSignature)
+                    : State.PollingForUploadStatus | State.InterruptedAfterSignatureValidityExceeded
+                case _ => throw AssertionError("impossible")
+              }.done)
+          )
+      ).untilRight {
+        case s: State.PollingForUploadStatus =>
+          s.asRight
+
+        case s: State.InterruptedAfterSignatureValidityExceeded =>
+          State.AllVirusChecksPassed(s.documentId, s.documentWithoutSignature).asLeft
+      }
+      .onRestartContinue
+      .named(
+        conditionName = "Did signing and upload succeed?",
+        releaseBranchName = "success",
+        restartBranchName = "signature validity exceeded"
+      )
+      .retryIn { case NonFatal(e) => 15.minutes.toJava } // TODO: Only unlimited retries are possible >:O
+  }
+  
   private lazy val signFile: WIO[State.AllVirusChecksPassed, Error.SigningFailed, State.DocumentSigned] =
     WIO.runIO { (state: State.AllVirusChecksPassed) =>
         encryptionService.signDocument(state.documentContent)

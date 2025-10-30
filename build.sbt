@@ -14,6 +14,7 @@ val V = new {
   val neotype = "0.3.25"
   val ox = "0.7.0"
   val upickle = "4.2.1"
+  val testcontainers = "1.21.3"
 }
 
 lazy val root = (project in file("."))
@@ -50,6 +51,8 @@ lazy val db = project
       "org.tpolecat" %% "doobie-postgres" % V.doobie,
       "org.tpolecat" %% "doobie-postgres-circe" % V.doobie,
       "org.tpolecat" %% "doobie-hikari" % V.doobie,
+      "org.testcontainers" % "testcontainers" % V.testcontainers % Test,
+      "org.testcontainers" % "postgresql" % V.testcontainers % Test
     )
   )
 

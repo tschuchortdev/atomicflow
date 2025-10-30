@@ -4,24 +4,28 @@ import atomicflow.*
 import atomicflow.Constants.libraryVersion
 import atomicflow.Fingerprintable.Fingerprinter
 import atomicflow.impl.db.DbWorkflowRuntime.given
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, SignalStore}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints, catching}
 import cats.Monad
 import cats.effect.std.Dispatcher
 import cats.effect.{Async, IO, Resource}
 import cats.syntax.all.*
-import de.lhns.doobie.flyway.BaselineMigrations.*
-import de.lhns.doobie.flyway.Flyway
 import doobie.*
 import doobie.hikari.HikariTransactor
 import doobie.implicits.*
 import doobie.postgres.circe.jsonb.implicits.*
 import doobie.postgres.implicits.*
+import org.flywaydb.core.Flyway
 
 import java.time.Instant
 import java.util
 import java.util.UUID
-import scala.concurrent.duration.FiniteDuration
+import javax.sql.DataSource
+import scala.concurrent.{ExecutionContext, TimeoutException}
+import scala.concurrent.duration.{DurationInt, FiniteDuration}
+import scala.math.Ordered.orderingToOrdered
 
+// TODO: rename to PostgresWorkflowRuntime
+// TODO: either get rid of effect type completely or return it in methods
 class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[F]) extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
 
   override def createWorkflowInstance[In, Out](
@@ -37,6 +41,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
     runSync {
+      // TODO: race condition. Use upsert with unique constraint on (id, input)?
       sql"SELECT input FROM workflow_instance WHERE id = $id"
         .query[Array[Byte]]
         .option
@@ -48,6 +53,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
             throw WorkflowInputConflictException()(using simpleWorkflowCtx)
 
           case None =>
+            // TODO: may throw unique constraint violation here
             sql"INSERT INTO workflow_instance (id, workflow_id, input) VALUES ($id, $workflowId, $input)"
               .update
               .run
@@ -73,14 +79,14 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
                                                ): Out = {
     val id = workflowInstance.instanceId
 
+    // TODO: What if workflow doesn't complete within 5 minutes? -> Bug: concurrent executions possible
     val lockDuration = java.time.Duration.ofMinutes(5)
     val now = Instant.now()
-    val lockUntil = now.plus(lockDuration)
 
     def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
-    runSync {
-      sql"SELECT id, locked_until FROM workflow_instance where id = $id"
+    val serializedInput: Array[Byte] = runSync {
+      sql"SELECT id, locked_until FROM workflow_instance where id = $id FOR UPDATE"
         .query[(WorkflowInstanceId, Option[Instant])]
         .option
         .flatMap {
@@ -91,10 +97,10 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
             throw WorkflowLockedException()(using simpleWorkflowCtx)
 
           case Some((_, _)) =>
-            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id"
+            val lockUntil = now.plus(lockDuration)
+            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id RETURNING input"
               .update
-              .run
-              .void
+              .withUniqueGeneratedKeys[Array[Byte]]("input")
         }
     }
 
@@ -120,10 +126,22 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
 
     try {
-      val inputBytes = runSync(loadInput(id)).get /*TODO: .getOrElse {
-        throw WorkflowNotFoundException()(using ctx)
-      }*/
-      workflowInstance.workflow.body(ctx, Cacheable[In].deserialize(inputBytes.asInstanceOf[IArray[Byte]]))
+      ox.raceResult(
+        workflowInstance.workflow.body(ctx, Cacheable[In].deserialize(IArray.unsafeFromArray(serializedInput))),
+        // background job refreshes the lock
+        ox.forever {
+          Thread.sleep(lockDuration.minus(java.time.Duration.ofMinutes(1)))
+          val lockUntil = Instant.now().plus(lockDuration)
+          ox.timeout(30.seconds) { // gives 30 seconds for the workflow to cancel itself before we are in bug territory
+            sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE id = $id"
+              .update
+              .run
+              .void
+          }.catching { case _: TimeoutException =>
+            throw RuntimeException("Could not renew lock on workflow instance in time")
+          }
+        }
+      )
     } finally {
       val unlock =
         sql"""
@@ -135,10 +153,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  private def loadInput(id: WorkflowInstanceId): ConnectionIO[Option[Array[Byte]]] =
-    sql"SELECT input FROM workflow_instance WHERE id = $id".query[Array[Byte]].option
-
-  class DbStepIdempotencyStore(
+  private class DbStepIdempotencyStore(
                                 stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
                               )(
                                 using ctx: StepContext[?]
@@ -220,7 +235,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  class DbStepCache[Out: Cacheable](using ctx: StepContext[Out]) extends StepCache[Out] {
+  private class DbStepCache[Out: Cacheable](using ctx: StepContext[Out]) extends StepCache[Out] {
     override def get(
                       stepIdempotencyId: StepIdempotencyId,
                       inputFingerprints: StepInputFingerprints
@@ -261,7 +276,7 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
     }
   }
 
-  object DbSignalStore extends SignalStore {
+  private object DbSignalStore extends SignalStore {
 
     // TODO: check expiry
     private def select[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): ConnectionIO[Option[Array[Byte]]] =
@@ -274,13 +289,13 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
       runSync {
         select(signal)
       }.map { bytes =>
-        signal.cacheable.deserialize(bytes.asInstanceOf[IArray[Byte]])
+        signal.asCacheable.deserialize(bytes.asInstanceOf[IArray[Byte]])
       }
 
     @throws[SignalConflictException]
     override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: SimpleWorkflowContext): Unit = {
       val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
-      val bytes: Array[Byte] = signal.cacheable.serialize(value).asInstanceOf[Array[Byte]]
+      val bytes: Array[Byte] = signal.asCacheable.serialize(value).asInstanceOf[Array[Byte]]
 
       runSync {
         select(signal).flatMap {
@@ -317,50 +332,40 @@ class DbWorkflowRuntime[F[_] : Async](xa: Transactor[F], dispatcher: Dispatcher[
 }
 
 object DbWorkflowRuntime {
-  case class DbConfig(
-                       driver: Option[String],
-                       url: String,
-                       user: String,
-                       password: String,
-                       poolSize: Option[Int]
-                     ) {
-    def driverOrDefault: String = driver.getOrElse("org.postgresql.Driver")
-
-    def poolSizeOrDefault: Int = poolSize.getOrElse(32)
-  }
-
-  private def transactor(config: DbConfig): Resource[IO, Transactor[IO]] =
-    for {
-      ce <- ExecutionContexts.fixedThreadPool[IO](config.poolSizeOrDefault)
-      xa <- HikariTransactor
-        .newHikariTransactor[IO](
-          config.driverOrDefault,
-          config.url,
-          config.user,
-          config.password,
-          ce
-        )
-      _ <- Flyway(xa) { flyway =>
-        for {
-          info <- flyway.info()
-          _ <- flyway
-            .configure(_
-              .withBaselineMigrate(info)
-              .validateMigrationNaming(true)
-            )
-            .migrate()
-        } yield ()
-      }
-    } yield xa
-
-  def apply(config: DbConfig): WorkflowRuntime = {
+  /**
+   * Creates a new [[DbWorkflowRuntime]] including all necessary schemas in the database.
+   * Since this function executes DDL statements on the database, it should not be called often; Reuse
+   * [[DbWorkflowRuntime]] instances instead of creating new ones where possible.
+   *
+   * @param ds DataSource to be used to connect to the database
+   * @param awaitConnectionEc Execution context to be used while getting a new connection from the data source.
+   *                          Asking for a connection from the data source can block when the connection is established
+   *                          for the first time or when the connection pool is exhausted. Therefore, this execution
+   *                          context should be from an IO thread pool.
+   */
+  def apply(ds: DataSource)(using awaitConnectionEc: ExecutionContext): WorkflowRuntime = {
+    import de.lhns.doobie.flyway.BaselineMigrations.BaselineMigrationOps
     (for {
-      dispatcher <- Dispatcher.parallel[IO]
-      xa <- transactor(config)
+      // dispatcher cleanup primarily ensures that all dispatched IOs have finished running, so not doing the cleanup
+      // is not that bad.
+      dispatcher <- Dispatcher.parallel[IO].allocated.map(_._1)
+      xa = Transactor.fromDataSource[IO](ds, awaitConnectionEc)
+      _ <- IO(
+        org.flywaydb.core.Flyway.configure
+          .dataSource(ds)
+      )
+      flyway = Flyway.configure()
+        .dataSource(ds)
+
+      flywayInfo <- IO(flyway.load().info())
+      _ <- IO(flyway
+        .withBaselineMigrate(flywayInfo)
+        .validateMigrationNaming(true)
+        .load()
+        .migrate())
     } yield
       new DbWorkflowRuntime[IO](xa, dispatcher))
-      .allocated.map(_._1)
-      .unsafeRunSync()(cats.effect.unsafe.IORuntime.global)
+      .unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
   }
 
   given Meta[StepIdempotencyId] = Meta[UUID].imap(uuid =>

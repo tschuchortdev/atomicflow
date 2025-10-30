@@ -6,7 +6,7 @@ import java.nio.charset.StandardCharsets
 trait Signal[A] {
   def meta: SignalMeta
 
-  def cacheable: Cacheable[A]
+  def asCacheable: Cacheable[A]
 
   def option(using WorkflowContext[?, ?]): Option[A]
 
@@ -15,7 +15,7 @@ trait Signal[A] {
   def isEmpty(using WorkflowContext[?, ?]): Boolean = option.isEmpty
 
   @throws[SignalEmptyException]
-  def value(using WorkflowContext[?, ?]): A =
+  def valueOrThrow(using WorkflowContext[?, ?]): A =
     option.getOrElse(throw new SignalEmptyException(this))
 
   /*@throws[SignalConflictException]
@@ -43,7 +43,7 @@ object Signal {
         }
       )
 
-      override def cacheable: Cacheable[A] = A
+      override def asCacheable: Cacheable[A] = A
 
       override def option(using workflowCtx: WorkflowContext[?, ?]): Option[A] =
         workflowCtx.getSignalStore.getSignalValue(this)

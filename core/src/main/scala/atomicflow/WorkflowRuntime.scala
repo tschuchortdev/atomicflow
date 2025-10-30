@@ -10,6 +10,11 @@ trait WorkflowRuntime {
 
   def generateStepIdempotencyId: StepIdempotencyId
 
+  // TODO: Why should anyone ever use this?
+  /**
+   * Registers this workflow instance but doesn't run it.
+   * @throws WorkflowInputConflictException when a workflow instance was previously created with non-equal input
+   */
   @throws[WorkflowInputConflictException]
   def createWorkflowInstance[In, Out](
                                        workflowInstance: WorkflowInstanceBuilder[In, Out],
@@ -19,7 +24,9 @@ trait WorkflowRuntime {
                                      ): Unit
 
   /**
-   * - Must lock the workflow while running
+   * Runs a workflow instance. The workflow instance is created if it doesn't already exist.
+   *
+   * Implementations must lock the workflow while running to prevent concurrent executions of the same workflow instance.
    */
   @throws[WorkflowInputConflictException]
   def runWorkflowInstance[In, Out](
@@ -30,8 +37,11 @@ trait WorkflowRuntime {
                                   ): Out
 
   /**
-   * - Must lock the workflow while running
-   * - Must throw a WorkflowNotFoundException
+   * Runs a workflow instance that was previously created. If the workflow instance ran before and didn't finish,
+   * it will run again from the beginning, but cached steps will not be executed again.
+   *
+   * Implementations must lock the workflow while running to prevent concurrent executions of the same workflow instance.
+   * @throws WorkflowNotFoundException when no workflow instance with this ID exists
    */
   @throws[WorkflowNotFoundException]
   def recoverWorkflowInstance[In, Out](

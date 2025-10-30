@@ -1,0 +1,55 @@
+flowchart TD
+node0@{ shape: circle, label: "Start"}
+subgraph node1 [" "]
+node2@{ shape: stadium, label: "fa:fa-envelope Input File Found"}
+node0 --> node2
+node3["Read File"]
+node2 --> node3
+node4["Archive File"]
+node3 --> node4
+subgraph node5 ["≡ Process Each Document"]
+node6@{ shape: fork, label: ""}
+node7["Virus Check1"]
+node6 --> node7
+node8["Virus Check2"]
+node6 --> node8
+node9@{ shape: fork, label: ""}
+node7 --> node9
+node8 --> node9
+node10["fa:fa-redo Sign File"]
+node9 --> node10
+subgraph node11 [" "]
+node12["Upload File"]
+node10 --> node12
+end
+node25@{ shape: stadium, label: "fa:fa-clock Sign And Upload With Retry (1h 30m)"}
+node11 --> node25
+node26@{ shape: hex, label: "fa:fa-redo Did signing and upload succeed?"}
+node25 --> node26
+node12 --> node26
+node26 -->|"signature validity exceeded"| node10
+node27["Check Upload Status"]
+node26 -->|"success"| node27
+node28@{ shape: hex, label: "Is upload acknowledged as error free?"}
+node27 --> node28
+node29@{ shape: stadium, label: "fa:fa-clock Await retry (15m)"}
+node28 -->|"No"| node29
+node29 --> node27
+end
+node4 --> node5
+node36["Report Result"]
+node28 -->|"Yes"| node36
+end
+node39@{ shape: stadium, label: "fa:fa-envelope User Cancels Upload Of Input File"}
+node1 --> node39
+node40["Handle User Cancels Upload Of Input File"]
+node39 --> node40
+node41["Report Result"]
+node3 -.->|"fa:fa-bolt Input File Error"| node41
+node4 -.->|"fa:fa-bolt Failed To Archive"| node41
+node7 -.->|"fa:fa-bolt Virus Check1Failed"| node41
+node8 -.->|"fa:fa-bolt Virus Check2Failed"| node41
+node10 -.->|"fa:fa-bolt Signing Failed"| node41
+node12 -.->|"fa:fa-bolt Downstream Rejected Upload"| node41
+node27 -.->|"fa:fa-bolt Error"| node41
+node40 -.->|"fa:fa-bolt Cancelled By User"| node41

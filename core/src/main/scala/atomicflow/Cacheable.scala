@@ -9,6 +9,8 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Path, Paths}
 import java.time.*
 import scala.collection.mutable.ListBuffer
+import scala.deriving.Mirror
+import scala.reflect.ClassTag
 
 trait Cacheable[A] {
   def serialize(value: A): IArray[Byte]
@@ -28,6 +30,11 @@ object Cacheable {
   }
 
   object Simple {
+    given Cacheable[Unit] = new Cacheable[Unit] {
+      override def serialize(value: Unit): IArray[Byte] = IArray.empty
+      override def deserialize(bytes: IArray[Byte]): Unit = assert(bytes.isEmpty)
+    }
+
     given Cacheable[IArray[Byte]] = new Cacheable[IArray[Byte]] {
       override def serialize(value: IArray[Byte]): IArray[Byte] = value
 
@@ -74,6 +81,12 @@ object Cacheable {
   }
 
   object MsgPack {
+    inline def derived[A: {Mirror.Of, ClassTag}]: Cacheable[A] = {
+      given reader: Reader[A] = Reader.derived[A]
+      given writer: Writer[A] = Writer.derived[A]
+      given_Cacheable_A
+    }
+    
     given [A: {Writer, Reader}]: Cacheable[A] = new Cacheable[A] {
       override def serialize(value: A): IArray[Byte] =
         writeBinary(value).asInstanceOf[IArray[Byte]]
