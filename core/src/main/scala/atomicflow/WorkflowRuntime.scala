@@ -6,7 +6,7 @@ import scala.concurrent.duration.FiniteDuration
 
 @implicitNotFound("No WorkflowRuntime available.\nAdd a using clause `(using WorkflowRuntime)` to the definition of the enclosing method.")
 trait WorkflowRuntime {
-  def generateWorkflowInstanceId: WorkflowInstanceId
+  def generateWorkflowInstanceId: String
 
   def generateStepIdempotencyId: StepIdempotencyId
 
@@ -62,7 +62,7 @@ trait WorkflowRuntime {
 object WorkflowRuntime {
   trait GenerateIds extends WorkflowRuntime {
 
-    override def generateWorkflowInstanceId: WorkflowInstanceId = WorkflowInstanceId.unsafeMake(UUID.randomUUID().toString)
+    override def generateWorkflowInstanceId: String = UUID.randomUUID().toString
 
     override def generateStepIdempotencyId: StepIdempotencyId = StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
 

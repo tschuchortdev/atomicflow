@@ -1,12 +1,17 @@
 -- Stores workflow instances and their locked state (with a timestamp)
 CREATE TABLE workflow_instance
 (
-    id           UUID PRIMARY KEY,
-    workflow_id  TEXT        NOT NULL,
+    workflow_id  UUID        NOT NULL,
+    -- Collation determines the locale of strings. Setting the locale "C" explicitly disables this behaviour so that
+    -- efficient prefix searches can be made on the index (all queries have to specify COLLATE "C" as well).
+    -- Alternatively, we could create an index with text_pattern_ops, which does not require queries to specify COLLATE "C"
+    -- but has the disadvantage of not allowing <, <=, >= queries.
+    key          TEXT        NOT NULL COLLATE "C",
     input        BYTEA       NOT NULL,
     locked_until TIMESTAMPTZ,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (workflow_id, key)
 );
 
 -- Stores idempotency IDs for each step within a workflow instance
@@ -15,12 +20,14 @@ CREATE TABLE step_idempotency
     id                   UUID PRIMARY KEY,
     library_version      BIGINT,
     workflow_id          UUID        NOT NULL,
-    workflow_instance_id UUID        NOT NULL REFERENCES workflow_instance (id) ON DELETE RESTRICT,
+    workflow_instance_key TEXT        NOT NULL COLLATE "C",
     step_id              UUID        NOT NULL,
     step_version         BIGINT,
     input_fingerprints   JSONB,
     is_only_once         BOOLEAN     NOT NULL DEFAULT FALSE,
-    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    is_overridden        BOOLEAN     DEFAULT FALSE NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (workflow_id, workflow_instance_key) REFERENCES workflow_instance (workflow_id, key) ON DELETE RESTRICT
 );
 
 -- Stores output of a step, identified by the step_idempotency_id
@@ -33,4 +40,26 @@ CREATE TABLE step_cache
     output              BYTEA       NOT NULL,
     expiry              TIMESTAMPTZ, -- null means never expires
     created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Stores signal values for a workflow instance
+CREATE TABLE workflow_signals
+(
+    id                   UUID        NOT NULL,
+    workflow_id          UUID        NOT NULL,
+    workflow_instance_key TEXT        NOT NULL COLLATE "C",
+    value                BYTEA       NOT NULL,
+    expiry               TIMESTAMPTZ, -- null means never expires
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (workflow_id, workflow_instance_key, id),
+    FOREIGN KEY (workflow_id, workflow_instance_key) REFERENCES workflow_instance (workflow_id, key) ON DELETE RESTRICT
+);
+
+CREATE TABLE restart_workflow_after
+(
+    workflow_id           UUID NOT NULL,
+    workflow_instance_key TEXT        NOT NULL COLLATE "C",
+    restart_after        TIMESTAMPTZ NOT NULL,
+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    FOREIGN KEY (workflow_id, workflow_instance_key) REFERENCES workflow_instance (workflow_id, key) ON DELETE RESTRICT
 );

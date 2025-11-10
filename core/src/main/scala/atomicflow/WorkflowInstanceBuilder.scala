@@ -7,14 +7,14 @@ import scala.concurrent.duration.FiniteDuration
 
 case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
                                                                             workflow: Workflow[In, Out],
-                                                                            instanceId: WorkflowInstanceId,
+                                                                            instanceKey: WorkflowInstanceKey,
                                                                             defaultCacheTtl: FiniteDuration = defaultCacheTtl,
                                                                             defaultSignalTtl: FiniteDuration = defaultSignalTtl,
                                                                             stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
                                                                           ) {
   private[atomicflow] def simpleWorkflowCtx: SimpleWorkflowContext = SimpleWorkflowContext(
     workflow.meta,
-    instanceId
+    instanceKey
   )
 
   def withDefaultCacheTtl(ttl: FiniteDuration): WorkflowInstanceBuilder[In, Out] =

@@ -11,19 +11,19 @@ import scala.concurrent.duration.FiniteDuration
 trait SimpleWorkflowContext {
   def meta: WorkflowMeta
 
-  def instanceId: WorkflowInstanceId
+  def instanceKey: WorkflowInstanceKey
 
-  override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceId"
+  override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceKey"
 }
 
 object SimpleWorkflowContext {
   def apply(
              workflowMeta: WorkflowMeta,
-             workflowInstanceId: WorkflowInstanceId
+             workflowInstanceId: WorkflowInstanceKey
            ): SimpleWorkflowContext = new SimpleWorkflowContext {
     override def meta: WorkflowMeta = workflowMeta
 
-    override def instanceId: WorkflowInstanceId = workflowInstanceId
+    override def instanceKey: WorkflowInstanceKey = workflowInstanceId
   }
 
   given (stepCtx: StepContext[?]) => SimpleWorkflowContext = stepCtx.workflowCtx

@@ -2,14 +2,10 @@ package test
 
 import atomicflow.WorkflowRuntime
 import atomicflow.impl.db.DbWorkflowRuntime
-import cats.effect.IO
-import doobie.util.transactor.Transactor
 import munit.AnyFixture
 import org.flywaydb.core.Flyway
 import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.containers.PostgreSQLContainer
-
-import scala.annotation.nowarn
 
 import scala.concurrent.ExecutionContext
 

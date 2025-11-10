@@ -26,7 +26,7 @@ object Step {
         case string: String => Some(string)
       },
       workflowMeta = workflowCtx.meta,
-      workflowInstanceId = workflowCtx.instanceId
+      workflowInstanceId = workflowCtx.instanceKey
     )
 
     val stepWorkflowCtx = workflowCtx

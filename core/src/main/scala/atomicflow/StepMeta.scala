@@ -6,5 +6,5 @@ case class StepMeta(
                      name: Option[String],
                      description: Option[String],
                      workflowMeta: WorkflowMeta,
-                     workflowInstanceId: WorkflowInstanceId
+                     workflowInstanceId: WorkflowInstanceKey
                    )

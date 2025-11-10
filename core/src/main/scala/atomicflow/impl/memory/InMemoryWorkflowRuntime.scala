@@ -87,7 +87,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                              stepIdempotencyStore: WorkflowIdempotencyStore
                                            )
 
-  private val workflowInstances: AtomicReference[Map[WorkflowInstanceId, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
+  private val workflowInstances: AtomicReference[Map[WorkflowInstanceKey, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
 
   override def createWorkflowInstance[WorkflowIn, WorkflowOut](
                                                                 workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut],
@@ -98,11 +98,11 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     given SimpleWorkflowContext {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
-      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+      override def instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
     }
 
     workflowInstances.updateAndGet { instances =>
-      instances.get(workflowInstance.instanceId) match {
+      instances.get(workflowInstance.instanceKey) match {
         case Some(state) =>
           if (state.in != in) {
             throw new WorkflowInputConflictException()
@@ -110,7 +110,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             instances
           }
         case None =>
-          instances + (workflowInstance.instanceId -> WorkflowState(
+          instances + (workflowInstance.instanceKey -> WorkflowState(
             locked = new AtomicBoolean(false),
             in = in,
             workflowInstance = workflowInstance,
@@ -139,10 +139,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     given SimpleWorkflowContext {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
-      override def instanceId: WorkflowInstanceId = workflowInstance.instanceId
+      override def instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
     }
 
-    workflowInstances.get().get(workflowInstance.instanceId) match {
+    workflowInstances.get().get(workflowInstance.instanceKey) match {
       case Some(state: WorkflowState[In, Out] @unchecked) =>
         if (state.locked.getAndSet(true)) {
           // was locked before
@@ -153,7 +153,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
             val ctx = new WorkflowContext[In, Out] {
               override val meta: WorkflowMeta = workflowInstance.workflow.meta
 
-              override val instanceId: WorkflowInstanceId = workflowInstance.instanceId
+              override val instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
 
               override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
@@ -181,17 +181,17 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
   }
 
   private val signalStore: SignalStore = new SignalStore {
-    val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceId, SignalId), ?]] = new AtomicReference(Map.empty)
+    val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceKey, SignalId), ?]] = new AtomicReference(Map.empty)
 
     override def getSignalValue[A](signal: Signal[A])(using ctx: SimpleWorkflowContext): Option[A] = {
-      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+      val key = (ctx.meta.id, ctx.instanceKey, signal.meta.id)
       signalValues.get().get(key).asInstanceOf[Option[A]]
     }
 
     override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: SimpleWorkflowContext): Unit = {
-      val key = (ctx.meta.id, ctx.instanceId, signal.meta.id)
+      val key = (ctx.meta.id, ctx.instanceKey, signal.meta.id)
 
-      if (!workflowInstances.get().contains(ctx.instanceId))
+      if (!workflowInstances.get().contains(ctx.instanceKey))
         throw new WorkflowNotFoundException()
 
       signalValues.updateAndGet { map =>

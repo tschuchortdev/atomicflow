@@ -5,7 +5,7 @@ trait WorkflowException(using workflowCtx: SimpleWorkflowContext) {
 
   def workflowMeta: WorkflowMeta = workflowCtx.meta
 
-  def workflowInstanceId: WorkflowInstanceId = workflowCtx.instanceId
+  def workflowInstanceId: WorkflowInstanceKey = workflowCtx.instanceKey
 }
 
 class WorkflowNotFoundException(message: String)

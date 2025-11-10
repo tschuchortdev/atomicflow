@@ -2,6 +2,8 @@ package atomicflow
 
 import neotype.*
 
+type WorkflowInstanceKey = String
+
 type WorkflowId = WorkflowId.Type
 
 object WorkflowId extends Newtype[String] {
