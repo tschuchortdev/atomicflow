@@ -1,6 +1,7 @@
 package atomicflow
 
 import atomicflow.Constants.{defaultCacheTtl, defaultSignalTtl}
+import atomicflow.WorkflowRuntime.StoppedWorkflow
 
 import scala.concurrent.TimeoutException
 import scala.concurrent.duration.FiniteDuration
@@ -35,32 +36,32 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
     create(())
 
   @throws[WorkflowInputConflictException]
-  def run(in: In)(using runtime: WorkflowRuntime): Out =
+  def run(in: In)(using runtime: WorkflowRuntime): Either[StoppedWorkflow[Out], Out] =
     runtime.runWorkflowInstance(this, in)
 
   @throws[WorkflowInputConflictException]
-  inline def run()(using runtime: WorkflowRuntime, ev: Unit =:= In): Out =
+  inline def run()(using runtime: WorkflowRuntime, ev: Unit =:= In): Either[StoppedWorkflow[Out], Out] =
     run(())
 
   @throws[WorkflowInputConflictException]
   @throws[TimeoutException]
-  def runWithTimeout(in: In, timeout: FiniteDuration)(using runtime: WorkflowRuntime): Out =
+  def runWithTimeout(in: In, timeout: FiniteDuration)(using runtime: WorkflowRuntime): Either[StoppedWorkflow[Out], Out] =
     ox.timeout(timeout) {
       run(in)
     }
 
   @throws[WorkflowInputConflictException]
   @throws[TimeoutException]
-  inline def runWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime, ev: Unit =:= In): Out =
+  inline def runWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime, ev: Unit =:= In): Either[StoppedWorkflow[Out], Out] =
     runWithTimeout((), timeout)
 
   @throws[WorkflowNotFoundException]
-  def recover()(using runtime: WorkflowRuntime): Out =
+  def recover()(using runtime: WorkflowRuntime): Either[StoppedWorkflow[Out], Out] =
     runtime.recoverWorkflowInstance(this)
 
   @throws[WorkflowNotFoundException]
   @throws[TimeoutException]
-  def recoverWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime): Out =
+  def recoverWithTimeout(timeout: FiniteDuration)(using runtime: WorkflowRuntime): Either[StoppedWorkflow[Out], Out] =
     ox.timeout(timeout) {
       recover()
     }

@@ -42,6 +42,8 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
       processIndividualDocument(document)
     }
 
+    checkInterrupt()
+
     Step[Unit](StepId("fbe6acf8-731a-431f-8a48-01889ef3802e"), version = 0, name = "report input file processing status") {
       Step.cache("filePath" -> inputFilePath.toAbsolutePath.toString)
 

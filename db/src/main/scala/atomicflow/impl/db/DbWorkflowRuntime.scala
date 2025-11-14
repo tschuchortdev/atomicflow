@@ -15,6 +15,7 @@ import doobie.implicits.*
 import doobie.postgres.circe.jsonb.implicits.*
 import doobie.postgres.implicits.*
 import org.flywaydb.core.Flyway
+import org.postgresql.util.PSQLException
 
 import java.time.Instant
 import java.util
@@ -26,7 +27,7 @@ import scala.math.Ordered.orderingToOrdered
 
 // TODO: rename to PostgresWorkflowRuntime
 class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: ExecutionContext)
-  extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
+  extends WorkflowRuntime with WorkflowRuntime.DefaultGenerateIdsMixin {
 
   protected val xa = Transactor.fromDataSource[IO](ds, awaitConnectionEc)
 
@@ -43,24 +44,19 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
     def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
 
     runSync {
-      // TODO: race condition. Use upsert with unique constraint on (id, input)?
-      sql"SELECT input FROM workflow_instance WHERE key = $key"
-        .query[Array[Byte]]
-        .option
-        .flatMap {
-          case Some(prevInput) if util.Arrays.equals(prevInput, input) =>
-            Monad[ConnectionIO].unit
-
-          case Some(_) =>
-            throw WorkflowInputConflictException()(using simpleWorkflowCtx)
-
-          case None =>
-            // TODO: may throw unique constraint violation here
-            sql"INSERT INTO workflow_instance (workflow_id, key, input) VALUES ($workflowId, $key, $input)"
-              .update
-              .run
-              .void
-        }
+      sql"""
+        INSERT INTO workflow_instance (workflow_id, key, input) VALUES ($workflowId, $key, $input)
+        ON CONFLICT (workflow_id, key) DO UPDATE
+        SET input = workflow_instance.input -- idempotent update
+        -- only allow update if input is unchanged --> we can check the number of updated rows to find out whether
+        -- workflow_instance.input was different from EXCLUDED.input
+        WHERE workflow_instance.input = EXCLUDED.input
+          """
+        .update
+        .run
+    } match {
+      case 0 => throw WorkflowInputConflictException()(using simpleWorkflowCtx)
+      case _ => ()
     }
   }
 
@@ -134,13 +130,13 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
         ox.forever {
           Thread.sleep(lockDuration.minus(java.time.Duration.ofMinutes(1)))
           val lockUntil = Instant.now().plus(lockDuration)
-          ox.timeout(30.seconds) { // gives 30 seconds for the workflow to cancel itself before we are in bug territory
+          ox.timeout(30.seconds) { // gives 1 minute minus 30 seconds for the workflow to cancel itself before we are in bug territory
             sql"UPDATE workflow_instance SET locked_until = $lockUntil WHERE key = $key"
               .update
               .run
               .void
-          }.catching { case _: TimeoutException =>
-            throw RuntimeException("Could not renew lock on workflow instance in time")
+          }.catching { case e: TimeoutException =>
+            throw RuntimeException("Could not renew lock on workflow instance in time", e)
           }
         }
       )
@@ -290,9 +286,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
     override def getSignalValue[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): Option[A] =
       runSync {
         select(signal)
-      }.map { bytes =>
-        signal.asCacheable.deserialize(bytes.asInstanceOf[IArray[Byte]])
-      }
+      }.map { bytes => signal.asCacheable.deserialize(IArray.unsafeFromArray(bytes)) }
 
     @throws[SignalConflictException]
     override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: SimpleWorkflowContext): Unit = {
@@ -317,10 +311,15 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
                 WHERE wi.workflow_id = ${workflowCtx.meta.id}
                   AND wi.key = ${workflowCtx.instanceKey}
               )
-              """.update.run.map {
-              case 0 => throw WorkflowNotFoundException()
-              case 1 => ()
-            }
+              """.update.run
+              .recover {
+                // 2305 is unique violation, i.e. duplicate primary key
+                case e: PSQLException if e.getSQLState == "23505" => throw SignalConflictException(signal)
+              }
+              .map {
+                case 0 => throw WorkflowNotFoundException()
+                case 1 => ()
+              }
         }
       }
     }
@@ -387,4 +386,8 @@ object DbWorkflowRuntime {
   given Get[StepInputFingerprints] = pgDecoderGetT[StepInputFingerprints]
 
   given Put[StepInputFingerprints] = pgEncoderPutT[StepInputFingerprints]
+
+  private class StoppedWorkflowImpl[Out](override val expectedRestartTime: Option[Instant]) extends StoppedWorkflow[Out] {
+
+  }
 }

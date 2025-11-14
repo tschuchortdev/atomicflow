@@ -2,6 +2,9 @@ package atomicflow
 
 import atomicflow.Workflow.*
 
+import java.time.Instant
+import scala.util.control.ControlThrowable
+
 case class Workflow[In: Cacheable, Out] private(
                                                  meta: WorkflowMeta,
                                                  body: (WorkflowContext[In, Out], In) => Out

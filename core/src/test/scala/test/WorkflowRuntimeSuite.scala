@@ -51,6 +51,22 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     workflow.newInstance(instanceId).run(())
   }
 
+  test("createWorkflowInstance is idempotent when the inputs are unchanged") {
+    given WorkflowRuntime = createWorkflowRuntime
+    val workflowInstanceId = randomInstanceId()
+    emptyWorkflow.newInstance(workflowInstanceId).create("hello")
+    emptyWorkflow.newInstance(workflowInstanceId).create("hello")
+  }
+
+  test("createWorkflowInstance throws when the inputs are different") {
+    given WorkflowRuntime = createWorkflowRuntime
+    val workflowInstanceId = randomInstanceId()
+    emptyWorkflow.newInstance(workflowInstanceId).create("hello")
+    intercept[WorkflowInputConflictException] {
+      emptyWorkflow.newInstance(workflowInstanceId).create("cześć")
+    }
+  }
+
   test("Empty workflow should fail with WorkflowInputConflictException if its inputs change") {
     given WorkflowRuntime = createWorkflowRuntime
     val workflowInstanceId = randomInstanceId()

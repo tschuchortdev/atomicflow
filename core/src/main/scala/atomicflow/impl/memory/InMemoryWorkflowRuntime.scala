@@ -2,21 +2,25 @@ package atomicflow.impl.memory
 
 import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToWait}
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints, SignalStore}
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints}
+import ox.discard
 
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
+import scala.collection.{immutable, mutable}
 import scala.concurrent.duration.FiniteDuration
+import scala.util.Try
 
-class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.GenerateIds {
-  class WorkflowIdempotencyStore {
-    sealed trait IdempotencyIdKey
+class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.DefaultGenerateIdsMixin {
+  private class WorkflowIdempotencyStore {
+    private sealed trait IdempotencyIdKey
 
-    case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: StepInputFingerprints) extends IdempotencyIdKey
+    private case class StepIdempotencyIdKey(stepId: StepId, stepVersion: Long, inputs: StepInputFingerprints) extends IdempotencyIdKey
 
-    case class OnceStepIdempotencyIdKey(stepId: StepId) extends IdempotencyIdKey
+    private case class OnceStepIdempotencyIdKey(stepId: StepId) extends IdempotencyIdKey
 
-    val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
+    private val idempotencyIds: AtomicReference[Map[IdempotencyIdKey, StepIdempotencyId]] = new AtomicReference(Map.empty)
 
     def getIdempotencyStore(
                              stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId]
@@ -51,8 +55,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
     }
   }
 
-  class WorkflowStepCache {
-    val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
+  private class WorkflowStepCache {
+    private val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
 
     def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
       override def get(
@@ -126,16 +130,20 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                                              in: In
                                            )(
                                              using Cacheable[In]
-                                           ): Out = {
+                                           ): Either[StoppedWorkflow[Out], Out] = {
     createWorkflowInstance(workflowInstance, in)
     recoverWorkflowInstance(workflowInstance)
   }
+
+  private type WorkflowCallback[Out] = Try[Either[StoppedWorkflow[Out], Out]] => Unit
+  private val workflowCallbacks = new collection.concurrent.TrieMap[WorkflowInstanceKey, immutable.HashSet[WorkflowCallback[Any]]]()
+  // TODO: Is reference equality comparison of lambdas ok? I think so.
 
   override def recoverWorkflowInstance[In, Out](
                                                  workflowInstance: WorkflowInstanceBuilder[In, Out]
                                                )(
                                                  using Cacheable[In]
-                                               ): Out = {
+                                               ): Either[StoppedWorkflow[Out], Out] = {
     given SimpleWorkflowContext {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
@@ -169,7 +177,33 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
               override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
                 workflowInstance.defaultCacheTtl
             }
-            state.workflowInstance.workflow.body(ctx, state.in)
+
+            try Right(state.workflowInstance.workflow.body(ctx, state.in))
+            catch { case WorkflowStoppedToWait(expectedRestartTime) =>
+              Left(new StoppedWorkflow[Out](
+                workflowId = workflowInstance.workflow.meta.id,
+                workflowInstanceKey = workflowInstance.instanceKey,
+                expectedRestartTime = expectedRestartTime
+              ) {
+
+                override def addContinueListener(onWorkflowContinued: Try[Either[StoppedWorkflow[Out], Out]] => Unit) = {
+                  workflowCallbacks.updateWith(workflowInstance.instanceKey) { valueMaybe =>
+                    Some(valueMaybe.getOrElse(immutable.HashSet.empty)
+                      .incl(onWorkflowContinued.asInstanceOf))
+                  }
+
+                  new StoppedWorkflow.ListenerHandle {
+                    override def remove(): Unit = workflowCallbacks.updateWith(workflowInstance.instanceKey) { valueMaybe =>
+                      val updated = valueMaybe.getOrElse(throw AssertionError(
+                          s"Expected at least one callback to be defined for workflow instance ${workflowInstance.instanceKey}"
+                        ))
+                        .excl(onWorkflowContinued.asInstanceOf)
+                      if updated.nonEmpty then Some(updated) else None
+                    }.discard
+                  }
+                }
+              })
+            }
           } finally {
             state.locked.set(false)
           }
@@ -209,4 +243,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Gener
                              ttl: FiniteDuration
                            )(using SimpleWorkflowContext): Unit =
     signalStore.setSignalValue(signal, value, ttl)
+}
+object InMemoryWorkflowRuntime {
+
 }
