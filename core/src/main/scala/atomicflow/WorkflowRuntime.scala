@@ -1,11 +1,15 @@
 //noinspection ScalaWeakerAccess
 package atomicflow
 
+import atomicflow.Fingerprintable.Fingerprinter
+import atomicflow.WorkflowContext.given_WorkflowInstanceMeta
 import atomicflow.WorkflowRuntime.StoppedWorkflow
 import atomicflow.WorkflowRuntime.StoppedWorkflow.ListenerHandle
+import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
 import ox.channels.Channel
+import ox.mapPar
 
-import java.time.Instant
+import java.time.{Clock, Instant}
 import java.util.UUID
 import scala.annotation.{implicitNotFound, tailrec}
 import scala.concurrent.duration.FiniteDuration
@@ -64,19 +68,58 @@ trait WorkflowRuntime {
                                         using Cacheable[In]
                                       ): Either[StoppedWorkflow[Out], Out]
 
-  def getWorkflowInstance[Out](exactKey: WorkflowInstanceKey): Nothing = ??? // TODO
+  def getWorkflowInstance[In, Out](workflow: Workflow[In, Out], exactKey: WorkflowInstanceKey): Option[Nothing]
 
-  def getWorkflowInstances[Out](keyPrefix: WorkflowInstanceKey): Vector[Nothing] = ??? // TODO
+  def getWorkflowInstances[In, Out](workflow: Workflow[In, Out], keyPrefix: WorkflowInstanceKey): Vector[Nothing]
 
   /**
-   * Get all workflow instances that haven't yet run to finish, including those that yet to start.
+   * Get all workflow instances that haven't yet run to finish, including those that have yet to start.
    * @param includeWaiting Include workflow instances that have stopped themselves and are waiting for a timer or signal.
    */
-  def getUnfinishedWorkflowInstances(includeWaiting: Boolean = false): Vector[Nothing] = ??? // TODO
+  def getUnfinishedWorkflowInstances[In, Out](workflow: Workflow[In, Out], includeWaiting: Boolean = false, limit: Int = -1): Vector[Nothing]
 
-  def scheduleWakeupOnTimer(workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit = ??? // TODO
+  @tailrec
+  def runPendingWorkflowInstances[In, Out](workflow: Workflow[In, Out], maxParallelism: Int)(
+      handleError: PartialFunction[Throwable, Unit] = e => throw e
+  )(using Cacheable[In]): Nothing = {
+    val unfinishedInstances = getUnfinishedWorkflowInstances(workflow, limit = maxParallelism)
+    unfinishedInstances.mapPar(maxParallelism) { wi =>
+      try {
+        // TODO
+        ???
+      } catch {
+        case _: WorkflowLockedException => () // Workflow is already being executed by someone else --> skip
+        case handleError(Some(())) => () // handled by extractor
+      }
+    }
 
-  def scheduleWakeupOnSignal(workflowInstanceKey: WorkflowInstanceKey, signal: Signal[?]): Unit = ??? // TODO
+    runPendingWorkflowInstances(workflow, maxParallelism)(handleError)
+  }
+
+
+  /** Instructs the runtime to start/recover the workflow some time after the [[wakeupTime]] is reached.
+   *
+   * Implementation note: If the workflow is already running at the time when the wakeup time is reached, the runtime should
+   * skip this schedule and try again later. If the workflow is finished when the wakeup time is reached, the schedule should be deleted.
+   * */
+  @throws[WorkflowNotFoundException]
+  def scheduleWakeupOnTimer(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit
+
+  /** Instructs the runtime to start/recover the workflow some time after the [[signal]] occurs.
+   *
+   * Implementation note: If the workflow is already running at the time when the wakeup time is reached, the runtime should
+   * skip this schedule and try again later. If the workflow is finished when the wakeup time is reached, the schedule should be deleted.
+   * */
+  @throws[WorkflowNotFoundException]
+  def scheduleWakeupOnSignal(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, signal: Signal[?]): Unit
+
+  /** Instructs the runtime to start/recover the workflow some time after the [[awaitedWorkflow]] has finished.
+   *
+   * Implementation note: If the workflow is already running at the time when the wakeup time is reached, the runtime should
+   * skip this schedule and try again later. If the workflow is finished when the wakeup time is reached, the schedule should be deleted.
+   * */
+  @throws[WorkflowNotFoundException]
+  def scheduleWakeupOnWorkflowCompletion(workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflow: WorkflowInstanceKey): Unit
 
   @throws[WorkflowNotFoundException]
   @throws[SignalConflictException]
@@ -84,7 +127,15 @@ trait WorkflowRuntime {
                     signal: Signal[A],
                     value: A,
                     ttl: FiniteDuration
-                  )(using SimpleWorkflowContext): Unit
+                  )(using WorkflowInstanceMeta): Unit
+
+  def getFingerprinter: Fingerprinter
+
+  def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
+
+  def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
+
+  def getSignalStore: SignalStore
 }
 
 object WorkflowRuntime {
@@ -142,8 +193,29 @@ object WorkflowRuntime {
    * it needs to wait on a timer or signal for a long time.
    *
    * This exception should always be rethrown and not logged. The [[scala.util.control.NonFatal]] extractor will not
-   * match this exception because it is a [[ControlThrowable]]
+   * match this exception because it is a [[ControlThrowable]].
    */
-  case class WorkflowStoppedToWait(expectedRestartTime: Option[Instant]) extends ControlThrowable
-  // TODO: should this really be a ControlThrowable?
+  sealed abstract class WorkflowStoppedToWait extends ControlThrowable {
+    // TODO: should this really be a ControlThrowable?
+    def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean
+  }
+
+  case class WorkflowStoppedToAwaitTimer(expectedRestartTime: Instant) extends WorkflowStoppedToWait {
+    def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =
+      Instant.now(clk).isAfter(expectedRestartTime)
+  }
+
+  case class WorkflowStoppedToAwaitSignal(signal: Signal[?]) extends WorkflowStoppedToWait {
+    def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =
+      ctx.workflowRuntime.getSignalStore.getSignalValue(signal).isDefined
+  }
+
+  case class WorkflowStoppedToAwaitWorkflow(awaitedWorkflow: WorkflowMeta, awaitedInstanceKey: WorkflowInstanceKey) extends WorkflowStoppedToWait
+
+  case class WorkflowStoppedToAwaitManyConditions(stops: Vector[WorkflowStoppedToWait]) extends WorkflowStoppedToWait {
+    def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =
+      stops.forall(_.isRestartConditionFulfilledNow)
+  }
+
+  
 }

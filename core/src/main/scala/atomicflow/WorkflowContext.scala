@@ -5,39 +5,36 @@ import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
 
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
+import java.util.Objects
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.FiniteDuration
 
-trait SimpleWorkflowContext {
-  def meta: WorkflowMeta
+class WorkflowInstanceMeta(val workflowInstanceKey: WorkflowInstanceKey, private val workflowMeta: WorkflowMeta)
+    extends WorkflowMeta(workflowMeta) {
 
-  def instanceKey: WorkflowInstanceKey
+  def this(other: WorkflowInstanceMeta) =
+    this(other.workflowInstanceKey, other.workflowMeta)
+  
+  override def equals(obj: Any): Boolean = obj match
+    case other: WorkflowInstanceMeta if
+      super.equals(other) && other.workflowInstanceKey == this.workflowInstanceKey => true
+    case _ => false
 
-  override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceKey"
-}
+  override def hashCode(): Int = Objects.hash(workflowInstanceKey, workflowMeta)
 
-object SimpleWorkflowContext {
-  def apply(
-             workflowMeta: WorkflowMeta,
-             workflowInstanceId: WorkflowInstanceKey
-           ): SimpleWorkflowContext = new SimpleWorkflowContext {
-    override def meta: WorkflowMeta = workflowMeta
-
-    override def instanceKey: WorkflowInstanceKey = workflowInstanceId
-  }
-
-  given (stepCtx: StepContext[?]) => SimpleWorkflowContext = stepCtx.workflowCtx
+  override lazy val toString: String = s"${workflowMeta.toString}/$workflowInstanceKey"
 }
 
 @implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`\nYou can require a WorkflowContext for the enclosing method by adding a using clause `(using WorkflowContext)` to its definition.")
-trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
-  protected[atomicflow] def getFingerprinter: Fingerprinter
-
-  protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
-
-  protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
-  
-  protected[atomicflow] def getSignalStore: SignalStore
-  
-  protected[atomicflow] def defaultCacheTtl: FiniteDuration
+case class WorkflowContext(
+  workflowInstanceMeta: WorkflowInstanceMeta,
+  workflowRuntime: WorkflowRuntime,
+  defaultCacheTtl: FiniteDuration,
+  subworkflowScope: Vector[String] = Vector.empty
+) {
+  def withSubworkflowScope(scopeKey: String): WorkflowContext =
+    this.copy(subworkflowScope = this.subworkflowScope.appended(scopeKey))
+}
+object WorkflowContext {
+  given (ctx: WorkflowContext) => WorkflowInstanceMeta = ctx.workflowInstanceMeta
 }

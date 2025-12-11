@@ -28,7 +28,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                              using stepCtx: StepContext[?]
                            ): StepIdempotencyStore = new StepIdempotencyStore {
       override def acquireStepIdempotencyId(inputFingerprints: StepInputFingerprints): StepIdempotencyId = {
-        val key = StepIdempotencyIdKey(stepCtx.meta.id, stepCtx.meta.version, inputFingerprints)
+        val key = StepIdempotencyIdKey(stepCtx.meta.stepId, stepCtx.meta.stepVersion, inputFingerprints)
         idempotencyIds.updateAndGet(ids => ids.get(key) match {
           case Some(_) => ids
           case None =>
@@ -38,8 +38,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
       }
 
       override def acquireOnlyOnceStepIdempotencyId(): StepIdempotencyId = {
-        val key = OnceStepIdempotencyIdKey(stepCtx.meta.id)
-        stepIdempotencyIdOverrides.get(stepCtx.meta.id) match {
+        val key = OnceStepIdempotencyIdKey(stepCtx.meta.stepId)
+        stepIdempotencyIdOverrides.get(stepCtx.meta.stepId) match {
           case Some(idempotencyId) =>
             idempotencyIds.updateAndGet(_ + (key -> idempotencyId))
             idempotencyId
@@ -63,7 +63,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints
                       ): Option[StepOut] = {
-        val stepVersion = ctx.meta.version
+        val stepVersion = ctx.meta.stepVersion
         stepCache.get().get(stepIdempotencyId).map {
           case (`stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
           case _ => throw new StepInputConflictException()
@@ -78,7 +78,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                         ttl: FiniteDuration
                       ): Unit = {
         // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
-        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.version, inputFingerprints, value)))
+        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.stepVersion, inputFingerprints, value)))
       }
     }
   }
@@ -99,7 +99,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                                                               )(
                                                                 using Cacheable[WorkflowIn]
                                                               ): Unit = {
-    given SimpleWorkflowContext {
+    given given_WorkflowInstanceMeta {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
       override def instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
@@ -144,10 +144,10 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                                                )(
                                                  using Cacheable[In]
                                                ): Either[StoppedWorkflow[Out], Out] = {
-    given SimpleWorkflowContext {
+    given WorkflowInstanceMeta {
       override def meta: WorkflowMeta = workflowInstance.workflow.meta
 
-      override def instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
+      override def workflowInstanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
     }
 
     workflowInstances.get().get(workflowInstance.instanceKey) match {
@@ -181,7 +181,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
             try Right(state.workflowInstance.workflow.body(ctx, state.in))
             catch { case WorkflowStoppedToWait(expectedRestartTime) =>
               Left(new StoppedWorkflow[Out](
-                workflowId = workflowInstance.workflow.meta.id,
+                workflowId = workflowInstance.workflow.meta.workflowId,
                 workflowInstanceKey = workflowInstance.instanceKey,
                 expectedRestartTime = expectedRestartTime
               ) {
@@ -217,15 +217,15 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   private val signalStore: SignalStore = new SignalStore {
     val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceKey, SignalId), ?]] = new AtomicReference(Map.empty)
 
-    override def getSignalValue[A](signal: Signal[A])(using ctx: SimpleWorkflowContext): Option[A] = {
-      val key = (ctx.meta.id, ctx.instanceKey, signal.meta.id)
+    override def getSignalValue[A](signal: Signal[A])(using ctx: WorkflowInstanceMeta): Option[A] = {
+      val key = (ctx.meta.id, ctx.workflowInstanceKey, signal.meta.id)
       signalValues.get().get(key).asInstanceOf[Option[A]]
     }
 
-    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: SimpleWorkflowContext): Unit = {
-      val key = (ctx.meta.id, ctx.instanceKey, signal.meta.id)
+    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: WorkflowInstanceMeta): Unit = {
+      val key = (ctx.meta.id, ctx.workflowInstanceKey, signal.meta.id)
 
-      if (!workflowInstances.get().contains(ctx.instanceKey))
+      if (!workflowInstances.get().contains(ctx.workflowInstanceKey))
         throw new WorkflowNotFoundException()
 
       signalValues.updateAndGet { map =>
@@ -241,7 +241,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                              signal: Signal[A],
                              value: A,
                              ttl: FiniteDuration
-                           )(using SimpleWorkflowContext): Unit =
+                           )(using WorkflowInstanceMeta): Unit =
     signalStore.setSignalValue(signal, value, ttl)
 }
 object InMemoryWorkflowRuntime {

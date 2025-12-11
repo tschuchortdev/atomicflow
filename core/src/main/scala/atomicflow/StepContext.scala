@@ -11,9 +11,9 @@ import scala.annotation.implicitNotFound
 trait StepContext[Out] {
   def meta: StepMeta
 
-  def workflowCtx: WorkflowContext[?, ?]
+  def workflowCtx: WorkflowContext
 
-  override lazy val toString: String = s"$workflowCtx/step:${meta.id}${meta.name.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
+  override lazy val toString: String = s"$workflowCtx/step:${meta.stepId}${meta.stepName.fold("")(name => "#" + URLEncoder.encode(name, StandardCharsets.UTF_8))}"
 
   def fingerprint(inputs: Seq[StepInput[?]]): StepInputFingerprints
 

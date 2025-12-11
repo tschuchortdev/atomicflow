@@ -37,9 +37,11 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
 
     checkInterrupt()
 
-    val perDocumentUploadResults = fileParsed.documents.mapPar { (document: DocumentFromInputFile) =>
-      checkInterrupt()
-      processIndividualDocument(document)
+    val perDocumentUploadResults = fileParsed.documents.mapPar(4) { (document: DocumentFromInputFile) =>
+      Workflow.subworkflow {
+        checkInterrupt()
+        processIndividualDocument(document)
+      }
     }
 
     checkInterrupt()
@@ -51,7 +53,7 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
     }
   }
 
-  private def readAndArchiveFile(inputFilePath: Path)(using workflowContext: WorkflowContext[?,?]): FileWithDocumentBatch =
+  private def readAndArchiveFile(inputFilePath: Path)(using workflowContext: WorkflowContext): FileWithDocumentBatch =
     Step(StepId("99f30d17-7443-4438-a68d-64fea152efdd"), version = 0, name = "read and archive file") {
       Step.cache("filePath" -> inputFilePath.toAbsolutePath.toString)
   
@@ -78,7 +80,7 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
       fileParsed
     }
     
-  private def processIndividualDocument(document: DocumentFromInputFile)(using WorkflowContext[?, ?]) = {
+  private def processIndividualDocument(document: DocumentFromInputFile)(using WorkflowContext) = {
     par(
       Step[Unit](StepId("a8bcb8c2-d1c9-484b-8d7f-f35c123143f7"), version = 0, name = "virus check 1") {
         Step.cache("documentContent" -> document.content)

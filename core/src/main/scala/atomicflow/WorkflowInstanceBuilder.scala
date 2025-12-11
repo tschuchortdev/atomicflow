@@ -13,10 +13,7 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
                                                                             defaultSignalTtl: FiniteDuration = defaultSignalTtl,
                                                                             stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty
                                                                           ) {
-  private[atomicflow] def simpleWorkflowCtx: SimpleWorkflowContext = SimpleWorkflowContext(
-    workflow.meta,
-    instanceKey
-  )
+  private[atomicflow] def workflowInstanceMeta: WorkflowInstanceMeta = WorkflowInstanceMeta(workflow.meta, instanceKey)
 
   def withDefaultCacheTtl(ttl: FiniteDuration): WorkflowInstanceBuilder[In, Out] =
     copy(defaultCacheTtl = ttl)
@@ -69,10 +66,10 @@ case class WorkflowInstanceBuilder[In: Cacheable, Out] private[atomicflow](
   @throws[WorkflowNotFoundException]
   @throws[SignalConflictException]
   def setSignalFor[A](ttl: FiniteDuration)(signal: Signal[A], value: A)(using runtime: WorkflowRuntime): Unit =
-    runtime.setSignal(signal, value, ttl)(using simpleWorkflowCtx)
+    runtime.setSignal(signal, value, ttl)(using workflowInstanceMeta)
 
   @throws[WorkflowNotFoundException]
   @throws[SignalConflictException]
   def setSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): Unit =
-    runtime.setSignal(signal, value, defaultSignalTtl)(using simpleWorkflowCtx)
+    runtime.setSignal(signal, value, defaultSignalTtl)(using workflowInstanceMeta)
 }

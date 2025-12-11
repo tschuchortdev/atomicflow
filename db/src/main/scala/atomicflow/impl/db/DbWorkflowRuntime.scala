@@ -17,7 +17,7 @@ import doobie.postgres.implicits.*
 import org.flywaydb.core.Flyway
 import org.postgresql.util.PSQLException
 
-import java.time.Instant
+import java.time.{Clock, Instant}
 import java.util
 import java.util.UUID
 import javax.sql.DataSource
@@ -35,13 +35,14 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
                                                 workflowInstance: WorkflowInstanceBuilder[In, Out],
                                                 in: In
                                               )(
-                                                using Cacheable[In]
+                                                using Cacheable[In],
+                                                clk: Clock
                                               ): Unit = {
     val key = workflowInstance.instanceKey
     val workflowId = workflowInstance.workflow.meta.id
     val input = Cacheable[In].serialize(in).asInstanceOf[Array[Byte]]
 
-    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
+    def simpleWorkflowCtx = workflowInstance.workflowInstanceMeta
 
     runSync {
       sql"""
@@ -81,7 +82,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
     val lockDuration = java.time.Duration.ofMinutes(5)
     val now = Instant.now()
 
-    def simpleWorkflowCtx = workflowInstance.simpleWorkflowCtx
+    def simpleWorkflowCtx = workflowInstance.workflowInstanceMeta
 
     val serializedInput: Array[Byte] = runSync {
       sql"SELECT key, locked_until FROM workflow_instance where key = $key FOR UPDATE"
@@ -162,15 +163,15 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
         WHERE library_version = $libraryVersion AND
               workflow_id = ${ctx.workflowCtx.meta.id} AND
               workflow_instance_key = ${ctx.workflowCtx.instanceKey} AND
-              step_id = ${ctx.meta.id} AND
-              step_version = ${ctx.meta.version} AND
+              step_id = ${ctx.meta.stepId} AND
+              step_version = ${ctx.meta.stepVersion} AND
               input_fingerprints = $inputFingerprints
       """.query[StepIdempotencyId].option
 
       def insertQuery(id: StepIdempotencyId) =
         sql"""
           INSERT INTO step_idempotency (id, library_version, workflow_id, workflow_instance_key, step_id, step_version, input_fingerprints, is_only_once)
-          VALUES ($id, $libraryVersion, ${ctx.workflowCtx.meta.id}, ${ctx.workflowCtx.instanceKey}, ${ctx.meta.id}, ${ctx.meta.version}, $inputFingerprints, false)
+          VALUES ($id, $libraryVersion, ${ctx.workflowCtx.meta.id}, ${ctx.workflowCtx.instanceKey}, ${ctx.meta.stepId}, ${ctx.meta.stepVersion}, $inputFingerprints, false)
           ON CONFLICT DO NOTHING
         """.update.run.as(id)
 
@@ -189,7 +190,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
         SELECT id FROM step_idempotency
         WHERE workflow_id = ${ctx.workflowCtx.meta.id} AND
               workflow_instance_key = ${ctx.workflowCtx.instanceKey} AND
-              step_id = ${ctx.meta.id} AND
+              step_id = ${ctx.meta.stepId} AND
               is_only_once = true AND
               is_overridden = false
       """.query[StepIdempotencyId].option
@@ -197,7 +198,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
       def insertQuery(id: StepIdempotencyId) =
         sql"""
           INSERT INTO step_idempotency (id, library_version, workflow_id, workflow_instance_key, step_id, is_only_once)
-          VALUES ($id, $libraryVersion, ${ctx.workflowCtx.meta.id}, ${ctx.workflowCtx.instanceKey}, ${ctx.meta.id}, true)
+          VALUES ($id, $libraryVersion, ${ctx.workflowCtx.meta.id}, ${ctx.workflowCtx.instanceKey}, ${ctx.meta.stepId}, true)
           ON CONFLICT DO NOTHING
         """.update.run.as(id)
 
@@ -207,7 +208,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
         SET is_overridden = true
         WHERE workflow_id = ${ctx.workflowCtx.meta.id} AND
               workflow_instance_key = ${ctx.workflowCtx.instanceKey} AND
-              step_id = ${ctx.meta.id} AND
+              step_id = ${ctx.meta.stepId} AND
               is_only_once = true AND
               is_overridden = false
         """.update.run.void
@@ -215,7 +216,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
       runSync {
         idQuery.flatMap {
           case Some(existing) =>
-            stepIdempotencyIdOverrides.get(ctx.meta.id) match {
+            stepIdempotencyIdOverrides.get(ctx.meta.stepId) match {
               case Some(overrideId) if overrideId != existing =>
                 updateQuery >>
                   insertQuery(overrideId)
@@ -224,7 +225,7 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
             }
           case None =>
             val stepIdempotencyId = stepIdempotencyIdOverrides.getOrElse(
-              ctx.meta.id,
+              ctx.meta.stepId,
               StepIdempotencyId.unsafeMake(UUID.randomUUID().toString)
             )
             insertQuery(stepIdempotencyId)
@@ -240,11 +241,11 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
                     ): Option[Out] = {
       val query = sql"""
         SELECT output, step_version, input_fingerprints FROM step_cache
-        WHERE step_idempotency_id = ${stepIdempotencyId} and step_id = ${ctx.meta.id}
+        WHERE step_idempotency_id = ${stepIdempotencyId} and step_id = ${ctx.meta.stepId}
       """.query[(Array[Byte], Long, StepInputFingerprints)].option
 
       runSync(query).flatMap {
-        case (data, version, fingerprints) if version == ctx.meta.version && fingerprints == inputFingerprints =>
+        case (data, version, fingerprints) if version == ctx.meta.stepVersion && fingerprints == inputFingerprints =>
           Some(Cacheable[Out].deserialize(data.asInstanceOf[IArray[Byte]]))
         case _ => throw new StepInputConflictException()
       }
@@ -262,9 +263,9 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
       val query =
         sql"""
         INSERT INTO step_cache (step_idempotency_id, step_id, step_version, input_fingerprints, output, expiry)
-        VALUES (${stepIdempotencyId}, ${ctx.meta.id}, ${ctx.meta.version}, $inputFingerprints, $data, $expiry)
+        VALUES (${stepIdempotencyId}, ${ctx.meta.stepId}, ${ctx.meta.stepVersion}, $inputFingerprints, $data, $expiry)
         ON CONFLICT (step_idempotency_id) DO UPDATE
-        SET step_version = ${ctx.meta.version},
+        SET step_version = ${ctx.meta.stepVersion},
             input_fingerprints = $inputFingerprints,
             output = $data,
             expiry = $expiry
@@ -277,19 +278,19 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
   private object DbSignalStore extends SignalStore {
 
     // TODO: check expiry
-    private def select[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): ConnectionIO[Option[Array[Byte]]] =
+    private def select[A](signal: Signal[A])(using workflowCtx: WorkflowInstanceMeta): ConnectionIO[Option[Array[Byte]]] =
       sql"""
       SELECT value FROM workflow_signals
-      WHERE id=${signal.meta.id} AND workflow_id=${workflowCtx.meta.id} AND workflow_instance_key=${workflowCtx.instanceKey}
+      WHERE id=${signal.meta.id} AND workflow_id=${workflowCtx.meta.id} AND workflow_instance_key=${workflowCtx.workflowInstanceKey}
       """.query[Array[Byte]].option
 
-    override def getSignalValue[A](signal: Signal[A])(using workflowCtx: SimpleWorkflowContext): Option[A] =
+    override def getSignalValue[A](signal: Signal[A])(using workflowCtx: WorkflowInstanceMeta): Option[A] =
       runSync {
         select(signal)
       }.map { bytes => signal.asCacheable.deserialize(IArray.unsafeFromArray(bytes)) }
 
     @throws[SignalConflictException]
-    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: SimpleWorkflowContext): Unit = {
+    override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using workflowCtx: WorkflowInstanceMeta): Unit = {
       val expiry = java.time.Instant.now().plusMillis(ttl.toMillis)
       val bytes: Array[Byte] = signal.asCacheable.serialize(value).asInstanceOf[Array[Byte]]
 
@@ -304,16 +305,16 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
           case None =>
             sql"""
               INSERT INTO workflow_signals (id, workflow_id, workflow_instance_key, value, expiry)
-              SELECT ${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.instanceKey}, $bytes, $expiry
+              SELECT ${signal.meta.id}, ${workflowCtx.meta.id}, ${workflowCtx.workflowInstanceKey}, $bytes, $expiry
               WHERE EXISTS (
                 SELECT 1
                 FROM workflow_instance AS wi
                 WHERE wi.workflow_id = ${workflowCtx.meta.id}
-                  AND wi.key = ${workflowCtx.instanceKey}
+                  AND wi.key = ${workflowCtx.workflowInstanceKey}
               )
               """.update.run
               .recover {
-                // 2305 is unique violation, i.e. duplicate primary key
+                // 23505 is unique violation, i.e. duplicate primary key
                 case e: PSQLException if e.getSQLState == "23505" => throw SignalConflictException(signal)
               }
               .map {
@@ -325,13 +326,61 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
     }
   }
 
-  private def runSync[A](fa: ConnectionIO[A]): A = {
-    fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
+  override def scheduleWakeupOnTimer(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit = {
+    val now = Instant.now(clk)
+    runSync {
+      sql"""
+           INSERT INTO workflows_awaiting_timer (awaiter_id, workflow_id, workflow_instance_key, restart_after, created_at)
+           VALUES ($???, $workflowId, $workflowInstanceKey, $wakeupTime, $now)
+           """
+        .recover {
+          // 23503 is foreign key constraint violation
+          case e: PSQLException if e.getSQLState == "23503" && e.getMessage.contains("not present in table \"workflow_instance\"") =>
+            throw WorkflowNotFoundException(e)
+        }
+    }
+  }
+
+  override def scheduleWakeupOnSignal(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, signal: Signal[_]): Unit = {
+    val now = Instant.now(clk)
+    runSync {
+      sql"""
+           INSERT INTO workflows_awaiting_signal (awaiter_id, workflow_id, workflow_instance_key, signal_id, created_at)
+           VALUES ($???, $workflowId, $workflowInstanceKey, ${signal.meta.id}, $now)
+           """
+        .recover {
+          // 23503 is foreign key constraint violation
+          case e: PSQLException if e.getSQLState == "23503" && e.getMessage.contains("not present in table \"workflow_instance\"") =>
+            throw WorkflowNotFoundException(e)
+        }
+    }
+  }
+
+  override def scheduleWakeupOnWorkflowCompletion(workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflow: WorkflowInstanceKey): Unit = {
+    val now = Instant.now(clk)
+    runSync {
+      sql"""
+           INSERT INTO workflows_awaiting_signal (
+              awaiter_id, workflow_id, workflow_instance_key,
+              awaited_workflow_id, awaited_workflow_instance_key, created_at
+            )
+           VALUES ($???, $workflowId, $workflowInstanceKey, $??? $???, $now)
+           """
+        .recover {
+          // 23503 is foreign key constraint violation
+          case e: PSQLException if e.getSQLState == "23503" && e.getMessage.contains("not present in table \"workflow_instance\"") =>
+            throw WorkflowNotFoundException(e)
+        }
+    }
   }
 
   @throws[SignalConflictException]
-  override def setSignal[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using SimpleWorkflowContext): Unit =
+  override def setSignal[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using WorkflowInstanceMeta): Unit =
     DbSignalStore.setSignalValue(signal, value, ttl)
+
+  private def runSync[A](fa: ConnectionIO[A]): A = {
+    fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
+  }
 }
 
 object DbWorkflowRuntime {
@@ -386,8 +435,4 @@ object DbWorkflowRuntime {
   given Get[StepInputFingerprints] = pgDecoderGetT[StepInputFingerprints]
 
   given Put[StepInputFingerprints] = pgEncoderPutT[StepInputFingerprints]
-
-  private class StoppedWorkflowImpl[Out](override val expectedRestartTime: Option[Instant]) extends StoppedWorkflow[Out] {
-
-  }
 }
