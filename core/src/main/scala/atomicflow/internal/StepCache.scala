@@ -85,6 +85,6 @@ trait StepCache[Out] {
            stepIdempotencyId: StepIdempotencyId,
            inputFingerprints: StepInputFingerprints,
            value: Out,
-           ttl: FiniteDuration
+           ttl: Option[FiniteDuration]
          ): Unit
 }

@@ -21,5 +21,5 @@ class StepMeta(val stepId: StepId,
         && super.equals(other) => true
     case _ => false
 
-  override lazy val toString: String = s"${super.toString}/$stepId"
+  override def toString: String = s"${super.toString}/$stepId"
 }

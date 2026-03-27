@@ -25,3 +25,6 @@ trait StepContext[Out] {
 
   def onCompensate(f: => Unit): Unit
 }
+object StepContext {
+  given (ctx: StepContext[?]) => StepMeta = ctx.meta
+}

@@ -6,11 +6,14 @@ import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToWait}
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints}
 import ox.discard
+import WorkflowContext.given_WorkflowInstanceMeta
 
+import java.time.Instant
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicReference}
 import scala.collection.{immutable, mutable}
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.Try
+import scala.util.chaining.*
 
 class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.DefaultGenerateIdsMixin {
   private class WorkflowIdempotencyStore {
@@ -64,20 +67,21 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                         inputFingerprints: StepInputFingerprints
                       ): Option[StepOut] = {
         val stepVersion = ctx.meta.stepVersion
+        // TODO: implement TTL check
         stepCache.get().get(stepIdempotencyId).map {
           case (`stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
           case _ => throw new StepInputConflictException()
         }
       }
 
-
       override def put(
                         stepIdempotencyId: StepIdempotencyId,
                         inputFingerprints: StepInputFingerprints,
                         value: StepOut,
-                        ttl: FiniteDuration
+                        ttl: Option[FiniteDuration]
                       ): Unit = {
         // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
+        // TODO: implement TTL
         stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.stepVersion, inputFingerprints, value)))
       }
     }
@@ -86,27 +90,24 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   private case class WorkflowState[In, Out](
                                              locked: AtomicBoolean,
                                              in: In,
-                                             workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                             workflow: Workflow[In, Out],
+                                             instanceKey: WorkflowInstanceKey,
                                              stepCache: WorkflowStepCache,
-                                             stepIdempotencyStore: WorkflowIdempotencyStore
+                                             stepIdempotencyStore: WorkflowIdempotencyStore,
+                                             result: Option[Out] = None
                                            )
 
+  // TODO: Map key should be workflowId+instanceKey
   private val workflowInstances: AtomicReference[Map[WorkflowInstanceKey, WorkflowState[?, ?]]] = new AtomicReference(Map.empty)
 
-  override def createWorkflowInstance[WorkflowIn, WorkflowOut](
-                                                                workflowInstance: WorkflowInstanceBuilder[WorkflowIn, WorkflowOut],
-                                                                in: WorkflowIn
-                                                              )(
-                                                                using Cacheable[WorkflowIn]
-                                                              ): Unit = {
-    given given_WorkflowInstanceMeta {
-      override def meta: WorkflowMeta = workflowInstance.workflow.meta
+  override def createWorkflowInstance[In, Out](workflow: Workflow[In, Out],
+                                                instanceKey: WorkflowInstanceKey,
+                                                in: In)(using Cacheable[In]): Unit = {
 
-      override def instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
-    }
+    given WorkflowInstanceMeta = WorkflowInstanceMeta(instanceKey, workflow.meta)
 
     workflowInstances.updateAndGet { instances =>
-      instances.get(workflowInstance.instanceKey) match {
+      instances.get(instanceKey) match {
         case Some(state) =>
           if (state.in != in) {
             throw new WorkflowInputConflictException()
@@ -114,25 +115,51 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
             instances
           }
         case None =>
-          instances + (workflowInstance.instanceKey -> WorkflowState(
+          instances + (instanceKey -> WorkflowState(
             locked = new AtomicBoolean(false),
             in = in,
-            workflowInstance = workflowInstance,
+            workflow = workflow,
+            instanceKey = instanceKey,
             stepCache = new WorkflowStepCache(),
-            stepIdempotencyStore = new WorkflowIdempotencyStore()
+            stepIdempotencyStore = new WorkflowIdempotencyStore(),
+            result = None
           ))
       }
     }
   }
 
+  override def createWorkflowInstanceDiscardExisting[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In]): Boolean = {
+    given WorkflowInstanceMeta = WorkflowInstanceMeta(instanceId, workflow.meta)
+
+    var hadExisting = false
+
+    workflowInstances.updateAndGet { instances =>
+      hadExisting = instances.contains(instanceId)
+
+      instances + (instanceId -> WorkflowState(
+        locked = new AtomicBoolean(false),
+        in = in,
+        workflow = workflow,
+        instanceKey = instanceId,
+        stepCache = new WorkflowStepCache(),
+        stepIdempotencyStore = new WorkflowIdempotencyStore(),
+        result = None
+      ))
+    }
+
+    hadExisting
+  }
+
+
   override def runWorkflowInstance[In, Out](
-                                             workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                             workflow: Workflow[In, Out],
+                                             instanceKey: WorkflowInstanceKey,
                                              in: In
                                            )(
-                                             using Cacheable[In]
+                                             using Cacheable[In], WorkflowRunSettings
                                            ): Either[StoppedWorkflow[Out], Out] = {
-    createWorkflowInstance(workflowInstance, in)
-    recoverWorkflowInstance(workflowInstance)
+    createWorkflowInstance(workflow, instanceKey, in)
+    recoverWorkflowInstance(workflow, instanceKey)
   }
 
   private type WorkflowCallback[Out] = Try[Either[StoppedWorkflow[Out], Out]] => Unit
@@ -140,17 +167,15 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   // TODO: Is reference equality comparison of lambdas ok? I think so.
 
   override def recoverWorkflowInstance[In, Out](
-                                                 workflowInstance: WorkflowInstanceBuilder[In, Out]
+                                                 workflow: Workflow[In, Out],
+                                                 instanceKey: WorkflowInstanceKey,
                                                )(
-                                                 using Cacheable[In]
+                                                 using Cacheable[In], WorkflowRunSettings
                                                ): Either[StoppedWorkflow[Out], Out] = {
-    given WorkflowInstanceMeta {
-      override def meta: WorkflowMeta = workflowInstance.workflow.meta
+    
+    given WorkflowInstanceMeta = WorkflowInstanceMeta(instanceKey, workflow.meta)
 
-      override def workflowInstanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
-    }
-
-    workflowInstances.get().get(workflowInstance.instanceKey) match {
+    workflowInstances.get().get(instanceKey) match {
       case Some(state: WorkflowState[In, Out] @unchecked) =>
         if (state.locked.getAndSet(true)) {
           // was locked before
@@ -158,44 +183,35 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
         } else {
           // was not locked before
           try {
-            val ctx = new WorkflowContext[In, Out] {
-              override val meta: WorkflowMeta = workflowInstance.workflow.meta
+            val ctx = WorkflowContext(given_WorkflowInstanceMeta, this, summon[WorkflowRunSettings].defaultCacheTtl)
 
-              override val instanceKey: WorkflowInstanceKey = workflowInstance.instanceKey
-
-              override protected[atomicflow] def getFingerprinter: Fingerprinter = Sha256Fingerprinter
-
-              override protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore =
-                state.stepIdempotencyStore.getIdempotencyStore(workflowInstance.stepIdempotencyIdOverrides)
-
-              override protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut] =
-                state.stepCache.getStepCache[StepOut]
-
-              override protected[atomicflow] def getSignalStore: SignalStore =
-                signalStore
-
-              override protected[atomicflow] val defaultCacheTtl: FiniteDuration =
-                workflowInstance.defaultCacheTtl
+            try {
+              val result = state.workflow.body(ctx, state.in)
+              workflowInstances.updateAndGet { instances =>
+                instances.get(instanceKey) match {
+                  case Some(currentState: WorkflowState[In, Out] @unchecked) =>
+                    instances + (instanceKey -> currentState.copy(result = Some(result)))
+                  case _ => instances
+                }
+              }
+              Right(result)
             }
-
-            try Right(state.workflowInstance.workflow.body(ctx, state.in))
-            catch { case WorkflowStoppedToWait(expectedRestartTime) =>
+            catch { case _: WorkflowStoppedToWait =>
               Left(new StoppedWorkflow[Out](
-                workflowId = workflowInstance.workflow.meta.workflowId,
-                workflowInstanceKey = workflowInstance.instanceKey,
-                expectedRestartTime = expectedRestartTime
+                workflowId = workflow.meta.workflowId,
+                workflowInstanceKey = instanceKey
               ) {
 
                 override def addContinueListener(onWorkflowContinued: Try[Either[StoppedWorkflow[Out], Out]] => Unit) = {
-                  workflowCallbacks.updateWith(workflowInstance.instanceKey) { valueMaybe =>
+                  workflowCallbacks.updateWith(instanceKey) { valueMaybe =>
                     Some(valueMaybe.getOrElse(immutable.HashSet.empty)
                       .incl(onWorkflowContinued.asInstanceOf))
                   }
 
                   new StoppedWorkflow.ListenerHandle {
-                    override def remove(): Unit = workflowCallbacks.updateWith(workflowInstance.instanceKey) { valueMaybe =>
+                    override def remove(): Unit = workflowCallbacks.updateWith(instanceKey) { valueMaybe =>
                       val updated = valueMaybe.getOrElse(throw AssertionError(
-                          s"Expected at least one callback to be defined for workflow instance ${workflowInstance.instanceKey}"
+                          s"Expected at least one callback to be defined for workflow instance ${instanceKey}"
                         ))
                         .excl(onWorkflowContinued.asInstanceOf)
                       if updated.nonEmpty then Some(updated) else None
@@ -210,7 +226,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
         }
 
       case _ =>
-        throw new WorkflowNotFoundException()
+        throw new WorkflowNotFoundException(given_WorkflowInstanceMeta)
     }
   }
 
@@ -218,15 +234,15 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
     val signalValues: AtomicReference[Map[(WorkflowId, WorkflowInstanceKey, SignalId), ?]] = new AtomicReference(Map.empty)
 
     override def getSignalValue[A](signal: Signal[A])(using ctx: WorkflowInstanceMeta): Option[A] = {
-      val key = (ctx.meta.id, ctx.workflowInstanceKey, signal.meta.id)
+      val key = (ctx.workflowId, ctx.workflowInstanceKey, signal.meta.id)
       signalValues.get().get(key).asInstanceOf[Option[A]]
     }
 
     override def setSignalValue[A](signal: Signal[A], value: A, ttl: FiniteDuration)(using ctx: WorkflowInstanceMeta): Unit = {
-      val key = (ctx.meta.id, ctx.workflowInstanceKey, signal.meta.id)
+      val key = (ctx.workflowId, ctx.workflowInstanceKey, signal.meta.id)
 
       if (!workflowInstances.get().contains(ctx.workflowInstanceKey))
-        throw new WorkflowNotFoundException()
+        throw new WorkflowNotFoundException(ctx)
 
       signalValues.updateAndGet { map =>
         if (map.get(key).exists(_ != value))
@@ -243,6 +259,99 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                              ttl: FiniteDuration
                            )(using WorkflowInstanceMeta): Unit =
     signalStore.setSignalValue(signal, value, ttl)
+
+
+  override def getWorkflowInstancesByPrefix(workflowId: WorkflowId, keyPrefix: WorkflowInstanceKey): Vector[WorkflowInstanceKey] = {
+    workflowInstances.get()
+      .collect { case (key, state: WorkflowState[?, ?])
+            if key.startsWith(keyPrefix) && state.workflow.meta.workflowId == workflowId =>
+
+          key
+      }
+      .toVector
+  }
+
+  override def getUnfinishedWorkflowInstances(workflowId: WorkflowId, includeWaiting: Boolean, limit: Int): Vector[WorkflowInstanceKey] = {
+    workflowInstances.get()
+      .view
+      .collect { case (key, state: WorkflowState[?, ?])
+        if state.workflow.meta.workflowId == workflowId && state.result.isEmpty =>
+
+        key
+      }
+      .pipe { it =>
+        if (limit > 0) it.take(limit)
+        else it
+      }
+      .toVector
+  }
+
+  override def deleteWorkflowInstancesByPrefix(workflowId: WorkflowId, instanceKeyPrefix: WorkflowInstanceKey): Long = {
+    var deletedCount = 0L
+
+    workflowInstances.updateAndGet { instances =>
+      val (toDelete, toKeep) = instances.partition { case (key, state) =>
+        key.startsWith(instanceKeyPrefix) && state.workflow.meta.workflowId == workflowId
+      }
+
+      deletedCount = toDelete.size.toLong
+      toKeep
+    }
+
+    deletedCount
+  }
+
+  override def isWorkflowCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean = {
+    workflowInstances.get().get(workflowInstanceKey) match {
+      case Some(state) if state.workflow.meta.workflowId == workflowId =>
+        state.result.isDefined
+      case Some(_) =>
+        throw new WorkflowNotFoundException(workflowId, Some(workflowInstanceKey))
+      case None =>
+        throw new WorkflowNotFoundException(workflowId, Some(workflowInstanceKey))
+    }
+  }
+
+  override def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out] = {
+    workflowInstances.get().get(workflowInstanceKey) match {
+      case Some(state: WorkflowState[?, Out] @unchecked) if state.workflow.meta.workflowId == workflow.meta.workflowId =>
+        state.result
+      case Some(_) =>
+        throw new WorkflowNotFoundException(workflow.meta.workflowId, Some(workflowInstanceKey))
+      case None =>
+        throw new WorkflowNotFoundException(workflow.meta.workflowId, Some(workflowInstanceKey))
+    }
+  }
+
+  override def scheduleWakeupOnTimer(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit = ???
+
+  override def scheduleWakeupOnSignal(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, signal: Signal[?]): Unit = ???
+
+  override def scheduleWakeupOnWorkflowCompletion(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflowId: WorkflowId, awaitedWorkflowInstanceKey: WorkflowInstanceKey): Unit = ???
+
+  override def getFingerprinter: Fingerprinter = Sha256Fingerprinter
+
+  override def getStepIdempotencyStore(using stepCtx: StepContext[?]): StepIdempotencyStore = {
+    val instanceKey = stepCtx.workflowCtx.workflowInstanceMeta.workflowInstanceKey
+    workflowInstances.get().get(instanceKey) match {
+      case Some(state) =>
+        state.stepIdempotencyStore.getIdempotencyStore(Map.empty)(using stepCtx)
+      case None =>
+        throw new WorkflowNotFoundException(stepCtx.meta)
+    }
+  }
+
+  override def getStepCache[StepOut: Cacheable](using stepCtx: StepContext[StepOut]): StepCache[StepOut] = {
+    val instanceKey = stepCtx.workflowCtx.workflowInstanceMeta.workflowInstanceKey
+    workflowInstances.get().get(instanceKey) match {
+      case Some(state) =>
+        state.stepCache.getStepCache[StepOut](using stepCtx)
+      case None =>
+        throw new WorkflowNotFoundException(stepCtx.meta)
+    }
+  }
+
+  override def getSignalStore: SignalStore = signalStore
 }
 object InMemoryWorkflowRuntime {
 

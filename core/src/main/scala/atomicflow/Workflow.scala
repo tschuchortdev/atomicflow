@@ -1,8 +1,8 @@
 package atomicflow
 
 import atomicflow.Workflow.*
-import atomicflow.WorkflowContext.given_WorkflowInstanceMeta 
-import atomicflow.WorkflowRuntime.{WorkflowStoppedToAwaitManyConditions, WorkflowStoppedToWait}
+import atomicflow.WorkflowContext.given_WorkflowInstanceMeta
+import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToAwaitManyConditions, WorkflowStoppedToWait}
 
 import java.time.{Clock, Instant}
 import java.util.UUID
@@ -12,8 +12,16 @@ case class Workflow[In: Cacheable, Out] private(
                                                  meta: WorkflowMeta,
                                                  body: (WorkflowContext, In) => Out
                                                ) {
-  def newInstance(instanceId: String)(using runtime: WorkflowRuntime): WorkflowInstanceBuilder[In, Out] =
+  final def create(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, c: Cacheable[In]): Unit =
+    rt.createWorkflowInstance(this, instanceId, in)
 
+  final def createAndRun(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
+      : Either[StoppedWorkflow[Out], Out] =
+    rt.runWorkflowInstance(this, instanceId, in)
+
+  final def recover(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
+      : Either[StoppedWorkflow[Out], Out] =
+    rt.recoverWorkflowInstance(this, instanceId)
 }
 
 object Workflow {
@@ -67,8 +75,13 @@ object Workflow {
       case None => throw WorkflowRuntime.WorkflowStoppedToAwaitSignal(signal)
     }
 
-  def stopAndAwaitWorkflow[Out](workflow: Workflow[?, Out], instance: WorkflowInstanceKey)(using ctx: WorkflowContext): Nothing | Out =
-    ctx.workflowRuntime.scheduleWakeupOnWorkflowCompletion(ctx.workflowInstanceMeta.workflowInstanceKey, workflow.meta.workflowId)
+  @throws[WorkflowNotFoundException]
+  def stopAndAwaitWorkflow[Out](awaitedWorkflow: Workflow[?, Out], awaitedInstanceKey: WorkflowInstanceKey)(using ctx: WorkflowContext): Nothing | Out = {
+    ctx.workflowRuntime.getWorkflowResult[Out](awaitedWorkflow, awaitedInstanceKey) match {
+      case Some(value) => value
+      case None => throw WorkflowRuntime.WorkflowStoppedToAwaitWorkflow(awaitedWorkflow.meta.workflowId, awaitedInstanceKey)
+    }
+  }
 
   def subworkflow[Res](key: String)(using ctx: WorkflowContext)(
     body: WorkflowContext ?=> Res

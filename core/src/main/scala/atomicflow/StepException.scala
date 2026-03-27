@@ -1,5 +1,7 @@
 package atomicflow
 
+import atomicflow.StepContext.given_StepMeta
+
 trait StepException(using stepCtx: StepContext[?])
   extends WorkflowException {
   self: Exception =>

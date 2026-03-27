@@ -23,23 +23,13 @@ trait WorkflowRuntime {
   def generateStepIdempotencyId: StepIdempotencyId
 
   /**
-   * Registers this workflow instance but doesn't run it.
+   * Registers this workflow instance key and input but doesn't run it.
    * @throws WorkflowInputConflictException when a workflow instance was previously created with non-equal input
    */
   @throws[WorkflowInputConflictException]
-  def createWorkflowInstance[In, Out](
-                                       workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                       in: In
-                                     )(
-                                       using Cacheable[In]
-                                     ): Unit
+  def createWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In]): Unit
 
-  def createWorkflowInstanceDiscardExisting[In, Out](
-                                                      workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                                      in: In
-                                                    )(
-                                                      using Cacheable[In]
-                                                    ): Boolean = ??? // TODO
+  def createWorkflowInstanceDiscardExisting[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In]): Boolean
 
   /**
    * Runs a workflow instance. The workflow instance is created if it doesn't already exist.
@@ -47,12 +37,8 @@ trait WorkflowRuntime {
    * Implementations must lock the workflow while running to prevent concurrent executions of the same workflow instance.
    */
   @throws[WorkflowInputConflictException]
-  def runWorkflowInstance[In, Out](
-                                    workflowInstance: WorkflowInstanceBuilder[In, Out],
-                                    in: In
-                                  )(
-                                    using Cacheable[In]
-                                  ): Either[StoppedWorkflow[Out], Out]
+  def runWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In], WorkflowRunSettings)
+      : Either[StoppedWorkflow[Out], Out]
 
   /**
    * Runs a workflow instance that was previously created. If the workflow instance ran before and didn't finish,
@@ -62,40 +48,26 @@ trait WorkflowRuntime {
    * @throws WorkflowNotFoundException when no workflow instance with this ID exists
    */
   @throws[WorkflowNotFoundException]
-  def recoverWorkflowInstance[In, Out](
-                                        workflowInstance: WorkflowInstanceBuilder[In, Out]
-                                      )(
-                                        using Cacheable[In]
-                                      ): Either[StoppedWorkflow[Out], Out]
+  def recoverWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey)(using Cacheable[In], WorkflowRunSettings)
+      : Either[StoppedWorkflow[Out], Out]
 
-  def getWorkflowInstance[In, Out](workflow: Workflow[In, Out], exactKey: WorkflowInstanceKey): Option[Nothing]
-
-  def getWorkflowInstances[In, Out](workflow: Workflow[In, Out], keyPrefix: WorkflowInstanceKey): Vector[Nothing]
+  def getWorkflowInstancesByPrefix(workflowId: WorkflowId, keyPrefix: WorkflowInstanceKey)
+      : Vector[WorkflowInstanceKey]
 
   /**
    * Get all workflow instances that haven't yet run to finish, including those that have yet to start.
    * @param includeWaiting Include workflow instances that have stopped themselves and are waiting for a timer or signal.
    */
-  def getUnfinishedWorkflowInstances[In, Out](workflow: Workflow[In, Out], includeWaiting: Boolean = false, limit: Int = -1): Vector[Nothing]
+  def getUnfinishedWorkflowInstances(workflowId: WorkflowId, includeWaiting: Boolean = false, limit: Int = -1)
+      : Vector[WorkflowInstanceKey]
 
-  @tailrec
-  def runPendingWorkflowInstances[In, Out](workflow: Workflow[In, Out], maxParallelism: Int)(
-      handleError: PartialFunction[Throwable, Unit] = e => throw e
-  )(using Cacheable[In]): Nothing = {
-    val unfinishedInstances = getUnfinishedWorkflowInstances(workflow, limit = maxParallelism)
-    unfinishedInstances.mapPar(maxParallelism) { wi =>
-      try {
-        // TODO
-        ???
-      } catch {
-        case _: WorkflowLockedException => () // Workflow is already being executed by someone else --> skip
-        case handleError(Some(())) => () // handled by extractor
-      }
-    }
+  def deleteWorkflowInstancesByPrefix(workflowId: WorkflowId, instanceKeyPrefix: WorkflowInstanceKey): Long
 
-    runPendingWorkflowInstances(workflow, maxParallelism)(handleError)
-  }
+  @throws[WorkflowNotFoundException]
+  def isWorkflowCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean
 
+  @throws[WorkflowNotFoundException]
+  def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out]
 
   /** Instructs the runtime to start/recover the workflow some time after the [[wakeupTime]] is reached.
    *
@@ -119,7 +91,8 @@ trait WorkflowRuntime {
    * skip this schedule and try again later. If the workflow is finished when the wakeup time is reached, the schedule should be deleted.
    * */
   @throws[WorkflowNotFoundException]
-  def scheduleWakeupOnWorkflowCompletion(workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflow: WorkflowInstanceKey): Unit
+  def scheduleWakeupOnWorkflowCompletion(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey,
+                                         awaitedWorkflowId: WorkflowId, awaitedWorkflowInstanceKey: WorkflowInstanceKey): Unit
 
   @throws[WorkflowNotFoundException]
   @throws[SignalConflictException]
@@ -139,6 +112,8 @@ trait WorkflowRuntime {
 }
 
 object WorkflowRuntime {
+  def apply(using runtime: WorkflowRuntime): WorkflowRuntime = runtime
+  
   trait DefaultGenerateIdsMixin extends WorkflowRuntime {
 
     override def generateWorkflowInstanceKey: String = UUID.randomUUID().toString
@@ -150,9 +125,7 @@ object WorkflowRuntime {
   /** Handle to a workflow that has __stopped__ itself because it is waiting on a timer or external signal */
   trait StoppedWorkflow[Out](
         val workflowId: WorkflowId,
-        val workflowInstanceKey: WorkflowInstanceKey,
-        /** The expected time when this workflow will be restarted (if it is waiting on a timer) or None if it is waiting on a signal. */
-        val expectedRestartTime: Option[Instant]
+        val workflowInstanceKey: WorkflowInstanceKey
   ) {
     /** Blocks the current thread until this workflow has restarted and finished execution. If the workflow restarts and
      * then stops itself a second time, this method will continue to block.
@@ -210,7 +183,10 @@ object WorkflowRuntime {
       ctx.workflowRuntime.getSignalStore.getSignalValue(signal).isDefined
   }
 
-  case class WorkflowStoppedToAwaitWorkflow(awaitedWorkflow: WorkflowMeta, awaitedInstanceKey: WorkflowInstanceKey) extends WorkflowStoppedToWait
+  case class WorkflowStoppedToAwaitWorkflow(awaitedWorkflowId: WorkflowId, awaitedInstanceKey: WorkflowInstanceKey) extends WorkflowStoppedToWait {
+    def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =
+      ctx.workflowRuntime.isWorkflowCompleted(awaitedWorkflowId, awaitedInstanceKey)
+  }
 
   case class WorkflowStoppedToAwaitManyConditions(stops: Vector[WorkflowStoppedToWait]) extends WorkflowStoppedToWait {
     def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =

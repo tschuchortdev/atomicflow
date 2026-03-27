@@ -32,10 +32,11 @@ class DbWorkflowRuntime protected (ds: DataSource)(using awaitConnectionEc: Exec
   protected val xa = Transactor.fromDataSource[IO](ds, awaitConnectionEc)
 
   override def createWorkflowInstance[In, Out](
-                                                workflowInstance: WorkflowInstanceBuilder[In, Out],
+                                                workflow: Workflow[In, Out],
                                                 in: In
                                               )(
-                                                using Cacheable[In],
+                                                using cacheable: Cacheable[In],
+                                                defaultSettings: WorkflowRunSettings,
                                                 clk: Clock
                                               ): Unit = {
     val key = workflowInstance.instanceKey

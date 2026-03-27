@@ -3,7 +3,7 @@ package atomicflow
 import atomicflow.internal.{StepCache, StepIdempotencyStore, StepInputFingerprints}
 
 import java.util.concurrent.atomic.AtomicReference
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.{Duration, FiniteDuration}
 import scala.util.control.ControlThrowable
 
 object Step {
@@ -26,8 +26,7 @@ object Step {
         case () => None
         case string: String => Some(string)
       },
-      workflowMeta = workflowCtx.workflowInstanceMeta.workflowMeta,
-      workflowInstanceId = workflowCtx.workflowInstanceMeta.workflowInstanceKey
+      workflowInstanceMeta = workflowCtx.workflowInstanceMeta,
     )
 
     val stepWorkflowCtx = workflowCtx
@@ -80,7 +79,7 @@ object Step {
 
   inline def compensate(f: => Unit)(using ctx: StepContext[?]): Unit = ctx.onCompensate(f)
 
-  def cacheFor[Out](ttl: FiniteDuration)(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
+  def cacheFor[Out](ttl: Option[FiniteDuration])(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireStepIdempotencyId(inputFingerprints)
@@ -100,7 +99,7 @@ object Step {
     cacheFor[Out](ctx.workflowCtx.defaultCacheTtl)(stepInputs *)
 
   @throws[StepInputConflictException]
-  def onlyOnceFor[Out](ttl: FiniteDuration)(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
+  def onlyOnceFor[Out](ttl: Option[FiniteDuration])(stepInputs: StepInput[?]*)(using ctx: StepContext[Out])(using Cacheable[Out]): Unit = {
     val inputFingerprints = ctx.fingerprint(stepInputs)
 
     val idempotencyId = ctx.idempotencyStore.acquireOnlyOnceStepIdempotencyId()
