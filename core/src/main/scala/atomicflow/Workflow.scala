@@ -17,11 +17,11 @@ case class Workflow[In: Cacheable, Out] private(
 
   final def createAndRun(instanceId: WorkflowInstanceKey, in: In)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out] =
-    rt.runWorkflowInstance(this, instanceId, in)
+    rt.createAndRunWorkflowInstance(this, instanceId, in)
 
-  final def recover(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
+  final def run(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out] =
-    rt.recoverWorkflowInstance(this, instanceId)
+    rt.runWorkflowInstance(this, instanceId)
 }
 
 object Workflow {

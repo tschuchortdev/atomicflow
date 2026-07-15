@@ -151,7 +151,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   }
 
 
-  override def runWorkflowInstance[In, Out](
+  override def createAndRunWorkflowInstance[In, Out](
                                              workflow: Workflow[In, Out],
                                              instanceKey: WorkflowInstanceKey,
                                              in: In
@@ -159,14 +159,14 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                                              using Cacheable[In], WorkflowRunSettings
                                            ): Either[StoppedWorkflow[Out], Out] = {
     createWorkflowInstance(workflow, instanceKey, in)
-    recoverWorkflowInstance(workflow, instanceKey)
+    runWorkflowInstance(workflow, instanceKey)
   }
 
   private type WorkflowCallback[Out] = Try[Either[StoppedWorkflow[Out], Out]] => Unit
   private val workflowCallbacks = new collection.concurrent.TrieMap[WorkflowInstanceKey, immutable.HashSet[WorkflowCallback[Any]]]()
   // TODO: Is reference equality comparison of lambdas ok? I think so.
 
-  override def recoverWorkflowInstance[In, Out](
+  override def runWorkflowInstance[In, Out](
                                                  workflow: Workflow[In, Out],
                                                  instanceKey: WorkflowInstanceKey,
                                                )(
@@ -301,7 +301,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
     deletedCount
   }
 
-  override def isWorkflowCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean = {
+  override def isWorkflowInstanceCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean = {
     workflowInstances.get().get(workflowInstanceKey) match {
       case Some(state) if state.workflow.meta.workflowId == workflowId =>
         state.result.isDefined

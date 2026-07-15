@@ -7,4 +7,7 @@ case class WorkflowRunSettings(
     defaultCacheTtl: Option[FiniteDuration] = Some(Constants.defaultCacheTtl),
     defaultSignalTtl: Option[FiniteDuration] = Some(Constants.defaultSignalTtl),
     stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = ListMap.empty
-)
+) {
+  def overrideStepIdempotencyId(stepId: StepId, stepIdempotencyId: StepIdempotencyId): WorkflowRunSettings =
+    copy(stepIdempotencyIdOverrides = stepIdempotencyIdOverrides + (stepId -> stepIdempotencyId))
+}

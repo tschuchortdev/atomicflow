@@ -37,7 +37,7 @@ trait WorkflowRuntime {
    * Implementations must lock the workflow while running to prevent concurrent executions of the same workflow instance.
    */
   @throws[WorkflowInputConflictException]
-  def runWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In], WorkflowRunSettings)
+  def createAndRunWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In], WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out]
 
   /**
@@ -48,7 +48,7 @@ trait WorkflowRuntime {
    * @throws WorkflowNotFoundException when no workflow instance with this ID exists
    */
   @throws[WorkflowNotFoundException]
-  def recoverWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey)(using Cacheable[In], WorkflowRunSettings)
+  def runWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey)(using Cacheable[In], WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out]
 
   def getWorkflowInstancesByPrefix(workflowId: WorkflowId, keyPrefix: WorkflowInstanceKey)
@@ -64,7 +64,10 @@ trait WorkflowRuntime {
   def deleteWorkflowInstancesByPrefix(workflowId: WorkflowId, instanceKeyPrefix: WorkflowInstanceKey): Long
 
   @throws[WorkflowNotFoundException]
-  def isWorkflowCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean
+  def isWorkflowInstanceCompleted(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean
+
+  /** Check if a workflow instance with this key has been created. */
+  def isWorkflowInstanceCreated(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean
 
   @throws[WorkflowNotFoundException]
   def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out]
@@ -113,7 +116,7 @@ trait WorkflowRuntime {
 
 object WorkflowRuntime {
   def apply(using runtime: WorkflowRuntime): WorkflowRuntime = runtime
-  
+
   trait DefaultGenerateIdsMixin extends WorkflowRuntime {
 
     override def generateWorkflowInstanceKey: String = UUID.randomUUID().toString
@@ -185,7 +188,7 @@ object WorkflowRuntime {
 
   case class WorkflowStoppedToAwaitWorkflow(awaitedWorkflowId: WorkflowId, awaitedInstanceKey: WorkflowInstanceKey) extends WorkflowStoppedToWait {
     def isRestartConditionFulfilledNow(using clk: Clock, ctx: WorkflowContext): Boolean =
-      ctx.workflowRuntime.isWorkflowCompleted(awaitedWorkflowId, awaitedInstanceKey)
+      ctx.workflowRuntime.isWorkflowInstanceCompleted(awaitedWorkflowId, awaitedInstanceKey)
   }
 
   case class WorkflowStoppedToAwaitManyConditions(stops: Vector[WorkflowStoppedToWait]) extends WorkflowStoppedToWait {

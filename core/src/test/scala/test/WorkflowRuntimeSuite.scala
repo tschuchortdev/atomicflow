@@ -31,7 +31,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
   test("Unknown empty workflow should fail with WorkflowNotFoundException") {
     given WorkflowRuntime = createWorkflowRuntime
     intercept[WorkflowNotFoundException] {
-      emptyWorkflow.recover(randomInstanceId())
+      emptyWorkflow.run(randomInstanceId())
     }
   }
 
@@ -48,7 +48,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       name = "recursive workflow"
     ) { _ =>
       intercept[WorkflowLockedException] {
-        workflow.recover(instanceId)
+        workflow.run(instanceId)
       }
     }
     workflow.createAndRun(instanceId, ())
@@ -227,20 +227,19 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       workflow.createAndRun(workflowInstanceId, "answer")
     }
 
-    assertEquals(
-      workflow.newInstance(workflowInstanceId)
-        .overrideStepIdempotencyId(
-          StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"),
-          StepIdempotencyId.generate
-        )
-        .run("answer"),
-      43
+    // When StepIdempotencyId is overriden, step execuates again (was 42, not 43)
+    given WorkflowRunSettings = this.given_WorkflowRunSettings.overrideStepIdempotencyId(
+      StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"),
+      StepIdempotencyId.generate
     )
+    assertEquals(workflow.run(workflowInstanceId), Right(43))
 
-    assertEquals(workflow.createAndRun(workflowInstanceId, "answer"), Right(43))
+    // When executing again, result remains 43 (StepIdempotencyId override takes effect only once)
+    assertEquals(workflow.run(workflowInstanceId), Right(43))
 
     answer.incrementAndGet()
 
+    // Instance with different ID is unaffected
     assertEquals(workflow.createAndRun(randomInstanceId(), "answer"), Right(44))
   }
 
@@ -261,7 +260,7 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     intercept[SignalEmptyException] {
       workflow.createAndRun(workflowInstanceId, ())
     }
-    
+
     workflow.newInstance(workflowInstanceId).setSignal(signal, "test")
 
     assertEquals(workflow.createAndRun(workflowInstanceId, ()), Right("test"))
