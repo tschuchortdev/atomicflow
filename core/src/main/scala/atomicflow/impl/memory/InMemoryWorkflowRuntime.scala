@@ -2,7 +2,7 @@ package atomicflow.impl.memory
 
 import atomicflow.*
 import atomicflow.Fingerprintable.Fingerprinter
-import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToWait}
+import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToAwaitManyConditions, WorkflowStoppedToAwaitSignal, WorkflowStoppedToAwaitTimer, WorkflowStoppedToAwaitWorkflow, WorkflowStoppedToWait}
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore, StepInputFingerprints}
 import ox.discard
@@ -201,7 +201,26 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
               }
               Right(result)
             }
-            catch { case _: WorkflowStoppedToWait =>
+            catch { case stopped: WorkflowStoppedToWait =>
+              stopped match {
+                case WorkflowStoppedToAwaitTimer(expectedRestartTime) =>
+                  scheduleWakeupOnTimer(workflow.meta.workflowId, instanceKey, expectedRestartTime)
+                case WorkflowStoppedToAwaitSignal(signal) =>
+                  scheduleWakeupOnSignal(workflow.meta.workflowId, instanceKey, signal)
+                case WorkflowStoppedToAwaitWorkflow(awaitedWorkflowId, awaitedInstanceKey) =>
+                  scheduleWakeupOnWorkflowCompletion(workflow.meta.workflowId, instanceKey, awaitedWorkflowId, awaitedInstanceKey)
+                case WorkflowStoppedToAwaitManyConditions(stops) =>
+                  stops.foreach {
+                    case WorkflowStoppedToAwaitTimer(expectedRestartTime) =>
+                      scheduleWakeupOnTimer(workflow.meta.workflowId, instanceKey, expectedRestartTime)
+                    case WorkflowStoppedToAwaitSignal(signal) =>
+                      scheduleWakeupOnSignal(workflow.meta.workflowId, instanceKey, signal)
+                    case WorkflowStoppedToAwaitWorkflow(awaitedWorkflowId, awaitedInstanceKey) =>
+                      scheduleWakeupOnWorkflowCompletion(workflow.meta.workflowId, instanceKey, awaitedWorkflowId, awaitedInstanceKey)
+                    case _: WorkflowStoppedToAwaitManyConditions => ()
+                  }
+              }
+
               Left(new StoppedWorkflow[Out](
                 workflowId = workflow.meta.workflowId,
                 workflowInstanceKey = instanceKey
@@ -232,6 +251,27 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
 
       case _ =>
         throw new WorkflowNotFoundException(given_WorkflowInstanceMeta)
+    }
+  }
+
+  private val dummyCacheable: Cacheable[Any] = new Cacheable[Any] {
+    override def serialize(value: Any): IArray[Byte] = IArray.empty
+    override def deserialize(bytes: IArray[Byte]): Any = ()
+  }
+
+  private def tryRunWorkflowInstance(workflowId: WorkflowId, instanceKey: WorkflowInstanceKey): Unit = {
+    workflowInstances.get().get(instanceKey) match {
+      case Some(state) if state.workflow.meta.workflowId == workflowId =>
+        if (state.result.isEmpty && !state.locked.get()) {
+          Thread.startVirtualThread(() => {
+            Try {
+              given WorkflowRunSettings = WorkflowRunSettings()
+              val workflow = state.workflow.asInstanceOf[Workflow[Any, Any]]
+              runWorkflowInstance(workflow, instanceKey)(using dummyCacheable, summon[WorkflowRunSettings])
+            }.discard
+          })
+        }
+      case _ => ()
     }
   }
 
@@ -331,11 +371,56 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
     }
   }
 
-  override def scheduleWakeupOnTimer(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit = ???
+  override def scheduleWakeupOnTimer(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, wakeupTime: Instant): Unit = {
+    Thread.startVirtualThread(() => {
+      val delay = java.time.Duration.between(Instant.now(), wakeupTime).toMillis.max(0)
+      if (delay > 0) Thread.sleep(delay)
+      tryRunWorkflowInstance(workflowId, workflowInstanceKey)
+    })
+  }
 
-  override def scheduleWakeupOnSignal(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, signal: Signal[?]): Unit = ???
+  override def scheduleWakeupOnSignal(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, signal: Signal[?]): Unit = {
+    Thread.startVirtualThread(() => {
+      var done = false
+      while (!done) {
+        if (isWorkflowInstanceCompleted(workflowId, workflowInstanceKey)) {
+          done = true
+        } else {
+          workflowInstances.get().get(workflowInstanceKey) match {
+            case Some(state) if state.workflow.meta.workflowId == workflowId =>
+              given WorkflowInstanceMeta = WorkflowInstanceMeta(workflowInstanceKey, state.workflow.meta)
+              if (signalStore.getSignalValue(signal).isDefined) {
+                tryRunWorkflowInstance(workflowId, workflowInstanceKey)
+                done = true
+              } else {
+                Thread.sleep(1000)
+              }
+            case _ =>
+              done = true
+          }
+        }
+      }
+    })
+  }
 
-  override def scheduleWakeupOnWorkflowCompletion(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflowId: WorkflowId, awaitedWorkflowInstanceKey: WorkflowInstanceKey): Unit = ???
+  override def scheduleWakeupOnWorkflowCompletion(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey, awaitedWorkflowId: WorkflowId, awaitedWorkflowInstanceKey: WorkflowInstanceKey): Unit = {
+    Thread.startVirtualThread(() => {
+      var done = false
+      while (!done) {
+        if (isWorkflowInstanceCompleted(workflowId, workflowInstanceKey)) {
+          done = true
+        } else {
+          val completed = Try(isWorkflowInstanceCompleted(awaitedWorkflowId, awaitedWorkflowInstanceKey)).toOption.getOrElse(false)
+          if (completed) {
+            tryRunWorkflowInstance(workflowId, workflowInstanceKey)
+            done = true
+          } else {
+            Thread.sleep(1000)
+          }
+        }
+      }
+    })
+  }
 
   override def getFingerprinter: Fingerprinter = Sha256Fingerprinter
 
