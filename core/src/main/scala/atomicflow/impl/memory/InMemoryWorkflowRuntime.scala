@@ -59,7 +59,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   }
 
   private class WorkflowStepCache {
-    private val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any)]] = new AtomicReference(Map.empty)
+    private val stepCache: AtomicReference[Map[StepIdempotencyId, (Long, StepInputFingerprints, Any, Option[Instant])]] = new AtomicReference(Map.empty)
 
     def getStepCache[StepOut](using ctx: StepContext[StepOut]): StepCache[StepOut] = new StepCache[StepOut] {
       override def get(
@@ -67,9 +67,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                         inputFingerprints: StepInputFingerprints
                       ): Option[StepOut] = {
         val stepVersion = ctx.meta.stepVersion
-        // TODO: implement TTL check
-        stepCache.get().get(stepIdempotencyId).map {
-          case (`stepVersion`, `inputFingerprints`, out: StepOut @unchecked) => out
+        stepCache.get().get(stepIdempotencyId).flatMap {
+          case (`stepVersion`, `inputFingerprints`, out: StepOut @unchecked, expiry) =>
+            expiry match {
+              case Some(expiryTime) if Instant.now().isAfter(expiryTime) => None
+              case _ => Some(out)
+            }
           case _ => throw new StepInputConflictException()
         }
       }
@@ -80,9 +83,8 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                         value: StepOut,
                         ttl: Option[FiniteDuration]
                       ): Unit = {
-        // TODO: check for already existing stepIdempotencyId should not be necessary since workflow instance is locked?
-        // TODO: implement TTL
-        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.stepVersion, inputFingerprints, value)))
+        val expiry = ttl.map(t => Instant.now().plusMillis(t.toMillis))
+        stepCache.updateAndGet(cache => cache + (stepIdempotencyId -> (ctx.meta.stepVersion, inputFingerprints, value, expiry)))
       }
     }
   }
