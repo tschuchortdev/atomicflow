@@ -15,6 +15,11 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
 
   private given WorkflowRunSettings = WorkflowRunSettings()
 
+  private given Cacheable[Any] = new Cacheable[Any] {
+    override def serialize(value: Any): IArray[Byte] = IArray.empty
+    override def deserialize(bytes: IArray[Byte]): Any = ()
+  }
+
   private def randomInstanceId(): String =
     Random.between(0,99999).toString
 

@@ -18,8 +18,9 @@ CREATE TABLE workflow_result
 (
     workflow_id  UUID        NOT NULL,
     workflow_instance_key TEXT        NOT NULL COLLATE "C",
-    result                JSONB,
+    result                BYTEA,
     created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    PRIMARY KEY (workflow_id, workflow_instance_key),
     FOREIGN KEY (workflow_id, workflow_instance_key) REFERENCES workflow_instance (workflow_id, key) ON DELETE RESTRICT
 );
 

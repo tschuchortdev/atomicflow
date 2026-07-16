@@ -158,7 +158,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                                              instanceKey: WorkflowInstanceKey,
                                              in: In
                                            )(
-                                             using Cacheable[In], WorkflowRunSettings
+                                             using Cacheable[In], Cacheable[Out], WorkflowRunSettings
                                            ): Either[StoppedWorkflow[Out], Out] = {
     createWorkflowInstance(workflow, instanceKey, in)
     runWorkflowInstance(workflow, instanceKey)
@@ -172,7 +172,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
                                                  workflow: Workflow[In, Out],
                                                  instanceKey: WorkflowInstanceKey,
                                                )(
-                                                 using Cacheable[In], WorkflowRunSettings
+                                                 using Cacheable[In], Cacheable[Out], WorkflowRunSettings
                                                ): Either[StoppedWorkflow[Out], Out] = {
     
     given WorkflowInstanceMeta = WorkflowInstanceMeta(instanceKey, workflow.meta)
@@ -269,7 +269,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
             Try {
               given WorkflowRunSettings = WorkflowRunSettings()
               val workflow = state.workflow.asInstanceOf[Workflow[Any, Any]]
-              runWorkflowInstance(workflow, instanceKey)(using dummyCacheable, summon[WorkflowRunSettings])
+              runWorkflowInstance(workflow, instanceKey)(using dummyCacheable, dummyCacheable, summon[WorkflowRunSettings])
             }.discard
           })
         }
@@ -362,7 +362,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
   override def isWorkflowInstanceCreated(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean =
     workflowInstances.get().get(workflowInstanceKey).exists(_.workflow.meta.workflowId == workflowId)
 
-  override def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out] = {
+  override def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey)(using Cacheable[Out]): Option[Out] = {
     workflowInstances.get().get(workflowInstanceKey) match {
       case Some(state: WorkflowState[?, Out] @unchecked) if state.workflow.meta.workflowId == workflow.meta.workflowId =>
         state.result

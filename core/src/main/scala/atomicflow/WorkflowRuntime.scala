@@ -37,7 +37,7 @@ trait WorkflowRuntime {
    * Implementations must lock the workflow while running to prevent concurrent executions of the same workflow instance.
    */
   @throws[WorkflowInputConflictException]
-  def createAndRunWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In], WorkflowRunSettings)
+  def createAndRunWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey, in: In)(using Cacheable[In], Cacheable[Out], WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out]
 
   /**
@@ -48,7 +48,7 @@ trait WorkflowRuntime {
    * @throws WorkflowNotFoundException when no workflow instance with this ID exists
    */
   @throws[WorkflowNotFoundException]
-  def runWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey)(using Cacheable[In], WorkflowRunSettings)
+  def runWorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceKey)(using Cacheable[In], Cacheable[Out], WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out]
 
   def getWorkflowInstancesByPrefix(workflowId: WorkflowId, keyPrefix: WorkflowInstanceKey)
@@ -70,7 +70,7 @@ trait WorkflowRuntime {
   def isWorkflowInstanceCreated(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean
 
   @throws[WorkflowNotFoundException]
-  def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out]
+  def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey)(using Cacheable[Out]): Option[Out]
 
   /** Instructs the runtime to start/recover the workflow some time after the [[wakeupTime]] is reached.
    *
