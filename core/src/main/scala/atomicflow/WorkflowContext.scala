@@ -15,6 +15,7 @@ case class WorkflowContext(
   workflowInstanceMeta: WorkflowInstanceMeta,
   workflowRuntime: WorkflowRuntime,
   defaultCacheTtl: Option[FiniteDuration] = None,
+  stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty,
   subworkflowScope: Vector[String] = Vector.empty
 ) {
   def withSubworkflowScope(scopeKey: String): WorkflowContext =

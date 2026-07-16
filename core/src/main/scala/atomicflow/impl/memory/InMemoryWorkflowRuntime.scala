@@ -183,7 +183,12 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
         } else {
           // was not locked before
           try {
-            val ctx = WorkflowContext(given_WorkflowInstanceMeta, this, summon[WorkflowRunSettings].defaultCacheTtl)
+            val ctx = WorkflowContext(
+              given_WorkflowInstanceMeta,
+              this,
+              summon[WorkflowRunSettings].defaultCacheTtl,
+              summon[WorkflowRunSettings].stepIdempotencyIdOverrides
+            )
 
             try {
               val result = state.workflow.body(ctx, state.in)
@@ -338,7 +343,7 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
     val instanceKey = stepCtx.workflowCtx.workflowInstanceMeta.workflowInstanceKey
     workflowInstances.get().get(instanceKey) match {
       case Some(state) =>
-        state.stepIdempotencyStore.getIdempotencyStore(Map.empty)(using stepCtx)
+        state.stepIdempotencyStore.getIdempotencyStore(stepCtx.workflowCtx.stepIdempotencyIdOverrides)(using stepCtx)
       case None =>
         throw new WorkflowNotFoundException(stepCtx.meta)
     }
