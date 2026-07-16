@@ -261,14 +261,14 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
       workflow.createAndRun(workflowInstanceId, ())
     }
 
-    workflow.newInstance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test", 30.minutes)
 
     assertEquals(workflow.createAndRun(workflowInstanceId, ()), Right("test"))
 
-    workflow.newInstance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test", 30.minutes)
 
     intercept[SignalConflictException] {
-      workflow.newInstance(workflowInstanceId).setSignal(signal, "test2")
+      workflow.setSignal(workflowInstanceId, signal, "test2", 30.minutes)
     }
   }
 
@@ -287,11 +287,11 @@ abstract class WorkflowRuntimeSuite extends FunSuite {
     val workflowInstanceId = randomInstanceId()
 
     intercept[WorkflowNotFoundException] {
-      workflow.newInstance(workflowInstanceId).setSignal(signal, "test")
+      workflow.setSignal(workflowInstanceId, signal, "test", 30.minutes)
     }
 
     workflow.create(workflowInstanceId, ())
 
-    workflow.newInstance(workflowInstanceId).setSignal(signal, "test")
+    workflow.setSignal(workflowInstanceId, signal, "test", 30.minutes)
   }
 }

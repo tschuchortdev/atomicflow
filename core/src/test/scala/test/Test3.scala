@@ -64,13 +64,15 @@ object Test3 {
   }
 
   def runFlow1(in: String)(using WorkflowRuntime): Unit = {
-    val instance = flow1.newInstance(Random.between(0, 99999).toString)
-    //.overrideStepIdempotencyId(sendFileStepId, StepIdempotencyId.generate)
-    instance.create(in)
+    given WorkflowRunSettings = WorkflowRunSettings()
+    val instanceId = Random.between(0, 99999).toString
+    flow1.create(instanceId, in)
 
     @tailrec
     def retry: Unit =
-      try instance.recover()
+      try
+        flow1.run(instanceId)
+        ()
       catch {
         case NonFatal(e) =>
           e.printStackTrace()
