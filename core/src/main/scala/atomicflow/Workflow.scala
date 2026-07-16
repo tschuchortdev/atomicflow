@@ -6,6 +6,7 @@ import atomicflow.WorkflowRuntime.{StoppedWorkflow, WorkflowStoppedToAwaitManyCo
 
 import java.time.{Clock, Instant}
 import java.util.UUID
+import scala.concurrent.duration.FiniteDuration
 import scala.util.control.ControlThrowable
 
 case class Workflow[In: Cacheable, Out] private(
@@ -22,6 +23,9 @@ case class Workflow[In: Cacheable, Out] private(
   final def run(instanceId: WorkflowInstanceKey)(using rt: WorkflowRuntime, c: Cacheable[In], s: WorkflowRunSettings)
       : Either[StoppedWorkflow[Out], Out] =
     rt.runWorkflowInstance(this, instanceId)
+
+  final def setSignal[A](instanceId: WorkflowInstanceKey, signal: Signal[A], value: A, ttl: FiniteDuration)(using rt: WorkflowRuntime): Unit =
+    rt.setSignal(signal, value, ttl)(using WorkflowInstanceMeta(instanceId, meta))
 }
 
 object Workflow {
