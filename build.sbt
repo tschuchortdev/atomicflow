@@ -24,7 +24,7 @@ lazy val root = (project in file("."))
     publishArtifact := false,
     publish / skip := true
   )
-  .aggregate(core, db)
+  .aggregate(core, db, example)
 
 lazy val core = project
   .settings(

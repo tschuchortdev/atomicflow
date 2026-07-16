@@ -135,7 +135,7 @@ class DocumentProcessingWorkflow4s(archiveDir: Path,
     case s: State.AllDocumentsProcessedSuccessfully =>
       resultReporter.reportResultSuccess(s.inputFilePath).as(Event.ResultReported)
 
-    case (_, _) => IO(???).as(Event.ResultReported) // TODO Error handling
+    case (_, _) => IO.pure(Event.ResultReported) // TODO Error handling
 
     /*case (_: State, _: Error.CancelledByUser.type) =>
       resultReporter.reportCancellation().as(Event.ResultReported)

@@ -1,9 +1,9 @@
 //noinspection ScalaWeakerAccess
 package example
 
-import atomicflow.*
-import atomicflow.given_Conversion_String_A_StepInput
+import atomicflow.{*, given}
 import atomicflow.Cacheable.Simple.given
+import atomicflow.Cacheable.MsgPack.given
 import atomicflow.impl.memory.InMemoryWorkflowRuntime
 import cats.effect.IO
 import cats.effect.unsafe.IORuntime
@@ -14,7 +14,6 @@ import ox.flow.*
 import ox.either.*
 import ox.scheduling.*
 import ox.resilience.*
-import scala.util.boundary.*
 
 import java.io.{FileNotFoundException, IOException}
 import java.nio.file.{Files, Path, Paths}
@@ -22,26 +21,26 @@ import scala.concurrent.duration.DurationInt
 import scala.jdk.CollectionConverters.*
 
 class DocumentProcessingAtomicflow(val archiveDir: Path,
-                                 virusCheckService: VirusCheckService,
-                                 encryptionService: EncryptionService,
-                                 documentUploadEndpoint: DocumentUploadEndpoint,
-                                 resultReporter: ResultReporter)(using IORuntime) {
+                                  virusCheckService: VirusCheckService,
+                                  encryptionService: EncryptionService,
+                                  documentUploadEndpoint: DocumentUploadEndpoint,
+                                  resultReporter: ResultReporter)(using IORuntime) {
   import DocumentProcessingAtomicflow.{*, given}
 
   private val workflowRuntime = InMemoryWorkflowRuntime()
 
   val w1 = Workflow(WorkflowId("99a2866c-99c5-49b7-b0f5-ad097a3e3a78"), name = "document batch processing") { (inputFilePath: Path) =>
     val fileId = FileWithDocumentBatch.idFromFileName(inputFilePath.getFileName.toString)
-    
+
     val fileParsed = readAndArchiveFile(inputFilePath)
 
     checkInterrupt()
 
-    val perDocumentUploadResults = fileParsed.documents.mapPar(4) { (document: DocumentFromInputFile) =>
-      Workflow.subworkflow {
-        checkInterrupt()
-        processIndividualDocument(document)
-      }
+    val perDocumentUploadResults = Workflow.subworkflowForEach(fileParsed.documents)(parallelism = 4)(
+      subworkflowKey = _.documentId
+    ) { document =>
+      checkInterrupt()
+      processIndividualDocument(document)
     }
 
     checkInterrupt()
@@ -56,43 +55,43 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
   private def readAndArchiveFile(inputFilePath: Path)(using workflowContext: WorkflowContext): FileWithDocumentBatch =
     Step(StepId("99f30d17-7443-4438-a68d-64fea152efdd"), version = 0, name = "read and archive file") {
       Step.cache("filePath" -> inputFilePath.toAbsolutePath.toString)
-  
+
       val fileContent =
         try Files.readString(inputFilePath)
         catch {
-          case e: IOException => ??? /* TODO handle read error */
+          case e: IOException => throw Error.ReadingFileFailed(e.getMessage)
         }
-  
+
       val fileParsed =
         try FileWithDocumentBatch.fromString(fileContent)
         catch {
-          case e: IllegalArgumentException => ??? /* TODO handle parsing error */
+          case e: IllegalArgumentException => throw Error.ParsingFileFailed(e.getMessage)
         }
-  
+
       try {
         Files.createDirectories(archiveDir)
         Files.move(inputFilePath, archiveDir.resolve(inputFilePath.getFileName))
       }
       catch {
-        case e: IOException => ??? /* TODO handle archiving error */
+        case e: IOException => throw Error.ArchivingFileFailed(e.getMessage)
       }
-  
+
       fileParsed
     }
-    
+
   private def processIndividualDocument(document: DocumentFromInputFile)(using WorkflowContext) = {
     par(
       Step[Unit](StepId("a8bcb8c2-d1c9-484b-8d7f-f35c123143f7"), version = 0, name = "virus check 1") {
         Step.cache("documentContent" -> document.content)
 
         if (!virusCheckService.checkForVirus1(document.content).unsafeRunSync())
-          throw ???
+          throw Error.VirusCheckFailed("Virus check 1 failed")
       },
       Step[Unit](StepId("9b373f01-1001-49f1-964c-72950e19b2f3"), version = 0, name = "virus check 2") {
         Step.cache("documentContent" -> document.content)
 
         if (!virusCheckService.checkForVirus2(document.content).unsafeRunSync())
-          throw ???
+          throw Error.VirusCheckFailed("Virus check 2 failed")
       }
     )
 
@@ -102,7 +101,7 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
     {
       // TODO: interrupt when signature no longer valid
       val documentSigned = Step[Array[Byte]](StepId("533dddc7-d355-43b4-81d8-bd8051808ec5"), version = 0, name = "sign document") {
-        Step.cacheFor(EncryptionService.signatureValidityPeriod - 2.seconds)(
+        Step.cacheFor(Some(EncryptionService.signatureValidityPeriod - 2.seconds))(
           "documentId" -> document.documentId,
           "documentContent" -> document.content
         )
@@ -123,9 +122,7 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
 
     checkInterrupt()
 
-    val processingResult = Step(StepId("070a7323-dd33-483c-907a-e7dd1aed2d7f"), version = 0, name = "check upload processing status") {
-      Step.cache("documentId" -> document.documentId)
-
+    val processingResult = Step[Either[ProcessingStatus, Either[ProcessingStatus, ProcessingStatus]]](StepId("070a7323-dd33-483c-907a-e7dd1aed2d7f"), version = 0, name = "check upload processing status") {
       retryEither(Schedule.fixedInterval(15.minutes).maxAttempts(10)) {
         (try documentUploadEndpoint.checkUploadProcessingStatus(document.documentId).unsafeRunSync()
         catch {
@@ -142,7 +139,19 @@ class DocumentProcessingAtomicflow(val archiveDir: Path,
   }
 }
 object DocumentProcessingAtomicflow {
-  protected given Cacheable[FileWithDocumentBatch] = Cacheable.MsgPack.derived[FileWithDocumentBatch]
+  protected given Cacheable[FileWithDocumentBatch] = new Cacheable[FileWithDocumentBatch] {
+    import io.circe.syntax.*
+    import io.circe.parser.*
+    import java.nio.charset.StandardCharsets
+
+    override def serialize(value: FileWithDocumentBatch): IArray[Byte] =
+      value.asJson.noSpaces.getBytes(StandardCharsets.UTF_8).asInstanceOf[IArray[Byte]]
+
+    override def deserialize(bytes: IArray[Byte]): FileWithDocumentBatch = {
+      val str = new String(bytes.asInstanceOf[Array[Byte]], StandardCharsets.UTF_8)
+      parse(str).flatMap(_.as[FileWithDocumentBatch]).toOption.get
+    }
+  }
 
   sealed abstract class Error extends RuntimeException
   object Error {
