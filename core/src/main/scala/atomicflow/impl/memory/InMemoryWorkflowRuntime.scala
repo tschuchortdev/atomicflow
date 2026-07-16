@@ -312,6 +312,9 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
     }
   }
 
+  override def isWorkflowInstanceCreated(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey): Boolean =
+    workflowInstances.get().get(workflowInstanceKey).exists(_.workflow.meta.workflowId == workflowId)
+
   override def getWorkflowResult[Out](workflow: Workflow[?, Out], workflowInstanceKey: WorkflowInstanceKey): Option[Out] = {
     workflowInstances.get().get(workflowInstanceKey) match {
       case Some(state: WorkflowState[?, Out] @unchecked) if state.workflow.meta.workflowId == workflow.meta.workflowId =>
