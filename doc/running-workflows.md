@@ -41,7 +41,7 @@ myWorkflow.createAndRun(instanceKey, input): Either[StoppedWorkflow[Out], Out]
 - `run` always works the same regardless of instance state: it takes a lease (lock) on the instance, executes the workflow function from the top, and replays previously executed steps from the `StepCache` instead of re-executing them.
 - The lease prevents concurrent executions of the same instance.
 - Already-completed instances are a terminal state: `run` returns the stored result immediately without executing the body.
-- Completed instances must eventually be deletable automatically (retention policy) — own design chapter later.
+- Completed instances must eventually be deletable automatically (retention policy) — TODO
 
 ## Suspension and results
 
