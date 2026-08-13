@@ -48,6 +48,7 @@ myWorkflow.createAndRun(instanceKey, input): Either[StoppedWorkflow[Out], Out]
 - A workflow that stops itself (waiting on a signal/timer/other workflow) yields `Left(StoppedWorkflow[Out])`; successful completion yields `Right(out)`.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
+- The suspension of a workflow is implemented as a special exception, which is then caught in the outermost layer by the runtime. User code must be able to distinguish this exception from genuine errors. Provide an extractor (similar to `NonFatal`) for this and accompanying documentation. Document that resource finalizers must catch the exception, finalize and then rethrow. The exception must never be swallowed or logged.
 - `StoppedWorkflow` offers `addContinueListener(...)` and `inefficientBlockUntilFinished()`; the name warns that blocking a thread for a long-running workflow is wasteful.
 - Planned: `awaitResult(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` — blocks through suspensions until the instance reaches a terminal state, with a **mandatory timeout** as footgun guard. Mainly for tests and short-lived request-scoped workflows. Implementation strategy still open.
 
@@ -71,7 +72,18 @@ runtime.deleteWorkflowInstancesByPrefix(workflowId, keyPrefix)
 - `WorkflowInstance[In, Out]`: captures the workflow definition (code), instance key, and runtime. See `core-types.md` for the full taxonomy (identity vs metadata vs persisted info vs handle).
 - Queries parameterized by a `Workflow[In, Out]` return typed handles; key-based queries without the definition return `WorkflowInstance.Info` records instead (they cannot produce something runnable).
 
+## Preemption: Thread interruption
+
+Workflows run on JVM threads. Cancellation and preemption are signaled via the JVM's interrupt flag:
+
+- **Runtime checks** the interrupted flag before and after every `Step` execution. If set, the step is aborted and the workflow suspends.
+- **User code** may check the flag explicitly at any point via `Thread.currentThread().isInterrupted()` or catch `InterruptedException`.
+- **Setting the flag** is how external code (via signal delivery, timeout, or manual cancellation) requests the workflow to stop. Whether the workflow honors it cooperatively depends on where execution is (mid-step vs at a checkpoint).
+- Integration with signals: TBD — design API for racing code (Activities, computation) against signals via Ox or similar concurrency library.
+
 ## Open points
 
 - `awaitResult` implementation approach (polling vs backend notification).
 - Retention / auto-deletion of completed instances.
+- **Cancellation mechanism with Thread.interrupt** — **TODO**: Design and implement cancellation coordination between signal delivery, timeout, and manual abort. How are interrupt flags propagated? What happens to running steps? Document the expected workflow behavior under cancellation.
+- **Workflow.fork / forkFromFailure** — **TODO**: Implement DBOS-style fork primitives as an alternative to manual step invalidation. `fork(cond)` branches to a different recovery workflow on failure. How does this interact with step/await invalidation?
