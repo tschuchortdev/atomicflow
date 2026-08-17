@@ -14,7 +14,11 @@ Guideline for identity, metadata, and handle types. Companion to `design.md` and
 
 ```scala
 // Identity: the address of an instance; used for queries, signals, logging
-case class WorkflowInstanceId(workflowId: WorkflowId, workflowInstanceKey: WorkflowInstanceKey)
+case class WorkflowInstanceId(
+  workflowId: WorkflowId,
+  workflowInstanceKey: WorkflowInstanceKey,
+  parentId: Option[WorkflowInstanceId]  // nullable; set if this is a child workflow
+)
 
 // Definition metadata: describes a *definition*, never instance state (pattern: existing SignalMeta)
 case class WorkflowMeta(workflowId: WorkflowId, version: Long, name: String, description: Option[String])
@@ -47,6 +51,7 @@ object WorkflowInstance:
 ## Rationale
 
 - "Meta" means *descriptive* metadata. Id-only bundles are named `...Id` (`WorkflowInstanceId`), not `...Meta`.
+- **`parentId` field**: tracks the parent workflow instance for child workflows (nullable for top-level workflows). Stored as a separate DB field but included in the `WorkflowInstanceId` case class because it is part of the instance's identity: two instances with the same `workflowId` and `workflowInstanceKey` but different parents are logically distinct (one is a child, one is top-level). This ensures queries and signals route correctly to the right instance.
 - Capability vs data: `WorkflowInstance` requires the workflow code and can act; `WorkflowInstance.Info` requires nothing and just reports. Key-based queries without the code can only return `Info`; queries parameterized by a `Workflow[In, Out]` return typed handles. The two meet in exactly one place: `instance.getInfo()`. Nesting `Info` inside `WorkflowInstance` expresses that it is the data view of the same concept, not a second concept.
 - `StepMeta` stays a single class combining step definition fields and the instance id: steps are inline lambdas, so step metadata cannot exist outside an execution — a definition-only `StepMeta` would have no producer or consumer. **`StepMeta` is never used as a lookup key.** Lookups use `WorkflowInstanceId` + `StepId`; since this pair appears only rarely in internal implementation code, a plain tuple suffices — no named type unless it surfaces in a public/SPI signature. Consequently, descriptive fields (`stepName`, `stepDescription`) never affect any lookup, so editing a description never orphans cached results.
 - Bulk data (serialized inputs, result, step cache) lives in **neither** class: `run()` loads it eagerly but internally; targeted accessors (`getWorkflowResult`) serve the rest. Keeps list queries cheap and both types small.

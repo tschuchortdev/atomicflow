@@ -72,18 +72,99 @@ runtime.deleteWorkflowInstancesByPrefix(workflowId, keyPrefix)
 - `WorkflowInstance[In, Out]`: captures the workflow definition (code), instance key, and runtime. See `core-types.md` for the full taxonomy (identity vs metadata vs persisted info vs handle).
 - Queries parameterized by a `Workflow[In, Out]` return typed handles; key-based queries without the definition return `WorkflowInstance.Info` records instead (they cannot produce something runnable).
 
-## Preemption: Thread interruption
+## Cancellation and termination
 
-Workflows run on JVM threads. Cancellation and preemption are signaled via the JVM's interrupt flag:
+Two operations stop a running or suspended workflow instance; they differ fundamentally.
 
-- **Runtime checks** the interrupted flag before and after every `Step` execution. If set, the step is aborted and the workflow suspends.
-- **User code** may check the flag explicitly at any point via `Thread.currentThread().isInterrupted()` or catch `InterruptedException`.
-- **Setting the flag** is how external code (via signal delivery, timeout, or manual cancellation) requests the workflow to stop. Whether the workflow honors it cooperatively depends on where execution is (mid-step vs at a checkpoint).
-- Integration with signals: TBD — design API for racing code (Activities, computation) against signals via Ox or similar concurrency library.
+### `runtime.cancel(instanceId)` — cooperative stop
+
+1. Persist a cancellation flag on the instance.
+2. If the instance is currently **suspended** (no thread): schedule a resume. On that resume the workflow replays normally (cached steps are not re-executed). When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `InterruptedException` inside whatever `try`/`catch` the workflow has reconstructed at that point. User code may catch this to run compensating `Step`s and then re-throw (or let it propagate).
+3. If the instance is currently **running**: set the interrupt flag on the workflow thread. The runtime already checks this flag around every Step and Await boundary; execution surfaces `InterruptedException` at the next checkpoint.
+4. **Timeout escalation.** After the runtime-configured `cancelTimeout`, if the instance has not reached a terminal state, cancel automatically escalates to `terminate`. This timeout is a global runtime option — not a per-instance field — to avoid extra DB columns.
+5. **Best-effort under non-determinism.** If the workflow body is non-deterministic, replay may diverge and take a checkpoint-free path, completing before cancellation is ever observed. Workflow bodies should be deterministic (all non-determinism wrapped in Steps); this is the only boundary at which the cancel guarantee holds.
+
+### `runtime.terminate(instanceId)` — force stop
+
+- Atomically flip DB state to `Terminated` and revoke the lease.
+- If currently running: also set the interrupt flag on the workflow thread. The orphan thread may continue briefly but can never commit — all lease-checked writes will be rejected. It self-terminates at its next checkpoint or when it observes the interrupt.
+- **JVM limitation**: there is no safe way to forcibly stop a JVM thread. `terminate` guarantees the instance is *durably stopped and lease-revoked*; it cannot guarantee the orphan thread stops immediately. A thread stuck in uninterruptible blocking I/O or a tight loop that ignores interrupts will run until it next checks the flag or the process ends. Document this as an inherent JVM constraint rather than hiding it.
+- Positioned as a **last-resort / manual-intervention** tool (matching the manual-intervention design goal). Prefer `cancel` for all lifecycle management; use `terminate` for stuck, buggy, or non-cooperative workflows and ops tooling.
+- Intentionally absent from `ParentClosePolicy`; not a lifecycle primitive.
+
+### Semantics and threading
+
+- **User code inside the workflow body sees `InterruptedException`**, the same exception Ox and other concurrency libraries use. No wrapping or translation. Code can handle it with ordinary `try`/`catch`.
+- The `run`/`createAndRun` functions are the outermost boundary. Any `InterruptedException` that escapes the workflow body is caught here and re-thrown as `StoppedWorkflow[Out]` in the return value (not thrown).
+- **Suspension is not an exception**, but a normal outcome. The `run` method returns `Either[StoppedWorkflow[Out], Out]`: `Left` means the instance suspended (waiting on a signal, timer, or other workflow); `Right` means successful completion. The cancellation that occurs during a pending await will propagate when the instance is resumed and the interrupt flag causes the await to throw.
+- The question "how does the cancelling thread obtain a handle to the executing thread?" is answered by the runtime: it tracks which thread holds the lease for each instance internally and sets the flag directly. No thread handles are ever exposed to external callers.
+
+### Rationale
+
+- Two distinct operations (`cancel` vs `terminate`) are necessary because cancel's delivery is path-dependent under non-determinism — it can miss entirely. `terminate` provides the unconditional stop that `cancel` cannot guarantee.
+- Re-running a workflow to deliver cancellation (rather than injecting it without replay) is consistent with the replay model and ensures `InterruptedException` surfaces inside the user's live `try`/`catch` block, where compensation code has access to local scope variables. Without replay, there is no scope to deliver into.
+- User code sees `InterruptedException` (not a wrapper) so it integrates seamlessly with Ox, concurrent libraries, and standard Java cancel semantics. This avoids the fragmentation of having multiple cancellation exception types.
+- Fewer execution modes is better; two (cooperative/forceful) is the minimum needed to cover the JVM and non-determinism constraints.
+
+## `continueAsNew` — bounded-history tail loops and tail recursion
+
+For workflows that run indefinitely (event-loop style) or that recurse deeply, the instance history (step cache rows, signal log, decision records) grows without bound if the workflow runs in a single generation. `continueAsNew` resets this by atomically completing the current generation and seeding a fresh one under the same key.
+
+```scala
+// inside a workflow body — never returns (return type Nothing)
+Workflow.continueAsNew(newInput: In): Nothing
+```
+
+A plain forwarder `runtime.continueAsNew(instanceId, newInput)` also exists; both do the same thing.
+
+### Semantics
+
+1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
+2. In one atomic transaction: mark the current generation `CompletedViaContinue`, increment the generation counter, create a new generation under the same `WorkflowInstanceKey`, and persist `newInput` as the new generation's input.
+3. The new generation starts with a **completely empty** step cache and signal log. No history carries over.
+4. The instance key is stable across generations. External signals addressed to that key are routed to the current (latest) generation automatically.
+
+### Unconsumed signals at the reset boundary — **TODO**
+
+Signals that arrived in the current generation but were not consumed are **not automatically forwarded** to the next generation. Behavior is unresolved:
+
+- **Option 1**: Discard all unconsumed signals. Workflow must explicitly drain any signals it cares about before calling `continueAsNew`.
+- **Option 2**: Forward unconsumed signals to the new generation with cursor reset. Trade-off: convenience vs complexity in cursor/position semantics.
+
+This decision is deferred pending concrete use cases. For now, document the unsupported behavior clearly.
+
+### Typical usage
+
+```scala
+// Eternal event loop: history resets on every iteration
+val processorWf = Workflow("processor") { (state: State) =>
+  val event = eventSignal.await("next-event")
+  val newState = processEvent(state, event)
+  Workflow.continueAsNew(newState)
+}
+
+// Paginated work: tail-recurse through cursor pages
+val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
+  val page = Step.atLeastOnce("fetch") { fetchPage(cursor) }
+  Step.atLeastOnce("process") { process(page.items) }
+  if page.hasMore then Workflow.continueAsNew(page.nextCursor)
+  else page.finalResult
+}
+```
+
+### Relationship to `fork`
+
+`fork` (planned, deferred) shares the same backend substrate but differs in intent: it seeds a new instance from an **existing step-prefix** (for recovery or branching at a specific point in history), assigns a **new key**, and optionally keeps the source running. `continueAsNew` is effectively `fork(fromStep = start, copyHistory = false, terminateSource = true, sameKey = true)`. The two are separate named functions rather than one parameterized `fork`; this keeps the common case (`continueAsNew`) simple and the rare case (`fork`) explicit.
+
+### Rationale
+
+- A function of the runtime (with a `Workflow` forwarder) rather than a helper like `Workflow.loop`: the recursive nature is the point. Users write the recursion themselves; `continueAsNew` is the tail call. A `loop` wrapper would hide the history-reset boundary behind a callback, making the semantics less visible.
+- Return type `Nothing`: `continueAsNew` is a transfer of control, not a value-producing expression. This makes it impossible to accidentally use its "return value."
+- No automatic history carry-over: keeping history reset semantics simple means the implementation stays correct in edge cases (e.g., concurrent signal delivery at the reset boundary). Users who need state across generations pass it as `newInput`.
 
 ## Open points
 
 - `awaitResult` implementation approach (polling vs backend notification).
 - Retention / auto-deletion of completed instances.
-- **Cancellation mechanism with Thread.interrupt** — **TODO**: Design and implement cancellation coordination between signal delivery, timeout, and manual abort. How are interrupt flags propagated? What happens to running steps? Document the expected workflow behavior under cancellation.
-- **Workflow.fork / forkFromFailure** — **TODO**: Implement DBOS-style fork primitives as an alternative to manual step invalidation. `fork(cond)` branches to a different recovery workflow on failure. How does this interact with step/await invalidation?
+- **Cancellation mechanism** — Interface and guarantee model are specified above. Implementation details still open: flag persistence, resume scheduling, timeout watchdog, lease revocation coordination between signal delivery, timeout, and manual abort.
+- **`fork` / `forkFromFailure`** — Deferred. `continueAsNew` is the first use case of the shared substrate. `fork` adds branching from a step-prefix with a new key; design deferred until a concrete recovery use case drives it.
