@@ -10,7 +10,7 @@ Single-instance operations exist on up to three levels; only `WorkflowRuntime` i
 |---|---|
 | `WorkflowRuntime` (trait) | Canonical home of all operations. Implemented per backend (in-memory, Postgres, ...). Convenience methods are `final`, built from a small set of abstract primitives. |
 | `Workflow[In, Out]` methods | Pre-instance sugar (`create`, `run`, `createAndRun`, ...). Forward to a contextual `(using WorkflowRuntime)`. |
-| `WorkflowInstance[Out]` | Post-instance typed handle. Captures the runtime it came from, so no `using` clause needed. |
+| `WorkflowInstance[In, Out]` | Post-instance typed handle. Captures the workflow definition and runtime it came from, so no `using` clause is needed. |
 
 - Why hybrid: `myWorkflow.createAndRun(...)` reads naturally for the common case; the runtime stays the single implementation point, so backends and tests only deal with one interface.
 - Rule of thumb: `Workflow` = "I don't have an instance yet", `WorkflowInstance` = "I do".
@@ -22,19 +22,32 @@ Single-instance operations exist on up to three levels; only `WorkflowRuntime` i
 given WorkflowRuntime = ... // backend implementation
 
 // Register key + input only, don't run (idempotent)
-myWorkflow.create(instanceKey, input): Unit
+myWorkflow.create(instanceKey, input): WorkflowInstance[In, Out]
 
 // Run a previously created instance (no input parameter!)
-myWorkflow.run(instanceKey): Either[StoppedWorkflow[Out], Out]
+myWorkflow.run(instanceKey): WorkflowRunResult[Out]
 
 // Atomic create-if-absent + run
-myWorkflow.createAndRun(instanceKey, input): Either[StoppedWorkflow[Out], Out]
+myWorkflow.createAndRun(instanceKey, input): WorkflowRunResult[Out]
 ```
 
 - `create` and `run` are separate because `run` takes no input: the input is already persisted. `createAndRun` covers the common atomic case. All three are needed.
 - `create` exists for deferred runs, e.g. registering a workflow in the same DB transaction as business data, or preparing a batch before running it.
 - Idempotency: `create`/`createAndRun` succeed if the instance already exists with equal input (`createAndRun` re-runs/returns the result); they throw `WorkflowInputConflictException` if the input differs. No separate `createIfNotExists` needed. `createWorkflowInstanceDiscardExisting` exists for explicitly replacing an instance.
 - Input is a **single parameter** (`In`); multiple values are passed as a case class or tuple. Scala 3 has no auto-tupling, so multi-param call sites would require type-level machinery (`TupledFunction` / match types) — can be added later as sugar without breaking the core API.
+
+`WorkflowRunResult` is the public synchronous execution outcome:
+
+```scala
+enum WorkflowRunResult[+A]:
+  case WorkflowStopped
+  case WorkflowCancelled
+  case Result(value: A)
+```
+
+- `WorkflowStopped` means execution durably suspended on an await.
+- `WorkflowCancelled` means cooperative cancellation escaped the workflow body.
+- `Result(value)` means the workflow completed successfully. Failures still propagate as exceptions.
 
 ## Run semantics
 
@@ -45,12 +58,11 @@ myWorkflow.createAndRun(instanceKey, input): Either[StoppedWorkflow[Out], Out]
 
 ## Suspension and results
 
-- A workflow that stops itself (waiting on a signal/timer/other workflow) yields `Left(StoppedWorkflow[Out])`; successful completion yields `Right(out)`.
+- A workflow that suspends yields `WorkflowStopped`; successful completion yields `Result(out)`.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
-- The suspension of a workflow is implemented as a special exception, which is then caught in the outermost layer by the runtime. User code must be able to distinguish this exception from genuine errors. Provide an extractor (similar to `NonFatal`) for this and accompanying documentation. Document that resource finalizers must catch the exception, finalize and then rethrow. The exception must never be swallowed or logged.
-- `StoppedWorkflow` offers `addContinueListener(...)` and `inefficientBlockUntilFinished()`; the name warns that blocking a thread for a long-running workflow is wasteful.
-- Planned: `awaitResult(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` — blocks through suspensions until the instance reaches a terminal state, with a **mandatory timeout** as footgun guard. Mainly for tests and short-lived request-scoped workflows. Implementation strategy still open.
+- Suspension, reset, and continue-as-new each use a distinct internal control-flow exception. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
+- Planned: `awaitResult(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` returns `WorkflowRunResult[Out]` and blocks through intermediate suspensions until the instance reaches a terminal state, with a **mandatory timeout** as footgun guard. Mainly for tests and short-lived request-scoped workflows. Implementation strategy still open.
 
 ## Multi-instance operations
 
@@ -95,8 +107,8 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 ### Semantics and threading
 
 - **User code inside the workflow body sees `InterruptedException`**, the same exception Ox and other concurrency libraries use. No wrapping or translation. Code can handle it with ordinary `try`/`catch`.
-- The `run`/`createAndRun` functions are the outermost boundary. Any `InterruptedException` that escapes the workflow body is caught here and re-thrown as `StoppedWorkflow[Out]` in the return value (not thrown).
-- **Suspension is not an exception**, but a normal outcome. The `run` method returns `Either[StoppedWorkflow[Out], Out]`: `Left` means the instance suspended (waiting on a signal, timer, or other workflow); `Right` means successful completion. The cancellation that occurs during a pending await will propagate when the instance is resumed and the interrupt flag causes the await to throw.
+- The `run`/`createAndRun` functions are the outermost boundary. Any `InterruptedException` that escapes the workflow body is caught there and returned as `WorkflowCancelled`.
+- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowStopped` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the interrupt flag causes the await to throw.
 - The question "how does the cancelling thread obtain a handle to the executing thread?" is answered by the runtime: it tracks which thread holds the lease for each instance internally and sets the flag directly. No thread handles are ever exposed to external callers.
 
 ### Rationale
@@ -108,30 +120,25 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 
 ## `continueAsNew` — bounded-history tail loops and tail recursion
 
-For workflows that run indefinitely (event-loop style) or that recurse deeply, the instance history (step cache rows, signal log, decision records) grows without bound if the workflow runs in a single generation. `continueAsNew` resets this by atomically completing the current generation and seeding a fresh one under the same key.
+For workflows that run indefinitely (event-loop style) or recurse deeply, the instance history (step cache rows, signal log, decision records) grows without bound. `continueAsNew` resets it by atomically replacing the current execution state in place, incrementing its generation, and installing new input under the same key.
 
 ```scala
 // inside a workflow body — never returns (return type Nothing)
 Workflow.continueAsNew(newInput: In): Nothing
 ```
 
-A plain forwarder `runtime.continueAsNew(instanceId, newInput)` also exists; both do the same thing.
+The public operation is available only inside an executing workflow through the `Workflow` companion forwarder. It is not an externally callable runtime operation because it relies on the current workflow context.
 
 ### Semantics
 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
-2. In one atomic transaction: mark the current generation `CompletedViaContinue`, increment the generation counter, create a new generation under the same `WorkflowInstanceKey`, and persist `newInput` as the new generation's input.
+2. In one atomic transaction: erase the current execution state, increment the generation counter in place, and persist `newInput`. Older generations are not retained as separate instances or history.
 3. The new generation starts with a **completely empty** step cache and signal log. No history carries over.
 4. The instance key is stable across generations. External signals addressed to that key are routed to the current (latest) generation automatically.
 
-### Unconsumed signals at the reset boundary — **TODO**
+### Unconsumed signals at the reset boundary
 
-Signals that arrived in the current generation but were not consumed are **not automatically forwarded** to the next generation. Behavior is unresolved:
-
-- **Option 1**: Discard all unconsumed signals. Workflow must explicitly drain any signals it cares about before calling `continueAsNew`.
-- **Option 2**: Forward unconsumed signals to the new generation with cursor reset. Trade-off: convenience vs complexity in cursor/position semantics.
-
-This decision is deferred pending concrete use cases. For now, document the unsupported behavior clearly.
+Before transition, the workflow's `onUnconsumedSignals` handler receives all unacknowledged events. After the handler finishes, all signal events are discarded with the rest of the old generation's execution state. Workflows that need information in the next generation must include it in `newInput`.
 
 ### Typical usage
 
@@ -154,7 +161,7 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 ### Relationship to `fork`
 
-`fork` (planned, deferred) shares the same backend substrate but differs in intent: it seeds a new instance from an **existing step-prefix** (for recovery or branching at a specific point in history), assigns a **new key**, and optionally keeps the source running. `continueAsNew` is effectively `fork(fromStep = start, copyHistory = false, terminateSource = true, sameKey = true)`. The two are separate named functions rather than one parameterized `fork`; this keeps the common case (`continueAsNew`) simple and the rare case (`fork`) explicit.
+`fork` (planned, deferred) shares some backend operations but differs in intent: it seeds a new instance from an **existing step-prefix** (for recovery or branching at a specific point in history), assigns a **new key**, and optionally keeps the source running. The two are separate named functions rather than one parameterized operation; this keeps the common case (`continueAsNew`) simple and the rare case (`fork`) explicit.
 
 ### Rationale
 

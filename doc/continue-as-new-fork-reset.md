@@ -17,20 +17,24 @@ workflow body does not continue after the call.
 - The runtime updates the existing instance in place.
 - The generation is incremented and all steps, awaits, and other execution
   records from the old generation are erased.
+- Older generations are not persisted separately.
 - The workflow key remains unique and unchanged. There are not multiple
   historical workflow instances with the same key.
 - The generation is exposed only through `WorkflowInstance.Info`. Users should
   not normally need to inspect or use it.
-- The transition is committed atomically by the runtime: the old generation is
-  closed, its execution records are removed, and the new input/generation is
-  installed as one durable state transition.
+- The transition is committed atomically by the runtime: current execution
+  records are removed and the incremented generation and new input are
+  installed as one durable in-place state transition.
 - Children of the old generation are handled according to their
   `ParentClosePolicy`: `Cancel` requests cancellation and `Abandon` detaches
   them. The continuation does not wait for cooperative child cancellation.
-- Signals and other pending external events require the same completion-boundary
-  treatment as a normal completion. Workflow code must establish the desired
-  policy before continuing; the runtime cannot infer whether an unprocessed
-  event should be carried into the new generation or discarded.
+- Signals and other pending external events receive the same completion-boundary
+  treatment as normal completion. The `onUnconsumedSignals` handler runs before
+  the transition; once it finishes, all events from the old generation are
+  discarded. State needed by the successor must be passed in `nextInput`.
+- The operation is available to users only as `Workflow.continueAsNew` from
+  inside an executing workflow. The runtime primitive is internal and requires
+  the current workflow context.
 
 ## Generations and child identity
 
@@ -49,8 +53,9 @@ child's instance key and supports awaiting it.
 
 - Including the generation prevents old children from colliding with children
   started by the successor generation.
-- The parent reference does not include a generation. It is an active
-  `parentInstanceId` relationship, and there is only one active generation.
+- The parent reference is relationship metadata in `WorkflowInstance.Info`,
+  not part of `WorkflowInstanceId`. It does not include a generation because
+  there is only one active parent generation.
 - The parent reference is cleared when the parent completes or continues as
   new, including when cancellation of a child is still in progress.
 - `WorkflowInstanceId` remains the single public identity type. No public
@@ -63,27 +68,37 @@ Forking is a recovery and manual-intervention operation, distinct from
 continue-as-new:
 
 ```scala
-runtime.forkWorkflow(sourceInstanceId, fromStep = stepId)
+runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFromStep = stepId)
 ```
 
 - A fork always receives a completely new instance ID.
 - The fork has generation = 0 and starts with the same input as the source instance.
-- The fork starts at the specified step ID, which must be a step that has already
-  been executed in the source instance.
-- Cached steps up to the selected point are copied to the new instance. (TODO: Can we assume that there is such an order between executed steps?)
+- `restartFromStep` is an exclusive boundary: cached history strictly before
+  the selected step is copied, while the selected step and subsequent history
+  are omitted so that the selected step executes again.
+- The workflow function still executes from its beginning. Copied history is
+  replayed until execution reaches the first uncopied operation; the runtime
+  does not jump directly into the workflow body.
+- `restartFromStep` must identify a step already executed by the source.
+- TODO: define a causal boundary for parallel branches, where executed steps do
+  not necessarily have one total order. A single step ID may be insufficient.
 - Forking does not require old generations to remain as separate workflow
   instances; it only operates on the source state that currently exists.
 
 ## Resetting
 
-Like a combination of fork and reset: It's like continueAsNew (keeps same key) but only erases the history after a certain step. 
+Reset keeps the same instance identity but erases history from a selected step
+onward. It is the in-place counterpart of a fork.
 
 ```scala
-runtime.resetWorkflow(sourceInstanceId, fromStep = stepId)
+runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
 ```
 
-- Generation is incremented
-- Behaves mostly like continueAsNew
+- Generation is incremented in place; no old generation is retained.
+- History strictly before `restartFromStep` remains cached. The selected step
+  and subsequent history are erased, and the workflow replays from the top.
+- TODO: define reset treatment for parallel branch history and for associated
+  awaits, signals, updates, and children at the reset boundary.
 
 ## Why this design
 
@@ -96,3 +111,6 @@ runtime.resetWorkflow(sourceInstanceId, fromStep = stepId)
 the operation explicit and avoids inventing a second iteration abstraction.
 - Forking uses a new identity and copied cached steps, so it does not need to
   address or preserve an old continue-as-new generation.
+- An exclusive `restartFromStep` boundary reruns the selected operation, which
+  matches the primary recovery case. An inclusive boundary would preserve the
+  operation most likely to require correction.

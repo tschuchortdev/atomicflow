@@ -91,11 +91,14 @@ val child: WorkflowInstance[In, Out] =
     parentClosePolicy = ParentClosePolicy.Cancel  // default
   )
 
-val result = child.awaitResult(timeout)
+val result = child.completion.await("worker-result")
 ```
 
 - **Idempotent on parent replay**: `startAsChild` is create-if-absent + run. Replaying the parent after a crash does not start a duplicate child; it returns the existing handle.
-- **Named durable operation**: `startId` identifies the child-start operation in the current scope, analogous to a Step. The returned handle contains the resolved child instance key and can be used to await completion.
+- **Deterministic identity**: the child instance key is derived from the parent,
+  supplied child key, and parent generation. No separately persisted `startId`
+  is needed. The returned handle contains the resolved child instance key and
+  exposes a durable completion source.
 - **No synchronous/blocking variant**: blocking the parent thread for a child's duration would pin the lease for the whole duration. If you want inline execution sharing the parent's scope, use `scoped` + Steps. If you want the result durably, await the child's completion signal.
 
 ### Fan-out and fan-in
