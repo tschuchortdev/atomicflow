@@ -90,9 +90,12 @@ val child: WorkflowInstance[In, Out] =
     input,
     parentClosePolicy = ParentClosePolicy.Cancel  // default
   )
+
+val result = child.awaitResult(timeout)
 ```
 
 - **Idempotent on parent replay**: `startAsChild` is create-if-absent + run. Replaying the parent after a crash does not start a duplicate child; it returns the existing handle.
+- **Named durable operation**: `startId` identifies the child-start operation in the current scope, analogous to a Step. The returned handle contains the resolved child instance key and can be used to await completion.
 - **No synchronous/blocking variant**: blocking the parent thread for a child's duration would pin the lease for the whole duration. If you want inline execution sharing the parent's scope, use `scoped` + Steps. If you want the result durably, await the child's completion signal.
 
 ### Fan-out and fan-in
@@ -136,9 +139,18 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 
 ### Key derivation
 
-- User-supplied keys are recommended: `key(i)` is typically `parentKey + "/" + elementId`.
-- A `Fingerprintable[T]` overload derives a key from the element directly, matching the `scoped` overload.
-- The resolved key must be globally unique across the workflow system; the convention is `parentInstanceKey/childKey`.
+- A child instance key is derived from the parent instance key, the supplied
+  child key, and the parent's generation. Conceptually its shape is
+  `parentKey + childKey + generation`; the exact encoding is part of the key
+  value because child workflows can be queried by key.
+- The generation distinguishes children started by different generations of
+  the same parent, including while old children are still cancelling or have
+  been abandoned.
+- The returned handle is the normal way to address a child. Users should not
+  normally reconstruct the derived key.
+- The active parent relationship is stored separately as an optional
+  `parentInstanceId`; it does not include the generation and is cleared when
+  the parent completes or continues as new.
 
 ## Recursion
 
@@ -168,10 +180,15 @@ val processorWf = Workflow("processor") { (state: State) =>
 - Sequential helpers (`Workflow.foreach`/`map`/`fold`) are omitted: plain loops with `scoped` are no more verbose, keep the model visible, and avoid a combinatory library that would not scale to new iteration shapes.
 - `runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `par` and the fan-in partial-collection pattern.
 - Single `startAsChild` method: parent controls timing positionally, not via a deferred-creation API. `create`/`run` separation is only needed for external callers who must register a workflow in the same transaction as other business data.
+- Child key. Two options
+  - Compute key from parent info that stays the same in every generation
+  - Randomized child key that is persisted like a Step
+  We chose to include generation number in the child key. That makes persisting the key unnecessary.
+- Parent reference without generation: there is only one active generation for an instance key, and the parent pointer represents active ownership rather than historical provenance. Clearing it when the parent closes also matches the child's view that the parent has completed.
 - Fan-out/fan-in via `.map` + `Wait.all`/`Wait.race`: consistent with the signals/timers model; no new primitive concepts.
 - `Terminate` outside `ParentClosePolicy`: force-kill at parent close is an ops concern, not a lifecycle concern. Keeping it off the policy enum reduces the decision surface for users writing workflow code.
 - O(n²) subworkflow problem: subworkflows are documented as O(events × elements) by design; this is acceptable for modest n. For large n or latency-sensitive flows, child workflows solve the problem structurally.
 
 ## Open questions and TODOs
 
-1. **Child instance ID structure** — **TODO**: Clarify the public API for child keys and how they interact with the parentId field stored separately in the DB. Define the uniqueness guarantee precisely.
+1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
