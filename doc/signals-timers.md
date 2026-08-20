@@ -95,7 +95,7 @@ val results: Seq[ItemResult] =
   wakes the workflow, then signal filters execute in workflow code. The runtime
   atomically records the eligible winning leaf and what it consumed. Replay
   reads that decision, so later runs cannot flip the winner.
-- **AND is first-class**: `all` writes N await-leaf rows with `mode=All`; the await flips only when every sibling leaf is satisfied. Selecting and acknowledging all signal events for a satisfied `all` is one atomic decision, so a competing await cannot take only part of its inputs.
+- **AND is first-class**: `all` writes N await-leaf rows with `mode=All`; the await flips only when every sibling leaf is satisfied. Selecting and acknowledging all signal events for a satisfied `all` is one atomic decision, so a competing await cannot take only part of its inputs. The same transaction persists the result and advances cursor(s) for single-signal awaits and `race`.
 - `race` currently accepts durable wait sources: signals, timers, and workflow
   completions. TODO: design racing these sources against regular code or
   Activities. Regular code has different crash, cancellation, and replay
@@ -158,7 +158,22 @@ A signal/update arriving after execution passed its await-site is not lost — i
   }
   ```
   The handler receives `Map[SignalId, Seq[Any]]` where the values are unconsumed events for each signal.
-- `setSignal` / `sendUpdate` are **lock-free** (don't acquire the execution lease), so busy or long-running workflows never block senders. They return `Delivered` or `InstanceAlreadyCompleted`, so senders learn the one fact knowable without executing workflow logic.
+- `setSignal` / `sendUpdate` do not acquire the workflow execution lease, so a
+  busy or long-running workflow never blocks senders. They append only signal
+  data and schedule work; they do not modify step, await-decision, or other
+  execution records owned by the running workflow.
+- Sending a Signal event briefly acquires a row-lock on the workflow instance row and check a field `is_accepting_signals` to prevent senders from inserting new events when the workflow is completed/completing.
+- A workflow that is completing sets `is_accepting_signals := false` before executing the unprocessed signals handler. If `is_accepting_signals == true` then the `send` function returns `InstanceAlreadyCompleted`.
+- The unprocessed signals handler is documented as at-least-once execution (program may crash during execution)
+- After appending an event, runtime checks for pending awaits whose source
+  matches the signal and upserts one durable wakeup record for the instance.
+  Signal predicates remain workflow code, so the sender cannot determine
+  whether a filtered await will consume the event.
+- The wakeup is scheduled even while the workflow currently holds its execution
+  lease. There is at most one pending wakeup per instance. If a worker finds
+  the lease held, the durable wakeup remains until a later worker runs the
+  instance again, ensuring that a relevant newly committed event is eventually
+  visible to workflow execution.
 
 ## Broadcast by key prefix
 
@@ -212,21 +227,30 @@ A timer whose expression (duration/deadline) is keyed on an invalidated upstream
 
 ## Persistence model (sketch) — **NOT A FINAL DECISION**
 
-Three tables for one possible runtime implementation (not part of the public API). This design may change based on resolution of open questions:
+Four tables for one possible runtime implementation (not part of the public API). This design may change based on resolution of open questions:
 
 ```
 signal_events (instanceId, signalId, seqNr, payload, arrivedAt, acknowledged) -- append-only log
 await         (instanceId, awaitId, mode: Race|All, status, decidedAt)
 await_leaf    (instanceId, awaitId, leafIdx, source, cursorSeqNr, satisfied, consumedSeqNr)
                  source = Signal(signalId) | Timer(deadline) | Completion(childId)
+workflow_wakeup (instanceId PRIMARY KEY, scheduledAt)               -- one pending wakeup
 ```
 
 - `signal_events` is append-only; `setSignal` is an INSERT.
-- Each signal event stores its acknowledged state; acknowledging an event and
-  recording the await decision happen atomically.
+- Each signal event stores its acknowledged state. For every await form, event
+  acknowledgement, await result/decision persistence, and cursor advancement
+  happen in one atomic transaction.
 - `await_leaf` (with `mode=All` or `mode=Race`) indexes condition leaves per await-site.
-- Wake-on-relevant-events: an incoming event joins only against *pending* `await_leaf` rows for that source; no pending leaf → no wake. An instance wakes only when one of its currently-registered awaits actually flips.
+- Wake-on-relevant-events: an incoming event checks only *pending* `await_leaf`
+  rows for that source; no pending leaf → no wake. For a matching source, it
+  upserts the instance's durable wakeup record. The sender does not decide
+  filtered satisfaction or alter the await decision; the awakened workflow does.
 - No lost wake-ups: on suspend, register subscription, re-scan the log from the await's cursor before committing; on deliver, append then check-and-schedule.
+- The wakeup row is removed only when a worker has obtained the workflow lease
+  and accepted responsibility for that wakeup. A delivery that races with that
+  removal upserts a replacement row, so an event cannot be missed while an
+  instance is running.
 - Timer deadlines are stored absolute (computed once at first registration), so replays never push timeouts forward.
 
 ## Rationale summary
