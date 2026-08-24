@@ -9,7 +9,9 @@ Steps have independent guarantees on two axes:
 ### Axis 1: Execution guarantee (crash/persistence)
 
 - **at-least-once (default)**: Step body executes; result is persisted after completion. If a crash occurs between execution and persistence, the step re-executes on the next workflow run (because no cached result is found). Safe for idempotent effects (queries, read-only operations); unsafe for non-idempotent side effects without external deduplication.
-- **at-most-once**: A "started" marker is persisted before the body executes. On workflow replay, if a started-but-no-result marker exists, the step returns `None` without re-executing (a lost effect is assumed over a double-execution). The caller must handle the `Option[R]` return and decide how to proceed. Recommended for effects that cannot be safely retried (resource creation, payments without external idempotency keys).
+- **at-most-once**: If a started-but-no-result marker exists on replay, the step returns `None` without re-executing (a lost effect is assumed over a double-execution). The caller must handle the `Option[R]` return and decide how to proceed. Recommended for effects that cannot be safely retried (resource creation, payments without external idempotency keys).
+
+Both guarantees persist a `Started` record before the body executes, then replace it with a completed result after successful execution. This gives both guarantees the same durable record shape and lets their public functions delegate to one implementation. Their replay policies differ: at-least-once re-executes after a `Started` record, while at-most-once returns `None`.
 
 ### Axis 2: Cache key drift policy (per-key)
 
@@ -41,7 +43,7 @@ Step.atLeastOnce("fetch-rates", version = 1,
 }
 
 // at-most-once, some keys frozen
-Step.atMostOnce("charge-payment", version = 1,
+Step.atMostOnce("charge-payment",
   ensureUnchanged = Seq("orderId" -> orderId, "amount" -> amount)
 ) {
   paymentProvider.charge(orderId, amount)
@@ -54,6 +56,7 @@ Step.atLeastOnce("send-welcome", version = 1) {
 ```
 
 - Constructor: `Step.atLeastOnce` or `Step.atMostOnce` is required; it sets Axis 1 (the guarantee).
+- `version` exists only on `Step.atLeastOnce`. Increasing it creates new retryable work and stops reusing the previous version's cached result. `Step.atMostOnce` deliberately has no version because a new version could execute after the old operation possibly produced its effect; use a new step ID and explicit workflow-version gating for a genuinely new operation.
 - Named parameters: `ensureUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty.
 - **Named parameters are mandatory** — if you write `ensureUnchanged = Seq(...)`, the reader sees immediately what the policy is; positional ambiguity is impossible.
 - `invalidateAfter`: optional TTL applied to the entire cached result (independent of drift policy).
@@ -62,8 +65,9 @@ Step.atLeastOnce("send-welcome", version = 1) {
 
 ## Internal storage model
 
-Steps do not use a separate idempotency-id indirection table. Cache and "started" markers are stored keyed by the natural composite key:
-- `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, stepVersion, cache-key-hash)`
+Steps do not use a separate idempotency-id indirection table. Both guarantees use the same `Started` / completed-result record, keyed by the natural composite key:
+- At-least-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, stepVersion, cache-key-hash)`
+- At-most-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, cache-key-hash)`
 
 Manual intervention / override of a step (e.g., "forget this step was started, retry it"):
 - Direct by `(workflowId, workflowInstanceKey, stepId)`: reset/delete the row, or replace the "started" marker and cached result.
@@ -91,3 +95,7 @@ Cache keys are specified as `"key" -> value` pairs, not bare values.
 - **Future tooling**: Per-key overrides, debugging, and documentation generation are easier with names attached to each value.
 
 Note: This decision is tightly coupled to workflow evolution semantics; revisit and refine during that design chapter if needed.
+
+## Exceptions in Steps
+
+Each `Step` definition declares its result type as a type argument with a `Cacheable` typeclass instance so that the result can be serialized by the runtime. However, that is not the only possible result: A step body may throw exceptions. Thus, the exceptions must also be cached by the runtime and rethrown on replay so that failed steps will not be silently retried on replay. 

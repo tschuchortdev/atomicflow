@@ -25,7 +25,7 @@ case class SignalMeta(id: SignalId, name: Option[String], description: Option[St
 
 // Execution-scoped: steps are inline lambdas, so their metadata only materializes while a
 // workflow instance executes — hence StepMeta carries the instance id (composition, not inheritance)
-case class StepMeta(stepId: StepId, stepVersion: Long, stepName: Option[String],
+case class StepMeta(stepId: StepId, stepVersion: Option[Long], stepName: Option[String],
                     stepDescription: Option[String], workflowInstanceId: WorkflowInstanceId)
 
 // Handle: capability object, obtained only from the runtime
@@ -56,6 +56,7 @@ object WorkflowInstance:
 - Capability vs data: `WorkflowInstance` requires the workflow code and can act; `WorkflowInstance.Info` requires nothing and just reports. Key-based queries without the code can only return `Info`; queries parameterized by a `Workflow[In, Out]` return typed handles. The two meet in exactly one place: `instance.getInfo()`. Nesting `Info` inside `WorkflowInstance` expresses that it is the data view of the same concept, not a second concept.
 - The handle retains both `In` and `Out` because it captures a `Workflow[In, Out]`. Every place that can construct a typed handle knows both types; operations that know only an ID return `Info` instead.
 - `StepMeta` stays a single class combining step definition fields and the instance id: steps are inline lambdas, so step metadata cannot exist outside an execution — a definition-only `StepMeta` would have no producer or consumer. **`StepMeta` is never used as a lookup key.** Lookups use `WorkflowInstanceId` + `StepId`; since this pair appears only rarely in internal implementation code, a plain tuple suffices — no named type unless it surfaces in a public/SPI signature. Consequently, descriptive fields (`stepName`, `stepDescription`) never affect any lookup, so editing a description never orphans cached results.
+- `StepMeta.stepVersion` is present for versioned at-least-once steps and empty for unversioned at-most-once steps. See `workflow-evolution.md` for why version bumps are intentionally unavailable to at-most-once operations.
 - Bulk data (serialized inputs, result, step cache) lives in **neither** class: `run()` loads it eagerly but internally; targeted accessors (`getWorkflowResult`) serve the rest. Keeps list queries cheap and both types small.
 - No stored status enum for now; completed/unfinished are derived via queries (matches existing implementation).
 - `Workflow` carries `WorkflowMeta` (including version and description). `Info` reports only the persisted bookkeeping fields needed by the current API.
