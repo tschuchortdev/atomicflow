@@ -11,7 +11,7 @@ Steps have independent guarantees on two axes:
 - **at-least-once (default)**: Step body executes; result is persisted after completion. If a crash occurs between execution and persistence, the step re-executes on the next workflow run (because no cached result is found). Safe for idempotent effects (queries, read-only operations); unsafe for non-idempotent side effects without external deduplication.
 - **at-most-once**: If a started-but-no-result marker exists on replay, the step returns `None` without re-executing (a lost effect is assumed over a double-execution). The caller must handle the `Option[R]` return and decide how to proceed. Recommended for effects that cannot be safely retried (resource creation, payments without external idempotency keys).
 
-Both guarantees persist a `Started` record before the body executes, then replace it with a completed result after successful execution. This gives both guarantees the same durable record shape and lets their public functions delegate to one implementation. Their replay policies differ: at-least-once re-executes after a `Started` record, while at-most-once returns `None`.
+Both guarantees persist a `Started` record before the body executes, then replace it with a durable success or failure outcome. This gives both guarantees the same durable record shape and lets their public functions delegate to one implementation. Their replay policies differ only for an unresolved `Started` record: at-least-once re-executes, while at-most-once returns `None`.
 
 ### Axis 2: Cache key drift policy (per-key)
 
@@ -63,9 +63,111 @@ Step.atLeastOnce("send-welcome", version = 1) {
 - **No implicit key list**: if neither `ensureUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., ensureUnchanged = Seq(instanceId -> "instance")) { ... }`).
 - Return type for `at-most-once`: `Option[R]`; `None` means "started but not completed, unsafe to retry." Caller must handle.
 
+## Durable results and failures
+
+Every Step has two cacheable outcomes:
+
+```text
+NeverStarted | Started | Succeeded(value) | Failed(exception)
+```
+
+### API alternatives
+
+Three API shapes were considered:
+
+```scala
+// Rejected: union of declared failure types
+Step.atLeastOnce[Result, PaymentDeclined | ProviderUnavailable](...) { ... }
+
+// Rejected: tuple retaining every declared failure type
+Step.atLeastOnce[Result, (PaymentDeclined, ProviderUnavailable)](...) { ... }
+
+// Chosen: one contextual codec for all thrown application failures
+given cacheableThrowable: Cacheable[Throwable] = ... 
+Step.atLeastOnce[Result](...)(using cacheableThrowable) { ... }
+```
+
+- A union is misleading: Scala absorbs a subtype into its supertype, and overlapping alternatives do not guarantee that every explicitly written type is reconstructed and catchable.
+- A tuple preserves all alternatives and permits most-specific dispatch, but makes the common single-error and no-error cases wordy and complicates every Step declaration.
+- A contextual `Cacheable[Throwable]` keeps the direct-style API small. Applications that care about concrete exception classes can compose a codec once with `unionMostSpecific`, rather than restating an error list on every Step.
+- The tradeoff is explicit: catch behavior depends on the globally selected throwable codec. This is unavoidable because durable replay can only throw what that codec reconstructs.
+
+### Chosen API
+
+Steps take no failure type parameter. Their result serialization and throwable serialization are contextual:
+
+```scala
+def atLeastOnce[A: Cacheable](...)(body: => A)(using Cacheable[Throwable]): A
+def atMostOnce[A: Cacheable](...)(body: => A)(using Cacheable[Throwable]): Option[A]
+```
+
+An application must explicitly import or define one global `Cacheable[Throwable]`:
+
+```scala
+import Cacheable.forThrowable.genericStringMessageSerializer
+
+// Or, for DBOS-like concrete Java exception serialization:
+import Cacheable.forThrowable.javaSerializable
+```
+
+- `genericStringMessageSerializer` stores portable diagnostics and replays a library `StepFailed` exception. It is the recommended default for new workflows.
+- `javaSerializable` uses Java serialization and can preserve concrete exception classes, but persisted data is coupled to those classes and their serializable object graphs.
+- Custom codecs decide which concrete exception types remain catchable after replay. Workflow code must not assume more than the selected codec promises.
+- Neither codec is an automatic given. Choosing the throwable codec is part of workflow behavior and must be explicit at application setup.
+
+### Commit before observation
+
+Workflow code must never observe an outcome that the runtime cannot reproduce. Successful values and thrown exceptions therefore cross the serialization boundary before they are returned or thrown:
+
+```text
+body returns  -> serialize -> deserialize -> persist Succeeded -> return decoded value
+body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded exception
+```
+
+- Replay returns or throws the persisted, decoded outcome without executing the Step body.
+- The initial run also exposes the decoded representation, so it takes the same downstream pattern-match or `catch` branch as replay.
+- A Step result's object identity is not preserved, even during its initial execution. Code after a Step may rely on its value, but not on reference equality with an object created inside the Step.
+- Fatal JVM errors and library control-flow exceptions for suspension, cancellation, reset, and continue-as-new are never cached as Step failures.
+- If result or exception serialization/deserialization fails, the runtime persists and throws a runtime-owned `StepSerializationFailed`, a subtype of `StepFailed`. Its minimal encoding does not use the failing user codec, avoiding recursive failure.
+- A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic `StepFailed` representation is preferable to failing serialization.
+
+### Cacheable identity and composition
+
+```scala
+trait Cacheable[A]:
+  def stableSerializedTypeId: String
+  def write(value: A): String
+  def read(serialized: String): A
+```
+
+- `stableSerializedTypeId` identifies a durable serialized representation, not a Scala/JVM class name. It must remain stable across class and package renames.
+- The ID lets generic codecs compose other `Cacheable` instances while treating their serialized strings as opaque payloads. The outer codec records the selected ID and a self-delimiting payload; it does not assume JSON, Protobuf, or any other inner format.
+- IDs used within one composite codec must be unique. Changing an ID is a persisted-format compatibility change.
+- `Cacheable` remains invariant because it both consumes and produces `A`.
+
+For applications that want concrete catches for selected exceptions and a broad fallback, the library provides a tuple-based codec builder:
+
+```scala
+given Cacheable[PaymentDeclined] = ...
+given Cacheable[ProviderUnavailable] = ...
+
+given Cacheable[Throwable] =
+  Cacheable.unionMostSpecific[
+    (PaymentDeclined, ProviderUnavailable)
+  ](fallback = Cacheable.forThrowable.genericStringMessageSerializer)
+```
+
+- Every tuple member must be a subtype of `Throwable` and have `Cacheable` and runtime type-test evidence.
+- On write, all matching members are considered and the unique most-specific member codec is selected. When none matches, the required `Cacheable[Throwable]` fallback is used.
+- On read, the persisted `stableSerializedTypeId` selects the same member directly; decoder trial order is never used.
+- The derivation macro rejects declarations where two potentially matching members are incomparable, such as overlapping exception traits, and reports that an explicit `Cacheable[Throwable]` is required.
+- The explicit fallback avoids a recursive `Cacheable[Throwable]` lookup while constructing the global `Cacheable[Throwable]`, and makes the resulting codec total.
+
+Temporal follows the portable-wrapper approach: terminal Activity failures are recorded and replayed as framework failure types rather than arbitrary original exceptions. DBOS Java records Step failures using Java serialization and rethrows reconstructed concrete exceptions. The two provided codecs cover both styles.
+
 ## Internal storage model
 
-Steps do not use a separate idempotency-id indirection table. Both guarantees use the same `Started` / completed-result record, keyed by the natural composite key:
+Steps do not use a separate idempotency-id indirection table. Both guarantees use the same `Started` / completed-outcome record, keyed by the natural composite key:
 - At-least-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, stepVersion, cache-key-hash)`
 - At-most-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, cache-key-hash)`
 
@@ -95,7 +197,3 @@ Cache keys are specified as `"key" -> value` pairs, not bare values.
 - **Future tooling**: Per-key overrides, debugging, and documentation generation are easier with names attached to each value.
 
 Note: This decision is tightly coupled to workflow evolution semantics; revisit and refine during that design chapter if needed.
-
-## Exceptions in Steps
-
-Each `Step` definition declares its result type as a type argument with a `Cacheable` typeclass instance so that the result can be serialized by the runtime. However, that is not the only possible result: A step body may throw exceptions. Thus, the exceptions must also be cached by the runtime and rethrown on replay so that failed steps will not be silently retried on replay. 
