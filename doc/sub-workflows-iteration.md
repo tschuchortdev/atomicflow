@@ -195,3 +195,5 @@ val processorWf = Workflow("processor") { (state: State) =>
 ## Open questions and TODOs
 
 1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
+
+2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.par` cleans up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
