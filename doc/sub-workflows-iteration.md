@@ -95,10 +95,8 @@ val result = child.completion.await("worker-result")
 ```
 
 - **Idempotent on parent replay**: `startAsChild` is create-if-absent + run. Replaying the parent after a crash does not start a duplicate child; it returns the existing handle.
-- **Deterministic identity**: the child instance key is derived from the parent,
-  supplied child key, and parent generation. No separately persisted `startId`
-  is needed. The returned handle contains the resolved child instance key and
-  exposes a durable completion source.
+- **Deterministic identity**: A child workflow's identity (`WorkflowInstanceId`) is made up from user-supplied `WorkflowInstancKey` and a scope. The scope is derived from the parent's identity (including parent generation) and
+  enclosing workflow scopes.
 - **No synchronous/blocking variant**: blocking the parent thread for a child's duration would pin the lease for the whole duration. If you want inline execution sharing the parent's scope, use `scoped` + Steps. If you want the result durably, await the child's completion signal.
 
 ### Fan-out and fan-in
@@ -142,15 +140,40 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 
 ### Key derivation
 
-- A child instance key is derived from the parent instance key, the supplied
-  child key, and the parent's generation. Conceptually its shape is
-  `parentKey + childKey + generation`; the exact encoding is part of the key
-  value because child workflows can be queried by key.
-- The generation distinguishes children started by different generations of
-  the same parent, including while old children are still cancelling or have
-  been abandoned.
+- A child keeps the user-supplied key unchanged. Its full identity is
+  `(childWorkflowId, childKey, derivedScope)`, where `derivedScope` is set only
+  by `startAsChild`. Top-level creation APIs always use the empty scope.
+- Conceptually, the derived scope is the parent's existing scope followed by
+  the parent workflow ID, parent instance key with workflow generation, and the
+  complete enclosing `Workflow.scoped` path. Restartable and loop scopes appear
+  as `scopeId@restartCount`; ordinary scopes appear as their scope ID. Segments
+  retain their outer-to-inner order.
+- Example:
+  ```text
+  parent:      (orders, order-42, "")
+  child:       (worker, worker-1, "orders/order-42@3/items/poll@7")
+  grandchild:  (audit, audit-1, "orders/order-42@3/items/poll@7/worker/worker-1@0/chunk/retry@2")
+  ```
+- The parent workflow generation distinguishes children started before and
+  after `continueAsNew`. Every enclosing restart count distinguishes children
+  started in different region loopings, including when an inner count starts
+  again after an outer region restarts.
+- Scope is part of immutable identity. If a child is abandoned, its active
+  parent relationship is cleared but its derived scope does not change.
+- The database uniqueness key is `(workflowId, instanceKey, scope)`. Queries
+  accept an optional scope whose default is `""`; omitting it means exactly the
+  top-level scope, never all matching scopes.
+- The scope has a maximum encoded length. Before appending the current local
+  `Workflow.scoped`/restartable path, an overlong parent portion is replaced by
+  a marked stable hash such as `shortened[sha256:...]`. Local scope segments are
+  not part of that shortening calculation, ensuring that all children of one
+  parent instance and generation begin with the same normalized scope prefix.
+  When such a child later becomes a parent, its former local path is ancestry
+  and may be included in a shortened parent portion.
+- The readable slash-and-`@` form is for debugging only. Callers must not construct or
+  parse derived scopes or rely on their textual layout.
 - The returned handle is the normal way to address a child. Users should not
-  normally reconstruct the derived key.
+  normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
   `parentInstanceId`; it does not include the generation and is cleared when
   the parent completes or continues as new.
@@ -183,11 +206,13 @@ val processorWf = Workflow("processor") { (state: State) =>
 - Sequential helpers (`Workflow.foreach`/`map`/`fold`) are omitted: plain loops with `scoped` are no more verbose, keep the model visible, and avoid a combinatory library that would not scale to new iteration shapes.
 - `runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `par` and the fan-in partial-collection pattern.
 - Single `startAsChild` method: parent controls timing positionally, not via a deferred-creation API. `create`/`run` separation is only needed for external callers who must register a workflow in the same transaction as other business data.
-- Child key. Two options
-  - Compute key from parent info that stays the same in every generation
-  - Randomized child key that is persisted like a Step
-  We chose to include generation number in the child key. That makes persisting the key unnecessary.
-- Parent reference without generation: there is only one active generation for an instance key, and the parent pointer represents active ownership rather than historical provenance. Clearing it when the parent closes also matches the child's view that the parent has completed.
+- Deriving child scope from parent identity, workflow generation, and enclosing
+  scope incarnations avoids persisting a randomized start ID while preventing
+  collisions with top-level instances and children from discarded generations.
+- Parent reference without generation: there is only one active generation for
+  an instance ID, and the parent pointer represents active ownership rather
+  than historical provenance. Clearing it when the parent closes also matches
+  the child's view that the parent has completed.
 - Fan-out/fan-in via `.map` + `Wait.all`/`Wait.race`: consistent with the signals/timers model; no new primitive concepts.
 - `Terminate` outside `ParentClosePolicy`: force-kill at parent close is an ops concern, not a lifecycle concern. Keeping it off the policy enum reduces the decision surface for users writing workflow code.
 - O(n²) subworkflow problem: subworkflows are documented as O(events × elements) by design; this is acceptable for modest n. For large n or latency-sensitive flows, child workflows solve the problem structurally.

@@ -82,9 +82,8 @@ The implementation uses internal control-flow exceptions to implement the `resta
 - Every region has a mandatory explicit ID, stable within its enclosing
   workflow or scope.
 - A restartable or loop region introduces a workflow subscope, like
-  `Workflow.scope`. It extends that scope with durable state and generation
-  rotation, and should reuse `Workflow.scope`'s scoping mechanism where
-  possible, even calling `Workflow.scope` internally.
+  `Workflow.scoped`. It should reuse `Workflow.scoped`'s scoping mechanism where
+  possible, even calling `Workflow.scoped` internally.
 - The initial state is a by-name, pure seed. It is evaluated and persisted only
   when the region is first created, then ignored on later replays.
 - Region state may be any cacheable value and is the only user state carried
@@ -119,7 +118,8 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
 - A nested region restart preserves the workflow signal log (since it is owned by the workflow as a whole). Stream-await cursors survive across loopings, while cached results of awaits are discarded (awaits are essentially reset).
 - Children created in a discarded generation are handled according to their
   `ParentClosePolicy`. Successor generations use distinct child identities.
-- Restartable regions have the same problems as `continueAsNew`: While Step and Await IDs can be reused after deletion, child IDs cannot, since the child may continue to live independently for a short time (there ID may then collide with the newly started child with the same ID). Thus, restartable regions must also include the loop count in the child ID derivation, just like `continueAsNew` does for the generation.
+- Restartable regions have the same problems as `continueAsNew`: While Step and Await IDs can be reused after deletion, child IDs cannot, since the child may continue to live independently for a short time (there ID may then collide with the newly started child with the same ID). Thus, restartable regions must also include the loop count in the child's `WorkflowInstanceId` derivation (in the `scope` field), just like `continueAsNew` does for the generation. Each enclosing region's key and `restartCount` therefore
+  contributes to the child's `scope`. The complete scope derivation rules are defined in `sub-workflows-iteration.md`.
 
 ## Parallel branches
 

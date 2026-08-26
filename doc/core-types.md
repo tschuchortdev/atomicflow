@@ -13,10 +13,14 @@ Guideline for identity, metadata, and handle types. Companion to `design.md` and
 | Handle | `WorkflowInstance[In, Out]` | workflow definition (code) + instance key + runtime |
 
 ```scala
+type WorkflowId = String
+type WorkflowInstanceKey = String
+
 // Identity: the address of an instance; used for queries, signals, logging
 case class WorkflowInstanceId(
   workflowId: WorkflowId,
-  workflowInstanceKey: WorkflowInstanceKey
+  workflowInstanceKey: WorkflowInstanceKey,
+  scope: String = ""
 )
 
 // Definition metadata: describes a *definition*, never instance state (pattern: existing SignalMeta)
@@ -52,7 +56,12 @@ object WorkflowInstance:
 ## Rationale
 
 - "Meta" means *descriptive* metadata. Id-only bundles are named `...Id` (`WorkflowInstanceId`), not `...Meta`.
-- **`parentId` field**: tracks the active parent relationship for child workflows (empty for top-level or detached workflows). It belongs to `WorkflowInstance.Info`, not `WorkflowInstanceId`, because the relationship may be cleared when the parent closes while identity must remain stable. Child key derivation already prevents a child from colliding with a top-level instance.
+- **`scope` field**: Child workflows need some sort of prefix to prevent collision between themselves. This is not a prefix of the regular key, but a separate field, to prevent collision between this derived key and the arbitrary user-specified key of top-level instances. Creation
+  APIs never accept a scope; top-level instances always have `scope = ""`, while
+  `startAsChild` derives a non-empty scope. Query APIs have a scope parameter with the same empty default, so omitting it means an exact top-level lookup rather than a
+  lookup across all scopes. The database uniqueness key is `(workflowId,
+  workflowInstanceKey, scope)`. See `sub-workflows-iteration.md` for derivation.
+- **`parentId` field**: tracks the active parent relationship for child workflows (empty for top-level or detached workflows). It belongs to `WorkflowInstance.Info`, not `WorkflowInstanceId`, because the relationship may be cleared when the parent closes while identity must remain stable.
 - Capability vs data: `WorkflowInstance` requires the workflow code and can act; `WorkflowInstance.Info` requires nothing and just reports. Key-based queries without the code can only return `Info`; queries parameterized by a `Workflow[In, Out]` return typed handles. The two meet in exactly one place: `instance.getInfo()`. Nesting `Info` inside `WorkflowInstance` expresses that it is the data view of the same concept, not a second concept.
 - The handle retains both `In` and `Out` because it captures a `Workflow[In, Out]`. Every place that can construct a typed handle knows both types; operations that know only an ID return `Info` instead.
 - `StepMeta` stays a single class combining step definition fields and the instance id: steps are inline lambdas, so step metadata cannot exist outside an execution — a definition-only `StepMeta` would have no producer or consumer. **`StepMeta` is never used as a lookup key.** Lookups use `WorkflowInstanceId` + `StepId`; since this pair appears only rarely in internal implementation code, a plain tuple suffices — no named type unless it surfaces in a public/SPI signature. Consequently, descriptive fields (`stepName`, `stepDescription`) never affect any lookup, so editing a description never orphans cached results.

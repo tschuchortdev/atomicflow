@@ -38,28 +38,9 @@ workflow body does not continue after the call.
 
 ## Generations and child identity
 
-There is only one active generation for a workflow instance key. Generation is
-internal execution state, not a second public address type. A child instance
-key has the conceptual shape:
-
-```text
-parent-key + child-key + parent-generation
-```
-
-The encoding remains part of the public key value because all workflow
-instances can be queried by key. Child callers normally avoid depending on the
-encoding and use the handle returned by `startAsChild`, which contains the
-child's instance key and supports awaiting it.
-
-- Including the generation prevents old children from colliding with children
-  started by the successor generation.
-- The parent reference is relationship metadata in `WorkflowInstance.Info`,
-  not part of `WorkflowInstanceId`. It does not include a generation because
-  there is only one active parent generation.
+- The generation of a workflow is informational metadata (`WorkflowInstance.Info`), not part of its identity (`WorkflowInstanceId`), since there is only ever one active generation of a particular instance. For child workflows however, the parent's generation number must be part of their identity to prevent key collisions between children of the previous parent generation which are still running and newly started children of the successive parent generation. The complete child-scope derivation rules are specified in `sub-workflows-iteration.md`.
 - The parent reference is cleared when the parent completes or continues as
   new, including when cancellation of a child is still in progress.
-- `WorkflowInstanceId` remains the single public identity type. No public
-  `WorkflowRunId` is introduced at this stage.
 - Stopping of the current execution is achieved by a throwing a special exception. This exception must also be ignored by the `NonFatal`-like extractor that the library provides.
 
 ## Forking
@@ -105,8 +86,6 @@ runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
 - Putting generation inside the parent key would make it part of the public identity and require users to
   understand and manage it.
 - Generation as part of keys introduces an additional key type (like RunId in Temporal) and complicates the public API.
-- Generation in child keys allows old children to finish cancellation or keep
-  running after a parent transition without colliding with successor children.
 - A runtime primitive rather than a loop helper makes the recursive nature of
 the operation explicit and avoids inventing a second iteration abstraction.
 - Forking uses a new identity and copied cached steps, so it does not need to
