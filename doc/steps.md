@@ -53,6 +53,11 @@ Step.atMostOnce("charge-payment",
 Step.atLeastOnce("send-welcome", version = 1) {
   sendMail(user)
 }
+
+// uses built-in retry functionality
+Step.atLeastOnce("check-results", retry = Step.RetryPolicy.exponentialBackoff(start = 1.minute, max = 3.days)) {
+  checkResults()
+}
 ```
 
 - Constructor: `Step.atLeastOnce` or `Step.atMostOnce` is required; it sets Axis 1 (the guarantee).
@@ -62,6 +67,48 @@ Step.atLeastOnce("send-welcome", version = 1) {
 - `invalidateAfter`: optional TTL applied to the entire cached result (independent of drift policy).
 - **No implicit key list**: if neither `ensureUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., ensureUnchanged = Seq(instanceId -> "instance")) { ... }`).
 - Return type for `at-most-once`: `Option[R]`; `None` means "started but not completed, unsafe to retry." Caller must handle.
+
+### Built-in retries
+
+`Step.atLeastOnce` provides a built-in retry functionality (`Step.atMostOnce` does not) via the `retry` parameter (default `Step.RetryPolicy.never`). It accepts a `Step.RetryPolicy`:
+```scala
+trait RetryPolicy {
+  def nextDelay(failure: Throwable, failedAttempts: Int, cumulativeDelay: FiniteDuration, lastDelay: Option[FiniteDuration]): Option[FiniteDuration] 
+}
+```
+The library provides a few basic retry policies:
+```scala
+object RetryPolicy {
+  def never: RetryPolicy = ...
+  
+  def fixedDelay(
+      maxRetries: Long, 
+      delay: FiniteDuration, 
+      isRetriable: Throwable => Boolean = { _ => true }
+  ): RetryPolicy = ...
+  
+  def exponentialBackoff(
+      initialDelay: FiniteDuration, 
+      maxCumulativeDelay: FiniteDuration, 
+      multiplier: Float = 2, 
+      isRetriable: Throwable => Boolean = { _ => true }
+  ): RetryPolicy = ...
+  
+  def exponentialBackoff(
+      maxRetries: Long, 
+      initialDelay: FiniteDuration, 
+      multiplier: Float = 2, 
+      isRetriable: Throwable => Boolean = { _ => true }
+  ): RetryPolicy = ...
+}
+```
+
+- Delays that are long should be durable suspensions while short delays can be implemented with a simple `Thread.sleep`. The threshold between the two is configurable through the `WorkflowRunSettings`.
+- The `failure` is the exact exception thrown by the Step body. If the policy decides to retry, it will not be serialized and cached.
+- `invalidateAfter` also invalidates ongoing retries or terminal failures. It is as if the step never executed before.
+- If the application crashes during a retry, it is as if the retry was never begun (scheduled retry in the database is not touched until the Step body has returned/thrown).
+
+Retry policies are orthogonal to "atLeastOnce" semantics: `Step.atLeastOnce` vs `Step.atMostOnce` is about how the workflow recovers from application crashes, when it is unclear whether the step body completed.  `RetryPolicy` retries when the body completed with an exception. This must be documented clearly for the user!
 
 ## Durable results and failures
 

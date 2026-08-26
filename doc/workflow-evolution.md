@@ -75,8 +75,9 @@ Step.getExecutionState[Receipt]("charge")
   from `Started`, while an at-most-once step returns `None` rather than retry.
 - `Completed` is returned only after the persisted result is decoded using the
   required `Cacheable[A]` instance.
-- Step versions evolve independently from workflow versions. Lookup is by one
+- Step versions evolve independently of workflow versions. Lookup is by one
   exact step version and does not mix the two version dimensions.
+- Steps that are currently retrying with the built-in step retry functionality are considered `Started`.
 
 ## Evolving cached formats
 

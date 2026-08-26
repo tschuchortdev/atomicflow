@@ -12,7 +12,7 @@ while (true) {
 ```
 Alternatively, polling could also be implemented through a Step with built-in unlimited retries:
 ```scala
-Step.atLeastOnce("polling_step", maxRetries = -1, retryAfter = 60.seconds) { // built-in retry functionality for Steps in library
+Step.atLeastOnce("polling_step", retryPolicy = RetryPolicy.fixedDelay(1.minute)) { // built-in retry functionality for Steps in library
   val r = poll()
   if (r == NoResult)
     throw RuntimeException("poll again")
