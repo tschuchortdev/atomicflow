@@ -1,12 +1,12 @@
 # Signals & Timers
 
-Guideline for waiting on external events and handling concurrent interruption. Companion to `design.md`, `steps.md`, `core-types.md`, `running-workflows.md`.
+Guideline for waiting on external events and timers.
 
 ## Core model: await is a runtime-computed step
 
 A step's result is computed by *user code* and cached. An **await's** result is computed by the *runtime* (from persisted events) and cached in the same way. When replay reaches an await-site:
 
-- a **decision record** already exists → return the recorded outcome (which leaf won, what it consumed). This prevents an await from re-suspending on every second run.
+- a **decision record** already exists → return the recorded outcome (which leaf won, what it consumed). This prevents an await from re-suspending on every re-run.
 - no record → evaluate the condition against the log; if satisfiable now, atomically record the decision and continue; otherwise persist a pending subscription and return `WorkflowStopped` from the outer workflow boundary.
 
 Awaits thus reuse the entire step machinery (explicit ids, persisted results, manual intervention via reset) instead of inventing a parallel mechanism.
@@ -16,41 +16,83 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 `setSignal` is an **append** (INSERT with monotonic `seqNr`), never an overwrite of a slot. Consequences:
 
 - A signal arriving at any moment — including mid-execution — is durable and can only be *not yet consumed*, never lost.
-- Every stream event records whether it has been acknowledged. An acknowledged
-  event cannot be consumed by another await. `Signal.state` is a compacted,
-  non-consuming view, so independent state awaits do not acknowledge away its
-  latest value.
-- Every await-site, including `Wait.race`, persists its own cursor. The cursor
-  records how far that await has scanned and identifies the event whose payload
-  satisfies it. There is no shared cursor for a signal.
+- A signal is like an inbox and can contain multiple events ordered by arrival time.
+- Every event entry in the DB records whether this event has been processed by anyone. An await marks an event as processed when it wants to prevent other awaits from processing the same event.
+- Every await-site, persists its own cursor. The cursor records how far that await has scanned the event log (to identify which events are new). In case of `race` and `all` the cursor(s) must record position of multiple signals. The cursor could also be the place where the await's result is persisted (i.e. the offset of the event that satisfied this await). Cursors are never shared between distinct awaits.
 - **Accumulation is free**: unacknowledged events remain in the log. The runtime owns the log and cursors; the workflow keeps no custom DB state (the Kafka-feeder case: an external job appends every event and never blocks).
-- Two **views** over the one primitive:
-  - `Signal.stream[T]("id")` — full log, supports `await`, `awaitBatch`, `fold`. Events are consumed by read position and not replayed.
-  - `Signal.state[T]("id")` — compacted "latest value" only. Multiple independent awaits on the same state signal do not interfere. Older entries may be garbage-collected.
 
+
+## Basic Signal API
+
+Creating signals:
 ```scala
-val approval = Signal.state[Approval]("approval")
-val orders   = Signal.stream[OrderEvent]("orders", onUnconsumed = deadLetter)  // handler optional
+class Signal[A](val key: String)(using val cacheable: Cacheable[A])
+
+val interruptSignal = Signal[Unit]("interrupt")
+```
+while it is possible to send events to signals by untyped key, creating a `Signal[A]` has several advantages:
+- Type `A` is associated with the key, so the compiler can check that the sender and receiver agree on the type.
+- `Cacheable[A]` is saved inside the `Signal` class, so the `Cacheable` does not have to be imported at the call-site and is controlled completely by the definition-site.
+- Easier code evolution: Key is independent of variable name
+
+Writing signals:
+```scala
+class Signal[A](...) {
+  @throws[WorkflowNotFoundException]
+  def send(workflowInstanceId: WorkflowInstanceId, value: A): SignalSendResult = ???
+}
+
+/* InstanceAlreadyCompleted is a first-class return type instead of an exception like WorkflowNotFoundException, because we want to make it clear to the user that this case has to be handled. */
+enum SignalSendResult {
+  case Success, InstanceAlreadyCompleted
+}
+
+class WorkflowInstanceId(...) {
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A](s: Signal[A], value: A): SignalSendResult = ???
+}
+
+class WorkflowInstance[In, Out](...) {
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A](s: Signal[A], value: A): SignalSendResult = ???
+}
+
+trait WorkflowRuntime {
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A: Cacheable](instanceId: WorkflowInstanceId, key: String, value: A): SignalSendResult
+}
 ```
 
-### Filtering
+- `sendSignal`does not acquire the workflow execution lease, so a
+  busy or long-running workflow never blocks senders. They append only signal
+  data and schedule work; they do not modify step, await-decision, or other
+  execution records owned by the running workflow.
+- Sending a Signal event briefly acquires a row-lock on the workflow instance row and check a field `is_accepting_signals` to prevent senders from inserting new events when the workflow is completed/completing.
 
-Every signal await accepts a workflow-code predicate:
-
+Reading Signals:
 ```scala
-val paid = payments.await("paid", filter = _.status == Paid)
-val large = orders.await("large-order", filter = _.total >= 1000)
+object Step {
+  def peekSignal[A](s: Signal[A]): Option[A] = ???
+  
+  def awaitSignal[A](
+    stepKey: String, 
+    s: Signal[A], 
+    filter: A => Boolean = { _ => true }, 
+    invalidateOn: Map[String, Any] = Map.empty,
+    ensureUnchanged: Map[String, Any] = Map.empty,
+    invalidateAfter: Duration = Duration.Inf
+  ): A = ???
+}
 ```
 
-- The backend wakes the workflow when an event arrives; it does not evaluate
-  arbitrary workflow code while the workflow is dormant.
-- During the workflow run, the await scans forward from its cursor and executes
-  `filter: A => Boolean`, whose default is `_ => true`.
-- A matching event is atomically acknowledged and returned. A rejected event is
-  not acknowledged, although this await advances its own cursor past it, so a
-  different await may still consume it.
+- Peek reads the latest unconsumed event for a signal, if any, without advancing the await cursor.
+- Await reads the log for an event that matches the filter and suspends the workflow if none is found. 
+  - When suspending, it registers a subscription/wake-up for that signal with the runtime. The filter is evaluated in workflow code. 
+  - The runtime cannot know which event will satisfy the filter, so the runtime must wake the workflow when any new event arrives. 
+  - If an event matches, it is atomically acknowledged and returned. The await must persist what the result of the await was for future replays.
+  - The await advances its cursor whenever it is called and scans forward
 
-## Awaits: explicit ids, race / all
+## `race` and `all`
 
 Every consuming await takes a **mandatory explicit id** (like `stepId`). This keeps the decision record and consumed range stable across replays and across invalidation-driven control-flow rerouting.
 
@@ -103,37 +145,129 @@ val results: Seq[ItemResult] =
 
 ## Updates: signals that return a value
 
-An **Update** is a `Signal` with a **response channel**. The sender is blocked until one of:
-- an await-site on that update signal consumes it and the handler returns a value → sender receives it synchronously.
-- the workflow completes without consuming it → sender receives `Left` (unhandled).
+An **Update** is a `Signal` with a **synchronous response channel**. The purpose of updates is to give some synchronous interactivity to workflows (for example: updating a user's name which requires timely validation), but the concept is not well-thought-out yet. 
 
-```scala
-val newPriority: Priority =
-  priorityUpdate.await("handle-priority-update") { priority =>
-    // sender will receive this return value
-    priority
+When an Update is sent, the runtime checks if there is a subscription/await currently registered for that Update, runs the workflow and returns a result, if that run handled the update.
+
+```
+:beginning
+
+if (workflow is completed) {
+  return InstanceAlreadyCompleted to sender
+}
+
+if (update key is currently subscribed/awaited) {
+  if (workflow is locked/already running) {
+    wait for lease to run out
+    goto beginning
+  } else {
+    run workflow on the sender's thread, until run finished
+    
+    if (result is set on update's DB record) {
+      return Success(result) to sender
+    } else {
+      return Unhandled to sender
+    }
   }
-// execution continues with the value from the update
+}
 ```
-
-Update sending includes two parameters:
 
 ```scala
-runtime.sendUpdate(
-  instanceId, 
-  priorityUpdate, 
-  newPriority,
-  idempotencyKey = "order-123-adj-attempt-1",  // runtime deduplicates
-  persistUnhandledUpdates = true                // keep unhandled in log or drop?
-)
+class Update[I, R](val key: String)(using val inputCacheable: Cacheable[I], responseCacheable: Cacheable[R])
+
+val nameUpdate = Update[String, ValidationResult]("name-update")
 ```
 
+Sending updates:
+```scala
+enum UpdateSendResult[+R] {
+  case Success(value: R)
+  case Unhandled
+  case InstanceAlreadyCompleted
+}
+
+class Update[I, R](...) {
+  @throws[WorkflowNotFoundException]
+  def send(workflowInstanceId: WorkflowInstanceId, input: I): UpdateSendResult[R] = ???
+}
+
+class WorkflowInstanceId(...) {
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I, R](u: Update[I, R], input: I): UpdateSendResult[R] = ???
+}
+
+class WorkflowInstance[In, Out](...) {
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I, R](u: Update[I, R], input: I): UpdateSendResult[R] = ???
+}
+
+trait WorkflowRuntime {
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I: Cacheable, R: Cacheable](
+      instanceId: WorkflowInstanceId,
+      updateKey: String,
+      input: I,
+      idempotencyKey: String = "", // runtime deduplicates
+      persistUnhandledUpdates: Boolean = false // keep unhandled in log or drop?
+  ): UpdateResult[R]
+}
+```
 - **idempotencyKey**: runtime deduplicates by this key; same key arriving twice → second is idempotent, sender gets the same result.
-- **persistUnhandledUpdates**: if `true`, an unhandled update stays in the signal log (unconsumed); if `false`, it is deleted after workflow completion. Default depends on the signal's `atLeastOnce`/`atMostOnce` axis (shared with steps).
+- **persistUnhandledUpdates**: if `true`, an unhandled update stays in the signal log (unconsumed); if `false`, it is deleted after workflow completion.
 
-## Unconsumed signals & updates at completion
+Responding to updates:
+```scala
+object Step {
+  def awaitUpdate[I, R, O](stepKey: String, u: Update[I, R])(respond: I => (R, O)): O = ???
+}
+```
 
-A signal/update arriving after execution passed its await-site is not lost — it remains unacknowledged in the log.
+### Manual advancement of the cursor
+
+Sometimes we want to ensure that we react only to events that arrived after some other step:
+
+```scala 
+Step("request-approval") {
+  requestApproval(item)
+}
+
+Step.await(itemApprovedSignal) // should only accept approval events that happened after the approval request!
+```
+
+One option for this is to manually mark all events (matching the signal key filter) up to that point as processed:
+
+```scala
+object Step {
+  def markAllSignalEventsAsProcessed(
+    stepKey: String, 
+    signalKeyPrefix: String,
+    invalidateOn: Map[String, Any] = Map.empty,
+    ensureUnchanged: Map[String, Any] = Map.empty,
+  ): Unit
+}
+```
+
+```scala 
+Step("request-approval") {
+  requestApproval(item)
+}
+
+Step.markAllSignalEventsAsProcessed("mark-events-processed", signalKeyPrefix = "approval-signal")
+
+Step.await(itemApprovedSignal)
+```
+
+The step key ensures that this is not executed again on every re-run of the workflow body. 
+
+## Queries
+
+Queries are functions that can synchronously ask about the current workflow state (ideally without executing the workflow). They exist in Temporal but are deliberately out of scope in atomicflow for now, since all our state is only readable from local variables in the workflow body.
+
+## Unconsumed signals at completion
+
+Every workflow can have an onOnconsumedSignals-handler function, which is mainly to be used for logging puroses.
+
+A signal/update arriving after execution passed its await-site is not lost — it remains in the event log.
 
 - **Default: ignore.** Unconsumed events at completion are discarded unless a handler is declared.
 - Optional `onUnconsumedSignals` handler can be passed to the `Workflow` constructor in the same parameter group as the body. It runs as a final step before the instance is marked complete and receives a map of all unconsumed signals:
@@ -145,8 +279,7 @@ A signal/update arriving after execution passed its await-site is not lost — i
     },
     onUnconsumedSignals = { unconsumed =>
       unconsumed.foreach { case (signalId, events) =>
-        if (signalId == orders.id)
-          Step.atLeastOnce("dead-letter", 1) { sendToDeadLetter(events.asInstanceOf[Seq[OrderEvent]]) }
+        ...
       }
     }
   )
@@ -158,40 +291,8 @@ A signal/update arriving after execution passed its await-site is not lost — i
   }
   ```
   The handler receives `Map[SignalId, Seq[Any]]` where the values are unconsumed events for each signal.
-- `setSignal` / `sendUpdate` do not acquire the workflow execution lease, so a
-  busy or long-running workflow never blocks senders. They append only signal
-  data and schedule work; they do not modify step, await-decision, or other
-  execution records owned by the running workflow.
-- Sending a Signal event briefly acquires a row-lock on the workflow instance row and check a field `is_accepting_signals` to prevent senders from inserting new events when the workflow is completed/completing.
+- The onUnconsumedSignals handler is a regular function (may not contain `Step`s) and executed at-least-once.
 - A workflow that is completing sets `is_accepting_signals := false` before executing the unprocessed signals handler. If `is_accepting_signals == true` then the `send` function returns `InstanceAlreadyCompleted`.
-- The unprocessed signals handler is documented as at-least-once execution (program may crash during execution)
-- After appending an event, runtime checks for pending awaits whose source
-  matches the signal and upserts one durable wakeup record for the instance.
-  Signal predicates remain workflow code, so the sender cannot determine
-  whether a filtered await will consume the event.
-- The wakeup is scheduled even while the workflow currently holds its execution
-  lease. There is at most one pending wakeup per instance. If a worker finds
-  the lease held, the durable wakeup remains until a later worker runs the
-  instance again, ensuring that a relevant newly committed event is eventually
-  visible to workflow execution.
-
-## Broadcast by key prefix
-
-Broadcast is a derived bulk runtime operation from the original design draft:
-append the same signal to every instance of one workflow whose instance key
-matches a prefix.
-
-```scala
-runtime.setSignalByPrefix(workflow.id, tenantPrefix, maintenanceSignal, Enabled)
-```
-
-It is convenience over enumerating matching instances and calling `setSignal`;
-it is not a different signal-delivery primitive.
-
-- TODO: define whether matching instances are selected from one snapshot.
-- TODO: define the aggregate result when some instances are already complete or
-  complete concurrently, and whether instances created during the operation
-  are included.
 
 ## Invalidation and await stability
 
@@ -200,7 +301,7 @@ When an upstream step is invalidated (TTL expired, `invalidateOn` dependency cha
 **Awaits inherit this rule:** an await can declare `invalidateOn` dependencies just as steps do:
 
 ```scala
-Wait.all("approval-race", approval, Timer(deadline),
+Step.awaitAll("approval-race", approval, Timer(deadline),
   invalidateOn = Seq("context" -> someContextValue)
 )
 ```
@@ -218,9 +319,6 @@ A timer whose expression (duration/deadline) is keyed on an invalidated upstream
 - The invalidated await retains its previous cursor and resumes scanning after
   that position. Because the cursor may be far in the past, it may consume an
   unacknowledged event that arrived before the invalidation.
-- TODO: provide an API that advances one await's cursor to the current end of
-  the log when only events arriving after a chosen point are valid. There is no
-  signal-wide cursor to advance because each await has an independent cursor.
 - If invalidation changes the filter, events this await previously scanned past
   are not reconsidered. Explicit cursor movement or reset semantics would be
   required to rescan them.

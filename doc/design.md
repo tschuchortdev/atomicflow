@@ -2,7 +2,7 @@
 
 The goal is to create a Scala 3 library for durable workflows. A durable workflow is characterized by:
 - being able to resume execution after a crash (state persisted, even if the process is killed)
-- steps with side effects have guarantees about how many times they are executed (at-most-once, at-least-once, only-once)
+- steps with side effects have guarantees about how many times they are executed (at-most-once, at-least-once)
 - workflows may be long-running (hours, days, weeks) and wait for external events (signals, timers, other workflows) to resume execution
 
 ## Primary design goals
@@ -46,11 +46,6 @@ This API is just a draft, and will be refined as we go along.
 - start all workflows matching a key prefix
 - abandon all workflows matching a key prefix
 
-- (deadlock detection)
-- workflow total execution time limit
-- detect when steps execute in different order after resume
-  - provide a way for the user to opt out for specific steps -> Problem: all steps that depend on this step will also have to opt out
-  - non-determinism of parallel execution could influence order of steps (see Temporal's `WorkflowThread`)
 
 # Workflow Steps
 

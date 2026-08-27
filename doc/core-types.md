@@ -23,9 +23,12 @@ case class WorkflowInstanceId(
   scope: String = ""
 )
 
+case class StepId(key: String, scope: String = "")
+
+
 // Definition metadata: describes a *definition*, never instance state (pattern: existing SignalMeta)
 case class WorkflowMeta(workflowId: WorkflowId, version: Long, name: String, description: Option[String])
-case class SignalMeta(id: SignalId, name: Option[String], description: Option[String])
+case class SignalMeta(name: String, description: Option[String])
 
 // Execution-scoped: steps are inline lambdas, so their metadata only materializes while a
 // workflow instance executes — hence StepMeta carries the instance id (composition, not inheritance)
@@ -33,7 +36,7 @@ case class StepMeta(stepId: StepId, stepVersion: Option[Long], stepName: Option[
                     stepDescription: Option[String], workflowInstanceId: WorkflowInstanceId)
 
 // Handle: capability object, obtained only from the runtime
-final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceKey: WorkflowInstanceKey, runtime: WorkflowRuntime):
+final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceKey: WorkflowInstanceKey, instanceScope: String, runtime: WorkflowRuntime):
   def id: WorkflowInstanceId
   def run(): WorkflowRunResult[Out]
   def awaitResult(timeout: FiniteDuration): WorkflowRunResult[Out]

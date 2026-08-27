@@ -3,7 +3,7 @@
 ## Continue-as-new
 
 `continueAsNew` is a runtime operation with a forwarder in the `Workflow`
-companion object. It has no `Workflow.loop` helper.
+companion object.
 
 ```scala
 Workflow.continueAsNew(nextInput)

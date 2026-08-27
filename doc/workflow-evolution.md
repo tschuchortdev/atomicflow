@@ -61,6 +61,7 @@ One API exposes the durable state known for either guarantee:
 enum StepExecutionState[+A]:
   case NeverStarted
   case Started
+  case Failed(failure: Throwable)
   case Completed(value: A)
 
 Step.getExecutionState[QuoteV1]("quote", stepVersion = 1)

@@ -32,7 +32,7 @@ myWorkflow.createAndRun(instanceKey, input): WorkflowRunResult[Out]
 ```
 
 - `create` and `run` are separate because `run` takes no input: the input is already persisted. `createAndRun` covers the common atomic case. All three are needed.
-- `create` exists for deferred runs, e.g. registering a workflow in the same DB transaction as business data, or preparing a batch before running it.
+- `create` exists for deferred runs.
 - Idempotency: `create`/`createAndRun` succeed if the instance already exists with equal input (`createAndRun` re-runs/returns the result); they throw `WorkflowInputConflictException` if the input differs. No separate `createIfNotExists` needed. `createWorkflowInstanceDiscardExisting` exists for explicitly replacing an instance.
 - Input is a **single parameter** (`In`); multiple values are passed as a case class or tuple. Scala 3 has no auto-tupling, so multi-param call sites would require type-level machinery (`TupledFunction` / match types) — can be added later as sugar without breaking the core API.
 
