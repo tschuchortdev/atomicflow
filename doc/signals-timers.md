@@ -94,28 +94,26 @@ object Step {
 
 ## `race` and `all`
 
-Every consuming await takes a **mandatory explicit id** (like `stepId`). This keeps the decision record and consumed range stable across replays and across invalidation-driven control-flow rerouting.
-
 Two combinators over a heterogeneous mix of `Signal | Timer | completion`:
 
 ```scala
 val a: Approval = approval.await("await-approval")
 
 val decision: RaceWinner[Approval | TimerFired] =
-  Wait.race("decision", approval, Timer(3.days))   // first to fire wins
+  Step.awaitRace("decision", approval, Timer(3.days))  // first to fire wins
 
 val (a, r): (Approval, Review) =
-  Wait.all("both", approval, review)               // wake once, when all leaves are satisfied
+  Step.awaitAll("both", approval, review)  // wake once, when all leaves are satisfied
 
 val results: Seq[ItemResult] =
-  Wait.all("fan-in", children.map(_.completion))   // homogeneous overload
+  Step.awaitAll("fan-in", children.map(_.completion))  // homogeneous overload
 ```
 
 - **`race` returns both source identity and value.** `RaceWinner[A]` contains a
   `source` and `value: A`; for heterogeneous leaves, `A` is their union. The
   typical pattern is to use the source before narrowing the value:
   ```scala
-  val decision = Wait.race("d", approval, rejection)
+  val decision = Step.awaitRace("d", approval, rejection)
   if (decision.source == approval.id) {
     val a: Approval = decision.value.asInstanceOf[Approval]
     ...
@@ -126,7 +124,7 @@ val results: Seq[ItemResult] =
   ```
   Or map each leaf to a tagged type before racing:
   ```scala
-  Wait.race("d", 
+  Step.awaitRace("d", 
     approval.map(a => ApprovedResult(a)), 
     rejection.map(r => RejectedResult(r))
   ).value match
@@ -242,7 +240,7 @@ object Step {
     stepKey: String, 
     signalKeyPrefix: String,
     invalidateOn: Map[String, Any] = Map.empty,
-    ensureUnchanged: Map[String, Any] = Map.empty,
+    ensureUnchanged: Map[String, Any] = Map.empty
   ): Unit
 }
 ```
@@ -262,6 +260,28 @@ The step key ensures that this is not executed again on every re-run of the work
 ## Queries
 
 Queries are functions that can synchronously ask about the current workflow state (ideally without executing the workflow). They exist in Temporal but are deliberately out of scope in atomicflow for now, since all our state is only readable from local variables in the workflow body.
+
+## Awaiting workflow completion
+
+The library provides a function to await completion of other workflows:
+
+```scala
+object Step {
+  @throws[WorkflowNotFoundException]
+  def awaitWorkflowCompletion[R: Cacheable](
+    workflowInstance: WorkflowInstance[?, R],
+    invalidateOn: Map[String, Any] = Map.empty,
+    ensureUnchanged: Map[String, Any] = Map.empty
+  ): R
+  
+  @throws[WorkflowNotFoundException]
+  def awaitWorkflowCompletion[R: Cacheable](
+    workflowInstanceId: WorkflowInstanceId,
+    invalidateOn: Map[String, Any] = Map.empty,
+    ensureUnchanged: Map[String, Any] = Map.empty
+  ): R
+}
+```
 
 ## Unconsumed signals at completion
 

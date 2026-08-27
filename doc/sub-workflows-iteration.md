@@ -12,7 +12,7 @@ Three genuinely different concepts; the distinction answers both the O(n²) resu
 
 - **Independent workflow** = a workflow started from outside (via the runtime directly) with no parent linkage. Out of scope for this doc; see `running-workflows.md`.
 
-**Deciding question:** "Does the loop body need to close over parent-scope variables that aren't serialisable as inputs?" Yes → subworkflow. No, or n is large → child workflow.
+**Deciding question:** "Does the loop body need to close over parent-scope variables that aren't serializable as inputs?" Yes → subworkflow. No, or n is large → child workflow.
 
 ## Primitives
 
@@ -20,7 +20,7 @@ Three primitives cover all subworkflow patterns. Everything else is regular Scal
 
 ### `Workflow.scoped`
 
-Wraps a body in an ID namespace. All `Step` and `Wait` IDs inside are prefixed with the scope key, so the same step definitions can execute independently per element.
+Wraps a body in an ID namespace. All `Step` and Await IDs inside are prefixed with the scope key, so the same step definitions can execute independently per element.
 
 ```scala
 // explicit stable key
@@ -45,7 +45,7 @@ Use this when you need to inspect whether a block suspended before deciding what
 
 ### `Workflow.par`
 
-Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Advances **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined suspension carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
+Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Waits for **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined suspension carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
 
 ```scala
 val results: Seq[R] = Workflow.par(
@@ -53,7 +53,9 @@ val results: Seq[R] = Workflow.par(
 )
 ```
 
-`par` is the only construct that requires runtime-level support; sequential iteration is plain Scala loops with `scoped`.
+### `Workflow.race`
+
+Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.par`. If at least one completes normally, it discards the other suspensions and returns the first result. 
 
 ## Sequential iteration: plain loops
 
@@ -221,4 +223,6 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
 
-2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.par` cleans up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
+2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.par` and `Workflow.race` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
+
+3. **Race awaits cleanup** — **TODO**: Define how `Workflow.race` cleans up registered awaits from other branches when one branch has completed.
