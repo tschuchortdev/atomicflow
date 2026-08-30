@@ -48,14 +48,49 @@ Use this when you need to inspect whether a block suspended before deciding what
 Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Waits for **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined suspension carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
 
 ```scala
+object Workflow {
+    def par[R](branches: Seq[() => R]): Seq[R]
+    def par[R](branches: (() => R)*): Seq[R]
+}
+```
+
+```scala
 val results: Seq[R] = Workflow.par(
   items.map(item => () => Workflow.scoped(item) { process(item) })
 )
 ```
 
-### `Workflow.race`
+### `Step.firstToCompleteWithoutSuspension`
 
 Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.par`. If at least one completes normally, it discards the other suspensions and returns the first result. 
+
+```scala
+object Step {
+    def firstToCompleteWithoutSuspension[R](
+        stepId: String,
+        invalidateOn: Map[String, Any] = Map.empty,
+        ensureUnchanged: Map[String, Any] = Map.empty
+    )(branches: Seq[() => R]): R
+    
+    def firstToCompleteWithoutSuspension[R](
+        stepId: String,
+        invalidateOn: Map[String, Any] = Map.empty,
+        ensureUnchanged: Map[String, Any] = Map.empty
+    )(branches: (() => R)*): R
+}
+```
+
+Because it is edge-triggered (not level-triggered like `Workflow.par`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
+
+This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
+
+```scala
+val result: R = Step.firstToCompleteWithoutSuspension("race-branches",
+    { Thread.sleep(10.minutes) },
+    { Step.awaitTimer("timer", 1.minute) }
+)
+```
+One would expect the timer to win, but it will not: The timer suspends immediately by throwing an exception and will not become unblocked until the entire workflow is re-executed. The `Thread.sleep` will just block the thread and complete before the other branch has a chance to re-run. This must be clearly documented!
 
 ## Sequential iteration: plain loops
 
@@ -110,10 +145,12 @@ No bespoke combinators are provided. Fan-out is a plain `.map`; fan-in reuses th
 val children = items.map(i => workerWf.startAsChild(key(i), i))
 
 // wait for all to complete
-val results = Wait.all("fan-in", children.map(_.completion))
+val results = Workflow.par(children.map { child => Step.awaitWorkflowCompletion(child) })
 
 // first to finish wins
-val winner = Wait.race("first", children.map(_.completion))
+val result = Step.firstToCompleteWithoutSuspension("race-children",
+  children.map { child => Step.awaitWorkflowCompletion(child) }
+)
 
 // partial: advance each, collect what's ready
 val outcomes: Seq[Either[SuspensionException, R]] =
