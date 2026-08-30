@@ -64,6 +64,8 @@ val results: Seq[R] = Workflow.par(
 
 Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.par`. If at least one completes normally, it discards the other suspensions and returns the first result. 
 
+TODO: how does it handle cancellation of child workflows started from a branch?
+
 ```scala
 object Step {
     def firstToCompleteWithoutSuspension[R](
@@ -91,6 +93,8 @@ val result: R = Step.firstToCompleteWithoutSuspension("race-branches",
 )
 ```
 One would expect the timer to win, but it will not: The timer suspends immediately by throwing an exception and will not become unblocked until the entire workflow is re-executed. The `Thread.sleep` will just block the thread and complete before the other branch has a chance to re-run. This must be clearly documented!
+
+Even if both branches are suspending, the code only works as expected when the workflow is re-run for each incoming event individually (== if no two branches become unblocked in the same run). If the workflow is re-run for multiple events at once (for example because there was a long queue in the job runner), code cannot tell which event came first. 
 
 ## Sequential iteration: plain loops
 
