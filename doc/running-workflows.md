@@ -40,12 +40,12 @@ myWorkflow.createAndRun(instanceKey, input): WorkflowRunResult[Out]
 
 ```scala
 enum WorkflowRunResult[+A]:
-  case WorkflowStopped
+  case WorkflowSuspended
   case WorkflowCancelled
   case Result(value: A)
 ```
 
-- `WorkflowStopped` means execution durably suspended on an await.
+- `WorkflowSuspended` means execution durably suspended on an await.
 - `WorkflowCancelled` means cooperative cancellation escaped the workflow body.
 - `Result(value)` means the workflow completed successfully. Failures still propagate as exceptions.
 
@@ -58,7 +58,7 @@ enum WorkflowRunResult[+A]:
 
 ## Suspension and results
 
-- A workflow that suspends yields `WorkflowStopped`; successful completion yields `Result(out)`.
+- A workflow that suspends yields `WorkflowSuspended`; successful completion yields `Result(out)`.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
 - Suspension, reset, and continue-as-new each use a distinct internal control-flow exception. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
@@ -108,7 +108,7 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 
 - **User code inside the workflow body sees `InterruptedException`**, the same exception Ox and other concurrency libraries use. No wrapping or translation. Code can handle it with ordinary `try`/`catch`.
 - The `run`/`createAndRun` functions are the outermost boundary. Any `InterruptedException` that escapes the workflow body is caught there and returned as `WorkflowCancelled`.
-- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowStopped` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the interrupt flag causes the await to throw.
+- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the interrupt flag causes the await to throw.
 - The question "how does the cancelling thread obtain a handle to the executing thread?" is answered by the runtime: it tracks which thread holds the lease for each instance internally and sets the flag directly. No thread handles are ever exposed to external callers.
 
 ### Rationale

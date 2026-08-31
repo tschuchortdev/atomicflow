@@ -11,6 +11,29 @@ A step's result is computed by *user code* and cached. An **await's** result is 
 
 Awaits thus reuse the entire step machinery (explicit ids, persisted results, manual intervention via reset) instead of inventing a parallel mechanism.
 
+Several different things can be awaited:
+```scala
+enum Awaitable[+R : Cacheable] {
+  case SignalEvent(
+      s: Signal[R], 
+      filter: R => Boolean = { _ => true },
+      lookBack: Duration = Duration.Inf // Only consider events that arrived within `now - lookBack`
+  ) extends Awaitable[R]
+  
+  case Timer(deadline: Instant) extends Awaitable[Unit]
+  object Timer {
+    def apply(delay: FiniteDuration)(using clk: Clock): Awaitable[Unit] = 
+      Timer(Instant.now(clk).plus(delay))
+  }
+  
+  case WorkflowCompletion(workflowInstanceId: WorkflowInstanceId) extends Awaitable[R]
+  object WorkflowCompletion {
+    def apply(workflowInstance: WorkflowInstance[?, R]): Awaitable[R] = 
+      WorkflowCompletion(workflowInstance.instanceId)
+  }
+}
+```
+
 ## Signal storage: append-log + per-await cursor
 
 `setSignal` is an **append** (INSERT with monotonic `seqNr`), never an overwrite of a slot. Consequences:
@@ -72,74 +95,41 @@ trait WorkflowRuntime {
 Reading Signals:
 ```scala
 object Step {
-  def peekSignal[A](s: Signal[A]): Option[A] = ???
+  def peekSignal[A](s: Signal[A]): Seq[A] = ???
   
-  def awaitSignal[A](
+  def await[A](
     stepKey: String, 
-    s: Signal[A], 
-    filter: A => Boolean = { _ => true }, 
+    awaitable: Awaitable[A],
     invalidateOn: Map[String, Any] = Map.empty,
     ensureUnchanged: Map[String, Any] = Map.empty,
-    invalidateAfter: Duration = Duration.Inf
+    invalidateAfter: Duration = Duration.Inf,
   ): A = ???
 }
 ```
 
-- Peek reads the latest unconsumed event for a signal, if any, without advancing the await cursor.
-- Await reads the log for an event that matches the filter and suspends the workflow if none is found. 
+- `Step.await` throw a `WorkflowSuspended` control-flow exception when the await cannot be satisfied immediately. The workflow runtime catches this exception and suspends the workflow. User code must always ignore or rethrow this exception.
+- Peek reads the list for a signal, if any, without advancing the await cursor.
+- Await-signal reads the log for an event that matches the filter and suspends the workflow if none is found. 
   - When suspending, it registers a subscription/wake-up for that signal with the runtime. The filter is evaluated in workflow code. 
   - The runtime cannot know which event will satisfy the filter, so the runtime must wake the workflow when any new event arrives. 
   - If an event matches, it is atomically acknowledged and returned. The await must persist what the result of the await was for future replays.
   - The await advances its cursor whenever it is called and scans forward
 
-## `race` and `all`
+## Racing signals/timers
 
-Two combinators over a heterogeneous mix of `Signal | Timer | completion`:
+`Step.awaitRace` allows racing multiple signals and timers. This is less flexible than racing arbitrary code but much safer: `Step.awaitRace` guarantees that whatever event/timer occured first will definitely win the race, whereas the result of racing arbitrary code with `Step.firstToRunWithoutSuspension` literally depends on when the code is run. 
 
 ```scala
-val a: Approval = approval.await("await-approval")
-
-val decision: RaceWinner[Approval | TimerFired] =
-  Step.awaitRace("decision", approval, Timer(3.days))  // first to fire wins
-
-val (a, r): (Approval, Review) =
-  Step.awaitAll("both", approval, review)  // wake once, when all leaves are satisfied
-
-val results: Seq[ItemResult] =
-  Step.awaitAll("fan-in", children.map(_.completion))  // homogeneous overload
+object Step {
+    def awaitRace[A](
+        stepKey: String,
+        invalidateOn: Map[String, Any] = Map.empty,
+        ensureUnchanged: Map[String, Any] = Map.empty
+    )(awaits: Awaitable[A]*): A = ???
+}
 ```
 
-- **`race` returns both source identity and value.** `RaceWinner[A]` contains a
-  `source` and `value: A`; for heterogeneous leaves, `A` is their union. The
-  typical pattern is to use the source before narrowing the value:
-  ```scala
-  val decision = Step.awaitRace("d", approval, rejection)
-  if (decision.source == approval.id) {
-    val a: Approval = decision.value.asInstanceOf[Approval]
-    ...
-  } else {
-    val r: Rejection = decision.value.asInstanceOf[Rejection]
-    ...
-  }
-  ```
-  Or map each leaf to a tagged type before racing:
-  ```scala
-  Step.awaitRace("d", 
-    approval.map(a => ApprovedResult(a)), 
-    rejection.map(r => RejectedResult(r))
-  ).value match
-    case ApprovedResult(a)  => ...
-    case RejectedResult(r)  => ...
-  ```
-- **Winner is decided once, during the awakened workflow run**: event arrival
-  wakes the workflow, then signal filters execute in workflow code. The runtime
-  atomically records the eligible winning leaf and what it consumed. Replay
-  reads that decision, so later runs cannot flip the winner.
-- **AND is first-class**: `all` writes N await-leaf rows with `mode=All`; the await flips only when every sibling leaf is satisfied. Selecting and acknowledging all signal events for a satisfied `all` is one atomic decision, so a competing await cannot take only part of its inputs. The same transaction persists the result and advances cursor(s) for single-signal awaits and `race`.
-- `race` currently accepts durable wait sources: signals, timers, and workflow
-  completions. TODO: design racing these sources against regular code or
-  Activities. Regular code has different crash, cancellation, and replay
-  semantics and cannot safely be treated as another persisted await leaf.
+`awaitRace` creates one subscription for each awaitable in the database.
 
 ## Updates: signals that return a value
 
@@ -257,31 +247,15 @@ Step.await(itemApprovedSignal)
 
 The step key ensures that this is not executed again on every re-run of the workflow body. 
 
+Another option is to use `lookBack` on the signal awaitable, which will ignore events that arrived before a certain time. Unfortunately, both solutions have potential for race conditions.
+
 ## Queries
 
 Queries are functions that can synchronously ask about the current workflow state (ideally without executing the workflow). They exist in Temporal but are deliberately out of scope in atomicflow for now, since all our state is only readable from local variables in the workflow body.
 
 ## Awaiting workflow completion
 
-The library provides a function to await completion of other workflows:
-
-```scala
-object Step {
-  @throws[WorkflowNotFoundException]
-  def awaitWorkflowCompletion[R: Cacheable](
-    workflowInstance: WorkflowInstance[?, R],
-    invalidateOn: Map[String, Any] = Map.empty,
-    ensureUnchanged: Map[String, Any] = Map.empty
-  ): R
-  
-  @throws[WorkflowNotFoundException]
-  def awaitWorkflowCompletion[R: Cacheable](
-    workflowInstanceId: WorkflowInstanceId,
-    invalidateOn: Map[String, Any] = Map.empty,
-    ensureUnchanged: Map[String, Any] = Map.empty
-  ): R
-}
-```
+The library provides a function to await completion of other workflows.
 
 ## Unconsumed signals at completion
 
@@ -321,7 +295,7 @@ When an upstream step is invalidated (TTL expired, `invalidateOn` dependency cha
 **Awaits inherit this rule:** an await can declare `invalidateOn` dependencies just as steps do:
 
 ```scala
-Step.awaitAll("approval-race", approval, Timer(deadline),
+Step.awaitRace("approval-race", approval, Timer(deadline),ne),
   invalidateOn = Seq("context" -> someContextValue)
 )
 ```

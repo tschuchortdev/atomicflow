@@ -124,7 +124,7 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
 ## Parallel branches
 
 `restart` and `break` use library control-flow exceptions. If either crosses a
-`Workflow.par` boundary, `Workflow.par` handles cleanup of the other branches
+`Workflow.parallel` boundary, `Workflow.parallel` handles cleanup of the other branches
 internally, just as it does for other control-flow exceptions.
 
 ## Why restartable regions cannot completely replace continue-as-new:

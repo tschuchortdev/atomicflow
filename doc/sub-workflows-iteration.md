@@ -43,38 +43,40 @@ val result: Either[SuspensionException, OrderResult] =
 
 Use this when you need to inspect whether a block suspended before deciding what to do next. Most code should not use this — suspensions propagate to the runtime automatically, which is the right default. `par` is built on this primitive internally.
 
-### `Workflow.par`
+### `Workflow.parallel`
 
 Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Waits for **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined suspension carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
 
 ```scala
 object Workflow {
-    def par[R](branches: Seq[() => R]): Seq[R]
-    def par[R](branches: (() => R)*): Seq[R]
+    def parallel[R](branches: Seq[() => R]): Seq[R]
+    def parallel[R](branches: (() => R)*): Seq[R]
 }
 ```
 
 ```scala
-val results: Seq[R] = Workflow.par(
+val results: Seq[R] = Workflow.parallel(
   items.map(item => () => Workflow.scoped(item) { process(item) })
 )
 ```
 
-### `Step.firstToCompleteWithoutSuspension`
+### `Step.firstToRunWithoutSuspension`
 
-Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.par`. If at least one completes normally, it discards the other suspensions and returns the first result. 
+Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.parallel`. If at least one completes normally, it discards the other suspensions and returns the first result. 
 
 TODO: how does it handle cancellation of child workflows started from a branch?
 
 ```scala
 object Step {
-    def firstToCompleteWithoutSuspension[R](
+    @experimental
+    def firstToRunWithoutSuspension[R](
         stepId: String,
         invalidateOn: Map[String, Any] = Map.empty,
         ensureUnchanged: Map[String, Any] = Map.empty
     )(branches: Seq[() => R]): R
     
-    def firstToCompleteWithoutSuspension[R](
+    @experimental
+    def firstToRunWithoutSuspension[R](
         stepId: String,
         invalidateOn: Map[String, Any] = Map.empty,
         ensureUnchanged: Map[String, Any] = Map.empty
@@ -82,12 +84,12 @@ object Step {
 }
 ```
 
-Because it is edge-triggered (not level-triggered like `Workflow.par`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
+Because it is edge-triggered (not level-triggered like `Workflow.parallel`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
 
 This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
 
 ```scala
-val result: R = Step.firstToCompleteWithoutSuspension("race-branches",
+val result: R = Step.firstToRunWithoutSuspension("race-branches",
     { Thread.sleep(10.minutes) },
     { Step.awaitTimer("timer", 1.minute) }
 )
@@ -149,10 +151,10 @@ No bespoke combinators are provided. Fan-out is a plain `.map`; fan-in reuses th
 val children = items.map(i => workerWf.startAsChild(key(i), i))
 
 // wait for all to complete
-val results = Workflow.par(children.map { child => Step.awaitWorkflowCompletion(child) })
+val results = Workflow.parallel(children.map { child => Step.awaitWorkflowCompletion(child) })
 
 // first to finish wins
-val result = Step.firstToCompleteWithoutSuspension("race-children",
+val result = Step.firstToRunWithoutSuspension("race-children",
   children.map { child => Step.awaitWorkflowCompletion(child) }
 )
 
@@ -161,14 +163,7 @@ val outcomes: Seq[Either[SuspensionException, R]] =
   children.map(c => Workflow.runToSuspension { c.completion.await(c.id.key) })
 ```
 
-Child failure surfaces as a normal exception from the `completion` await — handle with ordinary `try`/`catch`:
-
-```scala
-try
-  Wait.all("fan-in", children.map(_.completion))
-catch case FailedChild(id, cause) =>
-  Step.atLeastOnce("compensate") { compensate(id) }
-```
+Child failure surfaces as a normal exception from the `completion` await.
 
 ### `ParentClosePolicy`
 
@@ -247,7 +242,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 ## Rationale
 
 - Sequential helpers (`Workflow.foreach`/`map`/`fold`) are omitted: plain loops with `scoped` are no more verbose, keep the model visible, and avoid a combinatory library that would not scale to new iteration shapes.
-- `runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `par` and the fan-in partial-collection pattern.
+- `Workflow.runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `Workflow.parallel` and the fan-in partial-collection pattern.
 - Single `startAsChild` method: parent controls timing positionally, not via a deferred-creation API. `create`/`run` separation is only needed for external callers who must register a workflow in the same transaction as other business data.
 - Deriving child scope from parent identity, workflow generation, and enclosing
   scope incarnations avoids persisting a randomized start ID while preventing
@@ -264,6 +259,6 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
 
-2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.par` and `Workflow.race` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
+2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Workflow.race` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
 3. **Race awaits cleanup** — **TODO**: Define how `Workflow.race` cleans up registered awaits from other branches when one branch has completed.
