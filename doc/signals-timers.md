@@ -342,7 +342,7 @@ another retention boundary removes it.
     ...
   }
   ```
-  The handler receives `Map[SignalId, Seq[Any]]` where the values are currently
+  The handler receives `Map[SignalKey, Seq[Any]]` where the values are currently
   visible events after this workflow instance's cursor for each exact signal
   key.
 - The onUnconsumedSignals handler is a regular function (may not contain `Step`s) and executed at-least-once.

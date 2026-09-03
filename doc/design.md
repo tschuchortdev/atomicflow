@@ -38,7 +38,7 @@ This API is just a draft, and will be refined as we go along.
 
 - create workflow and start it immediately
 - create workflow and not start it immediately (in which use-cases is this necessary?)
-  - Do we need a class that is some kind of "handle" to a workflow instance? A workflow instance is identified by its workflow id + instance key. So how would this handle be different from WorkflowInstanceMeta? The handle can hardly "be" the workflow instance, in execution, because the workflow instance in execution is just a thread that is executing the workflow function.
+  - Do we need a class that is some kind of "handle" to a workflow instance? A workflow instance is identified by its workflow id + instance key. So how would this handle be different from WorkflowContext? The handle can hardly "be" the workflow instance, in execution, because the workflow instance in execution is just a thread that is executing the workflow function.
 - create workflow idempotently
   - throw error if input parameters are different from first creation
 - wait blockingly for a workflow to complete and get its result -> Function needs to return WorkflowStopped when workflow waits on signal/timer.

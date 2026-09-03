@@ -81,7 +81,7 @@ runtime.deleteWorkflowInstancesByPrefix(workflowId, keyPrefix)
 
 - Obtained **only** from the runtime (returned by `create`, queries, ...) — never constructed freely — so a handle always refers to an existing instance.
 - Use cases: await result, query info, send signals to one instance, manual intervention (restart at step, abandon), reattach from another process.
-- `WorkflowInstance[In, Out]`: captures the workflow definition (code), instance key, and runtime. See `core-types.md` for the full taxonomy (identity vs metadata vs persisted info vs handle).
+- `WorkflowInstance[In, Out]`: captures the workflow definition (code), instance id, and runtime. See `core-types.md` for the full taxonomy (identity vs definition objects vs runtime contexts vs persisted info vs handle).
 - Queries parameterized by a `Workflow[In, Out]` return typed handles; key-based queries without the definition return `WorkflowInstance.Info` records instead (they cannot produce something runnable).
 
 ## Cancellation and termination
