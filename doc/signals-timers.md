@@ -63,6 +63,24 @@ enum Awaitable[+R : Cacheable] {
   visibility over `workflow_events`, not event copying; see
   `child-signal-inheritance.md`.
 
+### Why the event log is global
+
+A parent-child-tree log would make direct and inherited signals within that
+tree easy to order and would permit independent trees to append concurrently.
+It cannot, however, implement the contract of `Step.awaitRace` when a race
+includes a workflow completion from another tree: sequence IDs from separate
+logs are not comparable, and copying completion events to every possible
+waiter's tree would be both expensive and incomplete for late subscriptions.
+
+One global log gives every persisted event the same comparable `sequenceId`.
+`awaitRace` can therefore choose the earliest durable signal, timer, or
+completion event regardless of which workflow produced it. The tradeoff is a
+single short append critical section. PostgreSQL queues appenders on the global
+advisory mutex rather than allowing conflicting allocations to fail and retry;
+the implementation must keep that section small and benchmark the resulting
+throughput. Parent-child trees remain necessary for signal inheritance and
+lifecycle, but no longer define an ordering boundary.
+
 
 ## Basic Signal API
 

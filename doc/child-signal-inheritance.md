@@ -49,6 +49,10 @@ workerWorkflow.startAsChild(
   all workflows and determines the durable order.
 - All event appends have one total order. Non-overlapping appends preserve
   happens-before order; concurrent appends are ordered by the global allocator.
+- The sequence is global rather than one log per parent-child tree because
+  `Step.awaitRace` must compare a local signal or timer with a completion event
+  from an unrelated workflow. See `signals-timers.md` for the ordering and
+  throughput tradeoff.
 - Lifecycle deletion leaves gaps but never resets or reuses `sequenceId`s.
 - Sending atomically appends one event. That fact is immediately readable by
   the addressed workflow and all currently eligible descendants, so there is no
