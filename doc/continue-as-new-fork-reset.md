@@ -15,23 +15,39 @@ It returns `Nothing` and is implemented as runtime control flow, so the
 workflow body does not continue after the call.
 
 - The runtime updates the existing instance in place.
-- The generation is incremented and all steps, awaits, and other execution
-  records from the old generation are erased.
+- The generation is incremented and all Step rows, subscriptions, and other
+  execution records from the old generation are erased (except for cursors).
 - Older generations are not persisted separately.
 - The workflow key remains unique and unchanged. There are not multiple
   historical workflow instances with the same key.
 - The generation is exposed only through `WorkflowInstance.Info`. Users should
   not normally need to inspect or use it.
 - The transition is committed atomically by the runtime: current execution
-  records are removed and the incremented generation and new input are
-  installed as one durable in-place state transition.
+  records and directly addressed `Signal` events are removed, child
+  relationships are closed before those events are deleted, and the incremented
+  generation and new input are installed as one durable in-place state
+  transition. Current execution records include old await subscriptions and
+  wakeups. The unconsumed-signal handler runs before this transaction while
+  signal acceptance is closed.
 - Children of the old generation are handled according to their
   `ParentClosePolicy`: `Cancel` requests cancellation and `Abandon` detaches
   them. The continuation does not wait for cooperative child cancellation.
-- Signals and other pending external events receive the same completion-boundary
-  treatment as normal completion. The `onUnconsumedSignals` handler runs before
-  the transition; once it finishes, all events from the old generation are
-  discarded. State needed by the successor must be passed in `nextInput`.
+- Signals receive the same completion-boundary treatment as normal completion.
+  The `onUnconsumedSignals` handler runs before the transition. Once it
+  finishes, directly addressed `Signal` events are deleted. State needed by the
+  successor must be passed in
+  `nextInput`.
+- Cancelled or abandoned children no longer need unprocessed
+  inherited events; cached Step results contain their replayable values and do
+  not depend on the event row remaining present.
+- The instance keeps its exact-key signal cursors. The global event sequence is
+  not reset or reused after rows are deleted, so new event `sequenceId`s remain
+  greater than all previously allocated IDs. Cursors may point into gaps left by
+  deletion; this is expected.
+- If the continuing workflow is itself a child, it remains attached to its own
+  parent with the same signal-inheritance configuration. Ancestor events cannot
+  be deleted by the child transition; retained events remain visible according
+  to `inheritSignals`, `inheritPastEvents`, and the preserved cursors.
 - The operation is available to users only as `Workflow.continueAsNew` from
   inside an executing workflow. The runtime primitive is internal and requires
   the current workflow context.
@@ -54,6 +70,8 @@ runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFromStep = stepId)
 
 - A fork always receives a completely new instance ID.
 - The fork has generation = 0 and starts with the same input as the source instance.
+- A fork is an independent top-level workflow. It does not inherit the source
+  workflow's parent relationship or inherited signals.
 - `restartFromStep` is an exclusive boundary: cached history strictly before
   the selected step is copied, while the selected step and subsequent history
   are omitted so that the selected step executes again.
@@ -78,8 +96,7 @@ runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
 - Generation is incremented in place; no old generation is retained.
 - History strictly before `restartFromStep` remains cached. The selected step
   and subsequent history are erased, and the workflow replays from the top.
-- TODO: define reset treatment for parallel branch history and for associated
-  awaits, signals, updates, and children at the reset boundary.
+- Runtime determines which steps are "after" or "before" by looking at the timestamp where the step row was last updated.
 
 ## Why this design
 

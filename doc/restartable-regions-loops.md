@@ -90,8 +90,8 @@ The implementation uses internal control-flow exceptions to implement the `resta
   between generations.
 - `restartCount` starts at zero and counts committed restart transitions. It
   does not count body executions caused by crashes or outer replay.
-- Restart atomically installs the next state and discards Steps, timers, await
-  decisions, and nested region data owned by the previous looping.
+- Restart atomically replaces the region's Step row with its next state and
+  discards nested Step rows and subscriptions owned by the previous looping.
 - Execution re-enters the region locally after restart; outer workflow code is
   not replayed merely to begin the next looping.
 - Only the current state and current-generation execution records are retained,
@@ -115,7 +115,11 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
 
 ## Signals and children
 
-- A nested region restart preserves the workflow signal log (since it is owned by the workflow as a whole). Stream-await cursors survive across loopings, while cached results of awaits are discarded (awaits are essentially reset).
+- A nested region restart preserves the workflow's visibility into the global
+  immutable event sequence. Exact-key signal cursors survive across loopings,
+  while cached await Step rows in the region are discarded. Discarding an await
+  result therefore does not make an event behind its signal cursor consumable
+  again.
 - Children created in a discarded generation are handled according to their
   `ParentClosePolicy`. Successor generations use distinct child identities.
 - Restartable regions have the same problems as `continueAsNew`: While Step and Await IDs can be reused after deletion, child IDs cannot, since the child may continue to live independently for a short time (there ID may then collide with the newly started child with the same ID). Thus, restartable regions must also include the loop count in the child's `WorkflowInstanceId` derivation (in the `scope` field), just like `continueAsNew` does for the generation. Each enclosing region's key and `restartCount` therefore
@@ -129,5 +133,9 @@ internally, just as it does for other control-flow exceptions.
 
 ## Why restartable regions cannot completely replace continue-as-new:
 
-- `continueAsNew` also discards the signal log. A restartable region cannot do this because the signal log is shared by the whole workflow whereas steps and awaits are clearly owned by specific code sections (and thus can be reset independently).
+- `continueAsNew` also deletes events addressed to the workflow instance, while
+  retaining its exact-key cursors. A restartable region cannot delete those
+  events because signal visibility belongs to the workflow instance as a whole,
+  whereas Step rows are owned by specific code sections and can be reset
+  independently.
 - `continueAsNew` is more appropriate for recursion.

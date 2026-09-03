@@ -65,6 +65,12 @@ object WorkflowInstance:
   lookup across all scopes. The database uniqueness key is `(workflowId,
   workflowInstanceKey, scope)`. See `sub-workflows-iteration.md` for derivation.
 - **`parentId` field**: tracks the active parent relationship for child workflows (empty for top-level or detached workflows). It belongs to `WorkflowInstance.Info`, not `WorkflowInstanceId`, because the relationship may be cleared when the parent closes while identity must remain stable.
+- The workflow-instance storage record also carries runtime-only child signal
+  inheritance fields: the selector, `inheritPastEvents`, and
+  `inheritedEventsStartSequenceId`. Runtime signal state also retains exact-key
+  cursors independently of deletable event rows. These are not identity and are
+  omitted from `WorkflowInstance.Info` until an external inspection use case
+  requires them. See `child-signal-inheritance.md`.
 - Capability vs data: `WorkflowInstance` requires the workflow code and can act; `WorkflowInstance.Info` requires nothing and just reports. Key-based queries without the code can only return `Info`; queries parameterized by a `Workflow[In, Out]` return typed handles. The two meet in exactly one place: `instance.getInfo()`. Nesting `Info` inside `WorkflowInstance` expresses that it is the data view of the same concept, not a second concept.
 - The handle retains both `In` and `Out` because it captures a `Workflow[In, Out]`. Every place that can construct a typed handle knows both types; operations that know only an ID return `Info` instead.
 - `StepMeta` stays a single class combining step definition fields and the instance id: steps are inline lambdas, so step metadata cannot exist outside an execution — a definition-only `StepMeta` would have no producer or consumer. **`StepMeta` is never used as a lookup key.** Lookups use `WorkflowInstanceId` + `StepId`; since this pair appears only rarely in internal implementation code, a plain tuple suffices — no named type unless it surfaces in a public/SPI signature. Consequently, descriptive fields (`stepName`, `stepDescription`) never affect any lookup, so editing a description never orphans cached results.

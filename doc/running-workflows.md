@@ -120,7 +120,7 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 
 ## `continueAsNew` — bounded-history tail loops and tail recursion
 
-For workflows that run indefinitely (event-loop style) or recurse deeply, the instance history (step cache rows, signal log, decision records) grows without bound. `continueAsNew` resets it by atomically replacing the current execution state in place, incrementing its generation, and installing new input under the same key.
+For workflows that run indefinitely (event-loop style) or recurse deeply, the instance history (Step rows, directly addressed events, and subscriptions) grows without bound. `continueAsNew` resets it by atomically replacing the current execution state in place, incrementing its generation, and installing new input under the same key.
 
 ```scala
 // inside a workflow body — never returns (return type Nothing)
@@ -132,13 +132,33 @@ The public operation is available only inside an executing workflow through the 
 ### Semantics
 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
-2. In one atomic transaction: erase the current execution state, increment the generation counter in place, and persist `newInput`. Older generations are not retained as separate instances or history.
-3. The new generation starts with a **completely empty** step cache and signal log. No history carries over.
+2. After the unconsumed-signal handler finishes, one atomic transaction closes
+   old child relationships before deleting directly addressed `Signal` events
+   addressed to this instance, erases the remaining current execution state
+   (including old subscriptions and wakeups but not cursors), increments the generation counter,
+   and persists `newInput`. Older generations are not retained separately.
+3. The new generation therefore starts with a **completely empty** set of Step
+   rows, subscriptions, and directly addressed event rows. Exact-key signal
+   cursors survive the transition.
 4. The instance key is stable across generations. External signals addressed to that key are routed to the current (latest) generation automatically.
+5. The global event sequence continues independently of lifecycle deletion.
+   Deleted `sequenceId`s are never reused, so exact-key signal cursors may point
+   into gaps; this is expected.
+6. If this workflow is itself a child, it remains attached to its parent with
+   the same signal-inheritance configuration. It retains its exact-key signal
+   cursors, so inherited parent signals already consumed are not consumed again.
 
 ### Unconsumed signals at the reset boundary
 
-Before transition, the workflow's `onUnconsumedSignals` handler receives all unacknowledged events. After the handler finishes, all signal events are discarded with the rest of the old generation's execution state. Workflows that need information in the next generation must include it in `newInput`.
+Before transition, the workflow's `onUnconsumedSignals` handler receives all
+currently visible signals after the old generation's exact-key cursors. After
+the handler finishes and old child relationships are closed, directly addressed
+`Signal` events are physically deleted. Cached child Step results remain
+replayable without their source event. Events belonging to other workflow
+instances are not owned by this transition and are not deleted. A continuing
+child remains attached to its own parent and can inherit retained parent events
+according to `inheritSignals` and `inheritPastEvents`. State the successor must
+own independently belongs in `newInput`.
 
 ### Typical usage
 
@@ -167,7 +187,11 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 - A function of the runtime (with a `Workflow` forwarder) rather than a helper like `Workflow.loop`: the recursive nature is the point. Users write the recursion themselves; `continueAsNew` is the tail call. A `loop` wrapper would hide the history-reset boundary behind a callback, making the semantics less visible.
 - Return type `Nothing`: `continueAsNew` is a transfer of control, not a value-producing expression. This makes it impossible to accidentally use its "return value."
-- No automatic history carry-over: keeping history reset semantics simple means the implementation stays correct in edge cases (e.g., concurrent signal delivery at the reset boundary). Users who need state across generations pass it as `newInput`.
+- No automatic history carry-over: deleting the old generation's directly
+  addressed signal events bounds event retention. Closing its child
+  relationships first makes those events unnecessary for unresolved child
+  awaits, while cached child Step results remain replayable. Users who need
+  state across generations pass it as `newInput`.
 
 ## Open points
 

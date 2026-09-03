@@ -1,6 +1,6 @@
 # Subworkflows, Child Workflows & Iteration
 
-Guideline for inline scoping, concurrent fan-out, and independent child workflows. Companion to `running-workflows.md`, `signals-timers.md`, `steps.md`.
+Guideline for inline scoping, concurrent fan-out, and independent child workflows. Companion to `running-workflows.md`, `signals-timers.md`, `child-signal-inheritance.md`, and `steps.md`.
 
 ## Core distinction
 
@@ -8,7 +8,13 @@ Three genuinely different concepts; the distinction answers both the O(n²) resu
 
 - **Subworkflow** = an inline code section whose Step and Await IDs are prefixed by a scope key. No independent existence; lives inside the parent's history. The parent re-runs on every event that touches any element. Replay of already-completed elements is cheap (cache lookups), but total work is O(events × elements). Correct when you need to capture parent-scope variables; use for modest n.
 
-- **Child workflow** = a separately registered `Workflow` started from within another workflow via `startAsChild`. Has its own instance, key, history, log, cursor, and observability. The parent suspends and is **not** re-run on child events. Lifecycle is coupled to the parent via `ParentClosePolicy`. Use when per-element independence, scale, or separate versioning matters.
+- **Child workflow** = a separately registered `Workflow` started from within
+  another workflow via `startAsChild`. Has its own instance, key, history,
+  exact-signal-key cursors, and observability. Signal events are stored once in
+  global `workflow_events`, not copied into a child-local log. The parent is
+  **not** re-run for an event addressed only to the child.
+  Lifecycle is coupled to the parent via `ParentClosePolicy`. Use when
+  per-element independence, scale, or separate versioning matters.
 
 - **Independent workflow** = a workflow started from outside (via the runtime directly) with no parent linkage. Out of scope for this doc; see `running-workflows.md`.
 
@@ -131,16 +137,54 @@ val child: WorkflowInstance[In, Out] =
   workerWf.startAsChild(
     childKey,
     input,
-    parentClosePolicy = ParentClosePolicy.Cancel  // default
+    parentClosePolicy = ParentClosePolicy.Cancel, // default
+    inheritSignals = SignalInheritance.some("approval/", "order/cancelled"),
+    inheritPastEvents = false                      // default
   )
 
 val result = child.completion.await("worker-result")
 ```
 
 - **Idempotent on parent replay**: `startAsChild` is create-if-absent + run. Replaying the parent after a crash does not start a duplicate child; it returns the existing handle.
-- **Deterministic identity**: A child workflow's identity (`WorkflowInstanceId`) is made up from user-supplied `WorkflowInstancKey` and a scope. The scope is derived from the parent's identity (including parent generation) and
+- **Deterministic identity**: A child workflow's identity (`WorkflowInstanceId`) is made up from user-supplied `WorkflowInstanceKey` and a scope. The scope is derived from the parent's identity (including parent generation) and
   enclosing workflow scopes.
 - **No synchronous/blocking variant**: blocking the parent thread for a child's duration would pin the lease for the whole duration. If you want inline execution sharing the parent's scope, use `scoped` + Steps. If you want the result durably, await the child's completion signal.
+
+### Inherited signals
+
+Because child workflows are hardly addressable from the outside (their exact key is difficult to know up front), they must be able to process the parent's signals to be useful.
+
+`inheritSignals` declares which signals addressed to the parent are visible to
+the child. It defaults to none; `SignalInheritance.all` permits every key and
+`SignalInheritance.some(prefixes*)` permits matching key prefixes.
+
+- Inheritance is transitive only when `inheritSignals` on every child edge also
+  permits the key.
+- `inheritPastEvents = false` limits inherited visibility to events with a
+  `sequenceId` greater than the child relationship's
+  `inheritedEventsStartSequenceId`. With `true`, retained older events can also
+  be visible if they remain ahead of the child's cursor.
+- When the parent completes or calls `continueAsNew`, directly addressed parent
+  `Signal` events are deleted. The child becomes cancelled or abandoned, and
+  any await Step result it already made remains cached for replay.
+- Replaying `startAsChild` replaces the current inheritance configuration.
+  Added prefixes can expose retained events; removed prefixes hide unresolved
+  events. Cached Step results are unaffected. Replaying an unchanged
+  configuration is a no-op and does not wake the subtree.
+- Updating the inheritance configuration does not acquire the child's execution
+  lease. A race with an await concurrently committing its result is deliberately left unordered; either the old or new configuration may be observed.
+- The active parent, inheritance fields, and
+  `inheritedEventsStartSequenceId` are persisted on the child's
+  workflow-instance record.
+- Signals are immutable event facts, not copied deliveries. One committed
+  send is therefore atomically visible to all currently eligible descendants.
+  Awaiting inherited events uses a recursive ancestor query.
+- When the inheritance policy is updated, this may unblock awaits in the child. Thus, all grandchildren need to be scheduled for execution after an inheritance policy update. Descendant scheduling may be asynchronous and reuse the normal
+  workflow wakeup mechanism.
+- Synchronous `Update`s are never inherited because multiple descendant
+  responses would be ambiguous.
+
+See `child-signal-inheritance.md` for ordering, cursor, and detachment semantics.
 
 ### Fan-out and fan-in
 
@@ -172,7 +216,7 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 | Policy | Behaviour |
 |---|---|
 | `Cancel` (default) | Deliver a cooperative cancellation to the child (see `running-workflows.md` for cancel semantics). |
-| `Abandon` | Child detaches and continues independently as if it were a top-level workflow. |
+| `Abandon` | Child detaches and continues independently. Unresolved inherited signals cease to be visible; cached Step results and directly addressed signals remain valid. |
 
 `Terminate` is intentionally absent from the policy enum. Force-killing a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 
@@ -213,8 +257,9 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 - The returned handle is the normal way to address a child. Users should not
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
-  `parentInstanceId`; it does not include the generation and is cleared when
-  the parent completes or continues as new.
+  `parentWorkflowInstanceId` on the storage record; it does not include the
+  generation and is cleared when the parent completes or continues as new.
+  `WorkflowInstance.Info` exposes this as `parentId`.
 
 ## Recursion
 
@@ -251,6 +296,9 @@ val processorWf = Workflow("processor") { (state: State) =>
   an instance ID, and the parent pointer represents active ownership rather
   than historical provenance. Clearing it when the parent closes also matches
   the child's view that the parent has completed.
+- Events can be sent to a parent or a child. Global event sequence IDs give
+  signals, timers, and workflow completions one order; each workflow instance
+  maintains its own exact-key signal cursors into that sequence.
 - Fan-out/fan-in via `.map` + `Wait.all`/`Wait.race`: consistent with the signals/timers model; no new primitive concepts.
 - `Terminate` outside `ParentClosePolicy`: force-kill at parent close is an ops concern, not a lifecycle concern. Keeping it off the policy enum reduces the decision surface for users writing workflow code.
 - O(n²) subworkflow problem: subworkflows are documented as O(events × elements) by design; this is acceptable for modest n. For large n or latency-sensitive flows, child workflows solve the problem structurally.

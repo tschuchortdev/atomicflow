@@ -214,15 +214,40 @@ Temporal follows the portable-wrapper approach: terminal Activity failures are r
 
 ## Internal storage model
 
-Steps do not use a separate idempotency-id indirection table. Both guarantees use the same `Started` / completed-outcome record, keyed by the natural composite key:
-- At-least-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, stepVersion, cache-key-hash)`
-- At-most-once: `(workflowId, workflowInstanceKey, [subworkflowScope], stepId, cache-key-hash)`
+One `workflow_steps` table stores the durable runtime state for ordinary user
+Steps, runtime-computed awaits, `Step.firstToRunWithoutSuspension`, and
+`Workflow.restartable` / `Workflow.loop` regions:
 
-Manual intervention / override of a step (e.g., "forget this step was started, retry it"):
-- Direct by `(workflowId, workflowInstanceKey, stepId)`: reset/delete the row, or replace the "started" marker and cached result.
-- No separate idempotency-id table or override map needed.
+```text
+workflow_steps (
+  workflowInstanceId, stepId, stepVersion, stepKind, stateKind, statePayload,
+  inputFingerprints, expiresAt, createdAt, updatedAt
+)
+```
 
-This removes `StepIdempotencyId` and `StepIdempotencyStore` as public concepts; they become internal implementation details of the backend if needed at all.
+- The natural key is `(workflowInstanceId, stepId, stepVersion)`. Unversioned
+  constructs use internal `stepVersion = 0`; public at-least-once versions are
+  positive. Reusing an ID with an incompatible `stepKind` is a conflict.
+- `stepKind` distinguishes `AtLeastOnce`, `AtMostOnce`, `Await`,
+  `FirstToRunWithoutSuspension`, and `RestartableRegion`.
+- `stateKind` distinguishes `Started`, `Succeeded`, `Failed`. 
+- `RestartableRegion` is permanently in state `Started` after the record was created. 
+- `statePayload` is a runtime-owned encoded value, so it
+  can carry a returned value, failure, retry bookkeeping, or a region's
+  `(restartCount, currentState)` without kind-specific nullable columns.
+- Awaits and `firstToRunWithoutSuspension` persist only their public returned
+  value. Their selected event and winning branch are used while committing the
+  result, cursor movement, and subscription cleanup but are not retained.
+- A restartable region updates its own row on each looping and deletes
+  nested Step rows and subscriptions from the previous looping. It never caches
+  the region's final return value.
+- `inputFingerprints` is comparison data, not part of the natural key. An
+  `ensureUnchanged` difference finds the existing row and raises
+  `StepInputConflictException`; an `invalidateOn` difference replaces the
+  existing state.
+- Manual intervention directly resets, deletes, or replaces the row addressed
+  by `(workflowInstanceId, stepId, stepVersion)`. No idempotency-ID indirection
+  table or override map is needed.
 
 ## Deferred: external idempotency tokens
 

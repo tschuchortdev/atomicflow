@@ -115,7 +115,7 @@ given Cacheable[Receipt] =
   completed effects.
 - Different APIs for versioned at-least-once and unversioned at-most-once steps
   make unsafe re-execution visible rather than hiding it behind a version bump.
-- A shared `Started` record gives both guarantees one storage shape and makes
-  the three-state inspection result an exact view of durable facts.
-- Deserialization fallbacks address data evolution independently from workflow
+- A shared `workflow_steps` record gives both guarantees one storage shape and
+  makes the three-state inspection result an exact view of durable facts.
+- Deserialization fallbacks address data evolution independently of workflow
   control-flow evolution.
