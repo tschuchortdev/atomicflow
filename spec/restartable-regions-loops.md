@@ -6,8 +6,8 @@ The goal of this feature was to have a region of steps and timers that can be ea
 ```scala 
 while (true) {
   Step.atLeastOnce(...) { ... }
-  Timer.await(...) { ... }
-  // both Timer and Step must be reset in every iteration to make sense
+  Step.await(..., Awaitable.Timer(...)) { ... }
+  // both Step and Timer await must be reset in every iteration to make sense
 }
 ```
 Alternatively, polling could also be implemented through a Step with built-in unlimited retries:
@@ -108,7 +108,7 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
 
   if status.isFinished then loop.break(status.result)
   else
-    Workflow.sleep("poll-interval", 5.seconds)
+    Step.await("poll-interval", Awaitable.Timer(5.seconds))
     state.nextAttempt
 }
 ```

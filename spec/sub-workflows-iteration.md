@@ -77,15 +77,15 @@ object Step {
     @experimental
     def firstToRunWithoutSuspension[R](
         stepId: String,
-        invalidateOn: Map[String, Any] = Map.empty,
-        ensureUnchanged: Map[String, Any] = Map.empty
+        invalidateOn: Seq[StepInput[?]] = Seq.empty,
+        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
     )(branches: Seq[() => R]): R
     
     @experimental
     def firstToRunWithoutSuspension[R](
         stepId: String,
-        invalidateOn: Map[String, Any] = Map.empty,
-        ensureUnchanged: Map[String, Any] = Map.empty
+        invalidateOn: Seq[StepInput[?]] = Seq.empty,
+        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
     )(branches: (() => R)*): R
 }
 ```
@@ -97,7 +97,7 @@ This function can be used to race arbitrary sub functions, but it has a lot of d
 ```scala
 val result: R = Step.firstToRunWithoutSuspension("race-branches",
     { Thread.sleep(10.minutes) },
-    { Step.awaitTimer("timer", 1.minute) }
+    { Step.await("timer", Awaitable.Timer(1.minute)) }
 )
 ```
 One would expect the timer to win, but it will not: The timer suspends immediately by throwing an exception and will not become unblocked until the entire workflow is re-executed. The `Thread.sleep` will just block the thread and complete before the other branch has a chance to re-run. This must be clearly documented!
@@ -142,7 +142,7 @@ val child: WorkflowInstance[In, Out] =
     inheritPastEvents = false                      // default
   )
 
-val result = child.completion.await("worker-result")
+val result = Step.await("worker-result", child.completion)
 ```
 
 - **Idempotent on parent replay**: `startAsChild` is create-if-absent + run. Replaying the parent after a crash does not start a duplicate child; it returns the existing handle.
@@ -188,23 +188,23 @@ See `child-signal-inheritance.md` for ordering, cursor, and detachment semantics
 
 ### Fan-out and fan-in
 
-No bespoke combinators are provided. Fan-out is a plain `.map`; fan-in reuses the existing `Wait` machinery from `signals-timers.md`:
+No bespoke combinators are provided. Fan-out is a plain `.map`; fan-in reuses `Step.await` on `child.completion` (see `signals-timers.md`):
 
 ```scala
 // fan-out
 val children = items.map(i => workerWf.startAsChild(key(i), i))
 
 // wait for all to complete
-val results = Workflow.parallel(children.map { child => Step.awaitWorkflowCompletion(child) })
+val results = Workflow.parallel(children.map { child => () => Step.await("complete-" + child.id.key, child.completion) })
 
 // first to finish wins
 val result = Step.firstToRunWithoutSuspension("race-children",
-  children.map { child => Step.awaitWorkflowCompletion(child) }
+  children.map { child => () => Step.await("complete-" + child.id.key, child.completion) }
 )
 
 // partial: advance each, collect what's ready
 val outcomes: Seq[Either[SuspensionException, R]] =
-  children.map(c => Workflow.runToSuspension { c.completion.await(c.id.key) })
+  children.map(c => Workflow.runToSuspension { Step.await(c.id.key, c.completion) })
 ```
 
 Child failure surfaces as a normal exception from the `completion` await.
@@ -268,7 +268,8 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 ```scala
 lazy val treeWf: Workflow[Node, Sum] = Workflow("tree") { (node: Node) =>
   val kids = node.children.map(c => treeWf.startAsChild(key(c), c))
-  node.value + Wait.all("kids", kids.map(_.completion)).sum
+  val kidResults = Workflow.parallel(kids.map(k => () => Step.await("kids-" + k.id.key, k.completion)))
+  node.value + kidResults.sum
 }
 ```
 
@@ -299,7 +300,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 - Events can be sent to a parent or a child. Global event sequence IDs give
   signals, timers, and workflow completions one order; each workflow instance
   maintains its own exact-key signal cursors into that sequence.
-- Fan-out/fan-in via `.map` + `Wait.all`/`Wait.race`: consistent with the signals/timers model; no new primitive concepts.
+- Fan-out/fan-in via `.map` + `Workflow.parallel` of `Step.await(child.completion)`: consistent with the signals/timers model; no new primitive concepts.
 - `Terminate` outside `ParentClosePolicy`: force-kill at parent close is an ops concern, not a lifecycle concern. Keeping it off the policy enum reduces the decision surface for users writing workflow code.
 - O(n²) subworkflow problem: subworkflows are documented as O(events × elements) by design; this is acceptable for modest n. For large n or latency-sensitive flows, child workflows solve the problem structurally.
 
@@ -307,6 +308,6 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
 
-2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Workflow.race` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
+2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstToRunWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
-3. **Race awaits cleanup** — **TODO**: Define how `Workflow.race` cleans up registered awaits from other branches when one branch has completed.
+3. **Race awaits cleanup** — **TODO**: Define how `Step.firstToRunWithoutSuspension` cleans up registered awaits from other branches when one branch has completed.

@@ -62,10 +62,10 @@ Step.atLeastOnce("check-results", retry = Step.RetryPolicy.exponentialBackoff(st
 
 - Constructor: `Step.atLeastOnce` or `Step.atMostOnce` is required; it sets Axis 1 (the guarantee).
 - `version` exists only on `Step.atLeastOnce`. Increasing it creates new retryable work and stops reusing the previous version's cached result. `Step.atMostOnce` deliberately has no version because a new version could execute after the old operation possibly produced its effect; use a new step ID and explicit workflow-version gating for a genuinely new operation.
-- Named parameters: `ensureUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty.
+- Named parameters: `ensureUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty. Each `"key" -> value` pair is converted to a `StepInput` by an implicit conversion; see the `StepInput` Scaladoc.
 - **Named parameters are mandatory** — if you write `ensureUnchanged = Seq(...)`, the reader sees immediately what the policy is; positional ambiguity is impossible.
 - `invalidateAfter`: optional TTL applied to the entire cached result (independent of drift policy).
-- **No implicit key list**: if neither `ensureUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., ensureUnchanged = Seq(instanceId -> "instance")) { ... }`).
+- **No implicit key list**: if neither `ensureUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., ensureUnchanged = Seq("instance" -> instanceId)) { ... }`).
 - Return type for `at-most-once`: `Option[R]`; `None` means "started but not completed, unsafe to retry." Caller must handle.
 
 ### Built-in retries
@@ -260,7 +260,11 @@ Deferred because:
 
 ## Cache key format: named pairs
 
-Cache keys are specified as `"key" -> value` pairs, not bare values.
+Cache keys are written as `"key" -> value` pairs. Each pair is converted to a
+`StepInput` by an implicit conversion. The sole purpose of `StepInput` is to
+reify the `Fingerprintable` instance of the value, so heterogeneous inputs can
+be fingerprinted without requiring a `Fingerprintable[Any]`; it is never
+constructed directly by callers.
 
 **Rationale:**
 - **Self-documenting**: `ensureUnchanged("orderId" -> orderId)` is instantly clear; bare values require inference from context.

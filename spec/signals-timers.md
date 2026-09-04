@@ -13,7 +13,7 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 
 Several different things can be awaited:
 ```scala
-enum Awaitable[+R : Cacheable] {
+enum Awaitable[R : Cacheable] {
   case SignalEvent(
       s: Signal[R], 
       filter: R => Boolean = { _ => true },
@@ -27,11 +27,31 @@ enum Awaitable[+R : Cacheable] {
   }
   
   case WorkflowCompletion(workflowInstanceId: WorkflowInstanceId) extends Awaitable[R]
-  object WorkflowCompletion {
-    def apply(workflowInstance: WorkflowInstance[?, R]): Awaitable[R] = 
-      WorkflowCompletion(workflowInstance.instanceId)
-  }
+
+  /** Transforms the awaited result. Mapping does not require a `Cacheable[B]` for
+    * the target type `B`: a `Cacheable` is only needed at the `Step.await` call
+    * site, where the mapped result is persisted. */
+  def map[B](f: R => B): Awaitable[B]
 }
+```
+
+- `Awaitable` is **invariant** in `R` (like `Cacheable` and `Signal`), so its
+  cases may safely embed `Signal[R]`.
+- `map` exists so that `Step.await` can race or combine awaitables whose raw
+  results (`Unit` timers, `Out` completion results) differ in type, mapping them
+  onto one common result type. It does not require a `Cacheable` for the mapped
+  type; the `Cacheable` needed to persist the awaited result is required at the
+  `Step.await` call site.
+- A `WorkflowCompletion` yields the child's result. `WorkflowInstance.completion`
+  and `WorkflowInstanceId.completion` return one directly; see `core-types.md`.
+
+Convenience accessors:
+```scala
+// on WorkflowInstance[In, Out]
+def completion: Awaitable[Out] = Awaitable.WorkflowCompletion(id)
+
+// on WorkflowInstanceId
+def completion: Awaitable.WorkflowCompletion = Awaitable.WorkflowCompletion(this)
 ```
 
 ## Event storage: globally ordered log + signal cursor per (workflow-instance, signal-key)
@@ -150,8 +170,8 @@ object Step {
   def await[A](
     stepKey: String, 
     awaitable: Awaitable[A],
-    invalidateOn: Map[String, Any] = Map.empty,
-    ensureUnchanged: Map[String, Any] = Map.empty,
+    invalidateOn: Seq[StepInput[?]] = Seq.empty,
+    ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
     invalidateAfter: Duration = Duration.Inf,
   ): A = ???
 }
@@ -190,8 +210,8 @@ object Step {
 object Step {
     def awaitRace[A](
         stepKey: String,
-        invalidateOn: Map[String, Any] = Map.empty,
-        ensureUnchanged: Map[String, Any] = Map.empty
+        invalidateOn: Seq[StepInput[?]] = Seq.empty,
+        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
     )(awaits: Awaitable[A]*): A = ???
 }
 ```
@@ -203,11 +223,9 @@ object Step {
 - All candidates are compared by global `sequenceId`, so the earliest
   satisfying signal, timer, or completion event wins even when the events
   belong to unrelated workflow trees.
-- When a race succeeds, only the winning signal key's cursor advances. When an
-  all-await succeeds, each selected signal key's cursor advances to its selected
-  event. The successful Step row and those cursor movements are persisted
-  atomically. If a combined await remains unsatisfied, none of its signal
-  cursors advance.
+- When a race succeeds, only the winning signal key's cursor advances. The
+  successful Step row and that cursor movement are persisted atomically. If no
+  candidate is satisfiable, none of the signal cursors advance.
 
 ## Updates: signals that return a value
 
@@ -357,7 +375,7 @@ When an upstream step is invalidated (TTL expired, `invalidateOn` dependency cha
 **Awaits inherit this rule:** an await can declare `invalidateOn` dependencies just as steps do:
 
 ```scala
-Step.awaitRace("approval-race", approval, Timer(deadline)),
+Step.awaitRace("approval-race", approval, Awaitable.Timer(deadline)),
   invalidateOn = Seq("context" -> someContextValue)
 )
 ```
