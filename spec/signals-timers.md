@@ -13,7 +13,7 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 
 Several different things can be awaited:
 ```scala
-enum Awaitable[R : Cacheable] {
+enum Awaitable[R : Cacheable as resultCacheable] {
   case SignalEvent(
       s: Signal[R], 
       filter: R => Boolean = { _ => true },
@@ -26,7 +26,13 @@ enum Awaitable[R : Cacheable] {
       Timer(Instant.now(clk).plus(delay))
   }
   
-  case WorkflowCompletion(workflowInstanceId: WorkflowInstanceId) extends Awaitable[R]
+  /** Yields the child's terminal outcome as a `WorkflowCompletionResult[R]`
+    * (see `running-workflows.md`). The child's output type `R` is pinned at
+    * the construction site; the codecs needed to persist and decode the
+    * outcome are required at the `Step.await` call site, like for mapped
+    * results. */
+  case WorkflowCompletion[R](workflowInstanceId: WorkflowInstanceId)(using throwableCacheable: Cacheable[Throwable])
+      extends Awaitable[WorkflowCompletionResult[R]]
 
   /** Transforms the awaited result. Mapping does not require a `Cacheable[B]` for
     * the target type `B`: a `Cacheable` is only needed at the `Step.await` call
@@ -42,16 +48,22 @@ enum Awaitable[R : Cacheable] {
   onto one common result type. It does not require a `Cacheable` for the mapped
   type; the `Cacheable` needed to persist the awaited result is required at the
   `Step.await` call site.
-- A `WorkflowCompletion` yields the child's result. `WorkflowInstance.completion`
-  and `WorkflowInstanceId.completion` return one directly; see `core-types.md`.
+- A `WorkflowCompletion` yields the child's terminal outcome as a
+  `WorkflowCompletionResult[R]`: `Completed(result)` on success, `Failed(decoded
+  failure)` when the child failed — the case carries the decoded `Throwable`,
+  ready to rethrow for direct-style handling — plus `Cancelled` and
+  `Terminated`. Awaiting never throws the child's failure implicitly; the
+  outcome crosses the serialization boundary before it is observed, exactly
+  like a Step result. `WorkflowInstance.completion` and
+  `WorkflowInstanceId.completion` return one directly; see `core-types.md`.
 
 Convenience accessors:
 ```scala
 // on WorkflowInstance[In, Out]
-def completion: Awaitable[Out] = Awaitable.WorkflowCompletion(id)
+def completion: Awaitable.WorkflowCompletion[Out] = Awaitable.WorkflowCompletion(id)
 
-// on WorkflowInstanceId
-def completion: Awaitable.WorkflowCompletion = Awaitable.WorkflowCompletion(this)
+// on WorkflowInstanceId — untyped: the caller pins the child's output type
+def completion[R]: Awaitable.WorkflowCompletion[R] = Awaitable.WorkflowCompletion(this)
 ```
 
 ## Event storage: globally ordered log + signal cursor per (workflow-instance, signal-key)
@@ -432,7 +444,7 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, scheduledAt)
 |---|---|---|---|
 | `Signal` | The addressed instance | Exact signal key | Serialized signal value |
 | `TimerFired` | The instance owning the timer | Timer subscription ID | Encoded `Unit` |
-| `WorkflowCompleted` | The completed instance | Empty string | Serialized terminal outcome |
+| `WorkflowCompleted` | The completed instance | Empty string | Serialized `WorkflowCompletionResult` — one event per terminal transition; see `running-workflows.md` |
 
 - `workflow_events.sequenceId` is the global durable event order. It is backed
   by a PostgreSQL `SEQUENCE ... CACHE 1`, not an application counter table.
@@ -475,7 +487,8 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, scheduledAt)
 - The three subscription tables contain only pending awaits and are never event
   rows. A timer subscription holds its absolute deadline; when the scheduler
   fires it, it appends a `TimerFired` event. Workflow completion appends one
-  `WorkflowCompleted` event whether or not a subscriber already exists.
+  `WorkflowCompleted` event in the same transaction as the guarded terminal
+  instance transition, whether or not a subscriber already exists.
 - A child await uses a recursive ancestor query over `workflow_instances` to
   find the sources allowed by every inheritance edge. An index over
   `(eventKind, eventKey, workflowInstanceId, sequenceId)` supports exact signal

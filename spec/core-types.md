@@ -26,10 +26,12 @@ case class WorkflowInstanceId(
   workflowId: WorkflowId,
   workflowInstanceKey: WorkflowInstanceKey,
   scope: String = ""
-):
+) {
   // Awaitable of this instance's completion; see signals-timers.md.
-  // The result type is untyped because an id alone carries no Workflow[_, Out].
-  def completion: Awaitable.WorkflowCompletion
+  // The child's output type cannot be derived from an id alone, so callers pin
+  // it explicitly; the codecs are resolved at the await call site.
+  def completion[R]: Awaitable.WorkflowCompletion[R]
+}
 
 case class StepId(key: String, scope: String = "")
 
@@ -49,40 +51,52 @@ final class Signal[A](
 
 
 // Runtime contexts: materialized only during execution; compose stable ids, not Meta wrappers.
-trait WorkflowContext:
+trait WorkflowContext {
   def instanceId: WorkflowInstanceId
   def versionAtCreation: Long
   def runtime: WorkflowRuntime
+}
 
-trait StepContext[Out]:
+trait StepContext[Out] {
   def stepId: StepId
   def stepVersion: Option[Long]
   def stepName: Option[String]
   def stepDescription: Option[String]
   def workflowCtx: WorkflowContext
-
+}
 
 // Handle: capability object, obtained only from the runtime
-final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId, runtime: WorkflowRuntime):
+final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
-  def run(): WorkflowRunResult[Out]
-  def awaitResult(timeout: FiniteDuration): WorkflowRunResult[Out]
-  def getInfo(): WorkflowInstance.Info   // fresh from DB
-  // Awaitable of this instance's completion; see signals-timers.md
-  def completion: Awaitable[Out]
+  def run()(using WorkflowRuntime): WorkflowRunResult[Out]
+  def awaitResult(timeout: FiniteDuration)(using WorkflowRuntime): WorkflowRunResult[Out]
+  def getInfo()(using WorkflowRuntime): WorkflowInstance.Info   // fresh from DB
+  // Awaitable of this instance's completion; yields a WorkflowCompletionResult[Out]
+  // (see running-workflows.md). Codecs resolve at the await call site.
+  def completion: Awaitable.WorkflowCompletion[Out]
+}
 
-object WorkflowInstance:
+object WorkflowInstance {
   // Persisted instance state: the data view of an instance ("a row"), returned by
   // key-based queries that don't have the workflow code, and by instance.getInfo()
   case class Info(
     id: WorkflowInstanceId,
     parentId: Option[WorkflowInstanceId],
     generation: Long,
+    status: WorkflowStatus,
     workflowVersionAtCreation: Long,
     createdAt: Instant,
     lastRunAt: Option[Instant],
     timesExecuted: Int,
   )
+}
+
+// Lifecycle status of an instance; transitions and terminal semantics in
+// running-workflows.md. CANCELLING is deliberately not a case: it is the
+// derived predicate cancel_requested_at IS NOT NULL AND status IN (Running, Suspended).
+enum WorkflowStatus {
+  case Created, Running, Suspended, Completed, Failed, Cancelled, Terminated
+}
 ```
 
 ## Rationale
@@ -105,7 +119,7 @@ object WorkflowInstance:
 - The handle retains both `In` and `Out` because it captures a `Workflow[In, Out]`. Every place that can construct a typed handle knows both types; operations that know only an ID return `Info` instead.
 - `StepContext.stepVersion` is present for versioned at-least-once steps and empty for unversioned at-most-once steps. See `workflow-evolution.md` for why version bumps are intentionally unavailable to at-most-once operations.
 - Bulk data (serialized inputs, result, step cache) lives in **neither** the handle nor `Info`: `run()` loads it eagerly but internally; targeted accessors (`getWorkflowResult`) serve the rest. Keeps list queries cheap and both types small.
-- No general status enum for now; completion and suspension are derived via queries. `terminate` persists a terminal `Terminated` flag that `run` checks before executing (see `running-workflows.md`).
+- `WorkflowInstance.Info` carries the instance `status` (`WorkflowStatus`; lifecycle model in `running-workflows.md`). `CANCELLING` is deliberately not a stored status — it is the derived predicate `cancel_requested_at IS NOT NULL AND status IN (Running, Suspended)`. Terminal outcomes are stored once in the `WorkflowCompleted` event and projected onto the instance row's `terminal_outcome` column; `run` checks the terminal status before executing (see `running-workflows.md`).
 - `Workflow` carries `version`, `name`, and `description` as direct fields. `Signal[A]` carries only its `key`; it needs no descriptive fields because signals are referenced by key alone and have no catalog/description consumers. `Info` reports only the persisted bookkeeping fields needed by the current API.
 
 ## Composition over inheritance

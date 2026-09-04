@@ -164,9 +164,11 @@ the child. It defaults to none; `SignalInheritance.all` permits every key and
   `sequenceId` greater than the child relationship's
   `inheritedEventsStartSequenceId`. With `true`, retained older events can also
   be visible if they remain ahead of the child's cursor.
-- When the parent completes or calls `continueAsNew`, directly addressed parent
-  `Signal` events are deleted. The child becomes cancelled or abandoned, and
-  any await Step result it already made remains cached for replay.
+- When the parent reaches a terminal state (success, failure, cancellation, or
+  termination) or calls `continueAsNew`, directly addressed parent `Signal`
+  events are deleted. The child becomes cancelled or abandoned per its
+  `ParentClosePolicy`, and any await Step result it already made remains cached
+  for replay.
 - Replaying `startAsChild` replaces the current inheritance configuration.
   Added prefixes can expose retained events; removed prefixes hide unresolved
   events. Cached Step results are unaffected. Replaying an unchanged
@@ -207,18 +209,40 @@ val outcomes: Seq[Either[SuspensionException, R]] =
   children.map(c => Workflow.runToSuspension { Step.await(c.id.key, c.completion) })
 ```
 
-Child failure surfaces as a normal exception from the `completion` await.
+Child failure surfaces as the `Failed` case of the `WorkflowCompletionResult`
+yielded by the `completion` await (see `running-workflows.md`); the case
+carries the decoded `Throwable`, ready to rethrow for direct-style handling.
 
 ### `ParentClosePolicy`
 
-Controls what happens to a child when the parent completes, fails, or is cancelled:
+Controls what happens to a child when the parent reaches a terminal state —
+success, failure, cancellation, or termination — or calls `continueAsNew`:
 
 | Policy | Behaviour |
 |---|---|
 | `Cancel` (default) | Deliver a cooperative cancellation to the child (see `running-workflows.md` for cancel semantics). |
 | `Abandon` | Child detaches and continues independently. Unresolved inherited signals cease to be visible; cached Step results and directly addressed signals remain valid. |
 
-`Terminate` is intentionally absent from the policy enum. Force-killing a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
+Application rules:
+
+- Applied when the parent's guarded terminal transition commits (or during the
+  `continueAsNew` child-close transaction); the active parent pointer on each
+  child is cleared in the same transaction.
+- **Idempotent.** Recovery, replay, and concurrent workers may re-trigger
+  application. Applying the policy twice is a no-op: a `Cancel` delivery to an
+  already-terminal child is a no-op, and `Abandon` clears an already-cleared
+  pointer.
+- Per child state, `Cancel` follows the standard per-state cancel semantics
+  (see `running-workflows.md`): a `CREATED` child is finalized `CANCELLED`
+  immediately without ever running; a `SUSPENDED` child gets
+  `cancel_requested_at` set and a resume scheduled in the same transaction; a
+  `RUNNING` child gets the flag set and delivers at its next checkpoint.
+- A cancelling parent never waits for the children it cancels. The parent is
+  terminal as soon as its own terminal transition commits; child cleanup is a
+  side obligation, and the global `cancelTimeout` escalation bounds any child
+  that never observes its cancellation.
+
+`Terminate` is intentionally absent from the policy enum. Force-stopping a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 
 ### Key derivation
 
@@ -258,8 +282,9 @@ Controls what happens to a child when the parent completes, fails, or is cancell
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
   `parentWorkflowInstanceId` on the storage record; it does not include the
-  generation and is cleared when the parent completes or continues as new.
-  `WorkflowInstance.Info` exposes this as `parentId`.
+  generation and is cleared when the parent reaches a terminal state or
+  continues as new — in the same transaction that applies the
+  `ParentClosePolicy`. `WorkflowInstance.Info` exposes this as `parentId`.
 
 ## Recursion
 
@@ -268,8 +293,8 @@ Controls what happens to a child when the parent completes, fails, or is cancell
 ```scala
 lazy val treeWf: Workflow[Node, Sum] = Workflow("tree") { (node: Node) =>
   val kids = node.children.map(c => treeWf.startAsChild(key(c), c))
-  val kidResults = Workflow.parallel(kids.map(k => () => Step.await("kids-" + k.id.key, k.completion)))
-  node.value + kidResults.sum
+  val kidSums = Workflow.parallel(kids.map(k => () => Step.await("kids-" + k.id.key, k.completion).get))
+  node.value + kidSums.sum
 }
 ```
 
@@ -306,7 +331,11 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 ## Open questions and TODOs
 
-1. **Child failure and cancellation** — **TODO**: Define the detailed cooperative cancellation behavior, including delivery to suspended children and escalation after the runtime-configured timeout.
+1. **Child failure and cancellation** — **Resolved**: cooperative cancellation
+   semantics, delivery to suspended children, sticky redelivery, and the
+   global `cancelTimeout` escalation to `TERMINATED` are specified in
+   `running-workflows.md` ("Cancellation and termination"); parent-close
+   application rules are specified above.
 
 2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstToRunWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 

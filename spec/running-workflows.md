@@ -42,19 +42,124 @@ myWorkflow.createAndRun(instanceKey, input): WorkflowRunResult[Out]
 enum WorkflowRunResult[+A]:
   case WorkflowSuspended
   case WorkflowCancelled
+  case WorkflowTerminated
   case Result(value: A)
 ```
 
 - `WorkflowSuspended` means execution durably suspended on an await.
 - `WorkflowCancelled` means cooperative cancellation escaped the workflow body.
+- `WorkflowTerminated` means the instance was force-stopped — by `runtime.terminate` or by the cancellation-timeout escalation.
 - `Result(value)` means the workflow completed successfully. Failures still propagate as exceptions.
+- Calling `run` again on a terminal instance returns the same outcome as the run that completed it — see "Re-run determinism".
 
 ## Run semantics
 
 - `run` always works the same regardless of instance state: it takes a lease (lock) on the instance, executes the workflow function from the top, and replays previously executed steps from the `StepCache` instead of re-executing them.
 - The lease prevents concurrent executions of the same instance.
-- Already-completed instances are a terminal state: `run` returns the stored result immediately without executing the body.
+- Terminal instances never execute the body again: `run` decodes the stored terminal outcome and returns or throws it — see "Terminal outcome storage" and "Re-run determinism".
 - Completed instances must eventually be deletable automatically (retention policy) — TODO
+
+## Instance lifecycle and terminal states
+
+Every instance row carries one status plus two lifecycle columns:
+
+- `status`: one of `CREATED`, `RUNNING`, `SUSPENDED`, `COMPLETED`, `FAILED`, `CANCELLED`, `TERMINATED` (stored uppercase; the Scala enum `WorkflowStatus` in `core-types.md` mirrors these values).
+- `cancel_requested_at` (nullable timestamp): set when cancellation is requested. It is set once and never reset. It doubles as the start of the escalation clock for the cancellation timeout.
+- `terminal_outcome` (nullable): the serialized terminal outcome, written by the terminal transition (see "Terminal outcome storage").
+
+`CANCELLING` is not a stored status. It is the derived predicate
+`cancel_requested_at IS NOT NULL AND status IN ('RUNNING', 'SUSPENDED')`.
+Monitoring and the cancellation-timeout sweep query this predicate; storing it
+would add one more transition that must be kept atomic without adding
+information.
+
+### Transitions
+
+| From | Event | To |
+|---|---|---|
+| — | `create` | `CREATED` |
+| `CREATED` | first `run` takes the lease | `RUNNING` |
+| `RUNNING` | parked on an await, timer, or child completion | `SUSPENDED` |
+| `SUSPENDED` | resume reaches the suspension point | `RUNNING` |
+| `CREATED` | cancel before first start | `CANCELLED` — finalized immediately; the body never runs |
+| `RUNNING` | uncaught non-control-flow exception | `FAILED` |
+| any non-terminal | terminal transition (guarded) | `COMPLETED` / `FAILED` / `CANCELLED` / `TERMINATED` |
+
+Rules:
+
+- **Exactly one terminal transition.** The terminal status update is conditional (`WHERE status NOT IN (<terminal states>)`) and runs in the same transaction that appends the `WorkflowCompleted` event. Concurrent attempts are serialized by the guarded update: exactly one wins; the loser re-reads and adopts the winner's outcome. **The first terminal event wins.** In particular, a workflow that catches a delivered cancellation and finishes normally is `COMPLETED` (with `cancel_requested_at` set) if its completion event lands first.
+- **Every resume path re-checks `status` before running user code** and discards the execution if the instance is terminal. This is what makes late timer firings, signal deliveries, child completions, and duplicate resume schedules harmless no-ops — including after cancellation and termination.
+- `run` on a terminal instance never executes the body.
+
+## Terminal outcome storage
+
+The `WorkflowCompleted` event is the authoritative record of a terminal
+outcome. It is appended exactly once, for *every* terminal transition, whatever
+the reason — success, failure, cancellation, and termination alike. Its payload
+is the serialized `WorkflowCompletionResult[Out]` (below).
+
+- The `terminal_outcome` column is a **projection** of that event: the same
+  serialized payload, written in the same transaction as the event and the
+  guarded status update. The event is truth; the column is a read cache for the
+  hot path (`run` on a terminal instance, child-completion awaits, monitoring
+  queries). If the column is ever lost, replaying the `WorkflowCompleted` event
+  reconstructs it.
+- Invariant: `status` and the outcome case agree — `COMPLETED` ↔ `Completed`,
+  `FAILED` ↔ `Failed`, `CANCELLED` ↔ `Cancelled`, `TERMINATED` ↔ `Terminated`.
+
+### `WorkflowCompletionResult[R]`
+
+```scala
+enum WorkflowCompletionResult[+R]:
+  case Completed[R](result: R)    extends WorkflowCompletionResult[R]
+  case Failed(failure: Throwable) extends WorkflowCompletionResult[Nothing]
+  case Cancelled                  extends WorkflowCompletionResult[Nothing]
+  case Terminated                 extends WorkflowCompletionResult[Nothing]
+```
+
+- `TERMINATED` is a real terminal state, not a flavor of cancellation: only
+  `cancel` gives the body a chance to react; `terminate` and the escalation
+  sweep stop the instance without running user code.
+- Decoding requires both codecs. The library provides
+  `given Cacheable[WorkflowCompletionResult[R]]` built from
+  `(Cacheable[R], Cacheable[Throwable])`; it records the selected member codec
+  IDs per the `Cacheable` composition scheme (see `steps.md`), so a stored
+  payload states how it was written.
+- Every operation that surfaces the completion takes the codecs contextually.
+  `run`/`awaitResult` already have `Cacheable[Out]` from the definition and
+  receive `Cacheable[Throwable]` — the application-global throwable codec that
+  every application must select explicitly (see `steps.md`). `Step.await` on a
+  completion awaitable resolves the composite codec at the call site, matching
+  the existing rule that the awaited result's codec is required there.
+- For direct-style call sites, `completionResult.get` returns the `Completed`
+  value, rethrows the `Failed` failure, and throws a runtime-owned
+  `WorkflowCancelledException` / `WorkflowTerminatedException` for the other
+  cases. These are ordinary exceptions user code may catch — not library
+  control-flow exceptions.
+- Considered and rejected: keeping the enum in serialized form (payload
+  strings plus `unapply` extractor methods taking the implicit codecs).
+  Rejected because every consumer would unwrap payloads by hand and the codec
+  plumbing would leak into all call sites; contextual givens keep decoded
+  values in memory while persistence stays self-describing. The one spot
+  without a static type — a bare `WorkflowInstanceId.completion` awaitable —
+  pins the child's output type at the call site (`completion[R]`) instead of
+  carrying serialized payloads.
+
+### Re-run determinism
+
+`run` on a terminal instance is a pure function of durable state: it returns
+the same outcome as the run that completed the instance.
+
+- success → `Result(decoded value)`, decoded with the definition's
+  `Cacheable[Out]`.
+- failure → throws the decoded failure, decoded with the recorded throwable
+  codec. Catch behavior therefore depends on the selected
+  `Cacheable[Throwable]` exactly as it does for Step failures. If decoding the
+  stored payload fails, the runtime throws a runtime-owned deterministic
+  exception mirroring `StepSerializationFailed` instead of recursing into a
+  broken codec.
+- cancelled → `WorkflowCancelled`.
+- terminated → `WorkflowTerminated`.
 
 ## Suspension and results
 
@@ -90,32 +195,53 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 
 ### `runtime.cancel(instanceId)` — cooperative stop
 
-1. Persist a cancellation flag on the instance.
-2. If the instance is currently **suspended** (no thread): schedule a resume. On that resume the workflow replays normally (cached steps are not re-executed). When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `InterruptedException` inside whatever `try`/`catch` the workflow has reconstructed at that point. User code may catch this to run compensating `Step`s and then re-throw (or let it propagate).
-3. If the instance is currently **running**: set the interrupt flag on the workflow thread. The runtime already checks this flag around every Step and Await boundary; execution surfaces `InterruptedException` at the next checkpoint.
-4. **Timeout escalation.** After the runtime-configured `cancelTimeout`, if the instance has not reached a terminal state, cancel automatically escalates to `terminate`. This timeout is a global runtime option — not a per-instance field — to avoid extra DB columns.
-5. **Best-effort under non-determinism.** If the workflow body is non-deterministic, replay may diverge and take a checkpoint-free path, completing before cancellation is ever observed. Workflow bodies should be deterministic (all non-determinism wrapped in Steps); this is the only boundary at which the cancel guarantee holds.
+### `runtime.cancel(instanceId)` — cooperative stop
+
+Cancellation is a **level, not an edge**: `cancel_requested_at` stays set forever, and delivery repeats at every checkpoint until the instance reaches a terminal state.
+
+1. **Request.** In one transaction, set `cancel_requested_at` and ensure
+   delivery: schedule a resume if the instance has no live owner; a live owner
+   observes the flag at its next checkpoint. If the instance is already
+   terminal, `cancel` is a no-op (the guarded terminal transition keeps this
+   idempotent). If the instance is still `CREATED`, finalize it as `CANCELLED`
+   immediately — there is no execution state to deliver into and the body never
+   runs.
+2. If the instance is currently **suspended** (no thread): the scheduled resume replays normally (cached steps are not re-executed). When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `InterruptedException` inside whatever `try`/`catch` the workflow has reconstructed at that point. User code may catch this to run compensating `Step`s and then re-throw (or let it propagate).
+3. If the instance is currently **running**: the owner re-reads the durable flag around every Step and Await boundary and, when set, throws the same synthetic `InterruptedException` at that checkpoint. No thread is ever interrupted; delivery is a runtime throw at a checkpoint, uniform with the suspended path.
+4. **Sticky redelivery.** If user code catches the `InterruptedException` and continues, the flag remains set and every subsequent checkpoint throws again. Catching it is for compensation, not for declining the cancel. The only way past it is to reach a terminal state — and if the workflow completes normally despite the pending cancel, the first-terminal-event rule applies: its `WorkflowCompleted` event wins and the instance is `COMPLETED`.
+5. **Timeout escalation.** When an instance in the derived `CANCELLING` state (see "Instance lifecycle") stays non-terminal longer than the runtime-configured `cancelTimeout` — measured from `cancel_requested_at` — a background sweep escalates it to `terminate`. The timeout is a global runtime/job-runner option, not a per-instance field: a cancelling parent never waits for the children it is cancelling, so no child-side timeout declaration exists. Escalation produces `TERMINATED` (never scheduled again); an orphan thread still executing a Step is handled like any terminated instance (below).
+6. **Best-effort under non-determinism.** If the workflow body is non-deterministic, replay may diverge and take a checkpoint-free path, completing before cancellation is ever observed. The first-terminal-event rule then makes the instance `COMPLETED`. Workflow bodies should be deterministic (all non-determinism wrapped in Steps); this is the only boundary at which the cancel guarantee holds.
 
 ### `runtime.terminate(instanceId)` — force stop
 
-- Atomically flip DB state to `Terminated` and revoke the lease.
-- If currently running: also set the interrupt flag on the workflow thread. The orphan thread may continue briefly but can never commit — all lease-checked writes will be rejected. It self-terminates at its next checkpoint or when it observes the interrupt.
-- **JVM limitation**: there is no safe way to forcibly stop a JVM thread. `terminate` guarantees the instance is *durably stopped and lease-revoked*; it cannot guarantee the orphan thread stops immediately. A thread stuck in uninterruptible blocking I/O or a tight loop that ignores interrupts will run until it next checks the flag or the process ends. Document this as an inherent JVM constraint rather than hiding it.
-- Positioned as a **last-resort / manual-intervention** tool (matching the manual-intervention design goal). Prefer `cancel` for all lifecycle management; use `terminate` for stuck, buggy, or non-cooperative workflows and ops tooling.
+- Atomically flip DB state to `Terminated` via the guarded terminal transition
+  (which also appends the `WorkflowCompleted` event with a `Terminated`
+  outcome), revoke the lease, and never schedule the instance again. No resume
+  is scheduled and no `InterruptedException` is delivered — the body gets no
+  chance to run.
+- If currently running: the orphan thread may continue briefly but can never
+  commit — all lease-checked writes are rejected, and its next checkpoint
+  re-check observes the terminal status and discards the execution.
+- **JVM limitation**: there is no safe way to forcibly stop a JVM thread. `terminate` guarantees the instance is *durably stopped and lease-revoked*; it cannot guarantee the orphan thread stops immediately. A thread stuck in uninterruptible blocking I/O or a tight loop will run until it next reaches a checkpoint or the process ends. Document this as an inherent JVM constraint rather than hiding it.
+- Positioned as a **last-resort / manual-intervention** tool (matching the manual-intervention design goal) and as the escalation target of `cancelTimeout`. Prefer `cancel` for all lifecycle management; use `terminate` for stuck, buggy, or non-cooperative workflows and ops tooling.
 - Intentionally absent from `ParentClosePolicy`; not a lifecycle primitive.
 
-### Semantics and threading
+### Delivery mechanics
 
-- **User code inside the workflow body sees `InterruptedException`**, the same exception Ox and other concurrency libraries use. No wrapping or translation. Code can handle it with ordinary `try`/`catch`.
+- **User code inside the workflow body sees `InterruptedException`** — the same exception Ox and other concurrency libraries use, and the exception `scala.util.control.NonFatal` deliberately does *not* catch. Broad `catch { case NonFatal(e) => }` cleanup blocks therefore never swallow a cancellation. No wrapping or translation.
+- The synthetic `InterruptedException` is thrown with the thread's interrupt flag **cleared** (the canonical JDK shape: blocking methods clear-then-throw). Stickiness comes solely from re-checking the durable `cancel_requested_at` at every checkpoint — the thread's interrupt bit is never an input to any runtime decision. The runtime guarantees an un-set interrupt flag whenever it hands control to user code.
+- `Thread.interrupt` is not part of the mechanism. A stray or user-set interrupt on a worker thread has no contractual meaning — an interrupt targets a thread, but the unit of semantics here is the durable workflow — and the runtime clears interrupt status it observes to protect its own I/O. The supported channel is `cancel` plus the durable flag.
+- Known limitation: a synthetic throw cannot unblock a library call that is already in progress. Cancellation is observed at the next checkpoint; a long-running Step delays it until the Step returns. The `cancelTimeout` escalation bounds the wait.
 - The `run`/`createAndRun` functions are the outermost boundary. Any `InterruptedException` that escapes the workflow body is caught there and returned as `WorkflowCancelled`.
-- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the interrupt flag causes the await to throw.
-- The question "how does the cancelling thread obtain a handle to the executing thread?" is answered by the runtime: it tracks which thread holds the lease for each instance internally and sets the flag directly. No thread handles are ever exposed to external callers.
+- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the checkpoint throws.
+- No thread handles are ever exposed to external callers: the runtime needs none, because delivery goes through the durable flag and checkpoint checks, not through cross-thread signaling.
 
 ### Rationale
 
 - Two distinct operations (`cancel` vs `terminate`) are necessary because cancel's delivery is path-dependent under non-determinism — it can miss entirely. `terminate` provides the unconditional stop that `cancel` cannot guarantee.
 - Re-running a workflow to deliver cancellation (rather than injecting it without replay) is consistent with the replay model and ensures `InterruptedException` surfaces inside the user's live `try`/`catch` block, where compensation code has access to local scope variables. Without replay, there is no scope to deliver into.
-- User code sees `InterruptedException` (not a wrapper) so it integrates seamlessly with Ox, concurrent libraries, and standard Java cancel semantics. This avoids the fragmentation of having multiple cancellation exception types.
+- User code sees `InterruptedException` (not a wrapper) so it integrates seamlessly with Ox, concurrent libraries, and standard Java cancel semantics, and so `NonFatal`-guarded cleanup does not intercept it. This avoids the fragmentation of having multiple cancellation exception types.
+- Cancellation as a durable level — a never-reset timestamp with redelivery at every checkpoint — instead of a one-shot signal: a workflow that catches and continues can never outrun its cancellation, and the timestamp doubles as the escalation clock without extra columns.
 - Fewer execution modes is better; two (cooperative/forceful) is the minimum needed to cover the JVM and non-determinism constraints.
 
 ## `continueAsNew` — bounded-history tail loops and tail recursion
@@ -197,5 +323,5 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 - `awaitResult` implementation approach (polling vs backend notification).
 - Retention / auto-deletion of completed instances.
-- **Cancellation mechanism** — Interface and guarantee model are specified above. Implementation details still open: flag persistence, resume scheduling, timeout watchdog, lease revocation coordination between signal delivery, timeout, and manual abort.
+- **Cancellation mechanism** — Interface and guarantee model are specified above, including the durable `cancel_requested_at` flag, same-transaction resume scheduling, sticky redelivery, and the `cancelTimeout` escalation sweep. Implementation details still open: lease revocation coordination between signal delivery, timeout sweep, and manual abort.
 - **`fork` / `forkFromFailure`** — Deferred. `continueAsNew` is the first use case of the shared substrate. `fork` adds branching from a step-prefix with a new key; design deferred until a concrete recovery use case drives it.

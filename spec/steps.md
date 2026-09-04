@@ -178,6 +178,21 @@ body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded 
 - If result or exception serialization/deserialization fails, the runtime persists and throws a runtime-owned `StepSerializationFailed`, a subtype of `StepFailed`. Its minimal encoding does not use the failing user codec, avoiding recursive failure.
 - A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic `StepFailed` representation is preferable to failing serialization.
 
+### Workflow-level failures use the same codec
+
+The terminal outcome of a failed workflow is serialized with the same
+application-global `Cacheable[Throwable]` (see `running-workflows.md`).
+
+- The global given is in scope at the workflow boundary: `run`/`awaitResult`
+  and the completion awaitable take it contextually, just as every Step call
+  does.
+- The stored outcome payload records the selected codec IDs per the
+  `Cacheable` composition scheme, so decoding later is self-describing even if
+  the application switches its global throwable codec.
+- Catch behavior for a re-run failed workflow depends on the selected codec
+  exactly as it does for Step replay; workflow code must not assume more than
+  the codec promises.
+
 ### Cacheable identity and composition
 
 ```scala
