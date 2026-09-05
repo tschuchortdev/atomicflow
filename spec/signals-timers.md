@@ -27,11 +27,12 @@ enum Awaitable[R : Cacheable as resultCacheable] {
   }
   
   /** Yields the child's terminal outcome as a `WorkflowCompletionResult[R]`
-    * (see `running-workflows.md`). The child's output type `R` is pinned at
-    * the construction site; the codecs needed to persist and decode the
-    * outcome are required at the `Step.await` call site, like for mapped
-    * results. */
-  case WorkflowCompletion[R](workflowInstanceId: WorkflowInstanceId)(using throwableCacheable: Cacheable[Throwable])
+    * (see `running-workflows.md`). The child's output type comes from the
+    * typed handle that constructs the awaitable
+    * (`WorkflowInstance[In, Out].completion`); the codecs needed to persist
+    * and decode the outcome are required at the `Step.await` call site, like
+    * for mapped results. */
+  case WorkflowCompletion[R](workflowInstanceId: WorkflowInstanceId)
       extends Awaitable[WorkflowCompletionResult[R]]
 
   /** Transforms the awaited result. Mapping does not require a `Cacheable[B]` for
@@ -54,16 +55,14 @@ enum Awaitable[R : Cacheable as resultCacheable] {
   ready to rethrow for direct-style handling — plus `Cancelled` and
   `Terminated`. Awaiting never throws the child's failure implicitly; the
   outcome crosses the serialization boundary before it is observed, exactly
-  like a Step result. `WorkflowInstance.completion` and
-  `WorkflowInstanceId.completion` return one directly; see `core-types.md`.
+  like a Step result. `WorkflowInstance.completion` returns one directly; see
+  `core-types.md`. A bare `WorkflowInstanceId` carries no output type — upgrade
+  it to a typed handle from the workflow definition to await a completion.
 
 Convenience accessors:
 ```scala
 // on WorkflowInstance[In, Out]
 def completion: Awaitable.WorkflowCompletion[Out] = Awaitable.WorkflowCompletion(id)
-
-// on WorkflowInstanceId — untyped: the caller pins the child's output type
-def completion[R]: Awaitable.WorkflowCompletion[R] = Awaitable.WorkflowCompletion(this)
 ```
 
 ## Event storage: globally ordered log + signal cursor per (workflow-instance, signal-key)

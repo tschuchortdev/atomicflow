@@ -21,17 +21,15 @@ type WorkflowId = String
 type WorkflowInstanceKey = String
 type SignalKey = String
 
-// Identity: the address of an instance; used for queries, signals, logging
+// Identity: the address of an instance; used for queries, signals, logging.
+// A bare id carries no workflow definition, hence no output type and no codecs.
+// To act on an instance, upgrade the id to a typed handle from the definition
+// (see WorkflowInstance below).
 case class WorkflowInstanceId(
   workflowId: WorkflowId,
   workflowInstanceKey: WorkflowInstanceKey,
   scope: String = ""
-) {
-  // Awaitable of this instance's completion; see signals-timers.md.
-  // The child's output type cannot be derived from an id alone, so callers pin
-  // it explicitly; the codecs are resolved at the await call site.
-  def completion[R]: Awaitable.WorkflowCompletion[R]
-}
+)
 
 case class StepId(key: String, scope: String = "")
 
@@ -65,7 +63,10 @@ trait StepContext[Out] {
   def workflowCtx: WorkflowContext
 }
 
-// Handle: capability object, obtained only from the runtime
+// Handle: capability object, obtained only from the runtime — returned by
+// create/startAsChild and typed queries, or upgraded from a bare id via
+// runtime.getWorkflowInstance(workflow, instanceId), which validates the
+// workflowId and throws on mismatch.
 final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
   def run()(using WorkflowRuntime): WorkflowRunResult[Out]
@@ -83,7 +84,7 @@ object WorkflowInstance {
     id: WorkflowInstanceId,
     parentId: Option[WorkflowInstanceId],
     generation: Long,
-    status: WorkflowStatus,
+    terminalState: Option[WorkflowTerminalState],
     workflowVersionAtCreation: Long,
     createdAt: Instant,
     lastRunAt: Option[Instant],
@@ -91,11 +92,13 @@ object WorkflowInstance {
   )
 }
 
-// Lifecycle status of an instance; transitions and terminal semantics in
-// running-workflows.md. CANCELLING is deliberately not a case: it is the
-// derived predicate cancel_requested_at IS NOT NULL AND status IN (Running, Suspended).
-enum WorkflowStatus {
-  case Created, Running, Suspended, Completed, Failed, Cancelled, Terminated
+// Terminal states are the only durable, user-visible lifecycle states; None
+// means the instance has not reached a terminal state yet. Whether an instance
+// is currently created, executing, or suspended is transient bookkeeping —
+// derivable from the lease and pending subscriptions — and does not interest
+// the user. Lifecycle model in running-workflows.md.
+enum WorkflowTerminalState {
+  case Completed, Failed, Cancelled, Terminated
 }
 ```
 
@@ -119,7 +122,7 @@ enum WorkflowStatus {
 - The handle retains both `In` and `Out` because it captures a `Workflow[In, Out]`. Every place that can construct a typed handle knows both types; operations that know only an ID return `Info` instead.
 - `StepContext.stepVersion` is present for versioned at-least-once steps and empty for unversioned at-most-once steps. See `workflow-evolution.md` for why version bumps are intentionally unavailable to at-most-once operations.
 - Bulk data (serialized inputs, result, step cache) lives in **neither** the handle nor `Info`: `run()` loads it eagerly but internally; targeted accessors (`getWorkflowResult`) serve the rest. Keeps list queries cheap and both types small.
-- `WorkflowInstance.Info` carries the instance `status` (`WorkflowStatus`; lifecycle model in `running-workflows.md`). `CANCELLING` is deliberately not a stored status — it is the derived predicate `cancel_requested_at IS NOT NULL AND status IN (Running, Suspended)`. Terminal outcomes are stored once in the `WorkflowCompleted` event and projected onto the instance row's `terminal_outcome` column; `run` checks the terminal status before executing (see `running-workflows.md`).
+- `WorkflowInstance.Info` carries only the nullable `terminalState` — the one durable, user-visible lifecycle fact (`WorkflowTerminalState`; lifecycle model in `running-workflows.md`). Whether an instance is created, executing, or suspended is transient bookkeeping rather than user-facing state: "running" is lease ownership — short-lived, rarely observable, and decided by the lease under concurrency — and "suspended" is derivable from pending subscriptions and wakeups. `CANCELLING` is likewise derived: `cancel_requested_at IS NOT NULL AND terminal_state IS NULL`. Terminal outcomes are stored once in the `WorkflowCompleted` event and projected onto the instance row's `terminal_outcome` column; `run` checks the stored terminal state before executing (see `running-workflows.md`).
 - `Workflow` carries `version`, `name`, and `description` as direct fields. `Signal[A]` carries only its `key`; it needs no descriptive fields because signals are referenced by key alone and have no catalog/description consumers. `Info` reports only the persisted bookkeeping fields needed by the current API.
 
 ## Composition over inheritance

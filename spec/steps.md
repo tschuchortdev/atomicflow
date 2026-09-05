@@ -174,7 +174,7 @@ body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded 
 - Replay returns or throws the persisted, decoded outcome without executing the Step body.
 - The initial run also exposes the decoded representation, so it takes the same downstream pattern-match or `catch` branch as replay.
 - A Step result's object identity is not preserved, even during its initial execution. Code after a Step may rely on its value, but not on reference equality with an object created inside the Step.
-- Fatal JVM errors and library control-flow exceptions for suspension, cancellation, reset, and continue-as-new are never cached as Step failures.
+- Fatal JVM errors and the internal library control-flow exceptions for suspension, reset, and continue-as-new are never cached as Step failures. The public `WorkflowCancelledException` delivered at checkpoints is likewise never a Step outcome: delivery happens before a Step body executes, so a cancellation surfacing through a Step boundary cannot poison the Step cache.
 - If result or exception serialization/deserialization fails, the runtime persists and throws a runtime-owned `StepSerializationFailed`, a subtype of `StepFailed`. Its minimal encoding does not use the failing user codec, avoiding recursive failure.
 - A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic `StepFailed` representation is preferable to failing serialization.
 
