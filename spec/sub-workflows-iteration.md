@@ -254,6 +254,31 @@ Application rules:
   complete enclosing `Workflow.scoped` path. Restartable and loop scopes appear
   as `scopeId@restartCount`; ordinary scopes appear as their scope ID. Segments
   retain their outer-to-inner order.
+- **Escaping.** The scope is a flat string whose *structural* delimiters are
+  `/` (segment boundary) and `@` (generation / restart-count marker, which is
+  always numeric). Every user-supplied segment that flows into a scope —
+  workflow IDs, instance keys, `Workflow.scoped` keys, restartable / loop IDs —
+  is **backslash-escaped** before being joined, so no segment content can be
+  confused with a structural delimiter. A single runtime function performs the
+  escaping for both scope composition and any scope-based prefix query:
+  ```scala
+  // escape `\`, `/`, `@`; the escaped `\` keeps the encoding unambiguous
+  def escapeScopeSegment(s: String): String =
+    s.replace("\\", "\\\\").replace("/", "\\/").replace("@", "\\@")
+  ```
+  The `@count` marker is appended *after* the escaped key (e.g. `worker\-1@0`),
+  so the numeric count is never escaped. Escaping guarantees the derivation is
+  injective: a key crafted to look like a nested chain (say `x@0/B/y`) encodes
+  to `x\@0\/B\/y`, which cannot collide with a genuine chain `x@0/B/y@0`. This
+  is what makes the `(workflowId, instanceKey, scope)` uniqueness key safe even
+  though scope is derived from user-supplied keys.
+- **Prefix search.** Instance-key prefix operations
+  (`getWorkflowInstancesByPrefix`, `deleteWorkflowInstancesByPrefix`) query the
+  raw `workflowInstanceKey` column and take an **unescaped** prefix — no
+  escaping is applied, because the escaped copy lives only inside the `scope`
+  column. Escaping matters only for a scope-based prefix query (e.g. all
+  children of a parent), and such a query must run its input segments through
+  `escapeScopeSegment` first so it matches the composed encoding.
 - Example:
   ```text
   parent:      (orders, order-42, "")
@@ -276,8 +301,9 @@ Application rules:
   parent instance and generation begin with the same normalized scope prefix.
   When such a child later becomes a parent, its former local path is ancestry
   and may be included in a shortened parent portion.
-- The readable slash-and-`@` form is for debugging only. Callers must not construct or
-  parse derived scopes or rely on their textual layout.
+- The readable slash-and-`@` form (with backslash escapes for embedded `/`,
+  `@`, `\`) is for debugging only. Callers must not construct or parse derived
+  scopes or rely on their textual layout.
 - The returned handle is the normal way to address a child. Users should not
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
