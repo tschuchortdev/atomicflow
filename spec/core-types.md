@@ -14,7 +14,7 @@ Guideline for identity, definition, context, and handle types. Companion to `des
 | Definition objects | `Workflow[In, Out]`, `Signal[A]` | code + id/key + version + name + description |
 | Runtime contexts | `WorkflowContext`, `StepContext` | instance identity + step identity + runtime services; materialized only during execution |
 | Persisted instance state | `WorkflowInstance.Info` | bookkeeping fields stored per instance |
-| Handle | `WorkflowInstance[In, Out]` | workflow definition (code) + instance id + runtime |
+| Handle | `WorkflowInstance[In, Out]` | workflow definition (code) + instance id |
 
 ```scala
 type WorkflowId = String
@@ -66,7 +66,8 @@ trait StepContext[Out] {
 // Handle: capability object, obtained only from the runtime — returned by
 // create/startAsChild and typed queries, or upgraded from a bare id via
 // runtime.getWorkflowInstance(workflow, instanceId), which validates the
-// workflowId and throws on mismatch.
+// workflowId and throws on mismatch. Does not capture the runtime; its
+// methods take (using WorkflowRuntime).
 final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
   def run()(using WorkflowRuntime): WorkflowRunResult[Out]

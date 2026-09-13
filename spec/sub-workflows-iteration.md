@@ -40,10 +40,10 @@ Scopes nest arbitrarily; the full prefix is the path of enclosing scope keys joi
 
 ### `Workflow.runToSuspension`
 
-Runs one by-name block, catches its suspension instead of propagating it, and returns `Either[SuspensionException, R]`. This is the opt-in primitive for local suspension handling.
+Runs one by-name block, catches its suspension instead of propagating it, and returns `Either[WorkflowSuspendedException, R]`. This is the opt-in primitive for local suspension handling.
 
 ```scala
-val result: Either[SuspensionException, OrderResult] =
+val result: Either[WorkflowSuspendedException, OrderResult] =
   Workflow.runToSuspension { Workflow.scoped(order) { process(order) } }
 ```
 
@@ -51,7 +51,7 @@ Use this when you need to inspect whether a block suspended before deciding what
 
 ### `Workflow.parallel`
 
-Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Waits for **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined suspension carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
+Runs multiple branches concurrently (using Ox `par`/`mapPar` under the hood). Waits for **all** branches before re-throwing: if some complete and others suspend, `par` collects all results first, then throws one combined `WorkflowSuspendedException` carrying each branch's suspension as a cause. Returns `Seq[R]` when every branch completes.
 
 ```scala
 object Workflow {
@@ -68,7 +68,7 @@ val results: Seq[R] = Workflow.parallel(
 
 ### `Step.firstToRunWithoutSuspension`
 
-Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined suspension like `Workflow.parallel`. If at least one completes normally, it discards the other suspensions and returns the first result. 
+Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined `WorkflowSuspendedException` like `Workflow.parallel`. If at least one completes normally, it discards the other suspensions and returns the first result. 
 
 TODO: how does it handle cancellation of child workflows started from a branch?
 
@@ -206,7 +206,7 @@ val result = Step.firstToRunWithoutSuspension("race-children",
 )
 
 // partial: advance each, collect what's ready
-val outcomes: Seq[Either[SuspensionException, R]] =
+val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
   children.map(c => Workflow.runToSuspension { Step.await(c.id.key, c.completion) })
 ```
 
@@ -329,7 +329,7 @@ lazy val treeWf: Workflow[Node, Sum] = Workflow("tree") { (node: Node) =>
 
 ```scala
 val processorWf = Workflow("processor") { (state: State) =>
-  val event = eventSignal.await("next-event")
+  val event = Step.await("next-event", Awaitable.SignalEvent(eventSignal))
   val newState = processEvent(state, event)
   Workflow.continueAsNew(newState)  // restarts with fresh history; never returns
 }

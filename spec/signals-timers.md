@@ -9,7 +9,7 @@ A step's result is computed by *user code* and cached. An **await's** result is 
 1. a completed Step row already exists → return its recorded result. This prevents an await from re-suspending on every re-run.
 2. no completed row → **gather candidates from durable facts**: visible signal events after the shared exact-key cursor (the filter is evaluated in code), `TimerFired` events matching the site's current timer subscriptions, and `WorkflowCompleted` events of the awaited instances.
 3. **fire the site's own due timers**: for each timer subscription with `deadline <= now` and no existing event, append its `TimerFired` event (subscription row lock + global append mutex) — it becomes a candidate like any other event.
-4. if any candidate satisfies the condition → **resolve atomically**: persist the result, advance signal cursors, delete the site's subscriptions; otherwise **suspend**: register/refresh pending subscriptions and return `WorkflowSuspended` from the outer workflow boundary.
+4. if any candidate satisfies the condition → **resolve atomically**: persist the result, advance signal cursors, delete the site's subscriptions; otherwise **suspend**: register/refresh pending subscriptions and throw `WorkflowSuspendedException` — caught at the outer workflow boundary, which returns `WorkflowSuspended` from `run` (see `running-workflows.md`).
 
 **Evaluation is self-sufficient**: it depends only on durable state — events, cached Step rows, and the await's own timer subscriptions with their stored deadlines — never on the scheduler having run. Wakeups and the timer sweep exist purely so *unattended* instances get noticed promptly; a run advances whether or not any scheduling happened (see `running-workflows.md`, "Run semantics"). The distinction matters: signal and completion subscriptions are pure wakeup hints (their facts live independently in the event log), while a **timer subscription is semantic state** — the durable deadline and firing identity (see below). A site's first evaluation has no subscriptions yet — registration happens in the suspension transaction — which is harmless: a timer's deadline is computed at registration (`now + delay`), so it can never already be due at first evaluation, while signals and completions are found at step 2 regardless.
 
@@ -237,7 +237,7 @@ object Step {
 }
 ```
 
-- `Step.await` throws a `WorkflowSuspended` control-flow exception when the
+- `Step.await` throws a `WorkflowSuspendedException` control-flow exception when the
   await cannot be satisfied immediately. The workflow runtime catches this
   exception and suspends the workflow. User code must always ignore or rethrow
   this exception.
@@ -409,7 +409,7 @@ another retention boundary removes it.
   ```scala
   val wf = Workflow("order")(
     (order: Order) => {
-      val orderEvents = orders.await("read-orders")
+      val orderEvents = Step.await("read-orders", Awaitable.SignalEvent(orders))
       ...
     },
     onUnconsumedSignals = { unconsumed =>
@@ -440,9 +440,10 @@ When an upstream step is invalidated (TTL expired, `invalidateOn` dependency cha
 **Awaits inherit this rule:** an await can declare `invalidateOn` dependencies just as steps do:
 
 ```scala
-Step.awaitRace("approval-race", approval, Awaitable.Timer(deadline)),
+Step.awaitRace(
+  "approval-race",
   invalidateOn = Seq("context" -> someContextValue)
-)
+)(Awaitable.SignalEvent(approval), Awaitable.Timer(deadline))
 ```
 
 If `someContextValue` changes, the await's cached Step result is discarded; on the next replay it re-evaluates from scratch.

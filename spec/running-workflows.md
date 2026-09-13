@@ -10,7 +10,7 @@ Single-instance operations exist on up to three levels; only `WorkflowRuntime` i
 |---|---|
 | `WorkflowRuntime` (trait) | Canonical home of all operations. Implemented per backend (in-memory, Postgres, ...). Convenience methods are `final`, built from a small set of abstract primitives. |
 | `Workflow[In, Out]` methods | Pre-instance sugar (`create`, `run`, `createAndRun`, ...). Forward to a contextual `(using WorkflowRuntime)`. |
-| `WorkflowInstance[In, Out]` | Post-instance typed handle. Captures the workflow definition and runtime it came from, so no `using` clause is needed. |
+| `WorkflowInstance[In, Out]` | Post-instance typed handle. Captures the workflow definition it came from; its runtime methods take a contextual `(using WorkflowRuntime)`. |
 
 - Why hybrid: `myWorkflow.createAndRun(...)` reads naturally for the common case; the runtime stays the single implementation point, so backends and tests only deal with one interface.
 - Rule of thumb: `Workflow` = "I don't have an instance yet", `WorkflowInstance` = "I do".
@@ -158,7 +158,36 @@ lease_expires_at (nullable timestamp)
     AND (lease_owner IS NULL OR lease_expires_at <= :now)
   ```
   Zero rows updated means a live owner or a terminal instance; the acquirer backs off.
-- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread; the lease is renewed on the workflow's own thread. The runtime invokes `Workflow.heartbeat` at every checkpoint (Step invocation, await evaluation, suspension), and long-running Step bodies may call it explicitly (the function itself is not specified yet — see Open points). `leaseDuration` must therefore exceed the longest gap between heartbeat opportunities. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread; the lease is renewed on the workflow's own thread. The runtime invokes the heartbeat at every checkpoint (Step invocation, await evaluation, suspension), and long-running Step bodies call it explicitly through the public API below. `leaseDuration` must therefore exceed the longest gap between heartbeat opportunities. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+
+**`Workflow.heartbeat()` — public lease renewal**
+
+```scala
+object Workflow {
+  /** Renews the execution lease of the instance executing on the current thread,
+    * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
+    * runtime calls this automatically at every checkpoint; call it explicitly
+    * inside long-running Step bodies, between checkpoints.
+    *
+    * @throws LeaseLostException when the lease was taken over or the instance is terminal
+    */
+  def heartbeat()(using WorkflowContext): Unit
+}
+```
+
+- Renewal is a **fenced write that does not bump the fencing token**:
+  ```sql
+  UPDATE workflow_instances
+  SET lease_expires_at = :now + :leaseDuration
+  WHERE workflow_instance_id = :id
+    AND lease_owner = :worker
+    AND fencing_token = :token
+    AND terminal_state IS NULL
+  ```
+  Zero rows updated → the runtime raises `LeaseLostException` and aborts the run without durable effect, identical to any other fenced-write loss.
+- **Not a cancellation checkpoint.** Heartbeat never delivers cancellation; delivery remains bound to checkpoints about to perform new work.
+- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; automatic and explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
+- Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
 - **Release.** A run releases the lease when it ends (suspension, terminal state, abort). Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
 - **Expiry is the crash signal**: `lease_owner IS NOT NULL AND lease_expires_at <= now()` means the worker died or stalled; the recovery sweep re-enqueues the instance.
@@ -462,7 +491,7 @@ the same outcome as the run that completed the instance.
 - A workflow that suspends yields `WorkflowSuspended`; successful completion yields `Result(out)`.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
-- Suspension, reset, and continue-as-new each use a distinct internal control-flow exception. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
+- Suspension, reset, and continue-as-new each use a distinct internal control-flow exception — suspension's is `WorkflowSuspendedException`. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
 - Planned: `awaitResult(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` returns `WorkflowRunResult[Out]` and blocks through intermediate suspensions until the instance reaches a terminal state, with a **mandatory timeout** as footgun guard. For request-scoped workflows (production, next to a runner) and for asserting on terminal states. It is a **passive waiter**: it never executes the workflow itself and never fires timers — it only waits for the terminal outcome. Progress comes from a runner or from caller-thread `run` calls; a suspended instance with no runner and no further `run` calls simply times out. Workflows that never suspend need no runner at all — `createAndRun` executes them inline to completion and `awaitResult` returns immediately. Implementation: in-memory registers a completion listener; Postgres polls the terminal projection, optionally optimized with `LISTEN/NOTIFY`. Tests drive progress deterministically with `run` and assert with `awaitResult` (see "Testing").
 
 ## Multi-instance operations
@@ -484,7 +513,7 @@ runtime.deleteWorkflowInstancesByPrefix(workflowId, keyPrefix)
 
 - Obtained **only** from the runtime (returned by `create`, queries, ...) — never constructed freely — so a handle always refers to an existing instance.
 - Use cases: await result, query info, send signals to one instance, manual intervention (restart at step, abandon), reattach from another process.
-- `WorkflowInstance[In, Out]`: captures the workflow definition (code), instance id, and runtime. See `core-types.md` for the full taxonomy (identity vs definition objects vs runtime contexts vs persisted info vs handle).
+- `WorkflowInstance[In, Out]`: captures the workflow definition (code) and instance id; its runtime methods take `(using WorkflowRuntime)`. See `core-types.md` for the full taxonomy (identity vs definition objects vs runtime contexts vs persisted info vs handle).
 - Queries parameterized by a `Workflow[In, Out]` return typed handles; key-based queries without the definition return `WorkflowInstance.Info` records instead (they cannot produce something runnable).
 
 ## Cancellation and termination
@@ -529,7 +558,7 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
 - **Level, with one escape hatch.** Redelivery repeats at every new-work checkpoint until the instance is terminal; the only suppression is `Workflow.uncancellable` (below). A workflow that catches and continues can never outrun its cancellation.
 - Known limitation: a throw at a checkpoint cannot unblock a library call that is already in progress inside a Step body. Cancellation is observed at the next checkpoint; a long-running Step delays it until the Step returns. The `cancelTimeout` escalation bounds the wait.
 - The `run`/`createAndRun` functions are the outermost boundary. Any `WorkflowCancelledException` that escapes the workflow body is caught there and returned as `WorkflowCancelled`.
-- **Suspension is a normal public outcome**, even though an internal exception performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the frontier checkpoint throws.
+- **Suspension is a normal public outcome**, even though an internal exception (`WorkflowSuspendedException`) performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the frontier checkpoint throws.
 - No thread handles are ever exposed to external callers: the runtime needs none, because delivery goes through the durable flag and checkpoint checks, not through cross-thread signaling.
 
 ### `Workflow.uncancellable[R](f: WorkflowCtx ?=> R)` — the compensation region
@@ -622,7 +651,7 @@ own independently belongs in `newInput`.
 ```scala
 // Eternal event loop: history resets on every iteration
 val processorWf = Workflow("processor") { (state: State) =>
-  val event = eventSignal.await("next-event")
+  val event = Step.await("next-event", Awaitable.SignalEvent(eventSignal))
   val newState = processEvent(state, event)
   Workflow.continueAsNew(newState)
 }
@@ -638,7 +667,7 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 ### Relationship to `fork`
 
-`fork` (planned, deferred) shares some backend operations but differs in intent: it seeds a new instance from an **existing step-prefix** (for recovery or branching at a specific point in history), assigns a **new key**, and optionally keeps the source running. The two are separate named functions rather than one parameterized operation; this keeps the common case (`continueAsNew`) simple and the rare case (`fork`) explicit.
+`fork` shares some backend operations but differs in intent: it seeds a new instance from an **existing step-prefix** (for recovery or branching at a specific point in history), assigns a **new key**, and optionally keeps the source running (specified in `continue-as-new-fork-reset.md`). The two are separate named functions rather than one parameterized operation; this keeps the common case (`continueAsNew`) simple and the rare case (`fork`) explicit.
 
 ### Rationale
 
@@ -655,6 +684,6 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 - `awaitResult` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `awaitResult`. `LISTEN/NOTIFY` is an optional latency optimization.
 - Retention / auto-deletion of completed instances. The job runner's sweep mechanism is the designated hook (see "Job runner and scheduling").
 - **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token bump (see "Job runner and scheduling").
-- **`Workflow.heartbeat`** — The public function for explicit lease renewal from workflow code (needed inside long Step bodies); its exact API, checkpoint-driven automatic invocation points, and interaction with `Workflow.uncancellable` still need specification. See "The execution lease".
+- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime invokes it automatically at every checkpoint; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
 - **Scheduler tuning** — Priority/fairness classes beyond `perWorkflowBatchShare` and per-workflow caps, and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
-- **`fork` / `forkFromFailure`** — Deferred. `continueAsNew` is the first use case of the shared substrate. `fork` adds branching from a step-prefix with a new key; design deferred until a concrete recovery use case drives it.
+- **`fork` / `forkFromFailure`** — `forkWorkflow` is specified in `continue-as-new-fork-reset.md`; its one open point there is the causal boundary for parallel-branch step prefixes. `forkFromFailure` is not yet specified.
