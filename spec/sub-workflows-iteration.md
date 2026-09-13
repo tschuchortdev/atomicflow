@@ -149,6 +149,7 @@ val result = Step.await("worker-result", child.completion)
 - **Deterministic identity**: A child workflow's identity (`WorkflowInstanceId`) is made up from user-supplied `WorkflowInstanceKey` and a scope. The scope is derived from the parent's identity (including parent generation) and
   enclosing workflow scopes.
 - **No synchronous/blocking variant**: blocking the parent thread for a child's duration would pin the lease for the whole duration. If you want inline execution sharing the parent's scope, use `scoped` + Steps. If you want the result durably, await the child's completion signal.
+- **Asynchronous start**: the child's first execution is scheduled through the normal wakeup mechanism and runs on a runner thread; it is never executed inline on the parent's thread (see `running-workflows.md`, "Job runner and scheduling").
 
 ### Inherited signals
 
