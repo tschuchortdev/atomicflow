@@ -1,7 +1,18 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.{AwaitSignalCandidate, AwaitTimerCandidate, StoredStep, WorkflowExecution}
+import atomicflow.internal.{
+  AwaitRaceCandidate,
+  AwaitRaceCompletionLeaf,
+  AwaitRaceDecision,
+  AwaitRaceLeaf,
+  AwaitRaceSignalLeaf,
+  AwaitRaceTimerLeaf,
+  AwaitSignalCandidate,
+  AwaitTimerCandidate,
+  StoredStep,
+  WorkflowExecution
+}
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -307,10 +318,40 @@ class PostgresWorkflowRuntime private[atomicflow] (
               SET terminal_state = $state, terminal_outcome = $payload, is_accepting_signals = false
               WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
                 AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
-        _ <- if (updated == 1) appendCompletedEvent(workflowId, key, scope, payload)
-             else ().pure[ConnectionIO]
+        _ <- if (updated == 1)
+          for {
+            _ <- appendCompletedEvent(workflowId, key, scope, payload)
+            _ <- wakeCompletionSubscribers(workflowId, key, scope)
+          } yield ()
+        else ().pure[ConnectionIO]
       } yield updated
     }
+
+  /** Upserts the wakeup of every instance holding a pending completion
+    * subscription on the instance that just completed, `ON CONFLICT DO NOTHING`
+    * with `scheduled_at = now`. Rides in the same transaction as the guarded
+    * terminal update and the `WorkflowCompleted` append.
+    */
+  private def wakeCompletionSubscribers(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    for {
+      subscribers <- sql"""SELECT workflow_id, key, scope FROM workflow_completion_subscriptions
+            WHERE completed_workflow_id = $workflowId AND completed_key = $key AND completed_scope = $scope""".query[
+          (WorkflowId, WorkflowInstanceKey, String)
+        ].to[Vector]
+      _ <- subscribers.traverse_ { case (subWf, subKey, subScope) =>
+        sql"""
+          INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+          VALUES ($subWf, $subKey, $subScope, $now, $now, 0)
+          ON CONFLICT (workflow_id, key, scope) DO NOTHING
+        """.update.run.map(_ => ())
+      }
+    } yield ()
+  }
 
   /** Appends a `WorkflowCompleted` event via the global event-append protocol.
     */
@@ -900,6 +941,142 @@ class PostgresWorkflowRuntime private[atomicflow] (
                     ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run
         } yield ()
       }
+
+    override def fireDueTimerLeaves(stepId: StepId, stepVersion: Long): Unit =
+      fenced {
+        val now = theClock.instant()
+        for {
+          due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                       WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                         AND step_id = ${stepId.key} AND step_version = $stepVersion
+                         AND deadline <= $now
+                       ORDER BY deadline, subscription_id
+                       FOR UPDATE""".query[java.util.UUID].to[Vector]
+          _ <- due.traverse_ { subId =>
+            for {
+              exists <- sql"""SELECT 1 FROM workflow_events
+                              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                                AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
+              _ <- if (exists.isEmpty) appendEvent(workflowId, key, instanceScope, "TimerFired", subId.toString, "")
+                   else ().pure[ConnectionIO]
+            } yield ()
+          }
+        } yield ()
+      }
+
+    override def evaluateAwaitRace(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        leaves: Vector[AwaitRaceLeaf],
+        expiresAt: Option[java.time.Instant]
+    )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String] =
+      fencedVal {
+        for {
+          _ <- registerAllSubscriptionsIO(stepId, stepVersion, leaves)
+          candidates <- readAllCandidatesIO(stepId, stepVersion, leaves)
+          decision = decide(candidates)
+          resolved <- decision match {
+            case Some(d) =>
+              for {
+                _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, d.payload, expiresAt)
+                _ <- d.advanceSignalKey.traverse_(k => advanceCursorIO(k, d.winningSequenceId))
+                _ <- deleteAllSubscriptionsIO(stepId, stepVersion)
+              } yield Some(d.payload)
+            case None => Option.empty[String].pure[ConnectionIO]
+          }
+        } yield resolved
+      }
+
+    private def registerAllSubscriptionsIO(
+        stepId: StepId,
+        stepVersion: Long,
+        leaves: Vector[AwaitRaceLeaf]
+    ): ConnectionIO[Unit] =
+      leaves.traverse_ {
+        case l: AwaitRaceSignalLeaf =>
+          sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key)
+                VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, ${l.leafIdx}, ${l.signalKey})
+                ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key) DO NOTHING""".update.run.map(_ => ())
+        case l: AwaitRaceTimerLeaf =>
+          sql"""INSERT INTO workflow_timer_subscriptions
+                  (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
+                VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, ${l.leafIdx}, ${l.deadline})
+                ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run.map(_ => ())
+        case l: AwaitRaceCompletionLeaf =>
+          sql"""INSERT INTO workflow_completion_subscriptions
+                  (workflow_id, key, scope, step_id, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope)
+                VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, ${l.leafIdx}, ${l.completedWorkflowId}, ${l.completedKey}, ${l.completedScope})
+                ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope) DO NOTHING""".update.run.map(_ => ())
+      }
+
+    private def readAllCandidatesIO(
+        stepId: StepId,
+        stepVersion: Long,
+        leaves: Vector[AwaitRaceLeaf]
+    ): ConnectionIO[Vector[AwaitRaceCandidate]] =
+      for {
+        signal <- leaves.collect { case l: AwaitRaceSignalLeaf => l }.traverse(readSignalLeafIO).map(_.flatten)
+        timer <- leaves
+          .collect { case l: AwaitRaceTimerLeaf => l }
+          .traverse(l => readTimerLeafIO(stepId, stepVersion, l))
+          .map(_.flatten)
+        completion <- leaves.collect { case l: AwaitRaceCompletionLeaf => l }.traverse(readCompletionLeafIO).map(_.flatten)
+      } yield signal ++ timer ++ completion
+
+    private def readSignalLeafIO(l: AwaitRaceSignalLeaf): ConnectionIO[Vector[AwaitRaceCandidate]] =
+      for {
+        cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                        WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = ${l.signalKey}""".query[Long].unique
+        events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                        WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                          AND event_kind = 'Signal' AND event_key = ${l.signalKey} AND sequence_id > $cursor
+                        ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+      } yield events.map { case (seq, payload, createdAt) =>
+        AwaitRaceCandidate(seq, l.leafIdx, payload, createdAt)
+      }
+
+    private def readTimerLeafIO(
+        stepId: StepId,
+        stepVersion: Long,
+        l: AwaitRaceTimerLeaf
+    ): ConnectionIO[Vector[AwaitRaceCandidate]] =
+      for {
+        subId <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                       WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                         AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = ${l.leafIdx}""".query[java.util.UUID].option
+        events <- subId match {
+          case None => Vector.empty[AwaitRaceCandidate].pure[ConnectionIO]
+          case Some(id) =>
+            sql"""SELECT sequence_id, created_at FROM workflow_events
+                  WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                    AND event_kind = 'TimerFired' AND event_key = ${id.toString}
+                  ORDER BY sequence_id""".query[(Long, java.time.Instant)].to[Vector]
+              .map(_.map { case (seq, createdAt) => AwaitRaceCandidate(seq, l.leafIdx, "", createdAt) })
+        }
+      } yield events
+
+    private def readCompletionLeafIO(l: AwaitRaceCompletionLeaf): ConnectionIO[Vector[AwaitRaceCandidate]] =
+      for {
+        events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                        WHERE workflow_id = ${l.completedWorkflowId} AND key = ${l.completedKey} AND scope = ${l.completedScope}
+                          AND event_kind = 'WorkflowCompleted' AND event_key = ''
+                        ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+      } yield events.map { case (seq, payload, createdAt) => AwaitRaceCandidate(seq, l.leafIdx, payload, createdAt) }
+
+    private def deleteAllSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+      for {
+        _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
+        _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
+      } yield ()
 
     private def deleteTimerSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
       sql"""DELETE FROM workflow_timer_subscriptions

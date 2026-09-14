@@ -2,7 +2,15 @@ package atomicflow
 
 import atomicflow.Cacheable.Simple.given
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.AwaitSignalCandidate
+import atomicflow.internal.{
+  AwaitRaceCandidate,
+  AwaitRaceCompletionLeaf,
+  AwaitRaceDecision,
+  AwaitRaceLeaf,
+  AwaitRaceSignalLeaf,
+  AwaitRaceTimerLeaf,
+  AwaitSignalCandidate
+}
 
 import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.*
@@ -263,11 +271,49 @@ object Step {
         awaitSignal(stepKey, signal, filter, lookBack, invalidateOn, ensureUnchanged, invalidateAfter)
       case Awaitable.Timer(deadline) =>
         awaitTimer(stepKey, deadline, invalidateOn, ensureUnchanged, invalidateAfter)
-      case Awaitable.WorkflowCompletion(_) =>
-        throw new UnsupportedOperationException("awaiting a workflow completion is not yet supported")
+      case wc @ Awaitable.WorkflowCompletion(_) =>
+        awaitRace0(stepKey, Seq(wc), invalidateOn, ensureUnchanged, invalidateAfter)
       case Awaitable.Mapped(_, _) =>
         throw new UnsupportedOperationException("awaiting a mapped awaitable is not yet supported")
     }
+
+  /** Race several awaitables and resolve with the earliest satisfying durable
+    * event, compared by global `sequenceId` so signals, timers, and workflow
+    * completions compete fairly regardless of kind or workflow tree.
+    *
+    * Creates one subscription per awaitable leaf in the corresponding table.
+    * Each signal leaf retains the shared exact-key cursor for its own key; only
+    * the winning signal key's cursor advances. A satisfied race persists a
+    * `succeeded` step row (result = the winning leaf's value) and retires every
+    * leaf's subscription atomically. If no candidate is satisfiable the workflow
+    * durably suspends with every leaf's subscription registered and no cursor
+    * movement.
+    *
+    * Due timer leaves of the race are materialized at evaluation in deadline
+    * order, so the earliest due timer wins deterministically among timers.
+    *
+    * Drift policies apply exactly as for [[await]]: `ensureUnchanged` values must
+    * be invariant between runs, and `invalidateOn` changes discard the cached
+    * result and re-evaluate from scratch (re-registering subscriptions).
+    *
+    * All awaitables must already be mapped onto the common result type `A` (see
+    * [[Awaitable.map]]), whose `Cacheable` is required at this call site.
+    *
+    * @param stepKey
+    *   the race's stable identity within the workflow
+    * @param invalidateOn
+    *   named inputs that invalidate the cached race result when they change
+    * @param ensureUnchanged
+    *   named inputs that must be invariant between runs
+    * @param awaits
+    *   the awaitables to race, all of result type `A`
+    */
+  def awaitRace[A: Cacheable](
+      stepKey: String,
+      invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+  )(awaits: Awaitable[A]*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
+    awaitRace0(stepKey, awaits.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
 
   /** Read the currently visible events of `s` (those after the instance's shared
     * exact-key cursor) without advancing the cursor. The returned values are the
@@ -424,6 +470,190 @@ object Step {
             case _ => evaluate()
           }
         }
+    }
+  }
+
+  /** The shared drift-aware machinery for `awaitRace` and for a plain completion
+    * await (routed here as a single completion leaf). Mirrors `awaitSignal`: an
+    * existing non-expired `succeeded` row replays; `ensureUnchanged` conflicts
+    * throw; an `invalidateOn` change deletes the row and re-evaluates from
+    * scratch; an expired row re-evaluates.
+    */
+  private def awaitRace0[A: Cacheable](
+      stepKey: String,
+      awaits: Seq[Awaitable[A]],
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateAfter: Duration
+  )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
+    val execution = ctx.execution
+    val stepId = StepId(stepKey, execution.currentScope)
+    val valueCodec = summon[Cacheable[A]]
+    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val now = execution.now
+    val expiresAt = invalidateAfter match {
+      case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
+      case _                 => None
+    }
+
+    val leaves: Vector[(AwaitRaceLeaf, RaceLeafPicker[A])] =
+      awaits.zipWithIndex.map { case (a, idx) => buildRaceLeaf(a, idx, valueCodec, now) }.toVector
+
+    def decode(payload: String): A =
+      try valueCodec.read(payload)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"Await '$stepKey' result could not be decoded")
+      }
+
+    def evaluate(): A = {
+      execution.fireDueTimerLeaves(stepId, 0L)
+      val decided: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] =
+        pickRaceWinner(leaves)
+      execution.evaluateAwaitRace(stepId, 0L, "AwaitRace", fingerprints, leaves.map(_._1), expiresAt)(decided) match {
+        case Some(payload) => decode(payload)
+        case None          => throw new WorkflowSuspendedException
+      }
+    }
+
+    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None => evaluate()
+      case Some(row) =>
+        val stored = parseFingerprints(row.inputFingerprints)
+        for (input <- ensureUnchanged) {
+          if (stored.get(input.name) != Some(fingerprintOf(input)))
+            throw new StepInputConflictException(
+              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
+            )
+        }
+        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
+        if (shouldReevaluate) {
+          execution.deleteStep(stepId, 0L)
+          evaluate()
+        } else {
+          row.stateKind match {
+            case "succeeded" => decode(row.statePayload)
+            case "failed" =>
+              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
+            case _ => evaluate()
+          }
+        }
+    }
+  }
+
+  /** Flattens the `Mapped` wrappers of an awaitable down to its raw base
+    * (`SignalEvent`, `Timer`, or `WorkflowCompletion`) plus the composition of
+    * its `map` transforms, which maps the raw value onto the awaited type `A`.
+    */
+  private def flattenAwaitable[A](a: Awaitable[A]): (Awaitable[?], Any => A) = a match {
+    case Awaitable.Mapped(u, f) =>
+      val (base, g) = flattenAwaitable(u)
+      (base, g.andThen(f))
+    case base => (base, (x: Any) => x.asInstanceOf[A])
+  }
+
+  /** Selects the earliest satisfying candidate across every leaf by global
+    * `sequenceId`. Each leaf's picker independently filters and serializes its
+    * own candidates; the minimum sequence id wins, and only a signal leaf reports
+    * the cursor key to advance.
+    */
+  private def pickRaceWinner[A](
+      pickers: Vector[(AwaitRaceLeaf, RaceLeafPicker[A])]
+  ): Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] = { candidates =>
+    val picks = pickers.flatMap { case (_, picker) => picker.pick(candidates) }
+    if (picks.isEmpty) None
+    else {
+      val (seq, payload, key) = picks.minBy(_._1)
+      Some(AwaitRaceDecision(seq, payload, key))
+    }
+  }
+
+  /** A single race leaf's candidate logic: how to accept and serialize the raw
+    * candidates it is handed.
+    */
+  private trait RaceLeafPicker[A] {
+    def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])]
+  }
+
+  private def buildRaceLeaf[A](
+      a: Awaitable[A],
+      leafIdx: Int,
+      valueCodec: Cacheable[A],
+      now: java.time.Instant
+  ): (AwaitRaceLeaf, RaceLeafPicker[A]) = {
+    val (base, toA) = flattenAwaitable(a)
+    base match {
+      case Awaitable.SignalEvent(signal, filter, lookBack) =>
+        val leaf = AwaitRaceSignalLeaf(leafIdx, signal.key)
+        val signalCodec = signal.cacheable
+        val picker = new RaceLeafPicker[A] {
+          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] = {
+            val matching = candidates.filter(_.leafIdx == leafIdx).find { c =>
+              val withinLookBack = lookBack match {
+                case d: FiniteDuration =>
+                  !c.createdAt.isBefore(now.minus(java.time.Duration.ofNanos(d.toNanos)))
+                case _ => true
+              }
+              withinLookBack && filter(signalCodec.read(c.payload))
+            }
+            matching.map { c =>
+              val serialized =
+                try valueCodec.write(toA(signalCodec.read(c.payload)))
+                catch {
+                  case _: Throwable =>
+                    throw new StepSerializationFailed(s"Race leaf '$leafIdx' result could not be encoded")
+                }
+              (c.sequenceId, serialized, Some(signal.key))
+            }
+          }
+        }
+        (leaf, picker)
+      case Awaitable.Timer(deadline) =>
+        val leaf = AwaitRaceTimerLeaf(leafIdx, deadline)
+        val picker = new RaceLeafPicker[A] {
+          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] =
+            candidates.find(_.leafIdx == leafIdx).map { c =>
+              val serialized =
+                try valueCodec.write(toA(()))
+                catch {
+                  case _: Throwable =>
+                    throw new StepSerializationFailed(s"Race leaf '$leafIdx' result could not be encoded")
+                }
+              (c.sequenceId, serialized, None)
+            }
+        }
+        (leaf, picker)
+      case wc @ Awaitable.WorkflowCompletion(_) =>
+        val leaf = AwaitRaceCompletionLeaf(
+          leafIdx,
+          wc.workflowInstanceId.workflowId,
+          wc.workflowInstanceId.workflowInstanceKey,
+          wc.workflowInstanceId.scope
+        )
+        val picker = new RaceLeafPicker[A] {
+          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] =
+            candidates.find(_.leafIdx == leafIdx).map { c =>
+              val decoded =
+                try valueCodec.read(c.payload)
+                catch {
+                  case _: Throwable =>
+                    throw new StepSerializationFailed(
+                      s"Race leaf '$leafIdx' completion could not be decoded; a completion leaf must be awaited unmapped so its result codec is available"
+                    )
+                }
+              val serialized =
+                try valueCodec.write(toA(decoded))
+                catch {
+                  case _: Throwable =>
+                    throw new StepSerializationFailed(s"Race leaf '$leafIdx' result could not be encoded")
+                }
+              (c.sequenceId, serialized, None)
+            }
+        }
+        (leaf, picker)
+      case other =>
+        throw new UnsupportedOperationException(s"Unsupported awaitable in a race: $other")
     }
   }
 

@@ -1,6 +1,6 @@
 package atomicflow.internal
 
-import atomicflow.{SignalKey, StepId}
+import atomicflow.{SignalKey, StepId, WorkflowId, WorkflowInstanceKey}
 
 import java.time.Instant
 
@@ -32,6 +32,57 @@ private[atomicflow] final case class AwaitTimerCandidate(
     sequenceId: Long,
     subscriptionId: java.util.UUID,
     createdAt: java.time.Instant
+)
+
+/** A single leaf of a `Step.awaitRace` site, describing how its durable
+  * subscription is registered in the corresponding table. The leaf index is the
+  * awaitable's position within the race (0..n-1).
+  */
+private[atomicflow] sealed trait AwaitRaceLeaf {
+  def leafIdx: Int
+}
+
+/** A signal leaf: subscribes in `workflow_signal_subscriptions` under its exact
+  * key and reads candidates after this instance's shared exact-key cursor.
+  */
+private[atomicflow] final case class AwaitRaceSignalLeaf(leafIdx: Int, signalKey: SignalKey) extends AwaitRaceLeaf
+
+/** A timer leaf: subscribes in `workflow_timer_subscriptions` with the absolute
+  * `deadline` and reads candidates from fired `TimerFired` events keyed by its
+  * subscription id.
+  */
+private[atomicflow] final case class AwaitRaceTimerLeaf(leafIdx: Int, deadline: java.time.Instant) extends AwaitRaceLeaf
+
+/** A completion leaf: subscribes in `workflow_completion_subscriptions` for the
+  * terminal outcome of another instance and reads candidates from that
+  * instance's `WorkflowCompleted` event (`event_key = ''`).
+  */
+private[atomicflow] final case class AwaitRaceCompletionLeaf(
+    leafIdx: Int,
+    completedWorkflowId: WorkflowId,
+    completedKey: WorkflowInstanceKey,
+    completedScope: String
+) extends AwaitRaceLeaf
+
+/** One durable candidate for a race leaf, selected by global `sequenceId`
+  * across all leaves so the earliest satisfying event wins regardless of kind or
+  * workflow tree.
+  */
+private[atomicflow] final case class AwaitRaceCandidate(
+    sequenceId: Long,
+    leafIdx: Int,
+    payload: String,
+    createdAt: java.time.Instant
+)
+
+/** The outcome of a satisfied race: the winning event's global sequence id, the
+  * serialized result persisted to the step row, and (only when the winning leaf
+  * is a signal) the exact key whose shared cursor advances.
+  */
+private[atomicflow] final case class AwaitRaceDecision(
+    winningSequenceId: Long,
+    payload: String,
+    advanceSignalKey: Option[SignalKey]
 )
 
 /** The per-run engine seam, materialized only during execution and funneled to
@@ -189,4 +240,29 @@ private[atomicflow] trait WorkflowExecution {
       stepVersion: Long,
       deadline: java.time.Instant
   ): Unit
+
+  /** Fire this race-site's own due timer leaves, fenced, in one transaction: for
+    * each leaf's subscription with `deadline <= now`, row-lock it, re-check that
+    * no `TimerFired` event exists yet, and append one via the global append
+    * protocol. Appends happen in deadline order so the earliest due timer leaf
+    * receives the lowest sequence id and wins deterministically among timers.
+    */
+  def fireDueTimerLeaves(stepId: StepId, stepVersion: Long): Unit
+
+  /** Evaluate a race atomically, fenced: register every leaf's subscription
+    * (idempotent), read all leaves' candidates, apply `decide` to select the
+    * earliest satisfying candidate by global `sequenceId`, and if satisfied
+    * persist the `succeeded` step row (`stepKind`), advance ONLY the winning
+    * signal key's cursor, and delete every leaf's subscription — all in one
+    * transaction. If no candidate is satisfiable, no cursor advances and the
+    * subscriptions remain. Returns the persisted payload when resolved.
+    */
+  def evaluateAwaitRace(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      leaves: Vector[AwaitRaceLeaf],
+      expiresAt: Option[java.time.Instant]
+  )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String]
 }

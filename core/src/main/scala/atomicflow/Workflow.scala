@@ -46,6 +46,12 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
   @throws[WorkflowNotFoundException]
   def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
     runtime.sendSignal(id, signal.key, value)(using signal.cacheable)
+
+  /** An awaitable that yields this instance's terminal outcome as a
+    * `WorkflowCompletionResult[Out]`, to be raced or awaited from another
+    * workflow via `Step.await`/`Step.awaitRace`.
+    */
+  def completion: Awaitable.WorkflowCompletion[Out] = Awaitable.WorkflowCompletion(id)
 }
 
 object WorkflowInstance {
