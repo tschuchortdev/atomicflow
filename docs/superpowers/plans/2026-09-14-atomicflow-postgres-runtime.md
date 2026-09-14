@@ -133,7 +133,7 @@ object Step:
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using WorkflowContext, Cacheable[Throwable]): A
 
-  def getExecutionState[A: Cacheable](key: String, stepVersion: Long = 0)(using WorkflowContext): StepExecutionState[A]
+  def getExecutionState[A: Cacheable](key: String, stepVersion: Long = 0)(using WorkflowContext, Cacheable[Throwable]): StepExecutionState[A]
 
 enum StepExecutionState[+A]:
   case NeverStarted
