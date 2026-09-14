@@ -1,14 +1,46 @@
 package atomicflow
 
+import java.time.Instant
+
 /** The typed handle of a workflow instance, obtained only from the runtime. It
   * captures the [[Workflow]] definition it came from plus the instance's stable
   * identity. Methods requiring execution take a contextual `(using
-  * WorkflowRuntime)`; further methods arrive in later tasks.
+  * WorkflowRuntime)`.
   */
 final class WorkflowInstance[In, Out] private[atomicflow] (
     val workflow: Workflow[In, Out],
     val id: WorkflowInstanceId
-)
+) {
+
+  /** Run the instance on the caller thread (no input parameter — the input is
+    * already persisted at creation). Terminal instances return/throw their stored
+    * outcome without re-executing the body.
+    */
+  @throws[WorkflowNotFoundException]
+  def run()(using
+      runtime: WorkflowRuntime,
+      cacheableThrowable: Cacheable[Throwable]
+  ): WorkflowRunResult[Out] =
+    runtime.runWorkflowInstance(workflow, id)
+}
+
+object WorkflowInstance {
+
+  /** Persisted instance state: the data view of an instance ("a row"), returned
+    * by key-based queries that don't have the workflow code, and by
+    * `getInfo()`. Fresh from the database.
+    */
+  final case class Info(
+      id: WorkflowInstanceId,
+      parentId: Option[WorkflowInstanceId],
+      generation: Long,
+      terminalState: Option[WorkflowTerminalState],
+      workflowVersionAtCreation: Long,
+      createdAt: Instant,
+      lastRunAt: Option[Instant],
+      timesExecuted: Int
+  )
+}
 
 /** A workflow definition: the identifying/descriptive fields plus the executable
   * `body` and its codecs. There is deliberately no separate meta wrapper; every

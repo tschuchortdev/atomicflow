@@ -34,3 +34,33 @@ object WorkflowInputConflictException {
 
 /** Thrown by operations that address a workflow instance that does not exist. */
 class WorkflowNotFoundException(message: String) extends RuntimeException(message)
+
+/** Thrown by an external `run` on an instance whose execution lease is held by
+  * another worker and does not become available within the runtime's
+  * `leaseAcquireTimeout`. The runtime never steals a live lease.
+  */
+class LeaseUnavailableException(message: String) extends RuntimeException(message)
+
+object LeaseUnavailableException {
+  def apply(instanceId: WorkflowInstanceId): LeaseUnavailableException =
+    new LeaseUnavailableException(
+      s"Workflow instance lease is held by another worker and did not become available in time: $instanceId"
+    )
+}
+
+/** Raised when the execution lease was lost mid-run — taken over by another
+  * worker or expired — so a fenced write affected zero rows. The run aborts
+  * without durable effect; the new owner is responsible for the instance.
+  */
+class LeaseLostException(message: String) extends RuntimeException(message)
+
+object LeaseLostException {
+  def apply(instanceId: WorkflowInstanceId): LeaseLostException =
+    new LeaseLostException(s"Workflow instance execution lease was lost: $instanceId")
+}
+
+/** Thrown when a stored terminal outcome cannot be decoded with the configured
+  * codecs (mirrors `StepSerializationFailed` for step payloads). A deterministic
+  * runtime-owned failure surfaced instead of recursing into a broken codec.
+  */
+class StepSerializationFailed(message: String) extends StepFailed(message)

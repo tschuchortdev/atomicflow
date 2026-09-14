@@ -14,9 +14,11 @@ sealed trait WorkflowControlException extends ControlThrowable
 
 /** Thrown when an await cannot be satisfied and the instance durably suspends.
   * The pending subscriptions are committed by the await evaluation before this
-  * exception is thrown; it carries no payload.
+  * exception is thrown; it carries no payload. Users may also throw it manually
+  * to suspend; the runtime catches it at the workflow boundary and returns
+  * `WorkflowSuspended`.
   */
-final class WorkflowSuspendedException private[atomicflow] () extends WorkflowControlException {
+final class WorkflowSuspendedException() extends WorkflowControlException {
   override def toString: String = "WorkflowSuspendedException"
 }
 
