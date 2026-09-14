@@ -1,8 +1,7 @@
 package atomicflow
 
 import scala.annotation.implicitNotFound
-
-import java.time.Instant
+import scala.concurrent.duration.{Duration, FiniteDuration}
 
 /** The canonical home of all single-instance workflow operations. Implemented per
   * backend (in-memory, Postgres, ...). Convenience methods are `final`, built
@@ -35,21 +34,22 @@ trait WorkflowRuntime {
   def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
-  )(using Cacheable[In], Cacheable[Out], Cacheable[Throwable]): WorkflowRunResult[Out]
+  )(using Cacheable[Throwable]): WorkflowRunResult[Out]
 
   /** Upsert a coalesced wakeup row for an instance, `ON CONFLICT DO NOTHING` so an
-    * existing row's timestamps are never reset.
+    * existing row's timestamps are never reset. The backend derives `scheduled_at`
+    * from its own clock (`clock.now + delay`).
     */
-  private[atomicflow] def upsertWakeup(instanceId: WorkflowInstanceId, scheduledAt: Instant): Unit
+  private[atomicflow] def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
-  /** Register and schedule the instance's first wakeup. */
+  /** Register and schedule the instance's first wakeup (due immediately). */
   final def createAndSchedule[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       in: In
-  )(using Cacheable[In]): WorkflowInstance[In, Out] = {
-    val instance = createWorkflowInstance(workflow, instanceKey, in)
-    upsertWakeup(instance.id, Instant.now())
+  ): WorkflowInstance[In, Out] = {
+    val instance = createWorkflowInstance(workflow, instanceKey, in)(using workflow.inputCacheable)
+    upsertWakeup(instance.id, Duration.Zero)
     instance
   }
 
@@ -58,12 +58,8 @@ trait WorkflowRuntime {
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       in: In
-  )(using
-      Cacheable[In],
-      Cacheable[Out],
-      Cacheable[Throwable]
-  ): WorkflowRunResult[Out] = {
-    createWorkflowInstance(workflow, instanceKey, in)
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
+    createWorkflowInstance(workflow, instanceKey, in)(using workflow.inputCacheable)
     runWorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey))
   }
 

@@ -8,9 +8,10 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 import org.flywaydb.core.Flyway
 
-import java.time.{Clock, Instant}
+import java.time.Clock
 import javax.sql.DataSource
 import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.FiniteDuration
 
 object PostgresWorkflowRuntime {
   def apply(ds: DataSource)(using ExecutionContext): PostgresWorkflowRuntime =
@@ -27,7 +28,7 @@ object PostgresWorkflowRuntime {
 class PostgresWorkflowRuntime private[atomicflow] (ds: DataSource, clock: Clock)(using ec: ExecutionContext)
     extends WorkflowRuntime {
 
-  Flyway.configure().dataSource(ds).cleanDisabled(false).load().migrate()
+  Flyway.configure().dataSource(ds).load().migrate()
 
   private val xa = Transactor.fromDataSource[IO](ds, ec)
 
@@ -91,11 +92,12 @@ class PostgresWorkflowRuntime private[atomicflow] (ds: DataSource, clock: Clock)
   override def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
-  )(using Cacheable[In], Cacheable[Out], Cacheable[Throwable]): WorkflowRunResult[Out] =
+  )(using Cacheable[Throwable]): WorkflowRunResult[Out] =
     throw new NotImplementedError("runWorkflowInstance is implemented in Task 2.2")
 
-  private[atomicflow] override def upsertWakeup(instanceId: WorkflowInstanceId, scheduledAt: Instant): Unit = {
+  private[atomicflow] override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
     val now = clock.instant()
+    val scheduledAt = now.plus(java.time.Duration.ofNanos(delay.toNanos))
     runSync {
       sql"""
         INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)

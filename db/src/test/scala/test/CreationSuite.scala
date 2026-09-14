@@ -5,7 +5,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.Instant
+import java.time.{Clock, Instant, ZoneOffset}
 
 class CreationSuite extends PostgresWorkflowRuntimeSuite {
 
@@ -102,7 +102,15 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(after.map(_._1), before.map(_._1))
     assertEquals(after.map(_._3), Some(0))
-    assert(after.exists(_._2 != null))
+  }
+
+  test("createAndSchedule derives scheduled_at from the injected clock") {
+    val fixed = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC)
+    val rt = newRuntime(fixed)
+    val wf = workflow("wf-8")
+    rt.createAndSchedule(wf, "key-8", "a")
+
+    assertEquals(wakeup(wf.id, "key-8").map(_._2), Some(Instant.parse("2026-01-01T00:00:00Z")))
   }
 
   test("plain create schedules nothing (no wakeup row)") {

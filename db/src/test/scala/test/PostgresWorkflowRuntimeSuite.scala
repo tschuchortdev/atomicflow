@@ -11,6 +11,7 @@ import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.containers.PostgreSQLContainer
 
 import scala.concurrent.ExecutionContext
+import java.time.Clock
 
 /** Shared munit harness for the Postgres backend.
   *
@@ -56,4 +57,8 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
   /** A fresh runtime backed by the suite's single container. */
   def newRuntime: PostgresWorkflowRuntime =
     PostgresWorkflowRuntime(newDataSource)(using ExecutionContext.global)
+
+  /** A fresh runtime with an injected clock, backed by the suite's single container. */
+  def newRuntime(clock: Clock): PostgresWorkflowRuntime =
+    PostgresWorkflowRuntime(newDataSource, clock)(using ExecutionContext.global)
 }

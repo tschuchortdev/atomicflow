@@ -40,7 +40,7 @@ CREATE SEQUENCE workflow_event_sequence AS BIGINT CACHE 1;
 
 CREATE UNIQUE INDEX workflow_events_timer_unique
   ON workflow_events (workflow_id, key, scope, event_key)
-  WHERE event_kind = 'timer_fired';
+  WHERE event_kind = 'TimerFired';
 
 CREATE INDEX workflow_events_lookup
   ON workflow_events (event_kind, event_key, workflow_id, key, scope, sequence_id);
