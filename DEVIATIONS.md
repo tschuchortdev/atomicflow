@@ -92,3 +92,48 @@ implementation phase.
     the boundary-catch behavior is tested from a package-`atomicflow` test
     (users fabricating suspensions would violate the durable-suspension
     invariant).
+
+## Phase 3 (signals, timers, awaits)
+
+18. **`RetryPolicy.exponentialBackoff` exists as one method, not the spec's two
+    overloads.** Scala 3 forbids two overloaded alternatives that both define
+    default arguments (verified empirically); the merged method serves both
+    spec signature-block call shapes (`initialDelay = ..., maxCumulativeDelay =
+    ...` and `maxRetries = ..., initialDelay = ...`). `steps.md`'s own example
+    (`start =`, `max =`) contradicts its signature block and is resolved in
+    favor of the latter.
+19. **`onUnconsumedSignals` receives `Map[SignalKey, Seq[String]]`** (raw
+    serialized payloads, in sequenceId order, after cursors) instead of the
+    spec's `Seq[Any]`: decoding would require a per-key codec registry the
+    spec does not provide. Payload strings serve the stated purpose
+    ("mainly for logging").
+20. **The spec's open TODO "completion delivery boundary" is resolved**: a
+    workflow flips `is_accepting_signals := false` BEFORE running the
+    unconsumed-signals handler, so a signal arriving during the handler is
+    rejected as `InstanceAlreadyCompleted` (never reported as delivered and
+    omitted).
+21. **`Awaitable` carries no `Cacheable` context bound.** The spec is
+    self-contradictory (it puts `R : Cacheable` on the enum but also states
+    `map` "does not require a `Cacheable[B]`" and that the result codec is
+    "required at the `Step.await` call site"). The call-site requirement wins.
+22. **`WorkflowCompletion` carries its composite codec, captured at
+    `.completion` call time** (which now takes `Cacheable[Throwable]`
+    contextually, per "every operation that surfaces the completion takes the
+    codecs contextually"). This makes mapped completion leaves decodable —
+    the spec's named use case for `map` — by decoding via the source's own
+    codec and persisting with the call-site codec.
+23. **Timer subscriptions are backed by a UNIQUE (site, leaf) constraint**, and
+    each durable retry attempt mints a fresh subscription (new id, new
+    deadline) atomically with its started-row write — the spec is silent on
+    both; idempotency otherwise rested on the lease fence alone.
+24. **The durable-retry delay threshold is a `PostgresWorkflowRuntime`
+    constructor parameter (`durableRetryThreshold`, default 30 seconds).**
+    The spec attributes it to a `WorkflowRunSettings` type that does not
+    exist in the new API.
+25. **An empty `awaitRace` fails fast** (`require(awaits.nonEmpty)`): a
+    zero-leaf race can never satisfy and would violate the
+    suspended-instance invariant.
+26. **The unconsumed-signals handler also runs on the failure path** (the spec
+    ties it to "before the instance is marked complete"); a throwing handler
+    on the failure path masks the original exception (unspecified edge,
+    documented behavior).
