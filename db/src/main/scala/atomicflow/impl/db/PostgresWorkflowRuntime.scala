@@ -252,6 +252,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                          AND terminal_state IS NULL""".update.run
       _ <- if (updated == 1)
         for {
+          _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
           _ <- appendCompletedEvent(workflowId, key, scope, payload)
           _ <- wakeCompletionSubscribers(workflowId, key, scope)
           _ <- terminalCleanupIO(workflowId, key, scope)
@@ -280,6 +281,20 @@ class PostgresWorkflowRuntime private[atomicflow] (
       _ <- sql"""DELETE FROM workflow_completion_subscriptions
                  WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
     } yield ()
+
+  /** Deletes the directly addressed `Signal` events of the instance at a terminal
+    * transition. `TimerFired` and `WorkflowCompleted` events are retained
+    * (subscribers and replays need them); consumers of the deleted `Signal`
+    * events already hold cached Step results.
+    */
+  private def deleteDirectSignalEventsIO(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Unit] =
+    sql"""DELETE FROM workflow_events
+          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+            AND event_kind = 'Signal'""".update.run.map(_ => ())
 
   /** Force-stop an instance. In one transaction, row-locking the instance: a
     * missing instance throws [[WorkflowNotFoundException]], an already-terminal
@@ -314,6 +329,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                              fencing_token = fencing_token + 1
                          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
                            AND terminal_state IS NULL""".update.run
+              _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
               _ <- appendCompletedEvent(workflowId, key, scope, payload)
               _ <- wakeCompletionSubscribers(workflowId, key, scope)
               _ <- terminalCleanupIO(workflowId, key, scope)
@@ -528,9 +544,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
         _ <- if (updated == 1)
           for {
-            _ <- sql"""DELETE FROM workflow_events
-                       WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
-                         AND event_kind = 'Signal'""".update.run
+            _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
             _ <- appendCompletedEvent(workflowId, key, scope, payload)
             _ <- wakeCompletionSubscribers(workflowId, key, scope)
             _ <- terminalCleanupIO(workflowId, key, scope)

@@ -82,6 +82,12 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
             WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
     )
 
+  private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
+    run(
+      sql"""SELECT COUNT(*) FROM workflow_events
+            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
+    )
+
   private def stepStateKind(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String): Option[String] =
     run(
       sql"""SELECT state_kind FROM workflow_steps
@@ -216,6 +222,42 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assert(after.get.isAfter(before.get), s"heartbeat inside the region must renew the lease: before=$before after=$after")
   }
 
+  test("an await inside an uncancellable region suspends despite the cancel flag and resolves via a signal") {
+    val rt = newRuntime
+    val wfId = "await-in-region"
+    val sig = Signal[String]("compensate")
+    val wf = Workflow[String, String](id = wfId) { in =>
+      try {
+        Step.atLeastOnce[String]("A") { rt.cancel(WorkflowInstanceId(wfId, "k")); "a" }
+        Step.atLeastOnce[String]("B") { "b" }
+        "not-reached"
+      } catch {
+        case _: WorkflowCancelledException =>
+          Workflow.uncancellable {
+            Step.await[String]("wait2", Awaitable.SignalEvent(sig))
+          }
+          "compensated"
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+
+    assertEquals(
+      rt.runWorkflowInstance(wf, id),
+      WorkflowRunResult.WorkflowSuspended,
+      "the await inside the region must suspend normally despite cancel_requested_at being set"
+    )
+    assert(cancelRequestedAt(wf.id, "k").isDefined, "the self-cancel must have set cancel_requested_at")
+    assertEquals(countSignalSubs(wf.id, "k"), 1, "the await registered its subscription inside the region")
+
+    sig.send(id, "v")(using rt)
+    assertEquals(
+      rt.runWorkflowInstance(wf, id),
+      WorkflowRunResult.Result("compensated"),
+      "the signal resolves the await inside the region; the compensation completes"
+    )
+    assertEquals(terminalRow(wf.id, "k").get._1, Some("completed"))
+  }
+
   test("terminate on a suspended instance: TERMINATED + event; wakeups/subscriptions deleted; body never runs on re-run") {
     val rt = newRuntime
     val bodyCounter = new AtomicInteger(0)
@@ -231,11 +273,9 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(bodyCounter.get(), 1)
     assertEquals(countSignalSubs(wf.id, "k"), 1, "a pending signal subscription exists while suspended")
-    run(
-      sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
-            VALUES ($wfId, 'k', '', now(), now(), 0)""".update.run
-    )
-    assertEquals(countWakeups(wf.id, "k"), 1)
+    sig.send(id, "v")(using rt)
+    assertEquals(countSignalEvents(wf.id, "k"), 1, "a directly addressed Signal event exists while suspended")
+    assertEquals(countWakeups(wf.id, "k"), 1, "the signal send upserts a wakeup for the suspended instance")
 
     rt.terminate(id)
 
@@ -247,6 +287,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(countSignalSubs(wf.id, "k"), 0, "terminate must delete signal subscriptions")
     assertEquals(countTimerSubs(wf.id, "k"), 0, "terminate must delete timer subscriptions")
     assertEquals(countCompletionSubs(wf.id, "k"), 0, "terminate must delete completion subscriptions")
+    assertEquals(countSignalEvents(wf.id, "k"), 0, "terminate must delete directly addressed Signal events")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowTerminated)
     assertEquals(bodyCounter.get(), 1, "re-running a terminated instance must never execute the body")
@@ -269,6 +310,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row._1, Some("terminated"))
     assertEquals(row._3, before + 1, "terminate must bump the fencing token to revoke the lease")
     assertEquals(leaseOwner(wf.id, "k"), None, "terminate must clear the lease owner")
+    assertEquals(leaseExpiry(wf.id, "k"), None, "terminate must clear the lease expiry")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowTerminated)
     assertEquals(instanceRow(wf.id, "k").get._3, before + 1, "a terminal read short-circuits without re-acquiring")
