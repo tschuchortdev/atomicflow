@@ -260,8 +260,8 @@ object Step {
     awaitable match {
       case Awaitable.SignalEvent(signal, filter, lookBack) =>
         awaitSignal(stepKey, signal, filter, lookBack, invalidateOn, ensureUnchanged, invalidateAfter)
-      case Awaitable.Timer(_) =>
-        throw new UnsupportedOperationException("awaiting a Timer is not yet supported")
+      case Awaitable.Timer(deadline) =>
+        awaitTimer(stepKey, deadline, invalidateOn, ensureUnchanged, invalidateAfter)
       case Awaitable.WorkflowCompletion(_) =>
         throw new UnsupportedOperationException("awaiting a workflow completion is not yet supported")
       case Awaitable.Mapped(_, _) =>
@@ -282,7 +282,7 @@ object Step {
 
   /** The runtime-computed step machinery for a [[Awaitable.SignalEvent]].
     */
-  private def awaitSignal[A](
+  private def awaitSignal[A: Cacheable](
       stepKey: String,
       signal: Signal[A],
       filter: A => Boolean,
@@ -293,7 +293,7 @@ object Step {
   )(using ctx: WorkflowContext): A = {
     val execution = ctx.execution
     val stepId = StepId(stepKey, execution.currentScope)
-    val valueCodec = signal.cacheable
+    val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
     val expiresAt = invalidateAfter match {
@@ -356,6 +356,62 @@ object Step {
         } else {
           row.stateKind match {
             case "succeeded" => decode(row.statePayload)
+            case "failed" =>
+              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
+            case _ => evaluate()
+          }
+        }
+    }
+  }
+
+  /** The runtime-computed step machinery for a [[Awaitable.Timer]].
+    */
+  private def awaitTimer(
+      stepKey: String,
+      deadline: java.time.Instant,
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateAfter: Duration
+  )(using ctx: WorkflowContext): Unit = {
+    val execution = ctx.execution
+    val stepId = StepId(stepKey, execution.currentScope)
+    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val now = execution.now
+    val expiresAt = invalidateAfter match {
+      case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
+      case _                 => None
+    }
+
+    def evaluate(): Unit = {
+      execution.fireDueTimers(stepId, 0L)
+      if (execution.readAwaitTimerCandidates(stepId, 0L).nonEmpty) {
+        execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, "", expiresAt)
+      } else {
+        execution.suspendAwaitTimer(stepId, 0L, "Await", fingerprints, deadline, expiresAt)
+        throw new WorkflowSuspendedException
+      }
+    }
+
+    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None => evaluate()
+      case Some(row) =>
+        val stored = parseFingerprints(row.inputFingerprints)
+        for (input <- ensureUnchanged) {
+          if (stored.get(input.name) != Some(fingerprintOf(input)))
+            throw new StepInputConflictException(
+              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
+            )
+        }
+        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
+        if (shouldReevaluate) {
+          execution.deleteStep(stepId, 0L)
+          execution.deleteTimerSubscriptions(stepId, 0L)
+          evaluate()
+        } else {
+          row.stateKind match {
+            case "succeeded" => ()
             case "failed" =>
               throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
             case _ => evaluate()

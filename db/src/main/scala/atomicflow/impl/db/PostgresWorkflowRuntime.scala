@@ -1,7 +1,7 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.{AwaitSignalCandidate, StoredStep, WorkflowExecution}
+import atomicflow.internal.{AwaitSignalCandidate, AwaitTimerCandidate, StoredStep, WorkflowExecution}
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -802,6 +802,100 @@ class PostgresWorkflowRuntime private[atomicflow] (
           }
         } yield resolved
       }
+
+    override def fireDueTimers(stepId: StepId, stepVersion: Long): Unit =
+      fenced {
+        val now = theClock.instant()
+        for {
+          due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                       WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                         AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = 0
+                         AND deadline <= $now
+                       FOR UPDATE""".query[java.util.UUID].to[Vector]
+          _ <- due.traverse_ { subId =>
+            for {
+              exists <- sql"""SELECT 1 FROM workflow_events
+                              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                                AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
+              _ <- if (exists.isEmpty) appendEvent(workflowId, key, instanceScope, "TimerFired", subId.toString, "")
+                   else ().pure[ConnectionIO]
+            } yield ()
+          }
+        } yield ()
+      }
+
+    override def readAwaitTimerCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate] =
+      runSync {
+        for {
+          subIds <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                            AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = 0""".query[
+              java.util.UUID
+            ].to[List]
+          events <- if (subIds.isEmpty) Vector.empty[AwaitTimerCandidate].pure[ConnectionIO]
+                    else {
+                      val idStrings = subIds.map(_.toString)
+                      (fr"""SELECT sequence_id, event_key, created_at FROM workflow_events
+                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                              AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
+                            ORDER BY sequence_id""").query[(Long, String, java.time.Instant)].to[Vector]
+                        .map(_.map { case (seq, ek, createdAt) =>
+                          AwaitTimerCandidate(seq, java.util.UUID.fromString(ek), createdAt)
+                        })
+                    }
+        } yield events
+      }
+
+    override def resolveAwaitTimer(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        for {
+          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+          _ <- deleteTimerSubscriptionsIO(stepId, stepVersion)
+        } yield ()
+      }
+
+    override def suspendAwaitTimer(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        deadline: java.time.Instant,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        for {
+          existing <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                              AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = 0""".query[
+              java.util.UUID
+            ].option
+          _ <- existing match {
+            case Some(_) => ().pure[ConnectionIO]
+            case None =>
+              sql"""INSERT INTO workflow_timer_subscriptions
+                      (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
+                    VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, 0, $deadline)
+                    ON CONFLICT (subscription_id) DO NOTHING""".update.run.map(_ => ())
+          }
+        } yield ()
+      }
+
+    override def deleteTimerSubscriptions(stepId: StepId, stepVersion: Long): Unit =
+      fenced {
+        deleteTimerSubscriptionsIO(stepId, stepVersion)
+      }
+
+    private def deleteTimerSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+      sql"""DELETE FROM workflow_timer_subscriptions
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+              AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run.map(_ => ())
 
     private def advanceCursorIO(signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
       sql"""INSERT INTO signal_cursor (workflow_id, key, scope, signal_key, sequence_id)

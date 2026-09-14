@@ -25,6 +25,15 @@ private[atomicflow] final case class AwaitSignalCandidate(
     createdAt: Instant
 )
 
+/** One durable `TimerFired` event matching a pending timer subscription of an
+  * awaiting site, keyed by the subscription id.
+  */
+private[atomicflow] final case class AwaitTimerCandidate(
+    sequenceId: Long,
+    subscriptionId: java.util.UUID,
+    createdAt: java.time.Instant
+)
+
 /** The per-run engine seam, materialized only during execution and funneled to
   * workflow code through [[atomicflow.WorkflowContext.execution]]. It carries
   * the fencing identity of the current run so the engine can implement fenced
@@ -127,4 +136,49 @@ private[atomicflow] trait WorkflowExecution {
       signalKey: SignalKey,
       expiresAt: Option[Instant]
   )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String]
+
+  /** Fire this await-site's own due timer subscriptions, fenced, in one
+    * transaction: for each subscription with `deadline <= now`, row-lock it,
+    * re-check that no `TimerFired` event exists yet, and append one via the
+    * global append protocol. The subscription row survives firing; only
+    * resolution retires it.
+    */
+  def fireDueTimers(stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `TimerFired` events matching this await-site's pending
+    * timer subscriptions (plain durable read; no lock or fence).
+    */
+  def readAwaitTimerCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
+
+  /** Resolve a timer await atomically, fenced: persist the `succeeded` step row
+    * (`stepKind`) and delete the site's timer subscriptions in one transaction
+    * (timers have no cursor).
+    */
+  def resolveAwaitTimer(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Suspend a timer await, fenced: register the pending subscription
+    * idempotently. The subscription id is minted on first registration with the
+    * given absolute `deadline` and reused on replay (the row persists and its
+    * stored deadline is never recomputed).
+    */
+  def suspendAwaitTimer(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      deadline: java.time.Instant,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Delete this await-site's timer subscriptions, fenced. Used to retire an
+    * invalidated timer before re-registering a fresh incarnation.
+    */
+  def deleteTimerSubscriptions(stepId: StepId, stepVersion: Long): Unit
 }
