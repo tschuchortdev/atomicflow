@@ -117,7 +117,7 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 - **Concurrency resources.** By default the runner owns a daemon worker pool sized by `workerThreads`; `executor = Some(...)` overrides it with a user-supplied `Executor` (e.g. a virtual-thread-per-task executor). `maxConcurrentInstances` caps concurrently executing instances per `workflowId` (default unlimited).
 - **Cap enforcement at claim time.** Each runner process keeps an in-process permit count per `workflowId`. If a claimed instance's workflow is at capacity, the wakeup is deferred *in place* (`scheduled_at = now + capacityRetryDelay`, no lease taken) so a hot workflow can neither starve the FIFO batch nor pin a worker. Caps are per-process and multiply across processes; the lease still prevents concurrent execution of one instance. Caller-thread `run` bypasses caps — they are runner-side resource control, not a cross-process guarantee.
 
-### Sources of work
+### Sources of wakeups
 
 `workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)` is the single scheduling queue. It holds **one row per instance** — many pending events coalesce — and every row means "this instance may have durable work". The queue is **instance-addressed only**: there are no rows meaning meta-work such as "run a thread which checks if a timer is due" — timer firing is time-driven, and only its *results* (a fired timer's wakeup for the owning instance) enter the queue. A sender's upsert uses `ON CONFLICT DO NOTHING` and never resets an existing row's timestamps. Sources:
 
