@@ -236,7 +236,133 @@ object WorkflowInstance:
 - `awaitResult` returns immediately for terminal instances; blocks until timeout for suspended/non-terminal (then throws a timeout exception — pinned: `java.util.concurrent.TimeoutException`); passive: never executes the workflow.
 - `Info` fields match row state.
 
-## Phases 3–9 (expanded at phase boundaries)
+## Phase 3 — Signals, timers, awaits, event log, wakeups
+
+Implements `spec/signals-timers.md` end-to-end for the Postgres runtime (manual test mode:
+caller threads drive everything). All event appends use the global protocol
+(`pg_advisory_xact_lock(EventAppendLockKey)` + `nextval('workflow_event_sequence')`).
+
+### Task 3.1: Event append primitive, Signal type, send, TestClock
+
+**Files:**
+- Modify: `core/.../Types.scala` (SignalSendResult), `core/.../WorkflowRuntime.scala`, `db/.../PostgresWorkflowRuntime.scala`
+- Create: `core/src/main/scala/atomicflow/Signal.scala`, `core/src/main/scala/atomicflow/TestClock.scala`
+- Test: `db/src/test/scala/test/SignalSuite.scala`
+
+**Interfaces:**
+```scala
+final class Signal[A] private (val key: SignalKey)(using val cacheable: Cacheable[A])
+object Signal { def apply[A: Cacheable](key: SignalKey): Signal[A] }
+// on Signal, WorkflowInstanceId, WorkflowInstance (forwarders) and trait primitive:
+@throws[WorkflowNotFoundException]
+def sendSignal[A: Cacheable](workflowInstanceId: WorkflowInstanceId, key: SignalKey, value: A): SignalSendResult
+trait WorkflowRuntime { def clock: Clock }  // exposed so apps/tests share one time source
+final class TestClock(start: Instant) extends Clock { def advanceBy(d: FiniteDuration): Unit; ... }
+```
+
+**Behavior (tests, per `signals-timers.md` "Basic Signal API" + "Event storage"):**
+- send appends one `Signal` event (row lock on the instance + `is_accepting_signals` check → `InstanceAlreadyCompleted` for terminal instances; `WorkflowNotFoundException` for missing instances) and upserts a wakeup for the instance when a matching pending subscription exists (subscription check returns empty in this task — exercised by 3.2).
+- Sequence IDs strictly increase; concurrent-ish appends (sequential here) commit-ordered.
+- Events are immutable; payload serialized with the signal's `Cacheable[A]`.
+
+### Task 3.2: `Awaitable` + `Step.await` for signals (cursors, filters, lookBack, subscriptions)
+
+**Files:**
+- Create: `core/src/main/scala/atomicflow/Awaitable.scala`, extend `core/.../Step.scala` (`await`, `peekSignal`), engine seam + runtime
+- Test: `db/src/test/scala/test/AwaitSignalSuite.scala`
+
+**Interfaces:**
+```scala
+enum Awaitable[R](using val resultCacheable: Cacheable[R]):
+  case SignalEvent(s: Signal[?], filter: Any => Boolean = _ => true, lookBack: Duration = Duration.Inf) extends Awaitable[Any]  // refined below
+  case Timer(deadline: Instant) extends Awaitable[Unit]
+  case WorkflowCompletion(workflowInstanceId: WorkflowInstanceId) extends Awaitable[WorkflowCompletionResult[?]]  // refined in 3.4
+  def map[B](f: R => B): Awaitable[B]
+
+object Step:
+  def await[A](stepKey: String, awaitable: Awaitable[A], invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty, invalidateAfter: Duration = Duration.Inf)
+    (using WorkflowContext, Cacheable[Throwable]): A
+  def peekSignal[A](s: Signal[A])(using WorkflowContext): Seq[A]
+```
+(Exact variance/type refinement is pinned in the task brief; invariant in R, `map` needs no `Cacheable[B]`.)
+
+**Behavior (tests, per "Core model: await is a runtime-computed step" + "Basic Signal API"):**
+- Await-satisfied event found → atomic resolve: persist await Step row (`stepKind='Await'`, version 0) + advance cursor + delete subscriptions in one transaction; returns decoded value.
+- No satisfying event → suspend: register/refresh subscriptions, throw `WorkflowSuspendedException`; run returns `WorkflowSuspended`; subscription rows exist; wakeup row upserted.
+- After the event is sent, a re-`run` resolves the await; body resumes from cached steps (no re-execution of earlier steps).
+- Filter: matching event wins; earlier rejected events are skipped permanently (cursor jumps past them) — test cursor position via SQL.
+- No match (all rejected) → cursor unchanged, suspension.
+- lookBack: events older than `now - lookBack` (event's original acceptance time, runtime clock) are ignored.
+- peekSignal: visible events after cursor without advancing.
+- Drift policies (`invalidateOn`/`ensureUnchanged`/`invalidateAfter`) apply to await rows like step rows.
+- Same key awaited twice sequentially: second await consumes the NEXT event.
+- Events sent while instance is running (before suspension commit): the recheck-before-commit rule — suspension transaction re-reads events; no lost wakeup. (Test: send during a run via a step body, then the await at the frontier resolves without a second run.)
+
+### Task 3.3: Timer awaits (subscriptions, inline firing, exactly-once)
+
+**Files:**
+- Extend: `Awaitable.scala` (Timer with `apply(delay)(using Clock)`), `Step.scala`, engine seam + runtime (timer-firing primitive)
+- Test: `db/src/test/scala/test/AwaitTimerSuite.scala`
+
+**Behavior (tests, per "Why timer awaits need a subscription" + "Timer firing: two paths, one primitive"):**
+- `Awaitable.Timer(5.seconds)(using clock)` computes `now + delay` from the contextual clock; the subscription stores the ABSOLUTE deadline; replays never recompute (deadline fixed at first registration) — test with TestClock: advance past deadline, run resolves without pushing the deadline forward.
+- Evaluation fires the site's own due timers inline (appends `TimerFired` keyed by subscription ID) then resolves — manual mode works with no sweep.
+- Timer not yet due → suspension; due → resolves even if the sweep never ran.
+- `TimerFired` appended exactly once per subscription (partial unique index + row-lock re-check; test repeated runs).
+- Subscription row SURVIVES firing; deleted only when the await resolves (or terminal cleanup — Phase 4/6).
+- Timer invalidated by `invalidateOn` change → re-registers fresh subscription (new subscription ID, recomputed deadline); the old incarnation's `TimerFired` event is inert (cannot satisfy the new evaluation).
+
+### Task 3.4: awaitRace + completion awaits
+
+**Files:**
+- Extend: `Step.scala` (`awaitRace`), `Awaitable.scala` (`WorkflowCompletion` refined), engine + runtime (completion subscriptions, terminal-transition wakeup for subscribers)
+- Test: `db/src/test/scala/test/AwaitRaceSuite.scala`
+
+**Interfaces:**
+```scala
+def awaitRace[A](stepKey: String, invalidateOn: Seq[StepInput[?]] = Seq.empty, ensureUnchanged: Seq[StepInput[?]] = Seq.empty)
+    (awaits: Awaitable[A]*)(using WorkflowContext, Cacheable[Throwable]): A
+// WorkflowInstance.completion: Awaitable.WorkflowCompletion[Out] (on the handle)
+```
+
+**Behavior (tests):**
+- Race of signal vs timer vs completion: earliest `sequenceId` wins; only the winning signal key's cursor advances; losers' subscriptions are cleaned.
+- Due timers of the race are materialized at evaluation in deadline order (earliest due wins among timers) — deterministic under TestClock.
+- All-candidates-unsatisfiable → suspension with subscriptions for every leaf; NO cursor advances.
+- Completion await: `WorkflowCompletion` yields `WorkflowCompletionResult[Out]`; child instance completing (top-level second workflow in tests) triggers the awaiting instance's wakeup; await resolves on next run; failed completion decodes `Failed(throwable)`.
+- The terminal transition (already implemented in 2.2) upserts wakeups for completion subscribers — verify.
+
+### Task 3.5: Step retries (RetryPolicy, durable suspensions, inline sleeps)
+
+**Files:**
+- Create: `core/src/main/scala/atomicflow/RetryPolicy.scala`; extend `Step.atLeastOnce` (`retry` param) + engine + runtime
+- Test: `db/src/test/scala/test/RetrySuite.scala`
+
+**Behavior (tests, per `steps.md` "Built-in retries" + timer mechanism):**
+- `RetryPolicy.never` (default): unchanged behavior.
+- `fixedDelay(maxRetries, delay, isRetriable)`: body throws retriable → retry; non-retriable → fail immediately.
+- `exponentialBackoff` (both variants per spec signature).
+- Delay below the durable-suspension threshold (runtime setting, default 30s, configurable on `PostgresWorkflowRuntime`) → inline `Thread.sleep` retry within the run.
+- Delay above the threshold → durable suspension via an internal timer subscription keyed to the retry bookkeeping; the run returns `WorkflowSuspended`; re-run after the deadline (TestClock advance) re-executes the step body.
+- `attempts`/`cumulativeDelay`/`lastDelay` inputs to `nextDelay`; retry state is Step-row bookkeeping (`stateKind='started'`, retry payload), not user-visible.
+- Crash during a retry = retry never begun (scheduled retry untouched until body returned/threw).
+- `invalidateAfter` expires ongoing retries ("as if the step never executed").
+- Failure after retries exhausted → normal Failed persistence.
+
+### Task 3.6: onUnconsumedSignals + accepting-signals boundary
+
+**Files:**
+- Modify: `Workflow.scala` (constructor param exists), engine + runtime (completion path)
+- Test: `db/src/test/scala/test/UnconsumedSignalsSuite.scala`
+
+**Behavior (tests):**
+- Workflow completion sets `is_accepting_signals := false` BEFORE running the handler; handler receives `Map[SignalKey, Seq[Any]]` of visible unconsumed events after cursors (decoded with each event's recorded codec — events store `Cacheable` ids per the composition scheme; decode with the runtime's available codecs or keep values opaque: pinned in brief).
+- Handler is at-least-once (may run on replay before terminal commit).
+- After completion, `send` returns `InstanceAlreadyCompleted`.
+- Default handler: ignore.
+
+## Phases 4–9 (expanded at phase boundaries)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
