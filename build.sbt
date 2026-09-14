@@ -5,14 +5,13 @@ ThisBuild / version := "0.1.0-SNAPSHOT"
 ThisBuild / scalaVersion := "3.7.3"
 
 val V = new {
-  val cats = "2.13.0"
   val circe = "0.14.14"
   val doobie = "1.0.0-RC9"
   val flywayPostgres = "11.10.0"
   val logbackClassic = "1.5.18"
   val munit = "1.1.1"
-  val neotype = "0.3.25"
   val ox = "0.7.0"
+  val slf4j = "2.0.17"
   val upickle = "4.2.1"
   val testcontainers = "1.21.3"
 }
@@ -33,10 +32,8 @@ lazy val core = project
       "ch.qos.logback" % "logback-classic" % V.logbackClassic % Test,
       "com.lihaoyi" %% "upickle" % V.upickle,
       "com.softwaremill.ox" %% "core" % V.ox,
-      "io.circe" %% "circe-generic" % V.circe,
-      "io.github.kitlangton" %% "neotype" % V.neotype,
       "org.scalameta" %% "munit" % V.munit % Test,
-      "org.typelevel" %% "cats-core" % V.cats,
+      "org.slf4j" % "slf4j-api" % V.slf4j,
     )
   )
 
@@ -45,11 +42,10 @@ lazy val db = project
   .settings(
     name := "atomicflow-db",
     libraryDependencies ++= Seq(
-      "de.lhns" %% "doobie-flyway" % "0.5.2",
+      "ch.qos.logback" % "logback-classic" % V.logbackClassic % Test,
       "org.flywaydb" % "flyway-database-postgresql" % V.flywayPostgres,
       "org.tpolecat" %% "doobie-core" % V.doobie,
       "org.tpolecat" %% "doobie-postgres" % V.doobie,
-      "org.tpolecat" %% "doobie-postgres-circe" % V.doobie,
       "org.tpolecat" %% "doobie-hikari" % V.doobie,
       "org.testcontainers" % "testcontainers" % V.testcontainers % Test,
       "org.testcontainers" % "postgresql" % V.testcontainers % Test
