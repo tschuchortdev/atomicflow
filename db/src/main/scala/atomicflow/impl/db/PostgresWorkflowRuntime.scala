@@ -211,6 +211,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           suspended = true
         case _: LeaseLostException => throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
         case WorkflowNonFatal(t) =>
+          runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
           val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
           val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
           if (updated == 1) {
@@ -226,6 +227,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         log.debug(s"Workflow instance $instanceId suspended")
         WorkflowRunResult.WorkflowSuspended
       } else {
+        runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
         val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
         val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
         if (updated == 1) {
@@ -300,10 +302,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
-    * append: the guarded `terminal_state`/`terminal_outcome` update and the event
-    * append commit together in one transaction. Wins only if the instance is not
-    * already terminal and the lease is still ours. Returns rows updated (1 if this
-    * writer won the transition, 0 if another writer already made it terminal).
+    * append and the deletion of this instance's directly addressed `Signal`
+    * events: the guarded `terminal_state`/`terminal_outcome` update, the event
+    * append, the subscriber wakeups, and the `Signal` deletion commit together in
+    * one transaction. Wins only if the instance is not already terminal and the
+    * lease is still ours. `TimerFired` and `WorkflowCompleted` events are
+    * retained (subscribers and replays need them); consumers of the deleted
+    * `Signal` events already hold cached Step results.
+    *
+    * Returns rows updated (1 if this writer won the transition, 0 if another
+    * writer already made it terminal).
     */
   private def terminalTransitionAndEvent(
       workflowId: WorkflowId,
@@ -322,12 +330,77 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
         _ <- if (updated == 1)
           for {
+            _ <- sql"""DELETE FROM workflow_events
+                       WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                         AND event_kind = 'Signal'""".update.run
             _ <- appendCompletedEvent(workflowId, key, scope, payload)
             _ <- wakeCompletionSubscribers(workflowId, key, scope)
           } yield ()
         else ().pure[ConnectionIO]
       } yield updated
     }
+
+  /** Flips the instance to not-accepting-signals, fenced by the completing run's
+    * lease. Idempotent, so re-running it on a replay before the terminal commit
+    * is safe. A signal arriving after this point is rejected by `sendSignal`.
+    */
+  private def setNotAcceptingSignals(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      worker: String,
+      token: Long
+  ): Unit =
+    runSync {
+      sql"""UPDATE workflow_instances SET is_accepting_signals = false
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+              AND lease_owner = $worker AND fencing_token = $token""".update.run
+    }
+
+  /** Gathers the currently visible unconsumed `Signal` events of the instance:
+    * for every key, the events after that key's shared cursor (cursor absent
+    * means from the first event), in `sequenceId` order, as their raw serialized
+    * payloads. Keys with no events after their cursor are absent from the result.
+    */
+  private def gatherUnconsumedSignals(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): Map[SignalKey, Seq[String]] =
+    runSync {
+      sql"""SELECT event_key, payload FROM workflow_events
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+              AND event_kind = 'Signal'
+              AND sequence_id > (
+                SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                  AND signal_key = workflow_events.event_key
+              )
+            ORDER BY sequence_id""".query[(String, String)].to[Vector]
+    }.groupMap(_._1)(_._2)
+
+  /** Runs the completing instance's `onUnconsumedSignals` handler as the final
+    * step before the terminal transition. First flips `is_accepting_signals` to
+    * false (fenced by our lease), then gathers the visible unconsumed signals,
+    * then invokes the handler with the map. Runs on every terminal transition
+    * driven by the completing run (normal completion and body failure).
+    *
+    * At-least-once: if the process crashes between the handler and the terminal
+    * commit, the next run re-executes it; both the flag flip and the signal
+    * gather are idempotent.
+    */
+  private def runUnconsumedSignals(
+      workflow: Workflow[?, ?],
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      worker: String,
+      token: Long
+  ): Unit = {
+    setNotAcceptingSignals(workflowId, key, scope, worker, token)
+    val unconsumed = gatherUnconsumedSignals(workflowId, key, scope)
+    workflow.onUnconsumedSignals(unconsumed)
+  }
 
   /** Upserts the wakeup of every instance holding a pending completion
     * subscription on the instance that just completed, `ON CONFLICT DO NOTHING`

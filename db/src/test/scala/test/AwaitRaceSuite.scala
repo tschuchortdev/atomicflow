@@ -205,8 +205,9 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(signalSubscriptions(wf.id, "k"), Vector(("after", 0L, 0, "b")), "the race's own leaves are retired")
 
     sigB.send(id, "yb")(using rt)
+    val ybSeq = seqOf(wf.id, "k", "b", "yb")
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("xa|yb"))
-    assertEquals(cursor(wf.id, "k", "b").get, seqOf(wf.id, "k", "b", "yb"))
+    assertEquals(cursor(wf.id, "k", "b").get, ybSeq)
   }
 
   test("a resolved race is cached: re-runs do not re-evaluate or re-register subscriptions") {
