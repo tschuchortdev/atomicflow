@@ -56,3 +56,39 @@ implementation phase.
    `ControlThrowable` (which covers all library control-flow exceptions).
    This gives broad catches one place to re-express "everything except library
    control flow".
+
+## Phase 2 (Postgres run engine)
+
+10. **Runtime-level lease settings.** `PostgresWorkflowRuntime` takes
+    constructor parameters `leaseDuration` (default 5 minutes) and
+    `leaseAcquireTimeout` (default 30 seconds) for caller-thread runs. The
+    spec pins these only on `JobRunnerSettings` (the runner's runs); external
+    `run` calls need durations too, so the runtime carries its own defaults.
+11. **`TestClock` will ship in `core`**, not "with the in-memory backend" as
+    the spec suggests — the in-memory backend is disabled for this rewrite,
+    and a mutable clock is backend-independent.
+12. **`getExecutionState` takes `(using Cacheable[Throwable])`.** The spec's
+    inspection examples omit it, but `Failed(failure: Throwable)` cannot
+    decode without the application-global throwable codec, which the spec
+    requires at every failure-decode point.
+13. **Drift policies also apply to unresolved `Started` rows.** The spec's
+    "an `ensureUnchanged` difference finds the existing row" is applied to any
+    existing row (including `Started`), which is more conservative than
+    re-executing with changed inputs.
+14. **`StepSerializationFailed` failure payloads are encoded through the
+    application's throwable codec** (a plain `RuntimeException` usually encodes
+    even when the original failure did not; the last resort propagates the
+    original failure unpersisted). The spec's "minimal encoding does not use
+    the failing user codec" is satisfied in outcome (no recursive failure),
+    but the payload is not written with a separate runtime-owned encoding —
+    that would break decode symmetry with the contextual codec on replay.
+    Only manifests with codecs that cannot encode any `RuntimeException`.
+15. **Step input fingerprints are stored as deterministic TEXT sorted by
+    name** (order-insensitive across runs); the spec is silent on ordering.
+16. **Event-kind values are CamelCase** (`Signal`, `TimerFired`,
+    `WorkflowCompleted`) per the spec's envelope table; the plan's original
+    snake_case index predicate was corrected before any data existed.
+17. **`WorkflowSuspendedException`'s constructor is `private[atomicflow]`**;
+    the boundary-catch behavior is tested from a package-`atomicflow` test
+    (users fabricating suspensions would violate the durable-suspension
+    invariant).
