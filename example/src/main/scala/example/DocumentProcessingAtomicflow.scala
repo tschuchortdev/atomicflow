@@ -1,3 +1,8 @@
+// NOTE: Disabled during the spec-conformant atomicflow rewrite.
+// This example will be updated to the new library API (see spec/) once the
+// rewrite is complete.
+
+/*
 //noinspection ScalaWeakerAccess
 package example
 
@@ -166,3 +171,5 @@ object DocumentProcessingAtomicflow {
     object CancelledByUser extends Error
   }
 }
+
+*/
