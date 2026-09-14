@@ -92,19 +92,6 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1)
   }
 
-  test("body throwing WorkflowSuspendedException returns WorkflowSuspended; instance not terminal; lease released") {
-    val rt = newRuntime
-    val wf = Workflow[String, String](id = "suspend") { in =>
-      throw new WorkflowSuspendedException()
-    }
-
-    assertEquals(rt.createAndRun(wf, "k", "x"), WorkflowRunResult.WorkflowSuspended)
-    val row = instanceRow(wf.id, "k").get
-    assertEquals(row._1, None)
-    assertEquals(row._5, None)
-    assertEquals(row._7, None)
-  }
-
   test("a run on a leased instance throws LeaseUnavailableException after leaseAcquireTimeout") {
     val rt = newRuntime(Clock.systemUTC(), leaseAcquireTimeout = 300.millis)
     val wf = Workflow[String, String](id = "leased")(in => s"out-$in")
@@ -156,18 +143,17 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf2, WorkflowInstanceId(wf2.id, "tk")), WorkflowRunResult.WorkflowTerminated)
   }
 
-  test("times_executed and last_run_at are maintained across runs of a non-terminal instance") {
+  test("a corrupt terminal_outcome payload throws StepSerializationFailed on re-run") {
     val rt = newRuntime
-    val wf = Workflow[String, String](id = "counts") { in =>
-      throw new WorkflowSuspendedException()
-    }
+    val wf = Workflow[String, String](id = "corrupt")(in => s"out-$in")
     rt.createWorkflowInstance(wf, "k", "a")
-    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-
-    val row = instanceRow(wf.id, "k").get
-    assertEquals(row._3, 2)
-    assert(row._4.isDefined)
+    run(
+      sql"""UPDATE workflow_instances SET terminal_state = 'completed', terminal_outcome = 'not-a-valid-payload'
+            WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+    )
+    intercept[StepSerializationFailed] {
+      rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    }
   }
 
   test("success path releases the lease so a second run starts immediately") {

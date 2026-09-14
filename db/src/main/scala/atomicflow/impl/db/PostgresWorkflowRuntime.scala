@@ -133,7 +133,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
     given Cacheable[Out] = outCacheable
     val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
 
-    // (a) load the row
     val row = runSync {
       sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation
             FROM workflow_instances
@@ -148,16 +147,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
         throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
     }
 
-    // (b) terminal instances return/throw their stored outcome without executing
     terminalState match {
       case Some(state) =>
         return handleTerminalRead(state, terminalOutcome, outCacheable, completionCodec, instanceId)
       case None => ()
     }
 
-    // (c) acquire the execution lease (bounded poll; never steals a live lease)
     val worker = workerId
-    val token = acquireLease(workflowId, key, scope, worker, instanceId) match {
+    val token = acquireLease(workflowId, key, scope, worker) match {
       case Some(t) => t
       case None    => throw LeaseUnavailableException(instanceId)
     }
@@ -187,7 +184,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
       log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
 
-      // (d)-(f) execute the body; classify outcome by what the body does
       var outValue: Out = null.asInstanceOf[Out]
       var suspended = false
       try {
@@ -196,28 +192,27 @@ class PostgresWorkflowRuntime private[atomicflow] (
         case _: WorkflowSuspendedException =>
           suspended = true
         case WorkflowNonFatal(t) =>
-          // (e) body failure: terminal 'failed' + event; rethrow the decoded failure
           val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
-          val updated = guardedTerminalTransition(workflowId, key, scope, worker, token, "failed", payload)
-          if (updated == 1) appendCompletedEvent(workflowId, key, scope, payload)
-          log.info(s"Workflow instance $instanceId failed", t)
-          throw cacheableThrowable.read(cacheableThrowable.write(t))
+          val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
+          if (updated == 1) {
+            log.info(s"Workflow instance $instanceId failed", t)
+            throw cacheableThrowable.read(cacheableThrowable.write(t))
+          } else {
+            log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
+            return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+          }
       }
 
       if (suspended) {
-        // (f) suspension: no terminal transition
         log.debug(s"Workflow instance $instanceId suspended")
         WorkflowRunResult.WorkflowSuspended
       } else {
-        // (d) normal return: terminal 'completed' + event
         val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
-        val updated = guardedTerminalTransition(workflowId, key, scope, worker, token, "completed", payload)
+        val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
         if (updated == 1) {
-          appendCompletedEvent(workflowId, key, scope, payload)
           log.debug(s"Workflow instance $instanceId completed")
           WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
         } else {
-          // lost the terminal race; adopt the winner's stored outcome
           readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
         }
       }
@@ -228,7 +223,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** One conditional lease-acquire attempt; returns the new fencing token on
     * success, `None` if the lease is held by a live owner or the instance is
-    * terminal.
+    * terminal. The acquire and the fencing-token read-back are a single
+    * `RETURNING` statement.
     */
   private def tryAcquireOnce(
       workflowId: WorkflowId,
@@ -238,22 +234,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Option[Long] = {
     val now = clock.instant()
     val expires = leaseExpiry(now)
-    val updated = runSync {
+    runSync {
       sql"""UPDATE workflow_instances
             SET lease_owner = $worker, fencing_token = fencing_token + 1, lease_expires_at = $expires
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
               AND terminal_state IS NULL
-              AND (lease_owner IS NULL OR lease_expires_at <= $now)""".update.run
+              AND (lease_owner IS NULL OR lease_expires_at <= $now)
+            RETURNING fencing_token""".query[Long].option
     }
-    if (updated == 1)
-      Some(
-        runSync {
-          sql"SELECT fencing_token FROM workflow_instances WHERE workflow_id = $workflowId AND key = $key AND scope = $scope"
-            .query[Long]
-            .unique
-        }
-      )
-    else None
   }
 
   /** Bounded poll of the conditional lease acquire, every 100ms up to
@@ -263,8 +251,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
-      worker: String,
-      instanceId: WorkflowInstanceId
+      worker: String
   ): Option[Long] = {
     val pollIntervalMillis = 100L
     val deadlineNanos = System.nanoTime() + leaseAcquireTimeout.toNanos
@@ -293,11 +280,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
               AND lease_owner = $worker AND fencing_token = $token""".update.run
     }
 
-  /** The guarded terminal transition: writes `terminal_state`/`terminal_outcome`
-    * atomically with the `WorkflowCompleted` event, winning only if the instance
-    * is not already terminal and the lease is still ours. Returns rows updated.
+  /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
+    * append: the guarded `terminal_state`/`terminal_outcome` update and the event
+    * append commit together in one transaction. Wins only if the instance is not
+    * already terminal and the lease is still ours. Returns rows updated (1 if this
+    * writer won the transition, 0 if another writer already made it terminal).
     */
-  private def guardedTerminalTransition(
+  private def terminalTransitionAndEvent(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
@@ -307,32 +296,34 @@ class PostgresWorkflowRuntime private[atomicflow] (
       payload: String
   ): Int =
     runSync {
-      sql"""UPDATE workflow_instances
-            SET terminal_state = $state, terminal_outcome = $payload
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
-              AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
+      for {
+        updated <- sql"""UPDATE workflow_instances
+              SET terminal_state = $state, terminal_outcome = $payload
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
+        _ <- if (updated == 1) appendCompletedEvent(workflowId, key, scope, payload)
+             else ().pure[ConnectionIO]
+      } yield updated
     }
 
-  /** Appends a `WorkflowCompleted` event using the global event-append protocol:
-    * `pg_advisory_xact_lock` + `nextval('workflow_event_sequence')`, held until
-    * commit.
+  /** Appends a `WorkflowCompleted` event via the global event-append protocol:
+    * `pg_advisory_xact_lock` + `nextval('workflow_event_sequence')` + insert, all
+    * within the caller's transaction and held until commit.
     */
   private def appendCompletedEvent(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
       payload: String
-  ): Unit =
-    runSync {
-      for {
-        _ <- takeEventAppendLock
-        sequenceId <- sql"SELECT nextval('workflow_event_sequence')".query[Long].unique
-        _ <- sql"""
-          INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, key, scope, event_key, payload)
-          VALUES ($sequenceId, 'WorkflowCompleted', $workflowId, $key, $scope, '', $payload)
-        """.update.run
-      } yield ()
-    }
+  ): ConnectionIO[Unit] =
+    for {
+      _ <- takeEventAppendLock
+      sequenceId <- sql"SELECT nextval('workflow_event_sequence')".query[Long].unique
+      _ <- sql"""
+        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, key, scope, event_key, payload)
+        VALUES ($sequenceId, 'WorkflowCompleted', $workflowId, $key, $scope, '', $payload)
+      """.update.run
+    } yield ()
 
   /** Takes the global event-append advisory lock, transaction-scoped (released at
     * commit/rollback). `pg_advisory_xact_lock` returns `void` and a SELECT result
