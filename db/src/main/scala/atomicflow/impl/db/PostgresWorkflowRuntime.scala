@@ -10,6 +10,7 @@ import atomicflow.internal.{
   AwaitRaceTimerLeaf,
   AwaitSignalCandidate,
   AwaitTimerCandidate,
+  Framing,
   StoredStep,
   WorkflowExecution
 }
@@ -139,6 +140,121 @@ class PostgresWorkflowRuntime private[atomicflow] (
     deleted > 0
   }
 
+  /** Requests cooperative cancellation of an instance. In one transaction:
+    * row-lock the instance; a missing instance throws, a terminal one is a no-op.
+    * An instance that has never started and has no execution state is finalized
+    * `CANCELLED` immediately (the body never runs). Otherwise `cancel_requested_at`
+    * is set once (never reset) and, when there is no live lease owner, a wakeup is
+    * upserted so the pending await is resumed and the frontier checkpoint throws.
+    */
+  override def cancel(instanceId: WorkflowInstanceId): Unit = {
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
+    val now = theClock.instant()
+    runSync {
+      for {
+        row <- sql"""SELECT terminal_state, times_executed, lease_owner, lease_expires_at
+                     FROM workflow_instances
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                     FOR UPDATE""".query[(Option[String], Int, Option[String], Option[java.time.Instant])].option
+        _ <- row match {
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+          case Some((Some(_), _, _, _)) =>
+            ().pure[ConnectionIO]
+          case Some((None, timesExecuted, leaseOwner, leaseExpiresAt)) =>
+            for {
+              hasExecutionState <- hasExecutionStateIO(workflowId, key, scope)
+              _ <- if (timesExecuted == 0 && !hasExecutionState)
+                finalizeCancelledWithoutLease(workflowId, key, scope)
+              else
+                for {
+                  _ <- sql"""UPDATE workflow_instances SET cancel_requested_at = $now
+                             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                               AND cancel_requested_at IS NULL""".update.run
+                  _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
+                    upsertWakeupIO(workflowId, key, scope, now)
+                  else ().pure[ConnectionIO]
+                } yield ()
+            } yield ()
+        }
+      } yield ()
+    }
+    ()
+  }
+
+  /** Whether the instance row has no live lease owner at `now`: no owner, or an
+    * owner whose lease has expired.
+    */
+  private def noLiveLease(
+      owner: Option[String],
+      expiresAt: Option[java.time.Instant],
+      now: java.time.Instant
+  ): Boolean =
+    owner.isEmpty || expiresAt.forall(!_.isAfter(now))
+
+  /** Whether the instance carries any durable execution state (step rows,
+    * subscriptions, or a wakeup row). Used to detect an instance that has never
+    * started and has nothing to deliver into.
+    */
+  private def hasExecutionStateIO(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Boolean] =
+    for {
+      steps <- sql"""SELECT 1 FROM workflow_steps
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $scope LIMIT 1""".query[Int].option
+      signal <- sql"""SELECT 1 FROM workflow_signal_subscriptions
+                      WHERE workflow_id = $workflowId AND key = $key AND scope = $scope LIMIT 1""".query[Int].option
+      timer <- sql"""SELECT 1 FROM workflow_timer_subscriptions
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $scope LIMIT 1""".query[Int].option
+      completion <- sql"""SELECT 1 FROM workflow_completion_subscriptions
+                          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope LIMIT 1""".query[Int].option
+      wakeup <- sql"""SELECT 1 FROM workflow_wakeups
+                      WHERE workflow_id = $workflowId AND key = $key AND scope = $scope LIMIT 1""".query[Int].option
+    } yield steps.isDefined || signal.isDefined || timer.isDefined || completion.isDefined || wakeup.isDefined
+
+  /** Upserts a coalesced wakeup row due immediately, within the caller's
+    * transaction.
+    */
+  private def upsertWakeupIO(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      now: java.time.Instant
+  ): ConnectionIO[Unit] =
+    sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+          VALUES ($workflowId, $key, $scope, $now, $now, 0)
+          ON CONFLICT (workflow_id, key, scope) DO NOTHING""".update.run.map(_ => ())
+
+  /** The guarded `CANCELLED` terminal transition for an instance that has no
+    * execution lease (finalized from a cancel request before first start): the
+    * guarded status update plus the `WorkflowCompleted(Cancelled)` event and the
+    * completion-subscriber wakeups, in one transaction. The `Cancelled` outcome
+    * carries no user code, so it is encoded directly with the runtime's framing.
+    */
+  private def finalizeCancelledWithoutLease(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Unit] = {
+    val payload = Framing.write("cancelled")
+    for {
+      updated <- sql"""UPDATE workflow_instances
+                       SET terminal_state = 'cancelled', terminal_outcome = $payload, is_accepting_signals = false
+                       WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                         AND terminal_state IS NULL""".update.run
+      _ <- if (updated == 1)
+        for {
+          _ <- appendCompletedEvent(workflowId, key, scope, payload)
+          _ <- wakeCompletionSubscribers(workflowId, key, scope)
+        } yield ()
+      else ().pure[ConnectionIO]
+    } yield ()
+  }
+
   override def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
@@ -210,6 +326,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
         case _: WorkflowSuspendedException =>
           suspended = true
         case _: LeaseLostException => throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+        case _: WorkflowCancelledException =>
+          runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
+          val payload = Framing.write("cancelled")
+          val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
+          if (updated == 1) {
+            log.info(s"Workflow instance $instanceId cancelled")
+            return WorkflowRunResult.WorkflowCancelled
+          } else {
+            log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
+            return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+          }
         case WorkflowNonFatal(t) =>
           runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
           val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
@@ -796,6 +923,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND terminal_state IS NULL""".update.run
       }
       if (updated != 1) throw LeaseLostException(instanceId)
+    }
+
+    override def checkCancellation(): Unit = {
+      val requestedAt = runSync {
+        sql"""SELECT cancel_requested_at FROM workflow_instances
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[
+            Option[java.time.Instant]
+          ].unique
+      }
+      if (requestedAt.isDefined) throw WorkflowCancelledException()
     }
 
     override def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =

@@ -286,6 +286,7 @@ object Step {
       */
     def execute(): A = {
       execution.renewLease()
+      execution.checkCancellation()
       execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body
@@ -321,6 +322,7 @@ object Step {
       while (result.isEmpty) {
         try {
           execution.renewLease()
+          execution.checkCancellation()
           val value = body
           val serialized =
             try valueCodec.write(value)
@@ -589,6 +591,7 @@ object Step {
     def serializedOf(c: AwaitSignalCandidate): (Long, String) = (c.sequenceId, valueCodec.write(decode(c.payload)))
 
     def evaluate(): A = {
+      execution.checkCancellation()
       val candidates = execution.readAwaitSignalCandidates(signal.key)
       candidates.find(accept) match {
         case Some(winning) =>
@@ -653,6 +656,7 @@ object Step {
     }
 
     def evaluate(): Unit = {
+      execution.checkCancellation()
       execution.fireDueTimers(stepId, 0L)
       if (execution.readAwaitTimerCandidates(stepId, 0L).nonEmpty) {
         execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
@@ -730,6 +734,7 @@ object Step {
       }
 
     def evaluate(): A = {
+      execution.checkCancellation()
       execution.fireDueTimerLeaves(stepId, 0L)
       val decided: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] =
         pickRaceWinner(leaves)

@@ -50,6 +50,20 @@ trait WorkflowRuntime {
       in: In
   )(using Cacheable[In]): Boolean
 
+  /** Request cooperative cancellation of an instance. Durably sets
+    * `cancel_requested_at` once and never resets it. If the instance has never
+    * started and has no execution state, it is finalized `CANCELLED` immediately
+    * (the body never runs). Otherwise the flag is delivered at the next new-work
+    * checkpoint (a Step body about to execute, or an await about to be
+    * evaluated), where the runtime throws [[WorkflowCancelledException]]. A
+    * terminal instance is a no-op.
+    *
+    * Does not acquire the execution lease; delivery is by checkpoint, never by
+    * thread interruption.
+    */
+  @throws[WorkflowNotFoundException]
+  def cancel(instanceId: WorkflowInstanceId): Unit
+
   /** Execute a created instance on the caller thread. */
   @throws[WorkflowNotFoundException]
   def runWorkflowInstance[In, Out](
