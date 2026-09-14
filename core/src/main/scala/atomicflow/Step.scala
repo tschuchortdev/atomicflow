@@ -22,6 +22,115 @@ object Step {
 
   private enum Guarantee { case AtLeastOnce, AtMostOnce }
 
+  /** A built-in retry policy for `Step.atLeastOnce` (see `spec/steps.md`,
+    * "Built-in retries"). A policy decides, from the exact failure thrown by the
+    * step body and the retry bookkeeping accumulated so far, whether to retry
+    * and after what delay.
+    *
+    * `RetryPolicy` is orthogonal to the at-least-once/at-most-once guarantee:
+    * the guarantee governs crash recovery (whether an unresolved `Started`
+    * record re-executes), while a retry policy governs what happens when the
+    * body *completes* with an exception.
+    *
+    * Delays at or below the runtime's durable-retry threshold are applied as
+    * inline `Thread.sleep`s inside the run; delays above it become durable
+    * suspensions (an ordinary timer subscription) so the workflow survives a
+    * crash while waiting.
+    */
+  trait RetryPolicy {
+
+    /** Decide the next retry delay, or `None` to stop retrying and persist the
+      * failure.
+      *
+      * @param failure
+      *   the exact exception thrown by the step body (never serialized/cached
+      *   while a retry is pending)
+      * @param failedAttempts
+      *   how many complete body attempts have failed before this one
+      * @param cumulativeDelay
+      *   the total delay already scheduled across prior retries
+      * @param lastDelay
+      *   the delay used for the most recent retry, or `None` on the first
+      *   failure
+      */
+    def nextDelay(
+        failure: Throwable,
+        failedAttempts: Int,
+        cumulativeDelay: FiniteDuration,
+        lastDelay: Option[FiniteDuration]
+    ): Option[FiniteDuration]
+  }
+
+  object RetryPolicy {
+
+    /** The default: never retry. A body failure is persisted immediately. */
+    val never: RetryPolicy = new RetryPolicy {
+      override def nextDelay(
+          failure: Throwable,
+          failedAttempts: Int,
+          cumulativeDelay: FiniteDuration,
+          lastDelay: Option[FiniteDuration]
+      ): Option[FiniteDuration] = None
+    }
+
+    /** Retry a retriable failure up to `maxRetries` times, always after the
+      * same `delay`.
+      */
+    def fixedDelay(
+        maxRetries: Long,
+        delay: FiniteDuration,
+        isRetriable: Throwable => Boolean = (t: Throwable) => true
+    ): RetryPolicy = new RetryPolicy {
+      override def nextDelay(
+          failure: Throwable,
+          failedAttempts: Int,
+          cumulativeDelay: FiniteDuration,
+          lastDelay: Option[FiniteDuration]
+      ): Option[FiniteDuration] =
+        if (failedAttempts < maxRetries && isRetriable(failure)) Some(delay) else None
+    }
+
+    /** Exponential backoff, bounded by `maxRetries` and/or `maxCumulativeDelay`
+      * (whichever is hit first; `Long.MaxValue` and `Duration.Inf` disable the
+      * respective bound). The delay for the `failedAttempts`-th retry is
+      * `initialDelay * multiplier^failedAttempts`.
+      *
+      * This is exposed as one method whose named-parameter forms match both
+      * spec variants: `exponentialBackoff(initialDelay, maxCumulativeDelay, ...)`
+      * and `exponentialBackoff(maxRetries, initialDelay, ...)`. (Scala forbids
+      * two overloaded methods both carrying default arguments.)
+      */
+    def exponentialBackoff(
+        initialDelay: FiniteDuration,
+        maxRetries: Long = Long.MaxValue,
+        maxCumulativeDelay: Duration = Duration.Inf,
+        multiplier: Float = 2,
+        isRetriable: Throwable => Boolean = (t: Throwable) => true
+    ): RetryPolicy = new RetryPolicy {
+      override def nextDelay(
+          failure: Throwable,
+          failedAttempts: Int,
+          cumulativeDelay: FiniteDuration,
+          lastDelay: Option[FiniteDuration]
+      ): Option[FiniteDuration] =
+        if (!isRetriable(failure) || failedAttempts >= maxRetries) None
+        else {
+          val delay = backoffDelay(initialDelay, multiplier, failedAttempts)
+          val exceedsCumulative = maxCumulativeDelay match {
+            case d: FiniteDuration => cumulativeDelay + delay > d
+            case _                 => false
+          }
+          if (exceedsCumulative) None else Some(delay)
+        }
+    }
+
+    /** `initialDelay * multiplier^failedAttempts`, floored at zero. */
+    private def backoffDelay(initialDelay: FiniteDuration, multiplier: Float, failedAttempts: Int): FiniteDuration = {
+      val nanos = initialDelay.toNanos * math.pow(multiplier.toDouble, failedAttempts.toDouble)
+      FiniteDuration(nanos.toLong.max(0L), NANOSECONDS)
+    }
+  }
+
   /** An at-least-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record causes
     * re-execution (crash-safe for idempotent effects).
@@ -45,15 +154,19 @@ object Step {
     *   named inputs that invalidate the cached result when they change
     * @param invalidateAfter
     *   TTL after which the cached result expires; `Duration.Inf` disables it
+    * @param retry
+    *   a [[Step.RetryPolicy]] deciding whether (and after what delay) a thrown
+    *   body failure is retried; default `Step.RetryPolicy.never`
     */
   def atLeastOnce[A: Cacheable](
       key: String,
       version: Long = 1L,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
-      invalidateAfter: Duration = Duration.Inf
+      invalidateAfter: Duration = Duration.Inf,
+      retry: Step.RetryPolicy = Step.RetryPolicy.never
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    runStep(Guarantee.AtLeastOnce, key, version, "AtLeastOnce", ensureUnchanged, invalidateOn, invalidateAfter)(body).get
+    runStep(Guarantee.AtLeastOnce, key, version, "AtLeastOnce", ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
   /** An at-most-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record yields `None`
@@ -79,12 +192,18 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runStep(Guarantee.AtMostOnce, key, 0L, "AtMostOnce", ensureUnchanged, invalidateOn, invalidateAfter)(body)
+    runStep(Guarantee.AtMostOnce, key, 0L, "AtMostOnce", ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** The shared machinery for both execution guarantees. Both persist a
     * `Started` record before the body executes and replace it with a durable
     * outcome; the guarantees differ only in how an unresolved `Started` record
     * is replayed (at-least-once re-executes, at-most-once returns `None`).
+    *
+    * An at-least-once step with a non-`never` `retry` policy retries a thrown
+    * body failure: a delay at or below the runtime's durable-retry threshold
+    * sleeps inline inside the run; a delay above it durably suspends the step
+    * (a `started` row carrying retry bookkeeping plus an ordinary timer
+    * subscription) and resumes after the deadline.
     */
   private def runStep[A: Cacheable](
       guarantee: Guarantee,
@@ -93,7 +212,8 @@ object Step {
       stepKind: String,
       ensureUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]],
-      invalidateAfter: Duration
+      invalidateAfter: Duration,
+      retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
     val execution = ctx.execution
     val stepId = StepId(key, execution.currentScope)
@@ -104,6 +224,27 @@ object Step {
       case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
       case _                 => None
     }
+    val threshold = execution.durableRetryThreshold
+    val useRetry = guarantee == Guarantee.AtLeastOnce && (retry ne Step.RetryPolicy.never)
+
+    final case class RetryBookkeeping(
+        failedAttempts: Int,
+        cumulativeDelay: FiniteDuration,
+        lastDelay: Option[FiniteDuration]
+    )
+
+    def encodeRetry(b: RetryBookkeeping): String =
+      s"retry:${b.failedAttempts}:${b.cumulativeDelay.toNanos}:${b.lastDelay.fold(-1L)(_.toNanos)}"
+
+    def decodeRetry(payload: String): RetryBookkeeping = {
+      val parts = payload.split(":")
+      val failed = parts(1).toInt
+      val cumulative = FiniteDuration(parts(2).toLong, NANOSECONDS)
+      val last =
+        if (parts(3).toLong == -1L) None
+        else Some(FiniteDuration(parts(3).toLong, NANOSECONDS))
+      RetryBookkeeping(failed, cumulative, last)
+    }
 
     def decodeFailure(payload: String): Throwable =
       try throwableCodec.read(payload)
@@ -111,6 +252,36 @@ object Step {
         case _: Throwable => throw new StepSerializationFailed(s"Step '$key' failure could not be decoded")
       }
 
+    def encodeAndPersistFailure(t: Throwable, persistFailed: String => Unit): Throwable = {
+      val encoded =
+        try Right(throwableCodec.write(t))
+        catch {
+          case _: Throwable =>
+            Left(
+              new StepSerializationFailed(
+                s"Step '$key' failure could not be encoded with the configured throwable codec: ${t.getClass.getName}: ${t.getMessage}"
+              )
+            )
+        }
+      encoded match {
+        case Right(serialized) =>
+          val decoded =
+            try throwableCodec.read(serialized)
+            catch { case _: Throwable => new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
+          persistFailed(serialized)
+          decoded
+        case Left(ssf) =>
+          val persisted =
+            try throwableCodec.write(ssf)
+            catch { case _: Throwable => throw t }
+          persistFailed(persisted)
+          ssf
+      }
+    }
+
+    /** The non-retry path (a `never` policy or at-most-once): persist the
+      * `Started` row, run the body once, and persist its outcome.
+      */
     def execute(): A = {
       execution.renewLease()
       execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
@@ -127,39 +298,73 @@ object Step {
       } catch {
         case t if isNonCacheable(t) => throw t
         case t =>
-          val encoded =
-            try Right(throwableCodec.write(t))
-            catch {
-              case _: Throwable =>
-                Left(
-                  new StepSerializationFailed(
-                    s"Step '$key' failure could not be encoded with the configured throwable codec: ${t.getClass.getName}: ${t.getMessage}"
-                  )
-                )
-            }
-          val failure: Throwable = encoded match {
-            case Right(serialized) =>
-              val decoded =
-                try throwableCodec.read(serialized)
-                catch { case _: Throwable => new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
-              execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, serialized, expiresAt)
-              decoded
-            case Left(ssf) =>
-              val persisted =
-                try throwableCodec.write(ssf)
-                catch { case _: Throwable => throw t }
-              execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, persisted, expiresAt)
-              ssf
-          }
-          throw failure
+          throw encodeAndPersistFailure(
+            t,
+            s => execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, s, expiresAt)
+          )
       }
     }
 
-    val existing = execution.lookupStep(stepId, stepVersion).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    /** One retry-aware body attempt. On success the `succeeded` row is persisted
+      * (retiring any retry subscription); on a terminal failure the `failed` row
+      * is persisted; on a retryable failure the policy decides between an inline
+      * sleep-and-retry and a durable suspension. The body is re-evaluated (the
+      * by-name `body`) per attempt.
+      */
+    def attempt(b: RetryBookkeeping): A = {
+      execution.renewLease()
+      try {
+        val value = body
+        val serialized =
+          try valueCodec.write(value)
+          catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be encoded") }
+        val decoded =
+          try valueCodec.read(serialized)
+          catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
+        execution.resolveStepRetry(stepId, stepVersion, stepKind, "succeeded", fingerprints, serialized, expiresAt)
+        decoded
+      } catch {
+        case t if isNonCacheable(t) => throw t
+        case t =>
+          retry.nextDelay(t, b.failedAttempts, b.cumulativeDelay, b.lastDelay) match {
+            case None =>
+              throw encodeAndPersistFailure(
+                t,
+                s => execution.resolveStepRetry(stepId, stepVersion, stepKind, "failed", fingerprints, s, expiresAt)
+              )
+            case Some(delay) =>
+              val nb = RetryBookkeeping(b.failedAttempts + 1, b.cumulativeDelay + delay, Some(delay))
+              if (delay <= threshold) {
+                Thread.sleep(delay.toMillis)
+                attempt(nb)
+              } else {
+                val deadline = execution.now.plus(java.time.Duration.ofNanos(delay.toNanos))
+                execution.suspendStepRetry(
+                  stepId, stepVersion, stepKind, fingerprints, encodeRetry(nb), deadline, expiresAt
+                )
+                throw new WorkflowSuspendedException
+              }
+          }
+      }
+    }
+
+    /** A fresh retry-aware execution: persist the `Started` row (bookkeeping
+      * starts empty) then run the first attempt.
+      */
+    def executeWithRetry(): A = {
+      execution.renewLease()
+      execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
+      attempt(RetryBookkeeping(0, 0.seconds, None))
+    }
+
+    val rawExisting = execution.lookupStep(stepId, stepVersion)
+    val expired = rawExisting.exists(_.expiresAt.exists(!_.isAfter(now)))
+    if (expired) execution.deleteStepRetry(stepId, stepVersion)
+    val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
       case None =>
-        Some(execute())
+        if (useRetry) Some(executeWithRetry()) else Some(execute())
 
       case Some(row) =>
         val stored = parseFingerprints(row.inputFingerprints)
@@ -172,8 +377,8 @@ object Step {
         val shouldReexecute = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
 
         if (shouldReexecute) {
-          execution.deleteStep(stepId, stepVersion)
-          Some(execute())
+          execution.deleteStepRetry(stepId, stepVersion)
+          if (useRetry) Some(executeWithRetry()) else Some(execute())
         } else {
           row.stateKind match {
             case "succeeded" =>
@@ -184,8 +389,17 @@ object Step {
             case "failed" => throw decodeFailure(row.statePayload)
             case _ =>
               guarantee match {
-                case Guarantee.AtLeastOnce => Some(execute())
-                case Guarantee.AtMostOnce  => None
+                case Guarantee.AtLeastOnce =>
+                  if (useRetry && row.statePayload.startsWith("retry:")) {
+                    execution.fireDueStepRetries(stepId, stepVersion)
+                    if (execution.readStepRetryCandidates(stepId, stepVersion).nonEmpty)
+                      Some(attempt(decodeRetry(row.statePayload)))
+                    else
+                      throw new WorkflowSuspendedException
+                  } else {
+                    Some(executeWithRetry())
+                  }
+                case Guarantee.AtMostOnce => None
               }
           }
         }

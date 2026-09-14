@@ -70,4 +70,12 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
       leaseAcquireTimeout: FiniteDuration = 30.seconds
   ): PostgresWorkflowRuntime =
     PostgresWorkflowRuntime(newDataSource, clock, leaseDuration, leaseAcquireTimeout)(using ExecutionContext.global)
+
+  /** A fresh runtime with injected clock and an explicit durable-retry
+    * threshold, so tests can force inline vs. durable retries deterministically.
+    */
+  def newRuntime(clock: Clock, durableRetryThreshold: FiniteDuration): PostgresWorkflowRuntime =
+    PostgresWorkflowRuntime(newDataSource, clock, durableRetryThreshold = durableRetryThreshold)(using
+      ExecutionContext.global
+    )
 }

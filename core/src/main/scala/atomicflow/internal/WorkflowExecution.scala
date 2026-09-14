@@ -3,6 +3,7 @@ package atomicflow.internal
 import atomicflow.{SignalKey, StepId, WorkflowId, WorkflowInstanceKey}
 
 import java.time.Instant
+import scala.concurrent.duration.FiniteDuration
 
 /** The durable facts of one workflow_steps row, as read without any lease or
   * fence. `stateKind` is one of `started`, `succeeded`, `failed`; `statePayload`
@@ -111,6 +112,12 @@ private[atomicflow] trait WorkflowExecution {
   /** The runtime's notion of the current instant, from the injected clock. */
   def now: Instant
 
+  /** The durable-retry threshold of this runtime: a step retry whose computed
+    * delay is at or below this sleeps inline inside the run; one whose delay is
+    * above it becomes a durable suspension (an ordinary timer subscription).
+    */
+  def durableRetryThreshold: FiniteDuration
+
   /** Renews the execution lease of this run, extending `lease_expires_at` by the
     * runtime's `leaseDuration`. A fenced write that does not bump the fencing
     * token; throws [[atomicflow.LeaseLostException]] if the lease no longer
@@ -148,6 +155,55 @@ private[atomicflow] trait WorkflowExecution {
 
   /** Delete the step row, fenced. */
   def deleteStep(stepId: StepId, stepVersion: Long): Unit
+
+  /** Durably suspend an at-least-once step for a retry, fenced, in one
+    * transaction: persist (or refresh) the `started` step row carrying the
+    * runtime-owned retry bookkeeping in `retryPayload` and its `expiresAt`, and
+    * register the retry's timer subscription (deadline = `now + delay`) under a
+    * reserved subscription identity that cannot collide with user awaits of the
+    * same site. The step body is NOT executed until the subscription is due.
+    */
+  def suspendStepRetry(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      retryPayload: String,
+      deadline: java.time.Instant,
+      expiresAt: Option[java.time.Instant]
+  ): Unit
+
+  /** Fire this step-site's own due retry timer subscriptions, fenced, in one
+    * transaction (the same "two paths, one primitive" as user timer awaits): for
+    * each retry subscription with `deadline <= now`, row-lock it, re-check that
+    * no `TimerFired` event exists yet, and append one. The subscription row
+    * survives firing; only resolution retires it.
+    */
+  def fireDueStepRetries(stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `TimerFired` events matching this step-site's pending retry
+    * timer subscription (plain durable read; no lock or fence).
+    */
+  def readStepRetryCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
+
+  /** Resolve a retrying step to a terminal state, fenced: persist the
+    * `stateKind` (`succeeded` or `failed`) step row and delete the retry timer
+    * subscription, in one transaction.
+    */
+  def resolveStepRetry(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      stateKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[java.time.Instant]
+  ): Unit
+
+  /** Delete the step row and its retry timer subscription atomically, fenced.
+    * Used to invalidate an ongoing retry "as if the step never executed".
+    */
+  def deleteStepRetry(stepId: StepId, stepVersion: Long): Unit
 
   /** Read the durable `Signal` events of `signalKey` that are visible to this
     * instance (after its shared exact-key cursor), in sequence order. A plain
