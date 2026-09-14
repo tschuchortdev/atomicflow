@@ -42,7 +42,7 @@ object PostgresWorkflowRuntime {
   */
 class PostgresWorkflowRuntime private[atomicflow] (
     ds: DataSource,
-    clock: Clock,
+    theClock: Clock,
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds
 )(using ec: ExecutionContext)
@@ -69,6 +69,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private def leaseExpiry(now: java.time.Instant): java.time.Instant =
     now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
+
+  override def clock: Clock = theClock
 
   override def createWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
@@ -163,7 +165,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
     try {
-      val now = clock.instant()
+      val now = theClock.instant()
       val bumped = runSync {
         sql"""UPDATE workflow_instances
               SET times_executed = times_executed + 1, last_run_at = $now
@@ -236,7 +238,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: String,
       worker: String
   ): Option[Long] = {
-    val now = clock.instant()
+    val now = theClock.instant()
     val expires = leaseExpiry(now)
     runSync {
       sql"""UPDATE workflow_instances
@@ -302,7 +304,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runSync {
       for {
         updated <- sql"""UPDATE workflow_instances
-              SET terminal_state = $state, terminal_outcome = $payload
+              SET terminal_state = $state, terminal_outcome = $payload, is_accepting_signals = false
               WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
                 AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token""".update.run
         _ <- if (updated == 1) appendCompletedEvent(workflowId, key, scope, payload)
@@ -310,9 +312,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       } yield updated
     }
 
-  /** Appends a `WorkflowCompleted` event via the global event-append protocol:
-    * `pg_advisory_xact_lock` + `nextval('workflow_event_sequence')` + insert, all
-    * within the caller's transaction and held until commit.
+  /** Appends a `WorkflowCompleted` event via the global event-append protocol.
     */
   private def appendCompletedEvent(
       workflowId: WorkflowId,
@@ -320,14 +320,31 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: String,
       payload: String
   ): ConnectionIO[Unit] =
+    appendEvent(workflowId, key, scope, "WorkflowCompleted", "", payload)
+
+  /** Appends one event via the global event-append protocol:
+    * `pg_advisory_xact_lock` + `nextval('workflow_event_sequence')` + insert, all
+    * within the caller's transaction and held until commit. `createdAt` comes
+    * from the runtime clock.
+    */
+  private def appendEvent(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      kind: String,
+      eventKey: String,
+      payload: String
+  ): ConnectionIO[Unit] = {
+    val createdAt = theClock.instant()
     for {
       _ <- takeEventAppendLock
       sequenceId <- sql"SELECT nextval('workflow_event_sequence')".query[Long].unique
       _ <- sql"""
-        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, key, scope, event_key, payload)
-        VALUES ($sequenceId, 'WorkflowCompleted', $workflowId, $key, $scope, '', $payload)
+        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, key, scope, event_key, payload, created_at)
+        VALUES ($sequenceId, $kind, $workflowId, $key, $scope, $eventKey, $payload, $createdAt)
       """.update.run
     } yield ()
+  }
 
   /** Takes the global event-append advisory lock, transaction-scoped (released at
     * commit/rollback). `pg_advisory_xact_lock` returns `void` and a SELECT result
@@ -340,6 +357,67 @@ class PostgresWorkflowRuntime private[atomicflow] (
       finally st.close()
       ()
     }
+
+  /** Appends a `Signal` event addressed to `workflowInstanceId`. In one
+    * transaction: row-lock the instance (`SELECT ... FOR UPDATE`), return
+    * [[WorkflowNotFoundException]] if absent or [[SignalSendResult.InstanceAlreadyCompleted]]
+    * if it has stopped accepting signals, else append the event (payload from the
+    * signal's [[Cacheable]]) and upsert a wakeup when a matching pending
+    * subscription exists. Does not acquire the execution lease.
+    */
+  override def sendSignal[A: Cacheable](
+      workflowInstanceId: WorkflowInstanceId,
+      key: SignalKey,
+      value: A
+  ): SignalSendResult = {
+    val workflowId = workflowInstanceId.workflowId
+    val instanceKey = workflowInstanceId.workflowInstanceKey
+    val scope = workflowInstanceId.scope
+    val cacheable = summon[Cacheable[A]]
+    val payload = cacheable.write(value)
+    runSync {
+      for {
+        accepting <- sql"""SELECT is_accepting_signals FROM workflow_instances
+              WHERE workflow_id = $workflowId AND key = $instanceKey AND scope = $scope
+              FOR UPDATE""".query[Boolean].option
+        result <- accepting match {
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $workflowInstanceId")
+          case Some(false) => SignalSendResult.InstanceAlreadyCompleted.pure[ConnectionIO]
+          case Some(true) =>
+            for {
+              _ <- appendEvent(workflowId, instanceKey, scope, "Signal", key, payload)
+              _ <- wakeMatchingSubscribers(workflowId, instanceKey, scope, key)
+            } yield SignalSendResult.Success
+        }
+      } yield result
+    }
+  }
+
+  /** Upserts the instance's wakeup row when a pending subscription for the exact
+    * signal key exists. The sender never evaluates payload filters; only
+    * key-matching subscriptions matter.
+    */
+  private def wakeMatchingSubscribers(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      signalKey: SignalKey
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    for {
+      has <- sql"""SELECT 1 FROM workflow_signal_subscriptions
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope AND signal_key = $signalKey
+            LIMIT 1""".query[Int].option
+      _ <- if (has.isDefined)
+        sql"""
+          INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+          VALUES ($workflowId, $key, $scope, $now, $now, 0)
+          ON CONFLICT (workflow_id, key, scope) DO NOTHING
+        """.update.run.map(_ => ())
+      else ().pure[ConnectionIO]
+    } yield ()
+  }
 
   private def readTerminalAndReturn[Out](
       workflowId: WorkflowId,
@@ -587,10 +665,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     override def currentScope: String = ""
 
-    override def now: java.time.Instant = clock.instant()
+    override def now: java.time.Instant = theClock.instant()
 
     override def renewLease(): Unit = {
-      val now = clock.instant()
+      val now = theClock.instant()
       val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
       val updated = runSync {
         sql"""UPDATE workflow_instances
@@ -612,7 +690,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         inputFingerprints: String
     ): Unit =
       fenced {
-        val now = clock.instant()
+        val now = theClock.instant()
         sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
               VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'started', '', $inputFingerprints, NULL, $now, $now)
               ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
@@ -628,7 +706,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         expiresAt: Option[java.time.Instant]
     ): Unit =
       fenced {
-        val now = clock.instant()
+        val now = theClock.instant()
         sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
               VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
               ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
@@ -644,7 +722,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         expiresAt: Option[java.time.Instant]
     ): Unit =
       fenced {
-        val now = clock.instant()
+        val now = theClock.instant()
         sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
               VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'failed', $payload, $inputFingerprints, $expiresAt, $now, $now)
               ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
@@ -678,7 +756,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   private[atomicflow] override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
-    val now = clock.instant()
+    val now = theClock.instant()
     val scheduledAt = now.plus(java.time.Duration.ofNanos(delay.toNanos))
     runSync {
       sql"""

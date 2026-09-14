@@ -39,6 +39,13 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
   /** The persisted data view of this instance, fresh from the database. */
   def getInfo()(using runtime: WorkflowRuntime): WorkflowInstance.Info =
     runtime.getWorkflowInstanceInfo(this)
+
+  /** Append a `Signal` event addressed to this instance. Forwarder for the
+    * runtime's `sendSignal`, resolving the signal's own [[Cacheable]].
+    */
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
+    runtime.sendSignal(id, signal.key, value)(using signal.cacheable)
 }
 
 object WorkflowInstance {

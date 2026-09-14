@@ -2,6 +2,7 @@ package atomicflow
 
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.{Duration, FiniteDuration}
+import java.time.Clock
 
 /** The canonical home of all single-instance workflow operations. Implemented per
   * backend (in-memory, Postgres, ...). Convenience methods are `final`, built
@@ -9,6 +10,26 @@ import scala.concurrent.duration.{Duration, FiniteDuration}
   */
 @implicitNotFound("No WorkflowRuntime available. Add a using clause (using WorkflowRuntime).")
 trait WorkflowRuntime {
+
+  /** The single time source for timer due-ness, retry thresholds, sweep
+    * predicates, and all persisted `:now` parameters. The database server's
+    * clock is never consulted for logic. Exposed so apps and tests share one
+    * clock with workflow code.
+    */
+  def clock: Clock
+
+  /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
+    * briefly row-locks the instance and checks `is_accepting_signals`, then
+    * appends the event (with the signal's `Cacheable`) and upserts a wakeup for
+    * the instance when a matching pending subscription exists. Does not acquire
+    * the execution lease.
+    */
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A: Cacheable](
+      workflowInstanceId: WorkflowInstanceId,
+      key: SignalKey,
+      value: A
+  ): SignalSendResult
 
   /** Register an instance, idempotent for equal (serialized) input; throws
     * [[WorkflowInputConflictException]] if the input differs.
