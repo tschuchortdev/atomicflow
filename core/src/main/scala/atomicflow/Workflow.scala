@@ -1,6 +1,7 @@
 package atomicflow
 
 import java.time.Instant
+import scala.concurrent.duration.FiniteDuration
 
 /** The typed handle of a workflow instance, obtained only from the runtime. It
   * captures the [[Workflow]] definition it came from plus the instance's stable
@@ -22,6 +23,22 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
       cacheableThrowable: Cacheable[Throwable]
   ): WorkflowRunResult[Out] =
     runtime.runWorkflowInstance(workflow, id)
+
+  /** Passive waiter: blocks until the instance reaches a terminal state or
+    * `timeout` elapses, then throws a timeout exception. Never executes the
+    * workflow.
+    */
+  @throws[WorkflowNotFoundException]
+  @throws[java.util.concurrent.TimeoutException]
+  def awaitResult(timeout: FiniteDuration)(using
+      runtime: WorkflowRuntime,
+      cacheableThrowable: Cacheable[Throwable]
+  ): WorkflowRunResult[Out] =
+    runtime.awaitResult(this, timeout)
+
+  /** The persisted data view of this instance, fresh from the database. */
+  def getInfo()(using runtime: WorkflowRuntime): WorkflowInstance.Info =
+    runtime.getWorkflowInstanceInfo(this)
 }
 
 object WorkflowInstance {
@@ -91,6 +108,20 @@ final class Workflow[In, Out] private[atomicflow] (
 }
 
 object Workflow {
+  /** Passive waiter for an instance's terminal outcome, addressed by key; see
+    * `WorkflowInstance.awaitResult`.
+    */
+  @throws[java.util.concurrent.TimeoutException]
+  def awaitResult[In, Out](
+      workflow: Workflow[In, Out],
+      instanceKey: WorkflowInstanceKey,
+      timeout: FiniteDuration
+  )(using
+      runtime: WorkflowRuntime,
+      cacheableThrowable: Cacheable[Throwable]
+  ): WorkflowRunResult[Out] =
+    runtime.awaitResult(WorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey)), timeout)
+
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
     * runtime calls this automatically at every checkpoint; call it explicitly

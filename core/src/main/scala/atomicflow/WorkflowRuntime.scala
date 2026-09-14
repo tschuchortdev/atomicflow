@@ -72,14 +72,70 @@ trait WorkflowRuntime {
     runWorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey))
   }
 
-  /** Upgrade a bare identity to a typed handle. Validation of the workflowId
-    * against the instance row is completed in a later task.
+  /** Upgrade a bare identity to a typed handle. Validates that the workflow id
+    * in the identity matches the provided definition (a programming error if it
+    * does not). Missing instances are not verified here; handles obtained from
+    * the runtime always refer to existing instances.
     */
-  def getWorkflowInstance[In, Out](
+  final def getWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
-  ): WorkflowInstance[In, Out] =
+  ): WorkflowInstance[In, Out] = {
+    if (instanceId.workflowId != workflow.id)
+      throw new IllegalArgumentException(
+        s"Cannot build a handle for workflow '${workflow.id}' from an instanceId referring to workflow '${instanceId.workflowId}'"
+      )
     WorkflowInstance(workflow, instanceId)
+  }
+
+  /** Key-prefix query over instances of one workflow definition, scoped exactly
+    * to `scope` (empty = top-level only). The prefix is matched literally: `%`
+    * and `_` in the user prefix are escaped, not treated as wildcards.
+    */
+  def getWorkflowInstancesByPrefix(
+      workflowId: WorkflowId,
+      keyPrefix: WorkflowInstanceKey,
+      scope: String = ""
+  ): Vector[WorkflowInstance.Info]
+
+  /** Instances of one workflow definition that have not reached a terminal
+    * state. `includeWaiting = false` (default) returns only instances that have
+    * never started (`times_executed = 0`); `true` returns all non-terminal
+    * instances. `limit <= 0` means unlimited.
+    */
+  def getUnfinishedWorkflowInstances(
+      workflowId: WorkflowId,
+      includeWaiting: Boolean = false,
+      limit: Int = -1
+  ): Vector[WorkflowInstance.Info]
+
+  /** Deletes all instances of one workflow definition whose key matches `scope`
+    * and `keyPrefix` (escaped as in [[getWorkflowInstancesByPrefix]]), plus
+    * their cascaded rows and their event rows. Returns the number of instances
+    * deleted.
+    */
+  def deleteWorkflowInstancesByPrefix(
+      workflowId: WorkflowId,
+      keyPrefix: WorkflowInstanceKey,
+      scope: String = ""
+  ): Long
+
+  /** Passive waiter for an instance's terminal outcome: polls the stored
+    * terminal projection until a terminal state is reached or `timeout`
+    * elapses, then throws [[java.util.concurrent.TimeoutException]]. Never
+    * executes the workflow. Terminal outcomes decode exactly as `run` on a
+    * terminal instance.
+    */
+  @throws[java.util.concurrent.TimeoutException]
+  def awaitResult[Out](
+      instance: WorkflowInstance[?, Out],
+      timeout: FiniteDuration
+  )(using Cacheable[Throwable]): WorkflowRunResult[Out]
+
+  /** The persisted data view of an instance, fresh from the database. */
+  private[atomicflow] def getWorkflowInstanceInfo[In, Out](
+      instance: WorkflowInstance[In, Out]
+  ): WorkflowInstance.Info
 }
 
 object WorkflowRuntime {

@@ -59,6 +59,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Well-known advisory-lock key for the global event-append protocol. */
   private val EventAppendLockKey: Long = 844810493715605001L
 
+  /** Poll cadence of the passive `awaitResult` waiter. */
+  private val AwaitResultPollIntervalMillis: Long = 50L
+
   private def runSync[A](fa: ConnectionIO[A]): A =
     fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
 
@@ -416,6 +419,161 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }.map { case (kind, payload, fingerprints, expiresAt) =>
       StoredStep(kind, payload, fingerprints, expiresAt)
     }
+
+  /** Escapes `%`, `_`, and the escape character itself so the caller's prefix is
+    * matched literally against the key with a trailing `%` wildcard.
+    */
+  private def likeEscaped(prefix: String): String =
+    prefix.flatMap {
+      case '\\' => "\\\\"
+      case '%'  => "\\%"
+      case '_'  => "\\_"
+      case c    => c.toString
+    }
+
+  /** The columns backing [[WorkflowInstance.Info]], in `InfoSelect` order. */
+  private type InfoRow = (
+      String,
+      Long,
+      Long,
+      Option[String],
+      Option[String],
+      Option[String],
+      java.time.Instant,
+      Option[java.time.Instant],
+      Int,
+      Option[String]
+    )
+
+  private val InfoSelect: Fragment =
+    fr"""SELECT key, workflow_version_at_creation, generation,
+         parent_workflow_id, parent_instance_key, parent_scope, created_at,
+         last_run_at, times_executed, terminal_state
+         FROM workflow_instances"""
+
+  private def terminalEnum(state: String): WorkflowTerminalState = state match {
+    case "completed"  => WorkflowTerminalState.Completed
+    case "failed"     => WorkflowTerminalState.Failed
+    case "cancelled"  => WorkflowTerminalState.Cancelled
+    case "terminated" => WorkflowTerminalState.Terminated
+    case other        => throw new StepSerializationFailed(s"Unknown terminal state '$other'")
+  }
+
+  private def toInfo(workflowId: WorkflowId, scope: String, r: InfoRow): WorkflowInstance.Info = {
+    val (key, versionAtCreation, generation, parentWf, parentKey, parentScope, createdAt, lastRunAt, timesExecuted, terminal) = r
+    val parentId = parentWf.map(pwf => WorkflowInstanceId(pwf, parentKey.getOrElse(""), parentScope.getOrElse("")))
+    WorkflowInstance.Info(
+      id = WorkflowInstanceId(workflowId, key, scope),
+      parentId = parentId,
+      generation = generation,
+      terminalState = terminal.map(terminalEnum),
+      workflowVersionAtCreation = versionAtCreation,
+      createdAt = createdAt,
+      lastRunAt = lastRunAt,
+      timesExecuted = timesExecuted
+    )
+  }
+
+  override def getWorkflowInstancesByPrefix(
+      workflowId: WorkflowId,
+      keyPrefix: WorkflowInstanceKey,
+      scope: String = ""
+  ): Vector[WorkflowInstance.Info] = {
+    val pattern = likeEscaped(keyPrefix) + "%"
+    runSync {
+      (InfoSelect ++ fr"WHERE workflow_id = $workflowId AND scope = $scope AND key LIKE $pattern ESCAPE '\' ORDER BY key")
+        .query[InfoRow]
+        .to[Vector]
+    }.map(toInfo(workflowId, scope, _))
+  }
+
+  override def getUnfinishedWorkflowInstances(
+      workflowId: WorkflowId,
+      includeWaiting: Boolean = false,
+      limit: Int = -1
+  ): Vector[WorkflowInstance.Info] = {
+    val waitingCond = if (includeWaiting) Fragment.empty else fr"AND times_executed = 0"
+    val limitFrag = if (limit > 0) fr"LIMIT $limit" else Fragment.empty
+    runSync {
+      (InfoSelect ++ fr"WHERE workflow_id = $workflowId AND scope = '' AND terminal_state IS NULL " ++
+        waitingCond ++ fr"ORDER BY key " ++ limitFrag).query[InfoRow].to[Vector]
+    }.map(toInfo(workflowId, "", _))
+  }
+
+  override def deleteWorkflowInstancesByPrefix(
+      workflowId: WorkflowId,
+      keyPrefix: WorkflowInstanceKey,
+      scope: String = ""
+  ): Long = {
+    val pattern = likeEscaped(keyPrefix) + "%"
+    runSync {
+      for {
+        _ <- sql"""DELETE FROM workflow_events
+                   WHERE workflow_id = $workflowId AND scope = $scope AND key LIKE $pattern ESCAPE '\'""".update.run
+        deleted <- sql"""DELETE FROM workflow_instances
+                         WHERE workflow_id = $workflowId AND scope = $scope AND key LIKE $pattern ESCAPE '\'""".update.run
+      } yield deleted.toLong
+    }
+  }
+
+  /** Reads the terminal projection of an instance; `None` if the instance is
+    * absent or not yet terminal.
+    */
+  private def readTerminal(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): Option[(String, Option[String])] =
+    runSync {
+      sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
+          (Option[String], Option[String])
+        ].option
+    }.flatMap { case (state, outcome) => state.map(s => (s, outcome)) }
+
+  override def awaitResult[Out](
+      instance: WorkflowInstance[?, Out],
+      timeout: FiniteDuration
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
+    val workflow = instance.workflow
+    val instanceId = instance.id
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
+    val outCacheable = workflow.outputCacheable
+    given Cacheable[Out] = outCacheable
+    val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
+
+    val deadlineNanos = System.nanoTime() + timeout.toNanos
+    var terminal: Option[(String, Option[String])] = None
+    while (terminal.isEmpty && System.nanoTime() < deadlineNanos) {
+      terminal = readTerminal(workflowId, key, scope)
+      if (terminal.isEmpty && System.nanoTime() < deadlineNanos) Thread.sleep(AwaitResultPollIntervalMillis)
+    }
+
+    terminal match {
+      case Some((state, outcome)) => handleTerminalRead(state, outcome, outCacheable, completionCodec, instanceId)
+      case None =>
+        throw new java.util.concurrent.TimeoutException(
+          s"Workflow instance did not reach a terminal state within $timeout: $instanceId"
+        )
+    }
+  }
+
+  private[atomicflow] override def getWorkflowInstanceInfo[In, Out](
+      instance: WorkflowInstance[In, Out]
+  ): WorkflowInstance.Info = {
+    val instanceId = instance.id
+    val row = runSync {
+      (InfoSelect ++ fr"WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}")
+        .query[InfoRow]
+        .option
+    }
+    row match {
+      case Some(r) => toInfo(instanceId.workflowId, instanceId.scope, r)
+      case None    => throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+    }
+  }
 
   private final class PostgresExecution(
       val workerId: String,
