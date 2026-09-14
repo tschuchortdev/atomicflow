@@ -845,25 +845,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       }
 
     override def fireDueTimers(stepId: StepId, stepVersion: Long): Unit =
-      fenced {
-        val now = theClock.instant()
-        for {
-          due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
-                       WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                         AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = 0
-                         AND deadline <= $now
-                       FOR UPDATE""".query[java.util.UUID].to[Vector]
-          _ <- due.traverse_ { subId =>
-            for {
-              exists <- sql"""SELECT 1 FROM workflow_events
-                              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                                AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-              _ <- if (exists.isEmpty) appendEvent(workflowId, key, instanceScope, "TimerFired", subId.toString, "")
-                   else ().pure[ConnectionIO]
-            } yield ()
-          }
-        } yield ()
-      }
+      fireDueTimerLeaves(stepId, stepVersion)
 
     override def readAwaitTimerCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate] =
       runSync {

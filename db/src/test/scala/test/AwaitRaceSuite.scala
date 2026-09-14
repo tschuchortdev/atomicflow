@@ -337,4 +337,91 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val failed = rt.runWorkflowInstance(aWf, aId)
     assert(failed.toString.contains("failed:") && failed.toString.contains("boom"), s"decoded failure message: $failed")
   }
+
+  test("a mapped completion leaf raced against a timer resolves with the completion when it completes first") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    given Clock = clock
+    val bWf = Workflow[String, String](id = "Bmap") { in => in.toUpperCase }
+    val bId = rt.createWorkflowInstance(bWf, "bm", "hello").id
+    val bHandle = rt.getWorkflowInstance(bWf, bId)
+
+    var last = ""
+    val aWf = Workflow[String, String](id = "Amap") { in =>
+      last = Step.awaitRace[String]("race")(
+        bHandle.completion.map {
+          case WorkflowCompletionResult.Completed(v) => v
+          case _                                     => "?"
+        },
+        Awaitable.Timer(1.minute).map(_ => "timeout")
+      )
+      TestControlFlow.suspend()
+      last
+    }
+    val aId = rt.createWorkflowInstance(aWf, "a", "in").id
+
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HELLO"))
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, "HELLO", "the mapped completion result wins when it completes first")
+    assertEquals(stepRow(aWf.id, "a", "race").map(_._2), Some("succeeded"))
+
+    clock.advanceBy(2.minutes)
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, "HELLO", "the resolved mapped completion is cached and replayed, not re-raced")
+  }
+
+  test("a mapped completion leaf raced against a timer resolves with the timer when it fires first") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    given Clock = clock
+    val bWf = Workflow[String, String](id = "Bmap2") { in => in.toUpperCase }
+    val bId = rt.createWorkflowInstance(bWf, "bm2", "hello").id
+    val bHandle = rt.getWorkflowInstance(bWf, bId)
+
+    var last = ""
+    val aWf = Workflow[String, String](id = "Amap2") { in =>
+      last = Step.awaitRace[String]("race")(
+        bHandle.completion.map {
+          case WorkflowCompletionResult.Completed(v) => v
+          case _                                     => "?"
+        },
+        Awaitable.Timer(1.minute).map(_ => "timeout")
+      )
+      TestControlFlow.suspend()
+      last
+    }
+    val aId = rt.createWorkflowInstance(aWf, "a", "in").id
+
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    clock.advanceBy(2.minutes)
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, "timeout", "the timer wins when it fires before the completion")
+  }
+
+  test("an unmapped completion leaf raced against a signal resolves with the earliest global event") {
+    val rt = newRuntime
+    val sig = Signal[String]("s")
+    val bWf = Workflow[String, String](id = "Bmix") { in => in.toUpperCase }
+    val bId = rt.createWorkflowInstance(bWf, "bmix", "hi").id
+    val bHandle = rt.getWorkflowInstance(bWf, bId)
+
+    var last: WorkflowCompletionResult[String] = WorkflowCompletionResult.Cancelled
+    val aWf = Workflow[String, String](id = "Amix") { in =>
+      last = Step.awaitRace[WorkflowCompletionResult[String]]("race")(
+        bHandle.completion,
+        Awaitable.SignalEvent(sig).map(v => WorkflowCompletionResult.Completed(v))
+      )
+      TestControlFlow.suspend()
+      "done"
+    }
+    val aId = rt.createWorkflowInstance(aWf, "a", "in").id
+
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HI"))
+
+    sig.send(aId, "sx")(using rt)
+    assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(last, WorkflowCompletionResult.Completed("HI"), "the earlier completion event beats the later signal")
+  }
 }

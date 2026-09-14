@@ -27,9 +27,14 @@ enum Awaitable[R] {
   /** Await until the given absolute deadline. */
   case Timer(deadline: Instant) extends Awaitable[Unit]
 
-  /** Await the terminal outcome of another workflow instance. */
-  case WorkflowCompletion[A](workflowInstanceId: WorkflowInstanceId)
-      extends Awaitable[WorkflowCompletionResult[A]]
+  /** Await the terminal outcome of another workflow instance. Carries the
+    * composite codec needed to decode the raw `WorkflowCompletionResult[R]`, so
+    * it can be mapped onto another result type and raced against other
+    * awaitables without losing the ability to decode the completed payload.
+    */
+  case WorkflowCompletion[R](workflowInstanceId: WorkflowInstanceId)(using
+      val completionCacheable: Cacheable[WorkflowCompletionResult[R]]
+  ) extends Awaitable[WorkflowCompletionResult[R]]
 
   /** The result of mapping an underlying awaitable. Used to align heterogeneous
     * raw results onto a common result type for racing and combining.

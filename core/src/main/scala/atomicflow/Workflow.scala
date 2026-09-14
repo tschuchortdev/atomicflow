@@ -49,9 +49,13 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
 
   /** An awaitable that yields this instance's terminal outcome as a
     * `WorkflowCompletionResult[Out]`, to be raced or awaited from another
-    * workflow via `Step.await`/`Step.awaitRace`.
+    * workflow via `Step.await`/`Step.awaitRace`. Takes the application-global
+    * throwable codec contextually to build the composite outcome codec.
     */
-  def completion: Awaitable.WorkflowCompletion[Out] = Awaitable.WorkflowCompletion(id)
+  def completion(using ct: Cacheable[Throwable]): Awaitable.WorkflowCompletion[Out] = {
+    given Cacheable[Out] = workflow.outputCacheable
+    Awaitable.WorkflowCompletion[Out](id)
+  }
 }
 
 object WorkflowInstance {

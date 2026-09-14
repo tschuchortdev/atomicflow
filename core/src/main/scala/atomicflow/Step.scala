@@ -486,6 +486,7 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]],
       invalidateAfter: Duration
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
+    require(awaits.nonEmpty, s"awaitRace('$stepKey') requires at least one awaitable")
     val execution = ctx.execution
     val stepId = StepId(stepKey, execution.currentScope)
     val valueCodec = summon[Cacheable[A]]
@@ -635,12 +636,10 @@ object Step {
           override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] =
             candidates.find(_.leafIdx == leafIdx).map { c =>
               val decoded =
-                try valueCodec.read(c.payload)
+                try wc.completionCacheable.read(c.payload)
                 catch {
                   case _: Throwable =>
-                    throw new StepSerializationFailed(
-                      s"Race leaf '$leafIdx' completion could not be decoded; a completion leaf must be awaited unmapped so its result codec is available"
-                    )
+                    throw new StepSerializationFailed(s"Race leaf '$leafIdx' completion could not be decoded")
                 }
               val serialized =
                 try valueCodec.write(toA(decoded))
