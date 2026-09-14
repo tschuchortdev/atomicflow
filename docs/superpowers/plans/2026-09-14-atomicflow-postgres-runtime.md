@@ -362,7 +362,56 @@ def awaitRace[A](stepKey: String, invalidateOn: Seq[StepInput[?]] = Seq.empty, e
 - After completion, `send` returns `InstanceAlreadyCompleted`.
 - Default handler: ignore.
 
-## Phases 4–9 (expanded at phase boundaries)
+## Phase 4 — Cancellation and termination
+
+Implements `spec/running-workflows.md` "Cancellation and termination" (COMPLETE section is
+NORMATIVE). The escalation sweep lands in Phase 5; this phase implements `cancel`, `terminate`,
+checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, and the boundary behavior.
+
+### Task 4.1: `cancel` — cooperative stop with checkpoint delivery
+
+**Files:**
+- Modify: `core/.../WorkflowRuntime.scala` (trait ops), `core/.../Exceptions.scala` (WorkflowCancelledException exists), `core/.../Workflow.scala` (uncancellable), engine seam + runtime
+- Test: `db/src/test/scala/test/CancelSuite.scala`
+
+**Interfaces:**
+```scala
+trait WorkflowRuntime:
+  def cancel(instanceId: WorkflowInstanceId): Unit  // idempotent; sets cancel_requested_at
+```
+
+**Behavior (tests):**
+- cancel before first start (CREATED, no execution state): finalizes CANCELLED immediately — body never runs (side-effect counter), terminal transition + WorkflowCompleted(Cancelled) event.
+- cancel a terminal instance: no-op.
+- cancel while suspended (no live lease): sets `cancel_requested_at`, upserts wakeup (schedule resume). On the next run, the frontier checkpoint (pending await or next not-yet-run step) throws `WorkflowCancelledException`; if user code doesn't catch, run boundary returns `WorkflowRunResult.WorkflowCancelled` + terminal CANCELLED transition; earlier cached steps are NOT re-executed (delivery at the frontier).
+- cancel while running: flag set; the live owner re-reads around Step/Await boundaries; next new-work checkpoint throws.
+- Sticky redelivery: user catches WorkflowCancelledException and continues → next new-work checkpoint throws again; only reaching a terminal state escapes; completing anyway → COMPLETED (first-terminal-event rule).
+- Replay of cached steps never delivers cancellation (frontier-only).
+- `cancel_requested_at` is set once and never reset (SQL assert).
+- Delivery points: before a step body executes (not cached) and at await evaluation; NOT between cached replays.
+
+### Task 4.2: `Workflow.uncancellable` + `terminate`
+
+**Files:**
+- Modify: `core/.../Workflow.scala`, `WorkflowRuntime.scala`, engine + runtime
+- Test: `db/src/test/scala/test/TerminateSuite.scala`
+
+**Interfaces:**
+```scala
+object Workflow:
+  def uncancellable[R](f: WorkflowContext ?=> R): R  // lexical, re-entrant region
+trait WorkflowRuntime:
+  def terminate(instanceId: WorkflowInstanceId): Unit  // force stop
+```
+
+**Behavior (tests):**
+- uncancellable: checkpoints inside the region do not deliver cancellation; steps execute; pending awaits still resolve; after exit, next checkpoint throws again; region does not clear the flag; replay-deterministic (compensation steps cached/replayed).
+- terminate: atomically TERMINATED via guarded transition (+ WorkflowCompleted(Terminated) event, lease revoked via fencing-token bump, wakeups deleted, subscriptions deleted — terminal cleanup); never runs user code; running orphan's next fenced write fails (LeaseLost) and its next checkpoint re-check discards execution; re-run returns WorkflowTerminated (terminal decode).
+- terminal cleanup at every terminal transition: delete this instance's subscriptions (signal/timer/completion) and wakeup row (extend the 2.2/3.4/3.6 transition transaction).
+- WorkflowCancelledException is a plain public RuntimeException; `scala.util.control.NonFatal` catches it (unit assert); the run boundary converts an escaping one to WorkflowCancelled.
+- The run boundary on LeaseLost during cancellation delivery: propagates LeaseLost (not WorkflowCancelled) — the new owner delivers.
+
+## Phases 5–9 (expanded at phase boundaries)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
