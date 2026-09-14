@@ -1,6 +1,7 @@
 package atomicflow
 
 import atomicflow.impl.Sha256Fingerprinter
+import atomicflow.internal.AwaitSignalCandidate
 
 import java.nio.charset.StandardCharsets
 import scala.concurrent.duration.*
@@ -214,6 +215,151 @@ object Step {
               }
             StepExecutionState.Failed(failure)
           case _ => StepExecutionState.Started
+        }
+    }
+  }
+
+  /** Await a runtime-computed condition: an event on a [[Signal]], a timer, or a
+    * workflow completion. The await behaves like a step — its resolved result is
+    * persisted in `workflow_steps` and replayed from cache, so a re-run never
+    * re-suspends on an already-resolved await.
+    *
+    * If the await cannot be satisfied from durable facts it durably suspends the
+    * workflow by throwing [[WorkflowSuspendedException]] (an internal
+    * control-flow exception the runtime catches at the boundary). User code must
+    * ignore or rethrow it.
+    *
+    * WARNING: an await with a filter may skip past unprocessed events. When it
+    * returns a matching event, all earlier rejected events of the same exact key
+    * become permanently unavailable to later awaits of that key in this
+    * workflow (the shared exact-key cursor advances past them).
+    *
+    * Drift policies apply exactly as for ordinary steps: `ensureUnchanged`
+    * values must be invariant between runs, `invalidateOn` changes discard the
+    * cached result and re-evaluate from scratch, and `invalidateAfter` sets a
+    * TTL over the cached result.
+    *
+    * @param stepKey
+    *   the await's stable identity within the workflow
+    * @param awaitable
+    *   the condition to await
+    * @param invalidateOn
+    *   named inputs that invalidate the cached await result when they change
+    * @param ensureUnchanged
+    *   named inputs that must be invariant between runs
+    * @param invalidateAfter
+    *   TTL after which the cached await result expires; `Duration.Inf` disables it
+    */
+  def await[A: Cacheable](
+      stepKey: String,
+      awaitable: Awaitable[A],
+      invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+      invalidateAfter: Duration = Duration.Inf
+  )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
+    awaitable match {
+      case Awaitable.SignalEvent(signal, filter, lookBack) =>
+        awaitSignal(stepKey, signal, filter, lookBack, invalidateOn, ensureUnchanged, invalidateAfter)
+      case Awaitable.Timer(_) =>
+        throw new UnsupportedOperationException("awaiting a Timer is not yet supported")
+      case Awaitable.WorkflowCompletion(_) =>
+        throw new UnsupportedOperationException("awaiting a workflow completion is not yet supported")
+      case Awaitable.Mapped(_, _) =>
+        throw new UnsupportedOperationException("awaiting a mapped awaitable is not yet supported")
+    }
+
+  /** Read the currently visible events of `s` (those after the instance's shared
+    * exact-key cursor) without advancing the cursor. The returned values are the
+    * decoded signal payloads.
+    */
+  def peekSignal[A](s: Signal[A])(using ctx: WorkflowContext): Seq[A] =
+    ctx.execution.readAwaitSignalCandidates(s.key).map { c =>
+      try s.cacheable.read(c.payload)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"Signal '${s.key}' payload could not be decoded")
+      }
+    }
+
+  /** The runtime-computed step machinery for a [[Awaitable.SignalEvent]].
+    */
+  private def awaitSignal[A](
+      stepKey: String,
+      signal: Signal[A],
+      filter: A => Boolean,
+      lookBack: Duration,
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateAfter: Duration
+  )(using ctx: WorkflowContext): A = {
+    val execution = ctx.execution
+    val stepId = StepId(stepKey, execution.currentScope)
+    val valueCodec = signal.cacheable
+    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val now = execution.now
+    val expiresAt = invalidateAfter match {
+      case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
+      case _                 => None
+    }
+
+    def decode(payload: String): A =
+      try valueCodec.read(payload)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"Await '$stepKey' result could not be decoded")
+      }
+
+    def accept(c: AwaitSignalCandidate): Boolean = {
+      val withinLookBack = lookBack match {
+        case d: FiniteDuration =>
+          !c.createdAt.isBefore(now.minus(java.time.Duration.ofNanos(d.toNanos)))
+        case _ => true
+      }
+      withinLookBack && filter(decode(c.payload))
+    }
+
+    def serializedOf(c: AwaitSignalCandidate): (Long, String) = (c.sequenceId, valueCodec.write(decode(c.payload)))
+
+    def evaluate(): A = {
+      val candidates = execution.readAwaitSignalCandidates(signal.key)
+      candidates.find(accept) match {
+        case Some(winning) =>
+          val serialized = valueCodec.write(decode(winning.payload))
+          execution.resolveAwaitSignal(
+            stepId, 0L, "Await", fingerprints, signal.key, winning.sequenceId, serialized, expiresAt
+          )
+          decode(serialized)
+        case None =>
+          execution.suspendAwaitSignal(stepId, 0L, "Await", fingerprints, signal.key, expiresAt) { recheck =>
+            recheck.find(accept).map(serializedOf)
+          } match {
+            case Some(serialized) => decode(serialized)
+            case None             => throw new WorkflowSuspendedException
+          }
+      }
+    }
+
+    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None => evaluate()
+      case Some(row) =>
+        val stored = parseFingerprints(row.inputFingerprints)
+        for (input <- ensureUnchanged) {
+          if (stored.get(input.name) != Some(fingerprintOf(input)))
+            throw new StepInputConflictException(
+              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
+            )
+        }
+        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
+        if (shouldReevaluate) {
+          execution.deleteStep(stepId, 0L)
+          evaluate()
+        } else {
+          row.stateKind match {
+            case "succeeded" => decode(row.statePayload)
+            case "failed" =>
+              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
+            case _ => evaluate()
+          }
         }
     }
   }

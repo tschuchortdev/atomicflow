@@ -1,6 +1,6 @@
 package atomicflow.internal
 
-import atomicflow.StepId
+import atomicflow.{SignalKey, StepId}
 
 import java.time.Instant
 
@@ -14,6 +14,15 @@ private[atomicflow] final case class StoredStep(
     statePayload: String,
     inputFingerprints: String,
     expiresAt: Option[Instant]
+)
+
+/** One durable `Signal` event that is currently visible to an awaiting site
+  * (i.e. after the instance's shared exact-key cursor).
+  */
+private[atomicflow] final case class AwaitSignalCandidate(
+    sequenceId: Long,
+    payload: String,
+    createdAt: Instant
 )
 
 /** The per-run engine seam, materialized only during execution and funneled to
@@ -79,4 +88,43 @@ private[atomicflow] trait WorkflowExecution {
 
   /** Delete the step row, fenced. */
   def deleteStep(stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `Signal` events of `signalKey` that are visible to this
+    * instance (after its shared exact-key cursor), in sequence order. A plain
+    * read of durable facts; no lease or fence is involved and the cursor is not
+    * advanced.
+    */
+  def readAwaitSignalCandidates(signalKey: SignalKey): Vector[AwaitSignalCandidate]
+
+  /** Resolve a signal await atomically, fenced: persist the `succeeded` step row
+    * (`stepKind`), advance the exact-key cursor to `winningSequenceId`, and
+    * delete the site's pending subscriptions, all in one transaction.
+    */
+  def resolveAwaitSignal(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      winningSequenceId: Long,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Suspend a signal await, fenced, in one transaction: register/refresh the
+    * pending subscription (idempotent), then re-read the visible events and
+    * apply `decide`. If `decide` selects a satisfying candidate, resolve the
+    * await (succeeded step row + cursor advance + subscription deletion) and
+    * return the persisted payload; otherwise return `None` (suspended, cursor
+    * unchanged). The re-read within the transaction closes the lost-wakeup gap
+    * between event gathering and the suspension commit.
+    */
+  def suspendAwaitSignal(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      expiresAt: Option[Instant]
+  )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String]
 }

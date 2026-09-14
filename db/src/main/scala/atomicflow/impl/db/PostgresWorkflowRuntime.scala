@@ -1,7 +1,7 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.{StoredStep, WorkflowExecution}
+import atomicflow.internal.{AwaitSignalCandidate, StoredStep, WorkflowExecution}
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -706,12 +706,25 @@ class PostgresWorkflowRuntime private[atomicflow] (
         expiresAt: Option[java.time.Instant]
     ): Unit =
       fenced {
-        val now = theClock.instant()
-        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
-              ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
-              SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run
+        writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
       }
+
+    private def writeStepSucceededIO(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): ConnectionIO[Unit] = {
+      val now = theClock.instant()
+      sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
+            ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
+            SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+        _ => ()
+      )
+    }
 
     override def writeStepFailed(
         stepId: StepId,
@@ -735,12 +748,104 @@ class PostgresWorkflowRuntime private[atomicflow] (
               WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
       }
 
+    override def readAwaitSignalCandidates(signalKey: SignalKey): Vector[AwaitSignalCandidate] =
+      runSync {
+        for {
+          cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
+          events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                            AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
+                          ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+        } yield events.map { case (seq, payload, createdAt) => AwaitSignalCandidate(seq, payload, createdAt) }
+      }
+
+    override def resolveAwaitSignal(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        signalKey: SignalKey,
+        winningSequenceId: Long,
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        for {
+          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+          _ <- advanceCursorIO(signalKey, winningSequenceId)
+          _ <- deleteSubscriptionsIO(stepId, stepVersion)
+        } yield ()
+      }
+
+    override def suspendAwaitSignal(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        signalKey: SignalKey,
+        expiresAt: Option[java.time.Instant]
+    )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String] =
+      fencedVal {
+        for {
+          _ <- upsertSubscriptionIO(stepId, stepVersion, signalKey)
+          candidates <- readCandidatesIO(signalKey)
+          decision = decide(candidates)
+          resolved <- decision match {
+            case Some((winSeq, payload)) =>
+              for {
+                _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+                _ <- advanceCursorIO(signalKey, winSeq)
+                _ <- deleteSubscriptionsIO(stepId, stepVersion)
+              } yield Some(payload)
+            case None => Option.empty[String].pure[ConnectionIO]
+          }
+        } yield resolved
+      }
+
+    private def advanceCursorIO(signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
+      sql"""INSERT INTO signal_cursor (workflow_id, key, scope, signal_key, sequence_id)
+            VALUES ($workflowId, $key, $instanceScope, $signalKey, $sequenceId)
+            ON CONFLICT (workflow_id, key, scope, signal_key) DO UPDATE
+            SET sequence_id = EXCLUDED.sequence_id""".update.run.map(_ => ())
+
+    private def deleteSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+      sql"""DELETE FROM workflow_signal_subscriptions
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run.map(
+        _ => ()
+      )
+
+    private def upsertSubscriptionIO(stepId: StepId, stepVersion: Long, signalKey: SignalKey): ConnectionIO[Unit] =
+      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key)
+            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, 0, $signalKey)
+            ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key) DO NOTHING""".update.run.map(
+        _ => ()
+      )
+
+    private def readCandidatesIO(signalKey: SignalKey): ConnectionIO[Vector[AwaitSignalCandidate]] =
+      for {
+        cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                        WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
+        events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                        WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                          AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
+                        ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+      } yield events.map { case (seq, payload, createdAt) => AwaitSignalCandidate(seq, payload, createdAt) }
+
     /** Runs `write` inside one transaction, guarded by an exclusive lock on the
       * instance row and a fencing check; throws [[LeaseLostException]] if the
       * lease no longer belongs to this run, affecting no rows.
       */
     private def fenced[A](write: ConnectionIO[A]): Unit = {
-      val ok = runSync {
+      fencedVal(write)
+      ()
+    }
+
+    /** Like [[fenced]] but returns the value `write` produced, or throws
+      * [[LeaseLostException]] if the fence failed.
+      */
+    private def fencedVal[A](write: ConnectionIO[A]): A = {
+      val res: Option[A] = runSync {
         for {
           _ <- sql"""SELECT 1 FROM workflow_instances
                      WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
@@ -748,10 +853,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
           fenceOk <- sql"""SELECT 1 FROM workflow_instances
                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                              AND lease_owner = $workerId AND fencing_token = $fencingToken""".query[Int].option
-          _ <- if (fenceOk.isDefined) write else ().pure[ConnectionIO]
-        } yield fenceOk.isDefined
+          r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]
+        } yield r
       }
-      if (!ok) throw LeaseLostException(instanceId)
+      res match {
+        case Some(a) => a
+        case None    => throw LeaseLostException(instanceId)
+      }
     }
   }
 
