@@ -20,3 +20,17 @@ class WorkflowCancelledException(message: String) extends RuntimeException(messa
 object WorkflowCancelledException {
   def apply(): WorkflowCancelledException = new WorkflowCancelledException("The workflow instance was cancelled")
 }
+
+/** Thrown by the create variants when an instance already exists under the same
+  * identity but its persisted (serialized) input differs from the new one. Input
+  * equality is byte-equality of the serialized input.
+  */
+class WorkflowInputConflictException(message: String) extends RuntimeException(message)
+
+object WorkflowInputConflictException {
+  def apply(instanceId: WorkflowInstanceId): WorkflowInputConflictException =
+    new WorkflowInputConflictException(s"Workflow instance already exists with different input: $instanceId")
+}
+
+/** Thrown by operations that address a workflow instance that does not exist. */
+class WorkflowNotFoundException(message: String) extends RuntimeException(message)
