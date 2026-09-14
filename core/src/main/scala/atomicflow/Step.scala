@@ -63,8 +63,7 @@ object Step {
 
   object RetryPolicy {
 
-    /** The default: never retry. A body failure is persisted immediately. */
-    val never: RetryPolicy = new RetryPolicy {
+    private val neverPolicy: RetryPolicy = new RetryPolicy {
       override def nextDelay(
           failure: Throwable,
           failedAttempts: Int,
@@ -72,6 +71,9 @@ object Step {
           lastDelay: Option[FiniteDuration]
       ): Option[FiniteDuration] = None
     }
+
+    /** The default: never retry. A body failure is persisted immediately. */
+    def never: RetryPolicy = neverPolicy
 
     /** Retry a retriable failure up to `maxRetries` times, always after the
       * same `delay`.
@@ -305,47 +307,54 @@ object Step {
       }
     }
 
-    /** One retry-aware body attempt. On success the `succeeded` row is persisted
-      * (retiring any retry subscription); on a terminal failure the `failed` row
-      * is persisted; on a retryable failure the policy decides between an inline
-      * sleep-and-retry and a durable suspension. The body is re-evaluated (the
-      * by-name `body`) per attempt.
+    /** One retry-aware body attempt sequence. On success the `succeeded` row is
+      * persisted (retiring any retry subscription); on a terminal failure the
+      * `failed` row is persisted; on a retryable failure the policy decides
+      * between an inline sleep-and-retry and a durable suspension. The body is
+      * re-evaluated (the by-name `body`) per attempt; inline retries loop rather
+      * than recurse so an unbounded policy with tiny delays cannot grow the
+      * stack.
       */
-    def attempt(b: RetryBookkeeping): A = {
-      execution.renewLease()
-      try {
-        val value = body
-        val serialized =
-          try valueCodec.write(value)
-          catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be encoded") }
-        val decoded =
-          try valueCodec.read(serialized)
-          catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
-        execution.resolveStepRetry(stepId, stepVersion, stepKind, "succeeded", fingerprints, serialized, expiresAt)
-        decoded
-      } catch {
-        case t if isNonCacheable(t) => throw t
-        case t =>
-          retry.nextDelay(t, b.failedAttempts, b.cumulativeDelay, b.lastDelay) match {
-            case None =>
-              throw encodeAndPersistFailure(
-                t,
-                s => execution.resolveStepRetry(stepId, stepVersion, stepKind, "failed", fingerprints, s, expiresAt)
-              )
-            case Some(delay) =>
-              val nb = RetryBookkeeping(b.failedAttempts + 1, b.cumulativeDelay + delay, Some(delay))
-              if (delay <= threshold) {
-                Thread.sleep(delay.toMillis)
-                attempt(nb)
-              } else {
-                val deadline = execution.now.plus(java.time.Duration.ofNanos(delay.toNanos))
-                execution.suspendStepRetry(
-                  stepId, stepVersion, stepKind, fingerprints, encodeRetry(nb), deadline, expiresAt
+    def attempt(initialB: RetryBookkeeping): A = {
+      var b = initialB
+      var result: Option[A] = None
+      while (result.isEmpty) {
+        try {
+          execution.renewLease()
+          val value = body
+          val serialized =
+            try valueCodec.write(value)
+            catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be encoded") }
+          val decoded =
+            try valueCodec.read(serialized)
+            catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
+          execution.resolveStepRetry(stepId, stepVersion, stepKind, "succeeded", fingerprints, serialized, expiresAt)
+          result = Some(decoded)
+        } catch {
+          case t if isNonCacheable(t) => throw t
+          case t =>
+            retry.nextDelay(t, b.failedAttempts, b.cumulativeDelay, b.lastDelay) match {
+              case None =>
+                throw encodeAndPersistFailure(
+                  t,
+                  s => execution.resolveStepRetry(stepId, stepVersion, stepKind, "failed", fingerprints, s, expiresAt)
                 )
-                throw new WorkflowSuspendedException
-              }
-          }
+              case Some(delay) =>
+                val nb = RetryBookkeeping(b.failedAttempts + 1, b.cumulativeDelay + delay, Some(delay))
+                if (delay <= threshold) {
+                  java.util.concurrent.TimeUnit.NANOSECONDS.sleep(delay.toNanos)
+                  b = nb
+                } else {
+                  val deadline = execution.now.plus(java.time.Duration.ofNanos(delay.toNanos))
+                  execution.suspendStepRetry(
+                    stepId, stepVersion, stepKind, fingerprints, encodeRetry(nb), deadline, expiresAt
+                  )
+                  throw new WorkflowSuspendedException
+                }
+            }
+        }
       }
+      result.get
     }
 
     /** A fresh retry-aware execution: persist the `Started` row (bookkeeping

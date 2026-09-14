@@ -107,8 +107,41 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1, "the body must not re-execute before the retry deadline")
   }
 
-  test("durable retry: after maxRetries are exhausted the failure is persisted and replayed without re-executing") {
+  test("two consecutive durable retries each mint a fresh subscription; a re-run before the second delay stays suspended") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
+    given Clock = clock
+    val counter = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "two-retries") { in =>
+      Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(3, 1.hour)) {
+        val n = counter.incrementAndGet()
+        if (n < 3) throw new RuntimeException("boom")
+        "recovered"
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "a").id
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(counter.get(), 1)
+    val sub1 = timerSubscriptions(wf.id, "k").head._1
+
+    clock.advanceBy(2.hours)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(counter.get(), 2, "the second attempt executes after the first deadline")
+    val subs2 = timerSubscriptions(wf.id, "k")
+    assertEquals(subs2.length, 1, "exactly one retry subscription")
+    assertNotEquals(subs2.head._1, sub1, "the second durable retry mints a fresh subscription id")
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(counter.get(), 2, "before the second deadline the body must not re-execute")
+
+    clock.advanceBy(2.hours)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("recovered"))
+    assertEquals(counter.get(), 3)
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the retry subscription is retired on success")
+  }
+
+  test("durable retry: after maxRetries are exhausted the failure is persisted and replayed without re-executing") {    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
     given Clock = clock
     val counter = new AtomicInteger(0)

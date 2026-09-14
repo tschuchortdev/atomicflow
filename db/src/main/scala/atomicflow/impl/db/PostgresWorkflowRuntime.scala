@@ -822,10 +822,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
     private val RetryLeafIdx: Int = Int.MaxValue
 
     private def insertRetrySubscriptionIO(stepId: StepId, stepVersion: Long, deadline: java.time.Instant): ConnectionIO[Unit] =
-      sql"""INSERT INTO workflow_timer_subscriptions
-              (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
-            VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $RetryLeafIdx, $deadline)
-            ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run.map(_ => ())
+      for {
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_id = ${stepId.key} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx""".update.run
+        _ <- sql"""INSERT INTO workflow_timer_subscriptions
+                    (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
+                  VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $RetryLeafIdx, $deadline)
+                  ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run
+      } yield ()
 
     override def suspendStepRetry(
         stepId: StepId,
