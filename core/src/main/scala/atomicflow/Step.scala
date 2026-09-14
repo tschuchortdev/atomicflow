@@ -1,5 +1,6 @@
 package atomicflow
 
+import atomicflow.Cacheable.Simple.given
 import atomicflow.impl.Sha256Fingerprinter
 import atomicflow.internal.AwaitSignalCandidate
 
@@ -385,17 +386,25 @@ object Step {
     def evaluate(): Unit = {
       execution.fireDueTimers(stepId, 0L)
       if (execution.readAwaitTimerCandidates(stepId, 0L).nonEmpty) {
-        execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, "", expiresAt)
+        execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
       } else {
         execution.suspendAwaitTimer(stepId, 0L, "Await", fingerprints, deadline, expiresAt)
         throw new WorkflowSuspendedException
       }
     }
 
-    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    def retireAndSuspend(): Nothing = {
+      execution.invalidateTimer(stepId, 0L, deadline)
+      throw new WorkflowSuspendedException
+    }
+
+    val rawExisting = execution.lookupStep(stepId, 0L)
+    val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
-      case None => evaluate()
+      case None =>
+        if (rawExisting.exists(_.expiresAt.exists(!_.isAfter(now)))) retireAndSuspend()
+        else evaluate()
       case Some(row) =>
         val stored = parseFingerprints(row.inputFingerprints)
         for (input <- ensureUnchanged) {
@@ -406,9 +415,7 @@ object Step {
         }
         val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
         if (shouldReevaluate) {
-          execution.deleteStep(stepId, 0L)
-          execution.deleteTimerSubscriptions(stepId, 0L)
-          evaluate()
+          retireAndSuspend()
         } else {
           row.stateKind match {
             case "succeeded" => ()

@@ -177,8 +177,16 @@ private[atomicflow] trait WorkflowExecution {
       expiresAt: Option[Instant]
   ): Unit
 
-  /** Delete this await-site's timer subscriptions, fenced. Used to retire an
-    * invalidated timer before re-registering a fresh incarnation.
+  /** Retire an invalidated/expired timer await atomically, fenced: discard the
+    * site's `succeeded` step row, delete its old timer subscriptions, and
+    * register a fresh subscription (new id, `deadline`) — all in one
+    * transaction, so no crash window can leave the old incarnation live. The
+    * fresh deadline is recomputed (`now + delay`), so its old `TimerFired`
+    * event is structurally inert.
     */
-  def deleteTimerSubscriptions(stepId: StepId, stepVersion: Long): Unit
+  def invalidateTimer(
+      stepId: StepId,
+      stepVersion: Long,
+      deadline: java.time.Instant
+  ): Unit
 }

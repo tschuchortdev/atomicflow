@@ -101,7 +101,8 @@ CREATE TABLE workflow_timer_subscriptions (
   deadline TIMESTAMPTZ NOT NULL,
   FOREIGN KEY (workflow_id, key, scope)
     REFERENCES workflow_instances (workflow_id, key, scope)
-    ON DELETE CASCADE
+    ON DELETE CASCADE,
+  UNIQUE (workflow_id, key, scope, step_id, step_version, leaf_idx)
 );
 
 CREATE INDEX workflow_timer_subscriptions_deadline

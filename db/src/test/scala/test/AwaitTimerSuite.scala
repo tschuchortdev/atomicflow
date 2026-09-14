@@ -189,4 +189,34 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(timerFiredCount(sub2), 0, "the new subscription has no event of its own")
     assertEquals(timerFiredCount(sub1), 1, "the old event remains but is not reused")
   }
+
+  test("invalidateAfter expiry re-registers a fresh subscription with a recomputed deadline; the old TimerFired is inert") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    given Clock = clock
+    val wf = Workflow[String, String](id = "timer-ttl") { in =>
+      Step.await[Unit]("t", Awaitable.Timer(1.minute), invalidateAfter = 10.seconds)
+      TestControlFlow.suspend()
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val (sub1, _) = timerSubscriptions(wf.id, "k").head
+
+    clock.advanceBy(2.minutes)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(timerFiredCount(sub1), 1, "the old timer fired and resolved before the TTL expired")
+    assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "resolution retired sub1")
+
+    clock.advanceBy(20.seconds)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val subs = timerSubscriptions(wf.id, "k")
+    assertEquals(subs.length, 1)
+    val (sub2, d2) = subs.head
+    assertNotEquals(sub2, sub1, "a fresh subscription is minted after the TTL expires")
+    assertEquals(d2, Instant.parse("2026-01-02T00:03:20Z"), "the deadline recomputes to now + delay")
+    assertEquals(timerFiredCount(sub2), 0, "the fresh subscription has no event of its own")
+    assertEquals(timerFiredCount(sub1), 1, "the old event remains but is inert")
+  }
 }

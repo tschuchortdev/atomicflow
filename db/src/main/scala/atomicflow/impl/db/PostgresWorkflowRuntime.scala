@@ -882,14 +882,23 @@ class PostgresWorkflowRuntime private[atomicflow] (
               sql"""INSERT INTO workflow_timer_subscriptions
                       (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
                     VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, 0, $deadline)
-                    ON CONFLICT (subscription_id) DO NOTHING""".update.run.map(_ => ())
+                    ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run.map(_ => ())
           }
         } yield ()
       }
 
-    override def deleteTimerSubscriptions(stepId: StepId, stepVersion: Long): Unit =
+    override def invalidateTimer(stepId: StepId, stepVersion: Long, deadline: java.time.Instant): Unit =
       fenced {
-        deleteTimerSubscriptionsIO(stepId, stepVersion)
+        for {
+          _ <- sql"""DELETE FROM workflow_steps
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                       AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
+          _ <- deleteTimerSubscriptionsIO(stepId, stepVersion)
+          _ <- sql"""INSERT INTO workflow_timer_subscriptions
+                      (subscription_id, workflow_id, key, scope, step_id, step_version, leaf_idx, deadline)
+                    VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, 0, $deadline)
+                    ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx) DO NOTHING""".update.run
+        } yield ()
       }
 
     private def deleteTimerSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
