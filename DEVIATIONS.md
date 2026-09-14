@@ -49,3 +49,10 @@ implementation phase.
    when the union codec is constructed. This is safe (fail-fast on first use)
    and much simpler than compile-time reflection over `Class` relationships,
    which Scala 3 cannot express.
+9. **`WorkflowNonFatal` matches `InterruptedException`** (unlike
+   `scala.util.control.NonFatal`). Interrupts carry no workflow semantics
+   ("Thread.interrupt plays no role", `running-workflows.md`), so user cleanup
+   code may handle them; the extractor only excludes fatal JVM errors and
+   `ControlThrowable` (which covers all library control-flow exceptions).
+   This gives broad catches one place to re-express "everything except library
+   control flow".
