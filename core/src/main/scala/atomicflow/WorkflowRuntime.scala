@@ -64,6 +64,24 @@ trait WorkflowRuntime {
   @throws[WorkflowNotFoundException]
   def cancel(instanceId: WorkflowInstanceId): Unit
 
+  /** Force-stop an instance. In one transaction: a guarded terminal transition to
+    * `TERMINATED` (appending the `WorkflowCompleted` event with a `Terminated`
+    * outcome), a lease revocation (fencing-token bump plus clearing the lease
+    * owner/expiry, fencing out any running orphan), and terminal cleanup of this
+    * instance's wakeup and subscription rows. The instance is never scheduled
+    * again, no resume is scheduled, and no [[WorkflowCancelledException]] is
+    * delivered — the body gets no chance to run.
+    *
+    * JVM limitation: `terminate` guarantees the instance is durably stopped and
+    * lease-revoked; an orphan thread already executing a Step cannot be forcibly
+    * stopped and may run until its next checkpoint or the process ends.
+    *
+    * A missing instance throws [[WorkflowNotFoundException]]; an already-terminal
+    * instance is a no-op.
+    */
+  @throws[WorkflowNotFoundException]
+  def terminate(instanceId: WorkflowInstanceId): Unit
+
   /** Execute a created instance on the caller thread. */
   @throws[WorkflowNotFoundException]
   def runWorkflowInstance[In, Out](

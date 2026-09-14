@@ -159,6 +159,24 @@ object Workflow {
     */
   def versionAtCreation(using ctx: WorkflowContext): Long = ctx.versionAtCreation
 
+  /** A lexical region inside which cancellation delivery is suppressed: while
+    * `f` runs, checkpoints do not throw [[WorkflowCancelledException]], so Step
+    * bodies execute and awaits resolve normally. This is the mechanism for
+    * durable compensation (the Saga pattern) and for finishing a unit of work
+    * before stopping.
+    *
+    * The region is lexical and re-entrant. It does not clear `cancel_requested_at`;
+    * after it exits, the next new-work checkpoint throws again. Heartbeats are
+    * not suppressed inside it. It is per-execution transient state, so replay
+    * re-enters the region as ordinary user code and already-completed
+    * compensation Steps are returned from the cache.
+    */
+  def uncancellable[R](f: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
+    ctx.execution.enterUncancellable()
+    try f(using ctx)
+    finally ctx.execution.exitUncancellable()
+  }
+
   def apply[In: Cacheable, Out: Cacheable](
       id: WorkflowId,
       version: Long = 1L,

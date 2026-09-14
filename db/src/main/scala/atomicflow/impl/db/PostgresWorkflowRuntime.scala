@@ -76,8 +76,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Poll cadence of the passive `awaitResult` waiter. */
   private val AwaitResultPollIntervalMillis: Long = 50L
 
-  private def runSync[A](fa: ConnectionIO[A]): A =
+  private def clearInterrupt(): Unit = Thread.interrupted()
+
+  private def runSync[A](fa: ConnectionIO[A]): A = {
+    clearInterrupt()
     fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
+  }
 
   private def workerId: String = s"$processUuid:${Thread.currentThread().getId}"
 
@@ -250,9 +254,74 @@ class PostgresWorkflowRuntime private[atomicflow] (
         for {
           _ <- appendCompletedEvent(workflowId, key, scope, payload)
           _ <- wakeCompletionSubscribers(workflowId, key, scope)
+          _ <- terminalCleanupIO(workflowId, key, scope)
         } yield ()
       else ().pure[ConnectionIO]
     } yield ()
+  }
+
+  /** Terminal cleanup of an instance's own scheduling and subscription rows:
+    * its wakeup row and its signal/timer/completion subscriptions. Called inside
+    * the terminal-transition transaction of every terminal state, so a terminal
+    * instance never remains scheduled or subscribed.
+    */
+  private def terminalCleanupIO(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Unit] =
+    for {
+      _ <- sql"""DELETE FROM workflow_wakeups
+                 WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+      _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                 WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+      _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                 WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+      _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                 WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+    } yield ()
+
+  /** Force-stop an instance. In one transaction, row-locking the instance: a
+    * missing instance throws [[WorkflowNotFoundException]], an already-terminal
+    * one is a no-op. Otherwise a guarded terminal transition to `TERMINATED`
+    * (appending the `WorkflowCompleted(Terminated)` event and waking completion
+    * subscribers), a lease revocation (fencing-token bump and clearing the lease
+    * owner/expiry, fencing out any running orphan), and terminal cleanup of the
+    * instance's wakeup and subscription rows. No user code runs and nothing is
+    * scheduled again.
+    */
+  override def terminate(instanceId: WorkflowInstanceId): Unit = {
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
+    val payload = Framing.write("terminated")
+    runSync {
+      for {
+        terminal <- sql"""SELECT terminal_state FROM workflow_instances
+                          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                          FOR UPDATE""".query[Option[String]].option
+        _ <- terminal match {
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+          case Some(Some(_)) =>
+            ().pure[ConnectionIO]
+          case Some(None) =>
+            for {
+              _ <- sql"""UPDATE workflow_instances
+                         SET terminal_state = 'terminated', terminal_outcome = $payload,
+                             is_accepting_signals = false,
+                             lease_owner = NULL, lease_expires_at = NULL,
+                             fencing_token = fencing_token + 1
+                         WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                           AND terminal_state IS NULL""".update.run
+              _ <- appendCompletedEvent(workflowId, key, scope, payload)
+              _ <- wakeCompletionSubscribers(workflowId, key, scope)
+              _ <- terminalCleanupIO(workflowId, key, scope)
+            } yield ()
+        }
+      } yield ()
+    }
+    ()
   }
 
   override def runWorkflowInstance[In, Out](
@@ -263,6 +332,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
     val outCacheable = workflow.outputCacheable
+
+    clearInterrupt()
 
     given Cacheable[Out] = outCacheable
     val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
@@ -462,6 +533,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                          AND event_kind = 'Signal'""".update.run
             _ <- appendCompletedEvent(workflowId, key, scope, payload)
             _ <- wakeCompletionSubscribers(workflowId, key, scope)
+            _ <- terminalCleanupIO(workflowId, key, scope)
           } yield ()
         else ().pure[ConnectionIO]
       } yield updated
@@ -906,6 +978,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     private val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
 
+    private var uncancellableDepth: Int = 0
+
+    private def inUncancellableRegion: Boolean = uncancellableDepth > 0
+
+    private[atomicflow] override def enterUncancellable(): Unit = uncancellableDepth += 1
+
+    private[atomicflow] override def exitUncancellable(): Unit = uncancellableDepth -= 1
+
     override def currentScope: String = ""
 
     override def now: java.time.Instant = theClock.instant()
@@ -926,13 +1006,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
     override def checkCancellation(): Unit = {
-      val requestedAt = runSync {
-        sql"""SELECT cancel_requested_at FROM workflow_instances
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[
-            Option[java.time.Instant]
-          ].unique
+      if (!inUncancellableRegion) {
+        val requestedAt = runSync {
+          sql"""SELECT cancel_requested_at FROM workflow_instances
+                WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[
+              Option[java.time.Instant]
+            ].unique
+        }
+        if (requestedAt.isDefined) throw WorkflowCancelledException()
       }
-      if (requestedAt.isDefined) throw WorkflowCancelledException()
     }
 
     override def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =

@@ -126,12 +126,23 @@ private[atomicflow] trait WorkflowExecution {
   def renewLease(): Unit
 
   /** A cancellation checkpoint: re-reads the durable `cancel_requested_at` flag
-    * and throws [[atomicflow.WorkflowCancelledException]] when set. Called right
-    * before any new work (a Step body about to execute, or an await about to be
-    * evaluated); cached replays never call it, so they never deliver. A later
-    * task extends it with the `uncancellable` region flag.
+    * and throws [[atomicflow.WorkflowCancelledException]] when set, unless the
+    * execution is inside a [[atomicflow.Workflow.uncancellable]] region. Called
+    * right before any new work (a Step body about to execute, or an await about
+    * to be evaluated); cached replays never call it, so they never deliver.
     */
   def checkCancellation(): Unit
+
+  /** Enters a `Workflow.uncancellable` region: increments a per-run transient
+    * counter so `checkCancellation` suppresses delivery while it is non-zero.
+    * Not durable; replay re-enters the region as ordinary user code.
+    */
+  private[atomicflow] def enterUncancellable(): Unit
+
+  /** Leaves a `Workflow.uncancellable` region, decrementing the per-run counter.
+    * Must balance every [[enterUncancellable]] (paired in a `try/finally`).
+    */
+  private[atomicflow] def exitUncancellable(): Unit
 
   /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
     * Reports the stored row even if it has expired.
