@@ -1,7 +1,7 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.WorkflowExecution
+import atomicflow.internal.{StoredStep, WorkflowExecution}
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -170,7 +170,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       if (bumped != 1) throw LeaseLostException(instanceId)
 
       val input = workflow.inputCacheable.read(inputSerialized)
-      val execution = new PostgresExecution(worker, token)
+      val execution = new PostgresExecution(worker, token, workflowId, key, scope)
       val ctxInstanceId = instanceId
       val ctxVersionAtCreation = versionAtCreation
       val ctxRuntime: WorkflowRuntime = this
@@ -191,6 +191,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       } catch {
         case _: WorkflowSuspendedException =>
           suspended = true
+        case _: LeaseLostException => throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
         case WorkflowNonFatal(t) =>
           val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
           val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
@@ -393,7 +394,117 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  private final class PostgresExecution(val workerId: String, val fencingToken: Long) extends WorkflowExecution
+  private[atomicflow] override def readStep(
+      instanceId: WorkflowInstanceId,
+      stepId: StepId,
+      stepVersion: Long
+  ): Option[StoredStep] =
+    readStepRow(instanceId.workflowId, instanceId.workflowInstanceKey, instanceId.scope, stepId.key, stepVersion)
+
+  private def readStepRow(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      stepId: String,
+      stepVersion: Long
+  ): Option[StoredStep] =
+    runSync {
+      sql"""SELECT state_kind, state_payload, input_fingerprints, expires_at FROM workflow_steps
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope AND step_id = $stepId AND step_version = $stepVersion""".query[
+          (String, String, String, Option[java.time.Instant])
+        ].option
+    }.map { case (kind, payload, fingerprints, expiresAt) =>
+      StoredStep(kind, payload, fingerprints, expiresAt)
+    }
+
+  private final class PostgresExecution(
+      val workerId: String,
+      val fencingToken: Long,
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      instanceScope: String
+  ) extends WorkflowExecution {
+
+    private val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
+
+    override def currentScope: String = ""
+
+    override def now: java.time.Instant = clock.instant()
+
+    override def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =
+      readStepRow(workflowId, key, instanceScope, stepId.key, stepVersion)
+
+    override def writeStepStarted(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String
+    ): Unit =
+      fenced {
+        val now = clock.instant()
+        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+              VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'started', '', $inputFingerprints, NULL, $now, $now)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
+              SET state_kind = 'started', state_payload = '', input_fingerprints = EXCLUDED.input_fingerprints, expires_at = NULL, updated_at = $now""".update.run
+      }
+
+    override def writeStepSucceeded(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        val now = clock.instant()
+        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+              VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
+              SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run
+      }
+
+    override def writeStepFailed(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        val now = clock.instant()
+        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+              VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, $stepVersion, $stepKind, 'failed', $payload, $inputFingerprints, $expiresAt, $now, $now)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version) DO UPDATE
+              SET state_kind = 'failed', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run
+      }
+
+    override def deleteStep(stepId: StepId, stepVersion: Long): Unit =
+      fenced {
+        sql"""DELETE FROM workflow_steps
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_version = $stepVersion""".update.run
+      }
+
+    /** Runs `write` inside one transaction, guarded by an exclusive lock on the
+      * instance row and a fencing check; throws [[LeaseLostException]] if the
+      * lease no longer belongs to this run, affecting no rows.
+      */
+    private def fenced[A](write: ConnectionIO[A]): Unit = {
+      val ok = runSync {
+        for {
+          _ <- sql"""SELECT 1 FROM workflow_instances
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     FOR UPDATE""".query[Int].unique
+          fenceOk <- sql"""SELECT 1 FROM workflow_instances
+                           WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                             AND lease_owner = $workerId AND fencing_token = $fencingToken""".query[Int].option
+          _ <- if (fenceOk.isDefined) write else ().pure[ConnectionIO]
+        } yield fenceOk.isDefined
+      }
+      if (!ok) throw LeaseLostException(instanceId)
+    }
+  }
 
   private[atomicflow] override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
     val now = clock.instant()

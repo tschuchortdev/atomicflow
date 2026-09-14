@@ -59,6 +59,12 @@ object LeaseLostException {
     new LeaseLostException(s"Workflow instance execution lease was lost: $instanceId")
 }
 
+/** Thrown by a step replay when a value pinned with `ensureUnchanged` changed
+  * between runs. The workflow is blocked and requires manual intervention; the
+  * step body is not re-executed.
+  */
+class StepInputConflictException(message: String) extends RuntimeException(message)
+
 /** Thrown when a stored terminal outcome cannot be decoded with the configured
   * codecs (mirrors `StepSerializationFailed` for step payloads). A deterministic
   * runtime-owned failure surfaced instead of recursing into a broken codec.

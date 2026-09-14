@@ -42,6 +42,15 @@ trait WorkflowRuntime {
     */
   private[atomicflow] def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
+  /** Read a step's durable facts without acquiring a lease or fence (a pure
+    * lookup of durable state, used by `Step.getExecutionState`).
+    */
+  private[atomicflow] def readStep(
+      instanceId: WorkflowInstanceId,
+      stepId: StepId,
+      stepVersion: Long
+  ): Option[atomicflow.internal.StoredStep]
+
   /** Register and schedule the instance's first wakeup (due immediately). */
   final def createAndSchedule[In, Out](
       workflow: Workflow[In, Out],
