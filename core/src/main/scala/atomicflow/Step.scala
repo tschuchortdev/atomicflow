@@ -7,10 +7,10 @@ import scala.concurrent.duration.*
 
 /** The public step API: durable, replayed operations with per-key cache-drift
   * policies (see `spec/steps.md`).
-  *
-  * `atMostOnce` and the built-in retry policies arrive in later tasks.
   */
 object Step {
+
+  private enum Guarantee { case AtLeastOnce, AtMostOnce }
 
   /** An at-least-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record causes
@@ -42,7 +42,49 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
-  )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
+  )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
+    runStep(Guarantee.AtLeastOnce, key, version, "AtLeastOnce", ensureUnchanged, invalidateOn, invalidateAfter)(body).get
+
+  /** An at-most-once step: the body executes, its result is persisted after
+    * completion, and on replay an unresolved `Started` record yields `None`
+    * without re-executing (a lost effect is assumed over a double execution).
+    *
+    * `ensureUnchanged`, `invalidateOn`, and `invalidateAfter` behave exactly as
+    * in [[atLeastOnce]]. There is deliberately no `version` parameter: a new
+    * version could execute after the old operation possibly produced its
+    * effect, so a genuinely new operation uses a new step id instead.
+    *
+    * @param key
+    *   the step's stable identity within the workflow
+    * @param ensureUnchanged
+    *   named inputs that must be invariant between runs
+    * @param invalidateOn
+    *   named inputs that invalidate the cached result when they change
+    * @param invalidateAfter
+    *   TTL after which the cached result expires; `Duration.Inf` disables it
+    */
+  def atMostOnce[A: Cacheable](
+      key: String,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+      invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      invalidateAfter: Duration = Duration.Inf
+  )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
+    runStep(Guarantee.AtMostOnce, key, 0L, "AtMostOnce", ensureUnchanged, invalidateOn, invalidateAfter)(body)
+
+  /** The shared machinery for both execution guarantees. Both persist a
+    * `Started` record before the body executes and replace it with a durable
+    * outcome; the guarantees differ only in how an unresolved `Started` record
+    * is replayed (at-least-once re-executes, at-most-once returns `None`).
+    */
+  private def runStep[A: Cacheable](
+      guarantee: Guarantee,
+      key: String,
+      stepVersion: Long,
+      stepKind: String,
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateOn: Seq[StepInput[?]],
+      invalidateAfter: Duration
+  )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
     val execution = ctx.execution
     val stepId = StepId(key, execution.currentScope)
     val valueCodec = summon[Cacheable[A]]
@@ -60,7 +102,7 @@ object Step {
       }
 
     def execute(): A = {
-      execution.writeStepStarted(stepId, version, "AtLeastOnce", fingerprints)
+      execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body
         val serialized =
@@ -69,7 +111,7 @@ object Step {
         val decoded =
           try valueCodec.read(serialized)
           catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
-        execution.writeStepSucceeded(stepId, version, "AtLeastOnce", fingerprints, serialized, expiresAt)
+        execution.writeStepSucceeded(stepId, stepVersion, stepKind, fingerprints, serialized, expiresAt)
         decoded
       } catch {
         case t if isNonCacheable(t) => throw t
@@ -89,24 +131,24 @@ object Step {
               val decoded =
                 try throwableCodec.read(serialized)
                 catch { case _: Throwable => new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
-              execution.writeStepFailed(stepId, version, "AtLeastOnce", fingerprints, serialized, expiresAt)
+              execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, serialized, expiresAt)
               decoded
             case Left(ssf) =>
               val persisted =
                 try throwableCodec.write(ssf)
                 catch { case _: Throwable => throw t }
-              execution.writeStepFailed(stepId, version, "AtLeastOnce", fingerprints, persisted, expiresAt)
+              execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, persisted, expiresAt)
               ssf
           }
           throw failure
       }
     }
 
-    val existing = execution.lookupStep(stepId, version).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    val existing = execution.lookupStep(stepId, stepVersion).filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
       case None =>
-        execute()
+        Some(execute())
 
       case Some(row) =>
         val stored = parseFingerprints(row.inputFingerprints)
@@ -119,17 +161,21 @@ object Step {
         val shouldReexecute = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
 
         if (shouldReexecute) {
-          execution.deleteStep(stepId, version)
-          execute()
+          execution.deleteStep(stepId, stepVersion)
+          Some(execute())
         } else {
           row.stateKind match {
             case "succeeded" =>
-              try valueCodec.read(row.statePayload)
+              try Some(valueCodec.read(row.statePayload))
               catch {
                 case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded")
               }
             case "failed" => throw decodeFailure(row.statePayload)
-            case _        => execute()
+            case _ =>
+              guarantee match {
+                case Guarantee.AtLeastOnce => Some(execute())
+                case Guarantee.AtMostOnce  => None
+              }
           }
         }
     }
