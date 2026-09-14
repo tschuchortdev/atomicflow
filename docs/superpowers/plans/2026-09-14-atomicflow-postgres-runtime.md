@@ -411,7 +411,83 @@ trait WorkflowRuntime:
 - WorkflowCancelledException is a plain public RuntimeException; `scala.util.control.NonFatal` catches it (unit assert); the run boundary converts an escaping one to WorkflowCancelled.
 - The run boundary on LeaseLost during cancellation delivery: propagates LeaseLost (not WorkflowCancelled) — the new owner delivers.
 
-## Phases 5–9 (expanded at phase boundaries)
+## Phase 5 — Job runner
+
+Implements `spec/running-workflows.md` "Job runner and scheduling" (COMPLETE section is
+NORMATIVE: the driver loop pseudocode, claim query with fairness + registry filter +
+`FOR UPDATE SKIP LOCKED`, outcome classification by durable state, sweeps, requeue, caps,
+lifecycle rules, `JobRunnerSettings` incl. `forTests`).
+
+### Task 5.1: JobRunnerSettings, startJobRunner, claim + dispatch loop
+
+**Files:**
+- Create: `core/src/main/scala/atomicflow/JobRunnerSettings.scala`, `core/src/main/scala/atomicflow/JobRunner.scala` (trait + lifecycle), `db/src/main/scala/atomicflow/impl/db/PostgresJobRunner.scala`
+- Modify: `core/.../WorkflowRuntime.scala` (`startJobRunner`), runtime internals
+- Test: `db/src/test/scala/test/JobRunnerSuite.scala`
+
+**Interfaces (defaults pinned):**
+```scala
+case class JobRunnerSettings(
+  workerThreads: Int = 8,                       // runtime-owned daemon pool; ignored when executor is set
+  executor: Option[Executor] = None,
+  maxConcurrentInstances: WorkflowId => Int = _ => Int.MaxValue,
+  capacityRetryDelay: FiniteDuration = 1.second,
+  perWorkflowBatchShare: Int = 8,
+  pollInterval: FiniteDuration = 250.millis,
+  wakeupBatchSize: Int = 32,
+  timerSweepInterval: FiniteDuration = 250.millis,
+  timerBatchSize: Int = 128,
+  sweepInterval: FiniteDuration = 1.second,
+  leaseDuration: FiniteDuration = 5.minutes,
+  leaseAcquireTimeout: FiniteDuration = 30.seconds,
+  cancelTimeout: FiniteDuration = 5.minutes,
+)
+object JobRunnerSettings { def forTests: JobRunnerSettings /* tiny intervals, 1 worker, short lease/cancel timeouts */ }
+
+trait JobRunner { def stop(gracePeriod: FiniteDuration): Unit }
+trait WorkflowRuntime { def startJobRunner(definitions: Seq[Workflow[?, ?]], settings: JobRunnerSettings = JobRunnerSettings.default): JobRunner }
+```
+Package-private test hook: `JobRunner.runDriverCycle(): Unit` (one driver-loop iteration: sweeps + claim + dispatch — for stepping deterministically).
+
+**Behavior (tests):**
+- `startJobRunner` constructs AND starts; duplicate start while active throws; after `stop` (idempotent), start works again.
+- Registry validated once at start (duplicate workflowId → error); immutable.
+- Claim query: `workflow_id IN (registry)` filter (unknown workflow's wakeup invisible), per-workflow `perWorkflowBatchShare` fairness (ROW_NUMBER partition), `scheduled_at <= now`, `FOR UPDATE OF wakeup SKIP LOCKED`, ordered by scheduledAt, LIMIT batch.
+- Claim is atomic with lease acquisition: wakeup deleted only when the lease was obtained (delete matches seen scheduled_at); lease conflict → row stays.
+- Executor resolves the definition from the registry by workflowId, decodes input, runs via the SAME code path as the public run API (re-use the engine; pass the runner's leaseDuration/leaseAcquireTimeout).
+- Suspension drains: on suspension, if a wakeup row exists again → loop again immediately.
+- Terminal outcome: done; FAILED outcomes logged, never rescheduled.
+- Runner mode end-to-end: `createAndSchedule` + started runner → instance completes autonomously (awaitResult); signal sent while runner runs → resumes and completes.
+- `runDriverCycle` package-private hook works for deterministic stepping.
+- stop(gracePeriod): stops claiming, waits for in-flight runs.
+
+### Task 5.2: Background sweeps (timer firing, cancellation escalation, lease recovery)
+
+**Files:**
+- Modify: `db/.../PostgresJobRunner.scala` + runtime internals
+- Test: `db/src/test/scala/test/SweepsSuite.scala`
+
+**Behavior (tests, per "Background sweeps" table):**
+- Timer sweep: due, not-yet-fired subscriptions (batched, deadline order) → fire (the two-paths-one-primitive operation) + upsert owner wakeups; idempotent across passes; unattended instances progress with no runner-side run (manual run also works — Phase 3 already covered inline firing).
+- Cancellation escalation sweep: `cancel_requested_at <= now - cancelTimeout` AND no terminal → guarded TERMINATED transition (same as terminate's); bounded batch.
+- Lease recovery sweep: `lease_owner IS NOT NULL AND lease_expires_at <= now AND terminal_state IS NULL` → clear lease_owner + upsert wakeup.
+- All sweeps leaderless/idempotent (run twice → same state), definition-agnostic (service other applications' workflows in shared tables), bounded batches.
+
+### Task 5.3: Transient-failure requeue, caps, lifecycle polish
+
+**Files:**
+- Modify: `db/.../PostgresJobRunner.scala`
+- Test: extend `db/src/test/scala/test/JobRunnerSuite.scala`
+
+**Behavior (tests):**
+- Requeue: claimed run aborts with a transient failure (simulate via package-private fault injection or by directly exercising the requeue op) → `created_at` unchanged, `scheduled_at = GREATEST(existing, now + backoff(attempts))`, `attempts + 1`; capped exponential backoff, unbounded retries.
+- Outcome classification by durable state, not exception type (terminal_state set → done incl. FAILED; lease lost → new owner responsible; only otherwise transient).
+- Caps: per-workflow in-process permit count; at capacity → in-place defer (`scheduled_at = now + capacityRetryDelay`, no lease taken) — a hot workflow neither starves the batch nor pins a worker.
+- Fairness observable: a burst from one workflow cannot monopolize the batch (two workflows, N wakeups each, share honored).
+- `capacityRetryDelay` from settings; caller-thread run bypasses caps.
+- Executor override honored (user-supplied `Executor` used instead of the daemon pool).
+
+## Phases 6–9 (expanded at phase boundaries)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
