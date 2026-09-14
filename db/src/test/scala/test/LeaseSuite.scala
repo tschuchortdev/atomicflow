@@ -97,22 +97,25 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
 
   test("automatic heartbeat: a later step's checkpoint renews a lease that would otherwise be expired") {
     val rt = newRuntime(Clock.systemUTC(), leaseDuration = 250.millis)
-    var observedExpiry: Option[Instant] = None
+    var before: Option[Instant] = None
+    var after: Option[Instant] = None
     val wf = Workflow[String, String](id = "auto") { in =>
       Step.atLeastOnce[String]("s1") {
+        before = Some(leaseExpiry("auto", "k").get)
         Thread.sleep(600)
         "a"
       }
       Step.atLeastOnce[String]("s2") {
-        observedExpiry = Some(leaseExpiry("auto", "k").get)
+        after = Some(leaseExpiry("auto", "k").get)
         "b"
       }
     }
 
     assertEquals(rt.createAndRun(wf, "k", "x"), WorkflowRunResult.Result("b"))
+    assert(before.isDefined && after.isDefined, s"the lease must be held at each step start: before=$before after=$after")
     assert(
-      observedExpiry.exists(_.isAfter(Instant.now())),
-      s"the second step's checkpoint must renew the lease, got $observedExpiry"
+      after.get.isAfter(before.get),
+      s"the second step's checkpoint must renew the lease beyond the initial expiry: before=$before after=$after"
     )
   }
 
