@@ -91,6 +91,26 @@ final class Workflow[In, Out] private[atomicflow] (
 }
 
 object Workflow {
+  /** Renews the execution lease of the instance executing on the current thread,
+    * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
+    * runtime calls this automatically at every checkpoint; call it explicitly
+    * inside long-running Step bodies, between checkpoints.
+    *
+    * Not a cancellation checkpoint, and available only inside an executing
+    * workflow (the `(using WorkflowContext)` requirement makes external or
+    * off-thread calls unrepresentable).
+    *
+    * @throws LeaseLostException when the lease was taken over or the instance is terminal
+    */
+  def heartbeat()(using ctx: WorkflowContext): Unit =
+    ctx.execution.renewLease()
+
+  /** The `Workflow.version` recorded when the instance was created. The current
+    * body may branch on it internally to adapt to the definition version that
+    * created the instance.
+    */
+  def versionAtCreation(using ctx: WorkflowContext): Long = ctx.versionAtCreation
+
   def apply[In: Cacheable, Out: Cacheable](
       id: WorkflowId,
       version: Long = 1L,

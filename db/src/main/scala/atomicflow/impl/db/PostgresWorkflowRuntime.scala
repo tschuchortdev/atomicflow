@@ -431,6 +431,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     override def now: java.time.Instant = clock.instant()
 
+    override def renewLease(): Unit = {
+      val now = clock.instant()
+      val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
+      val updated = runSync {
+        sql"""UPDATE workflow_instances
+              SET lease_expires_at = $expires
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                AND lease_owner = $workerId AND fencing_token = $fencingToken
+                AND terminal_state IS NULL""".update.run
+      }
+      if (updated != 1) throw LeaseLostException(instanceId)
+    }
+
     override def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =
       readStepRow(workflowId, key, instanceScope, stepId.key, stepVersion)
 

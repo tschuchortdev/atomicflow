@@ -102,6 +102,7 @@ object Step {
       }
 
     def execute(): A = {
+      execution.renewLease()
       execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body

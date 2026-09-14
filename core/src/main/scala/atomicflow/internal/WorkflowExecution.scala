@@ -42,6 +42,13 @@ private[atomicflow] trait WorkflowExecution {
   /** The runtime's notion of the current instant, from the injected clock. */
   def now: Instant
 
+  /** Renews the execution lease of this run, extending `lease_expires_at` by the
+    * runtime's `leaseDuration`. A fenced write that does not bump the fencing
+    * token; throws [[atomicflow.LeaseLostException]] if the lease no longer
+    * belongs to this run.
+    */
+  def renewLease(): Unit
+
   /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
     * Reports the stored row even if it has expired.
     */
