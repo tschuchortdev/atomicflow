@@ -36,6 +36,31 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
         ].option
     )
 
+  private def instanceRow(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey
+  ): Option[(Option[String], Option[String], Long)] =
+    run(
+      sql"""SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+          (Option[String], Option[String], Long)
+        ].option
+    )
+
+  private final class EncoderBombException(msg: String) extends RuntimeException(msg)
+
+  private def refusingThrowableCodec: Cacheable[Throwable] = {
+    val base = Cacheable.forThrowable.genericStringMessageSerializer
+    new Cacheable[Throwable] {
+      override def stableSerializedTypeId: String = "test-refusing"
+      override def write(t: Throwable): String = t match {
+        case _: EncoderBombException => throw new RuntimeException("refusing to encode")
+        case _                       => base.write(t)
+      }
+      override def read(s: String): Throwable = base.read(s)
+    }
+  }
+
   test("body executes once; re-run of a completed workflow returns the cached value without re-executing") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
@@ -242,6 +267,8 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     intercept[LeaseLostException] {
       rt.createAndRun(wf, "k", "a")
     }
+    val row = instanceRow(wf.id, "k").get
+    assertEquals(row._1, None, "the run must not become terminal after lease loss")
   }
 
   test("ensureUnchanged: same inputs hit the cache; a changed input raises StepInputConflictException") {
@@ -340,5 +367,108 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.createAndRun(wf, "k2", "a")
     assertEquals(counter.get(), 2, "a different instance re-executes")
+  }
+
+  test("getExecutionState decodes a Failed row with the contextual throwable codec") {
+    val rt = newRuntime
+    given Cacheable[Throwable] = Cacheable.forThrowable.javaSerializable
+    var state: StepExecutionState[String] = null
+    val wf = Workflow[String, String](id = "state-codec") { in =>
+      try {
+        Step.atLeastOnce[String]("step") {
+          throw new RuntimeException("boom")
+        }
+      } catch {
+        case _: Throwable => ()
+      }
+      state = Step.getExecutionState[String]("step", stepVersion = 1)
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+
+    rt.createAndRun(wf, "k", "a")
+    state match {
+      case StepExecutionState.Failed(f) => assert(f.getMessage.contains("boom"))
+      case other                       => fail(s"expected Failed, got $other")
+    }
+  }
+
+  test("a changed ensureUnchanged input against a Started row raises StepInputConflictException") {
+    val rt = newRuntime
+    var date = "2024-01-01"
+    var conflict: Option[String] = None
+    val wf = Workflow[String, String](id = "started-conflict") { in =>
+      try {
+        Step.atLeastOnce[String]("step", ensureUnchanged = Seq("date" -> date)) {
+          TestControlFlow.suspend()
+          "never"
+        }
+      } catch {
+        case e: StepInputConflictException => conflict = Some(e.getMessage)
+      }
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+
+    rt.createAndRun(wf, "k", "a")
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("started"))
+
+    date = "2024-02-01"
+    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assert(conflict.isDefined, "a changed ensureUnchanged input must conflict even against a Started row")
+  }
+
+  test("when the throwable codec cannot encode a failure, a StepSerializationFailed is persisted and replayed") {
+    val rt = newRuntime
+    given Cacheable[Throwable] = refusingThrowableCodec
+    val counter = new AtomicInteger(0)
+    var caught: Option[String] = None
+    val wf = Workflow[String, String](id = "enc-fail") { in =>
+      try {
+        Step.atLeastOnce[String]("step") {
+          counter.incrementAndGet()
+          throw new EncoderBombException("boom")
+        }
+      } catch {
+        case e: Throwable => caught = Some(e.getMessage)
+      }
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+
+    rt.createAndRun(wf, "k", "a")
+    assertEquals(counter.get(), 1)
+    assert(caught.get.contains("could not be encoded"), s"unexpected: $caught")
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("failed"))
+
+    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assertEquals(counter.get(), 1, "replay must not re-execute the failed step body")
+    assert(caught.get.contains("could not be encoded"), s"unexpected: $caught")
+  }
+
+  test("multi-input invalidateOn: only the changed input invalidates; colliding values under distinct names are independent") {
+    val rt = newRuntime
+    val counter = new AtomicInteger(0)
+    var a = "x"
+    var b = "x"
+    val wf = Workflow[String, String](id = "multi") { in =>
+      Step.atLeastOnce[String]("step", invalidateOn = Seq("a" -> a, "b" -> b)) {
+        counter.incrementAndGet()
+        "result"
+      }
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+
+    rt.createAndRun(wf, "k", "a")
+    assertEquals(counter.get(), 1)
+    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assertEquals(counter.get(), 1, "identical inputs hit the cache even when two names hold colliding values")
+
+    a = "y"
+    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assertEquals(counter.get(), 2, "changing only one of two inputs must re-execute")
+    rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assertEquals(counter.get(), 2, "the new result is cached")
   }
 }

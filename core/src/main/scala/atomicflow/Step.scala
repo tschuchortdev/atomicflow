@@ -74,13 +74,30 @@ object Step {
       } catch {
         case t if isNonCacheable(t) => throw t
         case t =>
-          val serialized =
-            try throwableCodec.write(t)
-            catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' failure could not be encoded") }
-          val failure =
-            try throwableCodec.read(serialized)
-            catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
-          execution.writeStepFailed(stepId, version, "AtLeastOnce", fingerprints, serialized, expiresAt)
+          val encoded =
+            try Right(throwableCodec.write(t))
+            catch {
+              case _: Throwable =>
+                Left(
+                  new StepSerializationFailed(
+                    s"Step '$key' failure could not be encoded with the configured throwable codec: ${t.getClass.getName}: ${t.getMessage}"
+                  )
+                )
+            }
+          val failure: Throwable = encoded match {
+            case Right(serialized) =>
+              val decoded =
+                try throwableCodec.read(serialized)
+                catch { case _: Throwable => new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
+              execution.writeStepFailed(stepId, version, "AtLeastOnce", fingerprints, serialized, expiresAt)
+              decoded
+            case Left(ssf) =>
+              val persisted =
+                try throwableCodec.write(ssf)
+                catch { case _: Throwable => throw t }
+              execution.writeStepFailed(stepId, version, "AtLeastOnce", fingerprints, persisted, expiresAt)
+              ssf
+          }
           throw failure
       }
     }
@@ -128,7 +145,8 @@ object Step {
     *   unversioned constructs)
     */
   def getExecutionState[A: Cacheable](key: String, stepVersion: Long = 0)(using
-      ctx: WorkflowContext
+      ctx: WorkflowContext,
+      throwableCodec: Cacheable[Throwable]
   ): StepExecutionState[A] = {
     val stepId = StepId(key, ctx.execution.currentScope)
     val valueCodec = summon[Cacheable[A]]
@@ -143,7 +161,7 @@ object Step {
             }
           case "failed" =>
             val failure =
-              try Cacheable.forThrowable.genericStringMessageSerializer.read(row.statePayload)
+              try throwableCodec.read(row.statePayload)
               catch {
                 case _: Throwable => throw new StepSerializationFailed(s"Step '$key' failure could not be decoded")
               }
