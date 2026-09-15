@@ -9,10 +9,13 @@ import atomicflow.internal.{
   AwaitRaceLeaf,
   AwaitRaceSignalLeaf,
   AwaitRaceTimerLeaf,
-  AwaitSignalCandidate
+  AwaitSignalCandidate,
+  ScopePath
 }
 
 import java.nio.charset.StandardCharsets
+import scala.annotation.experimental
+import scala.annotation.targetName
 import scala.concurrent.duration.*
 
 /** The public step API: durable, replayed operations with per-key cache-drift
@@ -551,6 +554,168 @@ object Step {
         case _: Throwable => throw new StepSerializationFailed(s"Signal '${s.key}' payload could not be decoded")
       }
     }
+
+  /** Runs several branches concurrently (via Ox `par`) and returns the result of
+    * the first branch to complete normally, without suspending. If every branch
+    * suspends, one combined [[WorkflowSuspendedException]] carrying each
+    * branch's suspension in `causes` is thrown, exactly like `Workflow.parallel`.
+    * If at least one branch completes, the first completed branch wins: its
+    * result is returned and the other branches' suspensions are DISCARDED (their
+    * pending subscriptions are cleaned up best-effort). A non-suspension failure
+    * in any branch fails the construct (propagated after the branches settle,
+    * parallel-failure semantics) and records no winner.
+    *
+    * Unlike `Workflow.parallel`, this construct is EDGE-triggered, so it persists
+    * its own step row (`FirstToRunWithoutSuspension`) recording the winning
+    * branch's index and result. On replay the first-ever-completed branch's
+    * result is returned even if later reruns would unblock a different branch
+    * first: once a winner is recorded it is never recomputed, and no branch runs
+    * again.
+    *
+    * WARNING — dangerous pitfalls: racing arbitrary code against an await depends
+    * on WHEN the code is run, and code that runs as a branch may be re-executed
+    * on replay. A `Thread.sleep` or other blocking call that completes inline
+    * will beat an await that merely suspends: the await throws
+    * [[WorkflowSuspendedException]] and is not unblocked until the whole workflow
+    * re-runs, while the blocking call finishes immediately on this run.
+    *
+    * Even when every branch suspends, the construct only behaves as expected when
+    * the workflow is re-run for each incoming event individually. If the workflow
+    * is re-run for multiple events at once (for example because of a long queue
+    * in the job runner), several branches may become unblocked in the same run
+    * and the code cannot tell which event came first: the winner is whichever the
+    * implementation observes first, NOT a spec-guaranteed order (though the
+    * recorded winner is durable first-wins).
+    *
+    * Each branch runs in its own branch-scoped identity, so two branches awaiting
+    * the same key register distinct subscriptions and a losing branch's cleanup
+    * cannot delete the winner's (or another branch's) rows.
+    *
+    * Drift policies apply exactly as for ordinary steps: `ensureUnchanged` values
+    * must be invariant between runs, and `invalidateOn` changes discard the
+    * cached winner and re-run from scratch.
+    *
+    * @param stepId
+    *   the construct's stable identity within the workflow
+    * @param invalidateOn
+    *   named inputs that invalidate the cached result when they change
+    * @param ensureUnchanged
+    *   named inputs that must be invariant between runs
+    * @param branches
+    *   the branches to race; the first to complete normally wins
+    */
+  @experimental
+  def firstToRunWithoutSuspension[R: Cacheable](
+      stepId: String,
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]]
+  )(branches: Seq[() => R])(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
+    firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
+
+  /** Vararg form of [[firstToRunWithoutSuspension]]. */
+  @targetName("firstToRunWithoutSuspensionVararg")
+  @experimental
+  def firstToRunWithoutSuspension[R: Cacheable](
+      stepId: String,
+      invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+  )(branches: (() => R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
+    firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
+
+  private def firstToRun0[R: Cacheable](
+      stepId: String,
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]],
+      branches: Vector[() => R]
+  )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R = {
+    require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepId') requires at least one branch")
+    val execution = ctx.execution
+    val stepIdv = StepId(stepId, execution.currentScope)
+    val valueCodec = summon[Cacheable[R]]
+    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val now = execution.now
+
+    def decodeWinner(payload: String): R = {
+      val nl = payload.indexOf('\n')
+      if (nl < 0) throw new StepSerializationFailed(s"Step '$stepId' stored a malformed first-to-run result")
+      val encoded = payload.substring(nl + 1)
+      try valueCodec.read(encoded)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"Step '$stepId' result could not be decoded")
+      }
+    }
+
+    def branchSegment(i: Int): String = ScopePath.escapeScopeSegment("branch" + i)
+
+    def branchPath(base: String, i: Int): String = {
+      val seg = branchSegment(i)
+      if (base.isEmpty) seg else base + "/" + seg
+    }
+
+    def evaluate(): R = {
+      execution.checkCancellation()
+      val baseScope = execution.currentScope
+      val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
+        ox.par(branches.indices.map { i =>
+          () =>
+            try Right {
+              execution.pushScope(branchSegment(i))
+              try branches(i)()
+              finally execution.popScope()
+            }
+            catch { case e: WorkflowSuspendedException => Left(e) }
+        })
+      val suspensions = outcomes.collect { case Left(s) => s }
+      if (suspensions.size == outcomes.size) {
+        throw new WorkflowSuspendedException(suspensions)
+      } else {
+        val completed = outcomes.zipWithIndex.collect { case (Right(r), i) => (i, r) }
+        val (winnerIdx, winnerResult) = completed.head
+        val serialized =
+          try valueCodec.write(winnerResult)
+          catch {
+            case _: Throwable => throw new StepSerializationFailed(s"Step '$stepId' result could not be encoded")
+          }
+        val decoded =
+          try valueCodec.read(serialized)
+          catch {
+            case _: Throwable => throw new StepSerializationFailed(s"Step '$stepId' result could not be decoded")
+          }
+        val loserPathsToClean = outcomes.zipWithIndex.collect {
+          case (Left(_), i) if i != winnerIdx => branchPath(baseScope, i)
+        }
+        execution.resolveFirstToRun(
+          stepIdv, 0L, "FirstToRunWithoutSuspension", fingerprints, loserPathsToClean, s"$winnerIdx\n$serialized", None
+        )
+        decoded
+      }
+    }
+
+    val rawExisting = execution.lookupStep(stepIdv, 0L)
+    val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None => evaluate()
+      case Some(row) =>
+        val stored = parseFingerprints(row.inputFingerprints)
+        for (input <- ensureUnchanged) {
+          if (stored.get(input.name) != Some(fingerprintOf(input)))
+            throw new StepInputConflictException(
+              s"Step '$stepId' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-execute"
+            )
+        }
+        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
+        if (shouldReevaluate) {
+          execution.deleteStep(stepIdv, 0L)
+          evaluate()
+        } else {
+          row.stateKind match {
+            case "succeeded" => decodeWinner(row.statePayload)
+            case _           => evaluate()
+          }
+        }
+    }
+  }
 
   /** The runtime-computed step machinery for a [[Awaitable.SignalEvent]].
     */

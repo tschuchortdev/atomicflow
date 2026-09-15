@@ -357,4 +357,21 @@ private[atomicflow] trait WorkflowExecution {
       leaves: Vector[AwaitRaceLeaf],
       expiresAt: Option[java.time.Instant]
   )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String]
+
+  /** Resolve a `Step.firstToRunWithoutSuspension` construct atomically, fenced:
+    * persist the `succeeded` step row (`stepKind`) recording the winner, and in
+    * the same transaction best-effort delete the pending subscriptions of every
+    * losing branch (identified by their branch scope paths), so a losing await
+    * cannot wake the workflow later. The winner's own subscriptions were already
+    * retired when its branch completed, so only the losers' rows are touched.
+    */
+  def resolveFirstToRun(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      loserScopePaths: Seq[String],
+      payload: String,
+      expiresAt: Option[java.time.Instant]
+  ): Unit
 }

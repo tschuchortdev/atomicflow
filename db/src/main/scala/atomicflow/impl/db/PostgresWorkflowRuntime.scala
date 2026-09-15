@@ -1879,6 +1879,37 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield resolved
       }
 
+    override def resolveFirstToRun(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        loserScopePaths: Seq[String],
+        payload: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        for {
+          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+          _ <- deleteBranchSubscriptionsIO(loserScopePaths)
+        } yield ()
+      }
+
+    private def deleteBranchSubscriptionsIO(loserScopePaths: Seq[String]): ConnectionIO[Unit] =
+      loserScopePaths.traverse_ { path =>
+        for {
+          _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+                       AND step_scope_path = $path""".update.run
+          _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+                       AND step_scope_path = $path""".update.run
+          _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+                       AND step_scope_path = $path""".update.run
+        } yield ()
+      }
+
     private def registerAllSubscriptionsIO(
         stepId: StepId,
         stepVersion: Long,
