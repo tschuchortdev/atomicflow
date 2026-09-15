@@ -148,6 +148,125 @@ class PostgresWorkflowRuntime private[atomicflow] (
     deleted > 0
   }
 
+  /** Reads the boundary timestamp of `stepId` on the instance: the last-updated
+    * timestamp of the step row with the highest version (used to decide which
+    * cached history is "before" vs. "after" the selected step). `None` means the
+    * step has no cached row (unknown or never executed).
+    */
+  private def readRestartBoundaryIO(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      stepId: StepId
+  ): ConnectionIO[Option[java.time.Instant]] =
+    sql"""SELECT updated_at FROM workflow_steps
+          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+            AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope}
+          ORDER BY step_version DESC
+          LIMIT 1""".query[java.time.Instant].option
+
+  override def forkWorkflow[In, Out](
+      sourceInstanceId: WorkflowInstanceId,
+      newInstanceKey: WorkflowInstanceKey,
+      restartFromStep: StepId
+  )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out] = {
+    val sourceWf = sourceInstanceId.workflowId
+    val sourceKey = sourceInstanceId.workflowInstanceKey
+    val sourceScope = sourceInstanceId.scope
+    val newWorkflowId = workflow.id
+    val newId = WorkflowInstanceId(newWorkflowId, newInstanceKey, "")
+
+    runSync {
+      for {
+        sourceInput <- sql"""SELECT input FROM workflow_instances
+                             WHERE workflow_id = $sourceWf AND key = $sourceKey AND scope = $sourceScope""".query[
+            String
+          ].option
+        _ <- sourceInput match {
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
+          case _ => ().pure[ConnectionIO]
+        }
+        boundary <- readRestartBoundaryIO(sourceWf, sourceKey, sourceScope, restartFromStep)
+        _ <- boundary match {
+          case None =>
+            throw new InvalidRestartStepException(
+              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope}' does not identify an executed step of $sourceInstanceId"
+            )
+          case _ => ().pure[ConnectionIO]
+        }
+        _ <- sql"""INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation)
+                   VALUES ($newWorkflowId, $newInstanceKey, '', $sourceInput, ${workflow.version})""".update.run
+        _ <- sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+                   SELECT $newWorkflowId, $newInstanceKey, '', step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at
+                   FROM workflow_steps
+                   WHERE workflow_id = $sourceWf AND key = $sourceKey AND scope = $sourceScope
+                     AND updated_at < $boundary""".update.run
+        _ <- upsertWakeupIO(newId.workflowId, newInstanceKey, "", theClock.instant())
+      } yield ()
+    }
+    WorkflowInstance(workflow, newId)
+  }
+
+  override def resetWorkflow[In, Out](
+      sourceInstanceId: WorkflowInstanceId,
+      restartFromStep: StepId
+  )(using workflow: Workflow[In, Out]): Unit = {
+    val wf = sourceInstanceId.workflowId
+    val key = sourceInstanceId.workflowInstanceKey
+    val scope = sourceInstanceId.scope
+    val now = theClock.instant()
+    runSync {
+      for {
+        terminal <- sql"""SELECT terminal_state FROM workflow_instances
+                          WHERE workflow_id = $wf AND key = $key AND scope = $scope
+                          FOR UPDATE""".query[Option[String]].option
+        _ <- terminal match {
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
+          case Some(Some(_)) =>
+            throw new IllegalStateException(s"Cannot reset a terminal workflow instance: $sourceInstanceId")
+          case Some(None) => ().pure[ConnectionIO]
+        }
+        boundary <- readRestartBoundaryIO(wf, key, scope, restartFromStep)
+        _ <- boundary match {
+          case None =>
+            throw new InvalidRestartStepException(
+              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope}' does not identify an executed step of $sourceInstanceId"
+            )
+          case _ => ().pure[ConnectionIO]
+        }
+        _ <- sql"""DELETE FROM workflow_signal_subscriptions s
+                   USING workflow_steps st
+                   WHERE s.workflow_id = $wf AND s.key = $key AND s.scope = $scope
+                     AND st.workflow_id = $wf AND st.key = $key AND st.scope = $scope
+                     AND st.updated_at >= $boundary
+                     AND st.step_id = s.step_id AND st.step_scope_path = s.step_scope_path AND st.step_version = s.step_version""".update.run
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions s
+                   USING workflow_steps st
+                   WHERE s.workflow_id = $wf AND s.key = $key AND s.scope = $scope
+                     AND st.workflow_id = $wf AND st.key = $key AND st.scope = $scope
+                     AND st.updated_at >= $boundary
+                     AND st.step_id = s.step_id AND st.step_scope_path = s.step_scope_path AND st.step_version = s.step_version""".update.run
+        _ <- sql"""DELETE FROM workflow_completion_subscriptions s
+                   USING workflow_steps st
+                   WHERE s.workflow_id = $wf AND s.key = $key AND s.scope = $scope
+                     AND st.workflow_id = $wf AND st.key = $key AND st.scope = $scope
+                     AND st.updated_at >= $boundary
+                     AND st.step_id = s.step_id AND st.step_scope_path = s.step_scope_path AND st.step_version = s.step_version""".update.run
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = $wf AND key = $key AND scope = $scope
+                     AND updated_at >= $boundary""".update.run
+        _ <- sql"""DELETE FROM workflow_wakeups
+                   WHERE workflow_id = $wf AND key = $key AND scope = $scope""".update.run
+        _ <- sql"""UPDATE workflow_instances SET generation = generation + 1
+                   WHERE workflow_id = $wf AND key = $key AND scope = $scope""".update.run
+        _ <- upsertWakeupIO(wf, key, scope, now)
+      } yield ()
+    }
+    ()
+  }
+
   /** Encodes a [[SignalInheritance]] configuration for the `inherit_signals`
     * column. `none`/`all` are stored as simple tokens; `some(prefixes)` as
     * `some:` followed by a JSON array of the prefixes (unambiguous for prefixes

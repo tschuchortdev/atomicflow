@@ -50,6 +50,64 @@ trait WorkflowRuntime {
       in: In
   )(using Cacheable[In]): Boolean
 
+  /** Fork a source instance into a brand-new independent top-level instance.
+    *
+    * The fork receives a completely new instance ID, generation 0, and the same
+    * input as the source; it is an independent top-level workflow (no parent
+    * relationship, no inherited signals). `restartFromStep` is an exclusive
+    * boundary: the cached history strictly before the selected step is copied
+    * (rewritten to the new identity), while the selected step and subsequent
+    * history are omitted so they re-execute in the fork. The workflow function
+    * still executes from its beginning, replaying the copied rows until the
+    * first uncopied operation.
+    *
+    * The boundary is ordered by the step rows' last-updated timestamp: rows
+    * strictly before the selected row are kept, the selected row and everything
+    * with an equal or later timestamp are omitted. `restartFromStep` must
+    * identify an already-executed step of the source or
+    * [[InvalidRestartStepException]] is thrown. Forking is allowed on any source
+    * state (suspended or terminal) and does not modify the source.
+    *
+    * LIMITATION: a single step id is used as the causal boundary, which is
+    * insufficient to describe a cut through parallel branches that have no one
+    * total order; rows sharing the boundary timestamp are conservatively
+    * omitted.
+    */
+  @throws[WorkflowNotFoundException]
+  @throws[InvalidRestartStepException]
+  def forkWorkflow[In, Out](
+      sourceInstanceId: WorkflowInstanceId,
+      newInstanceKey: WorkflowInstanceKey,
+      restartFromStep: StepId
+  )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out]
+
+  /** Reset an instance in place from `restartFromStep`: keep the same instance
+    * identity, increment the generation, erase the selected step and subsequent
+    * history (Step rows and their subscriptions/wakeups), and schedule the
+    * instance to re-run from the top. History strictly before the selected step
+    * remains cached and is replayed, so the workflow function still executes
+    * from its beginning. The instance's input, signal cursors, and directly
+    * addressed events are untouched.
+    *
+    * The boundary is ordered by the step rows' last-updated timestamp: rows
+    * strictly before the selected row are kept, the selected row and everything
+    * with an equal or later timestamp are erased. `restartFromStep` must
+    * identify an already-executed step or [[InvalidRestartStepException]] is
+    * thrown. Resetting a terminal instance throws [[IllegalStateException]].
+    *
+    * LIMITATION: a single step id is used as the causal boundary, which is
+    * insufficient to describe a cut through parallel branches that have no one
+    * total order; rows sharing the boundary timestamp are conservatively
+    * erased.
+    */
+  @throws[WorkflowNotFoundException]
+  @throws[InvalidRestartStepException]
+  @throws[IllegalStateException]
+  def resetWorkflow[In, Out](
+      sourceInstanceId: WorkflowInstanceId,
+      restartFromStep: StepId
+  )(using workflow: Workflow[In, Out]): Unit
+
   /** Request cooperative cancellation of an instance. Durably sets
     * `cancel_requested_at` once and never resets it. If the instance has never
     * started and has no execution state, it is finalized `CANCELLED` immediately

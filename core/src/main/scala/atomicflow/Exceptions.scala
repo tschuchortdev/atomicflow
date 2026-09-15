@@ -35,6 +35,12 @@ object WorkflowInputConflictException {
 /** Thrown by operations that address a workflow instance that does not exist. */
 class WorkflowNotFoundException(message: String) extends RuntimeException(message)
 
+/** Thrown by `forkWorkflow`/`resetWorkflow` when `restartFromStep` does not
+  * identify an already-executed step of the source instance (an unknown step id,
+  * or a step that has no cached row because it never executed).
+  */
+class InvalidRestartStepException(message: String) extends RuntimeException(message)
+
 /** Thrown by an external `run` on an instance whose execution lease is held by
   * another worker and does not become available within the runtime's
   * `leaseAcquireTimeout`. The runtime never steals a live lease.
