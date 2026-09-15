@@ -179,7 +179,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runSync {
       for {
         sourceInput <- sql"""SELECT input FROM workflow_instances
-                             WHERE workflow_id = $sourceWf AND key = $sourceKey AND scope = $sourceScope""".query[
+                             WHERE workflow_id = $sourceWf AND key = $sourceKey AND scope = $sourceScope
+                             FOR UPDATE""".query[
             String
           ].option
         _ <- sourceInput match {
@@ -195,8 +196,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
             )
           case _ => ().pure[ConnectionIO]
         }
-        _ <- sql"""INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation)
-                   VALUES ($newWorkflowId, $newInstanceKey, '', $sourceInput, ${workflow.version})""".update.run
+        inserted <- sql"""INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation)
+                          VALUES ($newWorkflowId, $newInstanceKey, '', $sourceInput, ${workflow.version})
+                          ON CONFLICT (workflow_id, key, scope) DO NOTHING""".update.run
+        _ <- if (inserted == 0)
+          throw new WorkflowInputConflictException(
+            s"Workflow instance already exists under the fork key: $newId"
+          )
+        else ().pure[ConnectionIO]
         _ <- sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
                    SELECT $newWorkflowId, $newInstanceKey, '', step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at
                    FROM workflow_steps

@@ -161,6 +161,27 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
+  test("forking twice with the same newInstanceKey throws the domain conflict error, not a raw PSQL error") {
+    val rt = newRuntime
+    val cA = new AtomicInteger(0)
+    val cB = new AtomicInteger(0)
+    val cC = new AtomicInteger(0)
+    val wf = counterWf("frk-conflict", cA, cB, cC)
+    val sourceId = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.Result("done"))
+
+    setUpdatedAt(wf.id, "k", "A", t1)
+    setUpdatedAt(wf.id, "k", "B", t2)
+    setUpdatedAt(wf.id, "k", "C", t3)
+
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    assertEquals(stepIds(wf.id, "fork"), Set("A"), "first fork succeeds")
+
+    intercept[WorkflowInputConflictException] {
+      rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    }
+  }
+
   test("reset keeps the strictly-before history cached, erases the selected step and later, increments generation, and re-runs from the top") {
     val rt = newRuntime
     val sig = Signal[String]("R")
@@ -254,6 +275,45 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(cA.get(), 1, "A replays")
     assertEquals(cB.get(), 2, "B re-executes (selected step)")
     assertEquals(cC.get(), 1, "C replays because it was backdated below the boundary")
+  }
+
+  test("reset's boundary is ordered by updated_at, not execution order: backdating a later step keeps it, and an earlier-erased step split follows timestamps") {
+    val rt = newRuntime
+    val sig = Signal[String]("R")
+    val cA = new AtomicInteger(0)
+    val cB = new AtomicInteger(0)
+    val cC = new AtomicInteger(0)
+    val wf = Workflow[String, String]("rst-ts") { _ =>
+      Step.atLeastOnce[String]("A") { cA.incrementAndGet(); "a" }
+      Step.atLeastOnce[String]("B") { cB.incrementAndGet(); "b" }
+      Step.atLeastOnce[String]("C") { cC.incrementAndGet(); "c" }
+      Step.await[String]("w", Awaitable.SignalEvent(sig))
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    val handle = rt.getWorkflowInstance(wf, id)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals((cA.get(), cB.get(), cC.get()), (1, 1, 1))
+
+    setUpdatedAt(wf.id, "k", "A", t1)
+    setUpdatedAt(wf.id, "k", "C", t2)
+    setUpdatedAt(wf.id, "k", "B", t3)
+
+    rt.resetWorkflow[String, String](id, StepId("B"))(using wf)
+    assertEquals(
+      stepIds(wf.id, "k"),
+      Set("A", "C"),
+      "C is backdated below the B boundary, so it is kept; only B and later are erased"
+    )
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(cA.get(), 1, "A replays")
+    assertEquals(cB.get(), 2, "B re-executes (selected step)")
+    assertEquals(cC.get(), 1, "C replays because it was backdated below the boundary")
+
+    sig.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    assertEquals(handle.getInfo()(using rt).terminalState, Some(WorkflowTerminalState.Completed))
   }
 
   test("fork and reset work on a SUSPENDED source; the fork completes independently") {
