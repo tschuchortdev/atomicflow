@@ -1,43 +1,26 @@
 package atomicflow
 
-import atomicflow.Fingerprintable.Fingerprinter
-import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
+import atomicflow.internal.WorkflowExecution
 
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import scala.annotation.implicitNotFound
-import scala.concurrent.duration.FiniteDuration
-
-trait SimpleWorkflowContext {
-  def meta: WorkflowMeta
-
+/** The runtime context materialized only during workflow execution. It carries
+  * the instance identity, the version of the definition captured at creation, the
+  * runtime services, and (via [[execution]]) the per-run engine seam.
+  *
+  * A new context is materialized for every run and is not retained between runs.
+  */
+trait WorkflowContext {
   def instanceId: WorkflowInstanceId
 
-  override lazy val toString: String = s"workflow:${meta.id}#${URLEncoder.encode(meta.name, StandardCharsets.UTF_8)}/$instanceId"
-}
+  /** The `Workflow.version` recorded when the instance was created. The current
+    * body may branch on it internally to adapt to the definition version that
+    * created the instance (see `spec/workflow-evolution.md`).
+    */
+  def versionAtCreation: Long
 
-object SimpleWorkflowContext {
-  def apply(
-             workflowMeta: WorkflowMeta,
-             workflowInstanceId: WorkflowInstanceId
-           ): SimpleWorkflowContext = new SimpleWorkflowContext {
-    override def meta: WorkflowMeta = workflowMeta
+  def runtime: WorkflowRuntime
 
-    override def instanceId: WorkflowInstanceId = workflowInstanceId
-  }
-
-  given (stepCtx: StepContext[?]) => SimpleWorkflowContext = stepCtx.workflowCtx
-}
-
-@implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`\nYou can require a WorkflowContext for the enclosing method by adding a using clause `(using WorkflowContext)` to its definition.")
-trait WorkflowContext[In, Out] extends SimpleWorkflowContext {
-  protected[atomicflow] def getFingerprinter: Fingerprinter
-
-  protected[atomicflow] def getStepIdempotencyStore(using StepContext[?]): StepIdempotencyStore
-
-  protected[atomicflow] def getStepCache[StepOut: Cacheable](using StepContext[StepOut]): StepCache[StepOut]
-  
-  protected[atomicflow] def getSignalStore: SignalStore
-  
-  protected[atomicflow] def defaultCacheTtl: FiniteDuration
+  /** The per-run engine seam: fencing identity and, in later tasks, the services
+    * a running body needs from the engine.
+    */
+  private[atomicflow] def execution: WorkflowExecution
 }
