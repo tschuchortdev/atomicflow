@@ -12,6 +12,7 @@ import scala.concurrent.duration.*
 
 final case class QuoteV1(symbol: String, price: Double) derives Cacheable
 final case class QuoteLegacy(symbol: String) derives Cacheable
+final case class QuoteChain(symbol: String, ver: Int) derives Cacheable
 
 private final class FatalMarker(msg: String) extends LinkageError(msg)
 
@@ -56,6 +57,18 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(handle2.getInfo()(using rt).workflowVersionAtCreation, 2L)
     assertEquals(rt.runWorkflowInstance(wf2, handle2.id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(stepPayload(wf2.id, "k2", "which", 1), Some("v2-b"))
+
+    // A v1-created instance, suspended mid-run, re-run under a v2 definition must
+    // still read the creation-time version from the instance row (1), not the
+    // version of the definition now driving the run (2).
+    val wf2re = Workflow[String, String](id = "evo-branch", version = 2) { in =>
+      Step.atLeastOnce[String]("which2") { "at" + Workflow.versionAtCreation + "-" + in }
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+    assertEquals(rt.runWorkflowInstance(wf2re, handle1.id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(stepPayload(wf1.id, "k1", "which2", 1), Some("at1-a"))
+    assertEquals(handle1.getInfo()(using rt).workflowVersionAtCreation, 1L)
   }
 
   test("unconditional code change reaches unfinished instances; completed step cached results are reused") {
@@ -187,14 +200,23 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
   test("getExecutionState reports Started for an at-most-once body that crashed after the Started row") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
+    var replayed: Option[String] = null
+    val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "evo-mo-crash") { in =>
       state = Step.getExecutionState[String]("charge")
-      Step.atMostOnce[String]("charge") { throw new FatalMarker("fatal") }
+      replayed = Step.atMostOnce[String]("charge") {
+        counter.incrementAndGet()
+        throw new FatalMarker("fatal")
+      }
       "unreachable"
     }
     try rt.createAndRun(wf, "k", "a")
     catch { case _: FatalMarker => () }
+    assertEquals(counter.get(), 1, "the body must have run exactly once before the crash")
+
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
+    assertEquals(counter.get(), 1, "the crashed at-most-once step must not re-execute on replay")
+    assertEquals(replayed, None, "an unresolved Started row yields the at-most-once no-retry None outcome")
     assertEquals(state, StepExecutionState.Started)
   }
 
@@ -256,6 +278,72 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     assert(
       fresh.exists(p => p.contains(""""price"""") && p.contains(""""fresh"""")),
       s"new writes must use the current serializer: $fresh"
+    )
+  }
+
+  test("cacheable evolution: a v1→v2→current fallback chain decodes each format to its own version") {
+    val v1Codec: Cacheable[QuoteChain] =
+      summon[Cacheable[QuoteLegacy]].imap(l => QuoteChain(l.symbol, 1))(q => QuoteLegacy(q.symbol))
+    val v2Codec: Cacheable[QuoteChain] =
+      summon[Cacheable[QuoteV1]].imap(v => QuoteChain(v.symbol, 2))(q => QuoteV1(q.symbol, 0.0))
+    val currentCodec: Cacheable[QuoteChain] =
+      summon[Cacheable[QuoteChain]].withFallback(v2Codec).withFallback(v1Codec)
+
+    val rt = newRuntime
+
+    {
+      given Cacheable[QuoteChain] = v1Codec
+      val wfWrite = Workflow[String, QuoteChain](id = "evo-chain") { in =>
+        Step.atLeastOnce[QuoteChain]("q") { QuoteChain(in, 1) }
+        TestControlFlow.suspend()
+        QuoteChain("unreachable", -1)
+      }
+      rt.createAndRun(wfWrite, "k1", "AAPL")
+    }
+    assertEquals(stepPayload("evo-chain", "k1", "q", 1), Some("""{"symbol":"AAPL"}"""))
+
+    var state1: StepExecutionState[QuoteChain] = null
+    {
+      given Cacheable[QuoteChain] = currentCodec
+      val wfRead = Workflow[String, QuoteChain](id = "evo-chain") { in =>
+        state1 = Step.getExecutionState[QuoteChain]("q", stepVersion = 1)
+        TestControlFlow.suspend()
+        QuoteChain("unreachable", -1)
+      }
+      rt.runWorkflowInstance(wfRead, WorkflowInstanceId("evo-chain", "k1"))
+    }
+    assertEquals(
+      state1,
+      StepExecutionState.Completed(QuoteChain("AAPL", 1)),
+      "a v1 row must fall through current and v2 and decode via the v1 fallback"
+    )
+
+    {
+      given Cacheable[QuoteChain] = v2Codec
+      val wfWrite = Workflow[String, QuoteChain](id = "evo-chain") { in =>
+        Step.atLeastOnce[QuoteChain]("q") { QuoteChain(in, 2) }
+        TestControlFlow.suspend()
+        QuoteChain("unreachable", -1)
+      }
+      rt.createAndRun(wfWrite, "k2", "AAPL")
+    }
+    val v2Payload = stepPayload("evo-chain", "k2", "q", 1)
+    assert(v2Payload.exists(_.contains(""""price"""")), s"v2 format must carry the price field: $v2Payload")
+
+    var state2: StepExecutionState[QuoteChain] = null
+    {
+      given Cacheable[QuoteChain] = currentCodec
+      val wfRead = Workflow[String, QuoteChain](id = "evo-chain") { in =>
+        state2 = Step.getExecutionState[QuoteChain]("q", stepVersion = 1)
+        TestControlFlow.suspend()
+        QuoteChain("unreachable", -1)
+      }
+      rt.runWorkflowInstance(wfRead, WorkflowInstanceId("evo-chain", "k2"))
+    }
+    assertEquals(
+      state2,
+      StepExecutionState.Completed(QuoteChain("AAPL", 2)),
+      "a v2 row must decode via the v2 fallback (before v1) in the chain"
     )
   }
 }
