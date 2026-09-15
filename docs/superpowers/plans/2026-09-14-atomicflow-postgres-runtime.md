@@ -719,7 +719,7 @@ Implements `spec/workflow-evolution.md` verification, the example rewrite, and t
 - Triage the deferred minors from the SDD ledger: fix the cheap-and-valuable ones, record the rest as accepted deviations in DEVIATIONS.md.
 - DEVIATIONS.md final pass: numbering, wording, completeness.
 
-## Phase 9 (expanded at phase boundary)
+## Implementation summary (phase retrospective)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).

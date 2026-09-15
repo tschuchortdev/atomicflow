@@ -241,3 +241,37 @@ implementation phase.
     instant as a sender-thread run can, in a narrow race, consume the update
     on the runner's thread and leave the sender reading `Unhandled` — the
     update IS handled durably; only the sender's synchronous view is stale.
+
+## Phase 9 (final conformance pass)
+
+64. **Metrics export and wakeup-age alerting are out of scope** (project
+    constraint). The spec's observability paragraphs (wakeup-age monitoring,
+    timer-firing lag, "workflow known to no runner" detection) are not
+    implemented; only SLF4J logging exists.
+65. **No lease renewal at await checkpoints.** Renewals happen at step
+    checkpoints; a run spending longer than `leaseDuration` between step
+    checkpoints risks lease loss (bounded, recovers via sweeps).
+66. **`StepContext` as a separate public type is folded into
+    `WorkflowContext`.**
+67. **No `getWorkflowResult` accessor**; `awaitResult` covers terminal-outcome
+    reading.
+68. **Reusing a step id with a different `stepKind` is not a conflict.** Rows
+    are keyed by identity; a kind change follows the same-version
+    compatible-hotfix semantics.
+69. **`Step.await` of a raw `Mapped` awaitable throws.** Composition happens
+    through `Awaitable.map`; awaiting the raw mapped case is a programming
+    error.
+70. **Race rows persist `stepKind = 'AwaitRace'`**, distinct from `'Await'`.
+71. **Draft `design.md` bullets (prefix bulk-start, broadcast send, signal
+    streams) are not implemented** — non-binding draft material.
+72. **`SignalInheritance.some` takes `Seq[SignalKey]`** (Scala 3 enum
+    parameters cannot be varargs; same class as entries 18/34). Scaladoc
+    shows the usage.
+73. **The inheritance ancestor walk is an iterative in-Scala walk, not a
+    recursive CTE** (semantics equivalent; the spec's PostgreSQL notes are
+    non-binding).
+74. **`StepSerializationFailed`'s payload is encoded via the user codec**
+    rather than a runtime-owned minimal encoding with a payload marker (only
+    manifests with broken user codecs).
+75. **Started rows persist an empty `state_payload` sentinel** (arbitrary
+    placeholder for the pre-body state).
