@@ -52,6 +52,25 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
   def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
     runtime.sendSignal(id, signal.key, value)(using signal.cacheable)
 
+  /** Send a synchronous [[Update]] addressed to this instance. Forwarder for the
+    * runtime's `sendUpdate`, resolving the update's own [[Cacheable]]s. This
+    * handle already carries the [[Workflow]] definition.
+    */
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I, R](
+      update: Update[I, R],
+      input: I,
+      idempotencyKey: String = "",
+      persistUnhandledUpdates: Boolean = false
+  )(using
+      runtime: WorkflowRuntime,
+      cacheableThrowable: Cacheable[Throwable]
+  ): UpdateSendResult[R] =
+    runtime.sendUpdate(workflow, id, update.key, input, idempotencyKey, persistUnhandledUpdates)(
+      using update,
+      cacheableThrowable
+    )
+
   /** An awaitable that yields this instance's terminal outcome as a
     * `WorkflowCompletionResult[Out]`, to be raced or awaited from another
     * workflow via `Step.await`/`Step.awaitRace`. Takes the application-global

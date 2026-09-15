@@ -26,6 +26,25 @@ final case class WorkflowInstanceId(
   @throws[WorkflowNotFoundException]
   def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
     runtime.sendSignal(this, signal.key, value)(using signal.cacheable)
+
+  /** Send a synchronous [[Update]] addressed to this instance. Forwarder for the
+    * runtime's `sendUpdate`, resolving the update's own [[Cacheable]]s.
+    */
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I, R](
+      workflow: Workflow[?, ?],
+      update: Update[I, R],
+      input: I,
+      idempotencyKey: String = "",
+      persistUnhandledUpdates: Boolean = false
+  )(using
+      runtime: WorkflowRuntime,
+      cacheableThrowable: Cacheable[Throwable]
+  ): UpdateSendResult[R] =
+    runtime.sendUpdate(workflow, this, update.key, input, idempotencyKey, persistUnhandledUpdates)(
+      using update,
+      cacheableThrowable
+    )
 }
 
 /** The result of appending a signal event. `InstanceAlreadyCompleted` is a

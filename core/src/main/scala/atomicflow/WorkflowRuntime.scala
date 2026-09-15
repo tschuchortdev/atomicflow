@@ -31,6 +31,31 @@ trait WorkflowRuntime {
       value: A
   ): SignalSendResult
 
+  /** Send a synchronous [[Update]] addressed directly to `workflowInstanceId`
+    * and block for its outcome.
+    *
+    * Updates are addressed to exactly one instance and are never inherited. The
+    * sender needs the [[Workflow]] definition so that, when the instance is free,
+    * it can run the workflow on the sender's own thread to deliver the update.
+    *
+    * `idempotencyKey`: when non-empty, sending the same (instance, update key,
+    * idempotency key) twice reuses the first send's record and returns the same
+    * result instead of creating a second record.
+    *
+    * `persistUnhandledUpdates`: when `true`, a run that finishes without handling
+    * the update keeps its record so a later `awaitUpdate` can consume it; when
+    * `false` (default) the unhandled record is deleted after the run.
+    */
+  @throws[WorkflowNotFoundException]
+  def sendUpdate[I, R](
+      workflow: Workflow[?, ?],
+      workflowInstanceId: WorkflowInstanceId,
+      updateKey: String,
+      input: I,
+      idempotencyKey: String = "",
+      persistUnhandledUpdates: Boolean = false
+  )(using u: Update[I, R], cacheableThrowable: Cacheable[Throwable]): UpdateSendResult[R]
+
   /** Register an instance, idempotent for equal (serialized) input; throws
     * [[WorkflowInputConflictException]] if the input differs.
     */

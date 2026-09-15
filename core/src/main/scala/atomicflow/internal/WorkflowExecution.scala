@@ -35,6 +35,27 @@ private[atomicflow] final case class AwaitTimerCandidate(
     createdAt: java.time.Instant
 )
 
+/** One unhandled `Update` record visible to an awaiting site (a row in
+  * `workflow_updates` with `handled_at IS NULL`). The row is identified by
+  * `createdAt` plus `idempotencyKey`; `encodedInput` is the update's payload.
+  */
+private[atomicflow] final case class UpdateCandidate(
+    createdAt: java.time.Instant,
+    idempotencyKey: String,
+    encodedInput: String
+)
+
+/** The outcome of an `awaitUpdate` that satisfies a candidate: which record was
+  * handled, the encoded synchronous `response` to persist on the record (what
+  * the blocked sender reads), and the encoded `output` to persist on the step
+  * row (what the workflow body receives).
+  */
+private[atomicflow] final case class AwaitUpdateDecision(
+    candidate: UpdateCandidate,
+    encodedResponse: String,
+    encodedOutput: String
+)
+
 /** A single leaf of a `Step.awaitRace` site, describing how its durable
   * subscription is registered in the corresponding table. The leaf index is the
   * awaitable's position within the race (0..n-1).
@@ -301,6 +322,49 @@ private[atomicflow] trait WorkflowExecution {
       signalKey: SignalKey,
       expiresAt: Option[Instant]
   )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String]
+
+  /** Read the unhandled `Update` records of `updateKey` addressed directly to
+    * this instance, oldest first, without handling any of them. A plain durable
+    * read; no lease, fence, or write. Updates are never inherited, so only this
+    * instance's own rows are consulted.
+    */
+  def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate]
+
+  /** Resolve an update await atomically, fenced: persist the `succeeded` step
+    * row (`stepKind`) carrying `encodedOutput`, mark the selected candidate's
+    * record handled by writing `encodedResponse` and `handled_at`, and delete
+    * the site's update subscriptions, all in one transaction. The written
+    * response is what the blocked sender reads as `UpdateSendResult.Success`.
+    */
+  def resolveAwaitUpdate(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      candidate: UpdateCandidate,
+      encodedResponse: String,
+      encodedOutput: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Suspend an update await, fenced, in one transaction: register the pending
+    * update subscription (idempotent), then re-read the unhandled records and
+    * apply `decide`. If `decide` selects a candidate, resolve the await
+    * (succeeded step row + handled record + subscription deletion) and return
+    * the decision; otherwise return `None` (suspended, subscriptions remain).
+    * The re-read within the transaction closes the lost-wakeup gap between
+    * candidate gathering and the suspension commit, so two awaits cannot
+    * double-consume the same record.
+    */
+  def suspendAwaitUpdate(
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      expiresAt: Option[Instant]
+  )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision]
 
   /** Fire this await-site's own due timer subscriptions, fenced, in one
     * transaction: for each subscription with `deadline <= now`, row-lock it,

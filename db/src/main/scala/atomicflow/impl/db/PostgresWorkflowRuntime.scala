@@ -10,10 +10,12 @@ import atomicflow.internal.{
   AwaitRaceTimerLeaf,
   AwaitSignalCandidate,
   AwaitTimerCandidate,
+  AwaitUpdateDecision,
   BranchContextSnapshot,
   Framing,
   ScopePath,
   StoredStep,
+  UpdateCandidate,
   WorkflowExecution
 }
 import cats.effect.IO
@@ -1416,6 +1418,197 @@ class PostgresWorkflowRuntime private[atomicflow] (
     } yield ()
   }
 
+  /** Outcomes of the terminal/dedup preparation phase of `sendUpdate`. */
+  private sealed trait SendOutcome
+  private object SendOutcome {
+    case object InstanceCompleted extends SendOutcome
+    final case class AlreadyHandled(encodedResult: String) extends SendOutcome
+    case object Ready extends SendOutcome
+  }
+
+  /** Sanity cap for the sender's wait on a live lease before retrying. */
+  private val SendLeaseWaitCap: FiniteDuration = 60.seconds
+
+  /** The lease poll interval of `sendUpdate`'s wait-for-expiry loop. */
+  private val SendLeasePollIntervalMillis: Long = 50L
+
+  /** Sends a synchronous [[Update]] to a single instance and blocks for its
+    * outcome.
+    *
+    * In one transaction, checks the instance (missing → throws
+    * [[WorkflowNotFoundException]], terminal → `InstanceAlreadyCompleted`) and
+    * deduplicates on `idempotencyKey` (a matching handled record → return its
+    * `Success` without running; a matching pending record → reused). If the
+    * instance is free it then runs the workflow on the sender's thread (the
+    * record already exists, so an `awaitUpdate` in the run handles it); if the
+    * instance is leased by another owner it waits for the lease to expire and
+    * retries from the beginning. After the run, a handled record yields
+    * `Success`; otherwise `Unhandled` (and, unless `persistUnhandledUpdates`,
+    * the record is deleted).
+    */
+  override def sendUpdate[I, R](
+      workflow: Workflow[?, ?],
+      workflowInstanceId: WorkflowInstanceId,
+      updateKey: String,
+      input: I,
+      idempotencyKey: String = "",
+      persistUnhandledUpdates: Boolean = false
+  )(using u: atomicflow.Update[I, R], cacheableThrowable: Cacheable[Throwable]): UpdateSendResult[R] = {
+    val wf = workflowInstanceId.workflowId
+    val k = workflowInstanceId.workflowInstanceKey
+    val s = workflowInstanceId.scope
+    val encodedInput = u.inputCacheable.write(input)
+    val respCacheable = u.responseCacheable
+
+    def notFound: WorkflowNotFoundException =
+      new WorkflowNotFoundException(s"Workflow instance not found: $workflowInstanceId")
+
+    def readOutcome(idem: String): ConnectionIO[SendOutcome] =
+      for {
+        exists <- sql"""SELECT 1 FROM workflow_instances
+                        WHERE workflow_id = $wf AND key = $k AND scope = $s
+                        FOR UPDATE""".query[Int].option
+        outcome <- exists match {
+          case None => throw notFound
+          case Some(_) =>
+            for {
+              terminal <- sql"""SELECT terminal_state FROM workflow_instances
+                                WHERE workflow_id = $wf AND key = $k AND scope = $s""".query[Option[String]].unique
+              existingIdem <- if (idem.isEmpty) Option.empty[(java.time.Instant, Option[String])].pure[ConnectionIO]
+                              else
+                                sql"""SELECT created_at, result FROM workflow_updates
+                                      WHERE workflow_id = $wf AND key = $k AND scope = $s
+                                        AND update_key = $updateKey AND idempotency_key = $idem
+                                      ORDER BY created_at""".query[(java.time.Instant, Option[String])].option
+              res <- existingIdem match {
+                case Some((_, Some(encodedResult))) => SendOutcome.AlreadyHandled(encodedResult).pure[ConnectionIO]
+                case _ if terminal.isDefined        => SendOutcome.InstanceCompleted.pure[ConnectionIO]
+                case _                              => SendOutcome.Ready.pure[ConnectionIO]
+              }
+            } yield res
+        }
+      } yield outcome
+
+    /** Ensures a `workflow_updates` record exists for this send and returns its
+      * identity (`createdAt`, `idempotencyKey`). Reuses a pending record when
+      * `idem` is non-empty and one already exists; otherwise inserts a fresh
+      * record. Called only after the lease is confirmed free, so the retry-from-
+      * the-beginning lease wait never inserts duplicates.
+      */
+    def ensureRecord(idem: String): (java.time.Instant, String) =
+      if (idem.isEmpty) {
+        val now = theClock.instant()
+        runSync {
+          sql"""INSERT INTO workflow_updates
+                  (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
+                VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)""".update.run
+        }
+        (now, "")
+      } else {
+        val existing = runSync {
+          sql"""SELECT created_at FROM workflow_updates
+                WHERE workflow_id = $wf AND key = $k AND scope = $s
+                  AND update_key = $updateKey AND idempotency_key = $idem
+                ORDER BY created_at""".query[java.time.Instant].option
+        }
+        existing match {
+          case Some(at) => (at, idem)
+          case None =>
+            val now = theClock.instant()
+            runSync {
+              sql"""INSERT INTO workflow_updates
+                      (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
+                    VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)""".update.run
+            }
+            (now, idem)
+        }
+      }
+
+    def isLeaseHeld: Boolean =
+      runSync {
+        sql"""SELECT lease_owner IS NOT NULL AND lease_expires_at > ${theClock.instant()}
+              FROM workflow_instances
+              WHERE workflow_id = $wf AND key = $k AND scope = $s""".query[Boolean].unique
+      }
+
+    def waitForLeaseExpiry(): Unit = {
+      val deadline = System.nanoTime() + SendLeaseWaitCap.toNanos
+      var held = true
+      while (held && System.nanoTime() < deadline) {
+        held = isLeaseHeld
+        if (held) Thread.sleep(SendLeasePollIntervalMillis)
+      }
+    }
+
+    def upsertWakeupForUpdate(): Unit =
+      runSync {
+        for {
+          has <- sql"""SELECT 1 FROM workflow_update_subscriptions
+                       WHERE workflow_id = $wf AND key = $k AND scope = $s AND update_key = $updateKey
+                       LIMIT 1""".query[Int].option
+          _ <- if (has.isDefined) upsertWakeupIO(wf, k, s, theClock.instant()) else ().pure[ConnectionIO]
+        } yield ()
+      }
+
+    def readResult(createdAt: java.time.Instant, idem: String): Option[R] =
+      runSync {
+        sql"""SELECT result FROM workflow_updates
+              WHERE workflow_id = $wf AND key = $k AND scope = $s
+                AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt""".query[
+            Option[String]
+          ].option
+      }.flatten.map(respCacheable.read)
+
+    def deleteUnhandled(createdAt: java.time.Instant, idem: String): Unit =
+      runSync {
+        sql"""DELETE FROM workflow_updates
+              WHERE workflow_id = $wf AND key = $k AND scope = $s
+                AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt
+                AND handled_at IS NULL""".update.run
+      }
+
+    var done = false
+    var result: UpdateSendResult[R] = null.asInstanceOf[UpdateSendResult[R]]
+    while (!done) {
+      val outcome = runSync(readOutcome(idempotencyKey))
+      outcome match {
+        case SendOutcome.InstanceCompleted =>
+          result = UpdateSendResult.InstanceAlreadyCompleted
+          done = true
+        case SendOutcome.AlreadyHandled(encodedResult) =>
+          result = UpdateSendResult.Success(respCacheable.read(encodedResult))
+          done = true
+        case SendOutcome.Ready =>
+          if (isLeaseHeld) {
+            waitForLeaseExpiry()
+          } else {
+            val (createdAt, idem) = ensureRecord(idempotencyKey)
+            upsertWakeupForUpdate()
+            val runSucceeded = try {
+              runWorkflowInstance(workflow, workflowInstanceId)(using cacheableThrowable)
+              true
+            } catch {
+              case _: LeaseUnavailableException =>
+                deleteUnhandled(createdAt, idem)
+                false
+            }
+            if (runSucceeded) {
+              readResult(createdAt, idem) match {
+                case Some(value) =>
+                  result = UpdateSendResult.Success(value)
+                  done = true
+                case None =>
+                  if (!persistUnhandledUpdates) deleteUnhandled(createdAt, idem)
+                  result = UpdateSendResult.Unhandled
+                  done = true
+              }
+            }
+          }
+      }
+    }
+    result
+  }
+
   private def readTerminalAndReturn[Out](
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
@@ -2000,6 +2193,96 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     override def fireDueTimers(stepId: StepId, stepVersion: Long): Unit =
       fireDueTimerLeaves(stepId, stepVersion)
+
+    override def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate] =
+      runSync {
+        sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
+              WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+                AND update_key = $updateKey AND handled_at IS NULL
+              ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
+      }.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) }
+
+    override def resolveAwaitUpdate(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        updateKey: String,
+        candidate: UpdateCandidate,
+        encodedResponse: String,
+        encodedOutput: String,
+        expiresAt: Option[java.time.Instant]
+    ): Unit =
+      fenced {
+        for {
+          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
+          _ <- handleUpdateRecordIO(updateKey, candidate, encodedResponse)
+          _ <- deleteUpdateSubscriptionsIO(stepId, stepVersion)
+        } yield ()
+      }
+
+    override def suspendAwaitUpdate(
+        stepId: StepId,
+        stepVersion: Long,
+        stepKind: String,
+        inputFingerprints: String,
+        updateKey: String,
+        expiresAt: Option[java.time.Instant]
+    )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision] =
+      fencedVal {
+        for {
+          _ <- upsertUpdateSubscriptionIO(stepId, stepVersion, updateKey)
+          candidates <- readUpdateCandidatesIO(updateKey)
+          decision = decide(candidates)
+          resolved <- decision match {
+            case Some(d) =>
+              for {
+                _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
+                _ <- handleUpdateRecordIO(updateKey, d.candidate, d.encodedResponse)
+                _ <- deleteUpdateSubscriptionsIO(stepId, stepVersion)
+              } yield Some(d)
+            case None => Option.empty[AwaitUpdateDecision].pure[ConnectionIO]
+          }
+        } yield resolved
+      }
+
+    private def readUpdateCandidatesIO(updateKey: String): ConnectionIO[Vector[UpdateCandidate]] =
+      sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+              AND update_key = $updateKey AND handled_at IS NULL
+            ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
+        .map(_.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) })
+
+    private def handleUpdateRecordIO(
+        updateKey: String,
+        candidate: UpdateCandidate,
+        encodedResponse: String
+    ): ConnectionIO[Unit] = {
+      val now = theClock.instant()
+      sql"""UPDATE workflow_updates
+            SET result = $encodedResponse, handled_at = $now, updated_at = $now
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+              AND update_key = $updateKey AND idempotency_key = ${candidate.idempotencyKey}
+              AND created_at = ${candidate.createdAt} AND handled_at IS NULL""".update.run.map(_ => ())
+    }
+
+    private def upsertUpdateSubscriptionIO(
+        stepId: StepId,
+        stepVersion: Long,
+        updateKey: String
+    ): ConnectionIO[Unit] =
+      sql"""INSERT INTO workflow_update_subscriptions
+              (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, update_key)
+            VALUES ($workflowId, $key, ${instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, 0, $updateKey)
+            ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, update_key, step_scope_path)
+              DO NOTHING""".update.run.map(_ => ())
+
+    private def deleteUpdateSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+      sql"""DELETE FROM workflow_update_subscriptions
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
+              AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(
+        _ => ()
+      )
 
     override def readAwaitTimerCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate] =
       runSync {

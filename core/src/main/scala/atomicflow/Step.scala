@@ -10,7 +10,9 @@ import atomicflow.internal.{
   AwaitRaceSignalLeaf,
   AwaitRaceTimerLeaf,
   AwaitSignalCandidate,
-  ScopePath
+  AwaitUpdateDecision,
+  ScopePath,
+  UpdateCandidate
 }
 
 import java.nio.charset.StandardCharsets
@@ -555,6 +557,37 @@ object Step {
       }
     }
 
+  /** Await a synchronous, direct-addressed [[Update]] and answer it with a
+    * response.
+    *
+    * Behaves like a step (the result is cached and replayed), but unlike a
+    * `Signal` the sender is blocked waiting for a response. When an unhandled
+    * update record for `u.key` exists (the OLDEST one), `respond(input)` is
+    * called with the update's decoded input; it returns `(response, output)`.
+    * The `response` is durably written to the update's record (so the blocked
+    * sender observes it as `UpdateSendResult.Success`) and `output` is what this
+    * await returns to the workflow body. When no unhandled record exists, the
+    * workflow durably suspends (a subscription is registered so a later
+    * `sendUpdate` can wake it).
+    *
+    * Updates are addressed directly to this instance and are never inherited:
+    * only records addressed to this instance are candidates, so a child never
+    * sees an update sent to its parent.
+    *
+    * @param stepKey
+    *   the await's stable identity within the workflow
+    * @param u
+    *   the update to await
+    * @param respond
+    *   computes the synchronous `response` (written to the record, read by the
+    *   sender) and the `output` (returned to the body)
+    */
+  def awaitUpdate[I, R, O: Cacheable](stepKey: String, u: Update[I, R])(respond: I => (R, O))(using
+      ctx: WorkflowContext,
+      throwableCodec: Cacheable[Throwable]
+  ): O =
+    awaitUpdate0(stepKey, u, respond)
+
   /** Runs several branches concurrently (via Ox `par`) and returns the result of
     * the first branch to complete normally, without suspending. If every branch
     * suspends, one combined [[WorkflowSuspendedException]] carrying each
@@ -801,6 +834,83 @@ object Step {
               throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
             case _ => evaluate()
           }
+        }
+    }
+  }
+
+  /** The runtime-computed step machinery for an [[Update]] await.
+    */
+  private def awaitUpdate0[I, R, O: Cacheable](
+      stepKey: String,
+      u: Update[I, R],
+      respond: I => (R, O)
+  )(using ctx: WorkflowContext): O = {
+    val execution = ctx.execution
+    val stepId = StepId(stepKey, execution.currentScope)
+    val outCodec = summon[Cacheable[O]]
+    val fingerprints = encodeFingerprints(Seq.empty)
+    val now = execution.now
+    val expiresAt = None
+
+    def decodeInput(encoded: String): I =
+      try u.inputCacheable.read(encoded)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"Update '${u.key}' input could not be decoded")
+      }
+
+    def decodeOutput(encoded: String): O =
+      try outCodec.read(encoded)
+      catch {
+        case _: Throwable => throw new StepSerializationFailed(s"AwaitUpdate '$stepKey' output could not be decoded")
+      }
+
+    def respondTo(c: UpdateCandidate): AwaitUpdateDecision = {
+      val input = decodeInput(c.encodedInput)
+      val (response, output) = respond(input)
+      val encodedResponse =
+        try u.responseCacheable.write(response)
+        catch {
+          case _: Throwable => throw new StepSerializationFailed(s"Update '${u.key}' response could not be encoded")
+        }
+      val encodedOutput =
+        try outCodec.write(output)
+        catch {
+          case _: Throwable => throw new StepSerializationFailed(s"AwaitUpdate '$stepKey' output could not be encoded")
+        }
+      AwaitUpdateDecision(c, encodedResponse, encodedOutput)
+    }
+
+    def evaluate(): O = {
+      execution.checkCancellation()
+      val candidates = execution.readAwaitUpdateCandidates(u.key)
+      candidates.headOption match {
+        case Some(winning) =>
+          val decision = respondTo(winning)
+          execution.resolveAwaitUpdate(
+            stepId, 0L, "AwaitUpdate", fingerprints, u.key, winning, decision.encodedResponse,
+            decision.encodedOutput, expiresAt
+          )
+          decodeOutput(decision.encodedOutput)
+        case None =>
+          execution.suspendAwaitUpdate(stepId, 0L, "AwaitUpdate", fingerprints, u.key, expiresAt) { recheck =>
+            recheck.headOption.map(respondTo)
+          } match {
+            case Some(decision) => decodeOutput(decision.encodedOutput)
+            case None           => throw new WorkflowSuspendedException
+          }
+      }
+    }
+
+    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None => evaluate()
+      case Some(row) =>
+        row.stateKind match {
+          case "succeeded" => decodeOutput(row.statePayload)
+          case "failed" =>
+            throw new StepSerializationFailed(s"AwaitUpdate '$stepKey' stored a failure without a failed await")
+          case _ => evaluate()
         }
     }
   }

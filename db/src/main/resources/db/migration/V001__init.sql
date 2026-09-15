@@ -146,3 +146,45 @@ CREATE TABLE workflow_wakeups (
     REFERENCES workflow_instances (workflow_id, key, scope)
     ON DELETE CASCADE
 );
+
+CREATE TABLE workflow_updates (
+  workflow_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  update_key TEXT NOT NULL,
+  encoded_input TEXT NOT NULL,
+  idempotency_key TEXT NOT NULL DEFAULT '',
+  result TEXT,
+  handled_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (workflow_id, key, scope, update_key, idempotency_key, created_at),
+  FOREIGN KEY (workflow_id, key, scope)
+    REFERENCES workflow_instances (workflow_id, key, scope)
+    ON DELETE CASCADE
+);
+
+CREATE UNIQUE INDEX workflow_updates_idempotency_unique
+  ON workflow_updates (workflow_id, key, scope, update_key, idempotency_key)
+  WHERE idempotency_key <> '';
+
+CREATE INDEX workflow_updates_await
+  ON workflow_updates (workflow_id, key, scope, update_key, created_at)
+  WHERE handled_at IS NULL;
+
+CREATE TABLE workflow_update_subscriptions (
+  workflow_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  step_id TEXT NOT NULL,
+  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_version BIGINT NOT NULL,
+  leaf_idx INT NOT NULL,
+  update_key TEXT NOT NULL,
+  PRIMARY KEY (
+    workflow_id, key, scope, step_id, step_version, leaf_idx, update_key, step_scope_path
+  ),
+  FOREIGN KEY (workflow_id, key, scope)
+    REFERENCES workflow_instances (workflow_id, key, scope)
+    ON DELETE CASCADE
+);
