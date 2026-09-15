@@ -162,3 +162,33 @@ implementation phase.
     processes outcomes before claiming again** (bounded pool = backpressure).
     The spec's pseudocode leaves the await semantics of the dispatch loop
     open.
+
+## Phase 6 (children, inheritance, parallelism)
+
+32. **`step_scope_path` is `NOT NULL DEFAULT ''` rather than nullable.** The
+    spec says step/await rows carry a "nullable scope-path column"; Postgres
+    primary-key columns cannot be NULL, and the column participates in the
+    natural keys of `workflow_steps` and all three subscription tables. The
+    empty string is the top-level sentinel.
+33. **Scope-path shortening (`shortened[sha256:...]`) is not implemented.**
+    The spec's derivation section describes truncating long scope paths; the
+    current implementation stores full escaped paths. Deferred as a
+    performance concern (no behavioral difference).
+34. **`firstToRunWithoutSuspension` defaults live on the vararg overload
+    only** (Seq form delegates without defaults) — Scala 3 forbids default
+    arguments on two overloaded apply methods (same class of limitation as
+    entry 18).
+35. **`firstToRunWithoutSuspension` records the lowest completed branch index
+    when multiple branches complete in the same execution** (deterministic
+    tie-break); the spec leaves the winner "whichever the implementation
+    observes first".
+36. **`firstToRunWithoutSuspension` accepts an unused `Cacheable[Throwable]`
+    parameter for parity** with the other `Step` constructs (uniform
+    signature); failures are carried by the step machinery, not encoded.
+37. **Signal inheritance selectors persist as text tokens** (`none`, `all`,
+    `some:` + JSON array of prefixes via upickle) — the storage format is an
+    implementation choice the spec leaves open.
+38. **Narrowing an inheritance policy schedules conservative wakeups** (the
+    affected subtree is woken and re-checks eligibility, re-suspending if
+    newly ineligible). The spec requires wakeups only on broadening; the
+    conservative extra wakeups are no-ops.
