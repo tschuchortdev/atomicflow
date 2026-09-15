@@ -68,6 +68,11 @@ final class PostgresJobRunner private[atomicflow] (
       (_: WorkflowId, v: java.lang.Integer) => if (v <= 1) null else java.lang.Integer.valueOf(v - 1)
     )
 
+  /** Fault-injection seam around a dispatched run: by default identity, a test may
+    * replace it to simulate an infrastructure failure that aborts a claimed run
+    * before the body runs (producing a transient, terminal-unset, lease-still-ours
+    * outcome). Package-private test hook; write from test threads only.
+    */
   @volatile
   private[atomicflow] var testRunWrapper: (() => Unit) => Unit = run => run()
 
@@ -102,6 +107,7 @@ final class PostgresJobRunner private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
+      createdAt: java.time.Instant,
       scheduledAt: java.time.Instant,
       attempts: Int
   )
@@ -110,7 +116,8 @@ final class PostgresJobRunner private[atomicflow] (
       instanceId: WorkflowInstanceId,
       worker: String,
       token: Long,
-      attempts: Int
+      attempts: Int,
+      createdAt: java.time.Instant
   )
 
   /** The ranked claim: per-workflow ROW_NUMBER over due, non-terminal wakeups of
@@ -125,7 +132,7 @@ final class PostgresJobRunner private[atomicflow] (
     val query =
       fr"""
         WITH ranked AS (
-          SELECT w.workflow_id, w.key, w.scope, w.scheduled_at, w.attempts,
+          SELECT w.workflow_id, w.key, w.scope, w.created_at, w.scheduled_at, w.attempts,
                  ROW_NUMBER() OVER (PARTITION BY w.workflow_id ORDER BY w.scheduled_at, w.key) AS share
           FROM workflow_wakeups w
           JOIN workflow_instances i
@@ -134,7 +141,7 @@ final class PostgresJobRunner private[atomicflow] (
             AND i.terminal_state IS NULL
             AND w.workflow_id = ANY($ids)
         )
-        SELECT r.workflow_id, r.key, r.scope, r.scheduled_at, r.attempts
+        SELECT r.workflow_id, r.key, r.scope, r.created_at, r.scheduled_at, r.attempts
         FROM ranked r
         JOIN workflow_wakeups w
           ON w.workflow_id = r.workflow_id AND w.key = r.key AND w.scope = r.scope
@@ -155,7 +162,7 @@ final class PostgresJobRunner private[atomicflow] (
                       WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
                         AND scheduled_at = ${row.scheduledAt}""".update.run.map { _ =>
                   acquirePermit(row.workflowId)
-                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.key, row.scope), runnerWorker, token, row.attempts)
+                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.key, row.scope), runnerWorker, token, row.attempts, row.createdAt)
                 }
               case None => acc.pure[ConnectionIO]
             }
@@ -179,16 +186,17 @@ final class PostgresJobRunner private[atomicflow] (
 
   /** Requeues a claimed wakeup after a transient failure. One transaction: the
     * row was deleted at claim, but a racing delivery may have re-inserted it, so
-    * an upsert preserves `created_at` when a row exists (else records `now`),
-    * pushes `scheduled_at` out to the capped exponential backoff (never earlier
-    * than an existing future time), and bumps `attempts` by one.
+    * an upsert preserves the original `created_at` carried from the claim (a fresh
+    * insert records `createdAt`; a conflict keeps the existing row's `created_at`
+    * unchanged), pushes `scheduled_at` out to the capped exponential backoff
+    * (never earlier than an existing future time), and bumps `attempts` by one.
     */
-  private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int): Unit = {
+  private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int, createdAt: java.time.Instant): Unit = {
     val now = runtime.clock.instant()
     val scheduled = now.plus(java.time.Duration.ofNanos(backoffDelay(attempts).toNanos))
     runtime.runSync {
       sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
-            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $now, $scheduled, ${attempts + 1})
+            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduled, ${attempts + 1})
             ON CONFLICT (workflow_id, key, scope) DO UPDATE
             SET created_at = workflow_wakeups.created_at,
                 scheduled_at = GREATEST(workflow_wakeups.scheduled_at, EXCLUDED.scheduled_at),
@@ -241,7 +249,7 @@ final class PostgresJobRunner private[atomicflow] (
       case None =>
         if (runtime.leaseStillOurs(c.instanceId, c.worker, c.token)) {
           log.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
-          requeueTransient(c.instanceId, c.attempts)
+          requeueTransient(c.instanceId, c.attempts, c.createdAt)
         } else
           log.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
     }
@@ -251,12 +259,21 @@ final class PostgresJobRunner private[atomicflow] (
     log.info(s"Job runner claimed ${claimed.size} wakeups this cycle")
     val latch = new CountDownLatch(claimed.size)
     claimed.foreach { c =>
-      pool.execute(() => {
-        try dispatchRun(c)
-        catch {
-          case e: Throwable => log.warn(s"Uncaught error dispatching ${c.instanceId}", e)
-        } finally latch.countDown()
-      })
+      try {
+        pool.execute(() => {
+          try dispatchRun(c)
+          catch {
+            case e: Throwable => log.warn(s"Uncaught error dispatching ${c.instanceId}", e)
+          } finally latch.countDown()
+        })
+      } catch {
+        case e: Throwable =>
+          log.warn(s"Executor rejected the dispatch of ${c.instanceId}; requeueing", e)
+          runtime.releaseLeaseIfOurs(c.instanceId, c.worker, c.token)
+          releasePermit(c.instanceId.workflowId)
+          requeueTransient(c.instanceId, c.attempts, c.createdAt)
+          latch.countDown()
+      }
     }
     latch.await()
   }

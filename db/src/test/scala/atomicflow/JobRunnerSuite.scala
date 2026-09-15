@@ -8,8 +8,9 @@ import test.PostgresWorkflowRuntimeSuite
 
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 import scala.concurrent.duration.*
 
 /** Job runner behavior: claiming with registry filter and fairness, claim-atomic
@@ -239,41 +240,44 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("a transient failure requeues the wakeup with backoff and attempts+1") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+  test("a transient failure requeues the wakeup with backoff, attempts+1, and created_at preserved") {
+    val t0 = Instant.parse("2026-01-02T00:00:00Z")
+    val clock = new TestClock(t0)
     val rt = newRuntime(clock)
     val wf = simpleWf("req")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       val inst = wf.createAndSchedule("k", "x")(using rt)
+      clock.advanceBy(10.seconds)
       runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
       runner.runDriverCycle()
       assertEquals(runner.lastClaimedBatch, Vector(inst.id))
       val row = wakeupRow(wf.id, "k").get
       assertEquals(row._3, 1, "first requeue must set attempts to 1")
-      assertEquals(row._1, clock.instant(), "first requeue (row deleted at claim) records created_at = now")
+      assertEquals(row._1, t0, "created_at must be preserved across the claim->requeue cycle, not reset to now")
       assert(row._2.isAfter(clock.instant()), "scheduled_at must be pushed into the future by backoff")
     } finally runner.stop(1.second)
   }
 
   test("requeue preserves created_at across requeues while attempts and backoff grow") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val t0 = Instant.parse("2026-01-02T00:00:00Z")
+    val clock = new TestClock(t0)
     val rt = newRuntime(clock)
     val wf = simpleWf("req2")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       val inst = wf.createAndSchedule("k", "x")(using rt)
       deleteWakeup(wf.id, "k")
-      runner.requeueTransient(inst.id, 0)
+      runner.requeueTransient(inst.id, 0, t0)
       val first = wakeupRow(wf.id, "k").get
       assertEquals(first._3, 1)
-      val firstCreated = first._1
+      assertEquals(first._1, t0)
       val firstScheduled = first._2
       clock.advanceBy(1.second)
-      runner.requeueTransient(inst.id, 1)
+      runner.requeueTransient(inst.id, 1, t0)
       val second = wakeupRow(wf.id, "k").get
       assertEquals(second._3, 2, "the second requeue must bump attempts to 2")
-      assertEquals(second._1, firstCreated, "created_at must be unchanged across requeues")
+      assertEquals(second._1, t0, "created_at must be unchanged across requeues")
       assert(second._2.isAfter(firstScheduled), "backoff must grow with attempts")
     } finally runner.stop(1.second)
   }
@@ -379,6 +383,45 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(claimed.size, 8)
       assertEquals(claimed.count(_.workflowId == wfA.id), 4, "workflow A must get at most its share")
       assertEquals(claimed.count(_.workflowId == wfB.id), 4, "workflow B must get at most its share")
+    } finally runner.stop(1.second)
+  }
+
+  test("executor override: dispatched runs execute on the supplied executor and stop does not shut it down") {
+    val rt = newRuntime
+    val executor = Executors.newSingleThreadExecutor()
+    val threadName = new AtomicReference[String]()
+    val wf = Workflow[String, String](id = "exec") { in =>
+      threadName.set(Thread.currentThread().getName)
+      s"done-$in"
+    }
+    try {
+      val runner = rt.startJobRunnerForTests(
+        Seq(wf),
+        JobRunnerSettings.forTests.copy(executor = Some(executor))
+      )
+      try {
+        wf.createAndSchedule("k", "x")(using rt)
+        runner.runDriverCycle()
+        assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
+        val name = threadName.get()
+        assert(name != null && name.startsWith("pool-"), s"run must execute on the supplied executor, got $name")
+        assert(!name.equals(Thread.currentThread().getName), "run must not execute on the caller thread")
+      } finally runner.stop(1.second)
+      val marker = new AtomicBoolean(false)
+      executor.execute(() => marker.set(true))
+      waitUntil(marker.get())
+    } finally executor.shutdownNow()
+  }
+
+  test("caller-thread run bypasses per-workflow caps") {
+    val rt = newRuntime
+    val wf = simpleWf("bypass")
+    val settings = JobRunnerSettings.forTests.copy(maxConcurrentInstances = _ => 0)
+    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
+    try {
+      val inst = wf.createAndSchedule("k", "x")(using rt)
+      assertEquals(rt.runWorkflowInstance(wf, inst.id), WorkflowRunResult.Result("done-x"))
+      assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
     } finally runner.stop(1.second)
   }
 
