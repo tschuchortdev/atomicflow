@@ -191,6 +191,29 @@ object Workflow {
     */
   def versionAtCreation(using ctx: WorkflowContext): Long = ctx.versionAtCreation
 
+  /** The recursive tail transition: ends the current execution and restarts the
+    * same logical workflow with `nextInput` and a fresh history, in place. The
+    * generation is incremented and the previous generation's execution records
+    * (Step rows, subscriptions, wakeups) are erased; exact-key signal cursors
+    * are kept. Children are closed per their `ParentClosePolicy`; the
+    * continuation does not wait for cooperative child cancellation. If this
+    * instance is itself a child it stays attached to its own parent with the
+    * same signal-inheritance configuration.
+    *
+    * Returns `Nothing` and is implemented as runtime control flow, so the body
+    * does not continue after the call. The run ends with a
+    * `WorkflowRunResult.ContinueAsNew` outcome and the successor is scheduled;
+    * a subsequent `run` (or the job runner) executes it from the top.
+    *
+    * The next input is encoded with the local `Cacheable` and decoded by the
+    * runtime with this workflow's input codec, which the type system ties to
+    * `nextInput` by convention; a mismatch fails the run.
+    */
+  def continueAsNew[A: Cacheable](nextInput: A)(using ctx: WorkflowContext): Nothing = {
+    val encoded = summon[Cacheable[A]].write(nextInput)
+    throw new ContinueAsNewException(encoded)
+  }
+
   /** A lexical region inside which cancellation delivery is suppressed: while
     * `f` runs, checkpoints do not throw [[WorkflowCancelledException]], so Step
     * bodies execute and awaits resolve normally. This is the mechanism for

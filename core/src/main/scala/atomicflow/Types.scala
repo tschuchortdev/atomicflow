@@ -80,5 +80,6 @@ enum WorkflowRunResult[+A] {
   case WorkflowSuspended
   case WorkflowCancelled
   case WorkflowTerminated
+  case ContinueAsNew
   case Result(value: A)
 }

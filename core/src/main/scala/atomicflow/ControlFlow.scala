@@ -25,10 +25,13 @@ final class WorkflowSuspendedException private[atomicflow] (
 }
 
 /** Thrown by `Workflow.continueAsNew` to abort the current body and restart the
-  * instance with new input. The runtime serializes [[newInput]] with the workflow
-  * definition's `Cacheable` when committing the transition.
+  * instance with new input. Carries the [[encoded]] bytes of the next input,
+  * serialized with the caller's local `Cacheable` at the forwarder. The runtime
+  * decodes them with the current workflow definition's input codec when it
+  * commits the transition; the type system ties the two by convention, so a
+  * mismatch fails the run (acceptable).
   */
-final class ContinueAsNewException private[atomicflow] (val newInput: Any) extends WorkflowControlException {
+final class ContinueAsNewException private[atomicflow] (val encoded: String) extends WorkflowControlException {
   override def toString: String = "ContinueAsNewException"
 }
 

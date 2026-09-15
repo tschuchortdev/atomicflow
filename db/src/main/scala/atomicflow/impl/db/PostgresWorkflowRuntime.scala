@@ -561,6 +561,54 @@ class PostgresWorkflowRuntime private[atomicflow] (
     ()
   }
 
+  /** The guarded `continueAsNew` in-place transition, committed in ONE
+    * transaction under the run's lease: erase the old generation's execution
+    * records (Step rows, subscriptions, and wakeup), keep the exact-key signal
+    * cursors, close children per their `ParentClosePolicy` (before the directly
+    * addressed `Signal` events are deleted), delete the directly addressed
+    * `Signal` events, increment the generation, install the new input, re-open
+    * signal acceptance for the successor, and upsert its wakeup. Fenced: if the
+    * lease no longer belongs to this run, no rows are affected and
+    * [[LeaseLostException]] is thrown.
+    */
+  private def continueAsNewTransition(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String,
+      worker: String,
+      token: Long,
+      newSerializedInput: String
+  ): Unit = {
+    val now = theClock.instant()
+    val res = runSync {
+      for {
+        _ <- sql"""SELECT 1 FROM workflow_instances
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                   FOR UPDATE""".query[Int].unique
+        fenceOk <- sql"""SELECT 1 FROM workflow_instances
+                         WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                           AND lease_owner = $worker AND fencing_token = $token""".query[Int].option
+        done <- fenceOk match {
+          case None => false.pure[ConnectionIO]
+          case Some(_) =>
+            for {
+              _ <- sql"""DELETE FROM workflow_steps
+                         WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+              _ <- terminalCleanupIO(workflowId, key, scope)
+              _ <- applyParentClosePoliciesIO(workflowId, key, scope)
+              _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
+              _ <- sql"""UPDATE workflow_instances
+                         SET input = $newSerializedInput, generation = generation + 1, is_accepting_signals = true
+                         WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".update.run
+              _ <- upsertWakeupIO(workflowId, key, scope, now)
+            } yield true
+        }
+      } yield done
+    }
+    if (!res) throw LeaseLostException(WorkflowInstanceId(workflowId, key, scope))
+    ()
+  }
+
   /** The guarded `TERMINATED` terminal transition, shared by the public
     * [[terminate]] and the cancellation-escalation sweep. Row-locks the
     * instance; a missing or already-terminal instance is a no-op (returns
@@ -772,6 +820,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   suspended = true
                 case _: LeaseLostException =>
                   throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+                case e: ContinueAsNewException =>
+                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                  val newSerializedInput = wf.inputCacheable.write(wf.inputCacheable.read(e.encoded))
+                  continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
+                  log.info(s"Workflow instance $instanceId continued as new")
+                  return WorkflowRunResult.ContinueAsNew
                 case _: WorkflowCancelledException =>
                   runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
                   val payload = Framing.write("cancelled")
