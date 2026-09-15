@@ -269,4 +269,45 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     sig.send(id, "go2")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
   }
+
+  test("a continueAsNew whose new-input codec fails to decode does not consume pending signals and leaves the instance runnable") {
+    val rt = newRuntime
+    val sig = Signal[String]("S")
+    var handlerCalled = false
+    val (wf, id) = {
+      val identity = {
+        import atomicflow.Cacheable.Simple.given
+        summon[Cacheable[String]]
+      }
+      given boomCodec: Cacheable[String] = new Cacheable[String] {
+        override def stableSerializedTypeId: String = "boom-str"
+        override def write(value: String): String = identity.write(value)
+        override def read(serialized: String): String =
+          if (serialized == "boom") throw new IllegalStateException("input codec mismatch: boom")
+          else identity.read(serialized)
+      }
+      val w = Workflow[String, String]("can-mismatch")(
+        in => {
+          if (in == "start") Workflow.continueAsNew("boom")(using identity)
+          "done"
+        },
+        onUnconsumedSignals = _ => handlerCalled = true
+      )
+      (w, rt.createWorkflowInstance(w, "k", "start").id)
+    }
+    sig.send(id, "pending")(using rt)
+    assertEquals(countSignalEvents(wf.id, "k"), 1)
+
+    intercept[IllegalStateException](rt.runWorkflowInstance(wf, id))
+
+    assertEquals(handlerCalled, false, "onUnconsumedSignals must not run when the new input fails to decode")
+    assertEquals(countSignalEvents(wf.id, "k"), 1, "pending signals are not consumed when the new input fails to decode")
+
+    val repaired = Workflow[String, String]("can-mismatch") { in => "recovered:" + in }
+    assertEquals(
+      rt.runWorkflowInstance(repaired, id),
+      WorkflowRunResult.Result("recovered:start"),
+      "the instance is not stranded after the decode failure"
+    )
+  }
 }

@@ -821,8 +821,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 case _: LeaseLostException =>
                   throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
                 case e: ContinueAsNewException =>
+                  val newInput = wf.inputCacheable.read(e.encoded)
                   runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
-                  val newSerializedInput = wf.inputCacheable.write(wf.inputCacheable.read(e.encoded))
+                  val newSerializedInput = wf.inputCacheable.write(newInput)
                   continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
                   log.info(s"Workflow instance $instanceId continued as new")
                   return WorkflowRunResult.ContinueAsNew
