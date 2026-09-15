@@ -1655,12 +1655,29 @@ class PostgresWorkflowRuntime private[atomicflow] (
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
   ): JobRunner =
+    createRunner(definitions, settings, startLoop = true)
+
+  /** Package-private test hook: like [[startJobRunner]] but builds a runner whose
+    * background driver loop is NOT started, so a test can drive claim cycles
+    * deterministically via `runDriverCycle` without racing the auto-loop.
+    */
+  private[atomicflow] def startJobRunnerForTests(
+      definitions: Seq[Workflow[?, ?]],
+      settings: JobRunnerSettings
+  ): PostgresJobRunner =
+    createRunner(definitions, settings, startLoop = false)
+
+  private def createRunner(
+      definitions: Seq[Workflow[?, ?]],
+      settings: JobRunnerSettings,
+      startLoop: Boolean
+  ): PostgresJobRunner =
     runnerGuard.synchronized {
       if (isRunnerActive)
         throw new IllegalStateException(
           "This runtime already has an active job runner; stop it before starting another"
         )
-      val runner = new PostgresJobRunner(this, definitions, settings)
+      val runner = new PostgresJobRunner(this, definitions, settings, startLoop)
       activeRunner = runner
       runner
     }

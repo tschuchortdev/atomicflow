@@ -7,6 +7,9 @@ import doobie.postgres.implicits.*
 import test.PostgresWorkflowRuntimeSuite
 
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
 
 /** Job runner behavior: claiming with registry filter and fairness, claim-atomic
@@ -73,7 +76,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val rt = newRuntime
     val wfA = simpleWf("ra")
     val wfB = simpleWf("rb")
-    val runner = rt.startJobRunner(Seq(wfA), JobRunnerSettings.forTests)
+    val runner = rt.startJobRunnerForTests(Seq(wfA), JobRunnerSettings.forTests)
     try {
       wfB.createAndSchedule("k", "x")(using rt)
       runner.runDriverCycle()
@@ -88,7 +91,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wfB = simpleWf("fb")
     (1 to 3).foreach(i => wfA.createAndSchedule(s"a$i", "x")(using rt))
     (1 to 3).foreach(i => wfB.createAndSchedule(s"b$i", "x")(using rt))
-    val runner = rt.startJobRunner(
+    val runner = rt.startJobRunnerForTests(
       Seq(wfA, wfB),
       JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 1, wakeupBatchSize = 2)
     )
@@ -110,7 +113,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
             SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
             WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
     )
-    val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       runner.runDriverCycle()
       assert(wakeupExists(wf.id, "k"), "the wakeup must persist when the lease is held by a live owner")
@@ -124,7 +127,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       throw new RuntimeException("boom")
     }
     rt.createAndSchedule(wf, "k", "x")
-    val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       runner.runDriverCycle()
       val row = instanceRow(wf.id, "k").get
@@ -173,6 +176,49 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     r1.stop(1.second)
     val r2 = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
     r2.stop(1.second)
+  }
+
+  test("stop(gracePeriod) waits for the in-flight run, stops claiming, and is idempotent") {
+    val rt = newRuntime
+    val started = new AtomicInteger(0)
+    val finished = new AtomicInteger(0)
+    val releaseA = new CountDownLatch(1)
+    val aStarted = new CountDownLatch(1)
+    val wf = Workflow[String, String](id = "grace") { in =>
+      started.incrementAndGet()
+      if (in == "a") {
+        aStarted.countDown()
+        releaseA.await()
+      }
+      try s"done-$in"
+      finally finished.incrementAndGet()
+    }
+    val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      wf.createAndSchedule("a", "a")(using rt)
+      assert(aStarted.await(10, TimeUnit.SECONDS), "the in-flight run must start")
+      wf.createAndSchedule("b", "b")(using rt)
+      val stopDone = new CountDownLatch(1)
+      val stopThread = new Thread(() => {
+        runner.stop(5.seconds)
+        stopDone.countDown()
+      })
+      stopThread.setDaemon(true)
+      stopThread.start()
+      Thread.sleep(200)
+      assertEquals(stopDone.getCount, 1L, "stop must block while the in-flight run is unfinished")
+      releaseA.countDown()
+      assert(stopDone.await(10, TimeUnit.SECONDS), "stop must return once the in-flight run finishes")
+      assertEquals(started.get(), 1, "only the in-flight run may have started (B stays unclaimed)")
+      assertEquals(finished.get(), 1, "the in-flight run must complete before stop returns")
+      assert(wakeupExists(wf.id, "b"), "B's wakeup must remain unclaimed after stop")
+      val t0 = System.nanoTime()
+      runner.stop(1.second)
+      assert((System.nanoTime() - t0) < 1.second.toNanos, "the second stop must return promptly")
+    } finally {
+      releaseA.countDown()
+      runner.stop(1.second)
+    }
   }
 
   test("duplicate workflow ids in the registry are rejected at start") {

@@ -22,7 +22,8 @@ import cats.syntax.all.*
 final class PostgresJobRunner private[atomicflow] (
     runtime: PostgresWorkflowRuntime,
     definitions: Seq[Workflow[?, ?]],
-    settings: JobRunnerSettings
+    settings: JobRunnerSettings,
+    startLoop: Boolean = true
 ) extends JobRunner {
 
   private val log = LoggerFactory.getLogger(getClass)
@@ -199,6 +200,13 @@ final class PostgresJobRunner private[atomicflow] (
     dispatchAndAwait(claimed)
   }
 
+  /** The most recent batch of workflow instance ids claimed, either by a
+    * `runDriverCycle` call or by the running driver loop. Package-private test
+    * hook; written by a driver thread and read by test threads, so it is
+    * `@volatile`. Caveat: a concurrently running driver loop can clobber the
+    * value a `runDriverCycle` caller just set.
+    */
+  @volatile
   private[atomicflow] var lastClaimedBatch: Vector[WorkflowInstanceId] = Vector.empty
 
   private val loopThread = new Thread(
@@ -233,21 +241,31 @@ final class PostgresJobRunner private[atomicflow] (
   }
 
   loopThread.setDaemon(true)
-  loopThread.start()
+  if (startLoop) loopThread.start()
 
   override def stop(gracePeriod: FiniteDuration): Unit = {
     if (!stopped.getAndSet(true)) {
       runtime.clearActiveRunner(this)
+      val deadline = System.nanoTime() + gracePeriod.toNanos
       loopThread.interrupt()
-      try loopThread.join(gracePeriod.toMillis)
-      catch {
+      try {
+        val remaining = deadline - System.nanoTime()
+        if (remaining > 0) {
+          loopThread.join(remaining / 1000000L, (remaining % 1000000L).toInt)
+        }
+      } catch {
         case _: InterruptedException => Thread.currentThread().interrupt()
       }
       ownedPool match {
         case Some(es) =>
           es.shutdown()
           try {
-            if (!es.awaitTermination(gracePeriod.toMillis, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            val remaining = deadline - System.nanoTime()
+            if (remaining > 0) {
+              if (!es.awaitTermination(remaining, java.util.concurrent.TimeUnit.NANOSECONDS)) {
+                es.shutdownNow()
+              }
+            } else {
               es.shutdownNow()
             }
           } catch {
