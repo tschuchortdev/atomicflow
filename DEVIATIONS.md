@@ -221,3 +221,23 @@ implementation phase.
 45. **Reset leaves subscriptions of erased steps in place when they have no
     step row** (benign: re-registration reuses them via ON CONFLICT and
     consumption is cursor-based).
+
+## Phase 8 (Updates)
+
+46. **`sendUpdate` and its forwarders take a leading `workflow` definition
+    argument** (the sender-thread run needs the definition; the runtime has no
+    registry). The spec's shapes omit it.
+47. **`Step.awaitUpdate` requires `O: Cacheable`** (the await persists its
+    output like every other step construct); the spec's shape omits the bound.
+48. **A `workflow_update_subscriptions` table backs suspended
+    `awaitUpdate`s**, in addition to the spec's update records — the same
+    subscription/wakeup machinery signals use, so a send wakes a suspended
+    awaiter.
+49. **Handled update records are retained only when they carry an
+    idempotency key** (dedup requires them); empty-key handled records are
+    deleted. The spec's "deleted after workflow completion" phrasing is
+    resolved in favor of idempotency.
+50. **Known edge (deferred):** a runner-mode wakeup scheduled for the same
+    instant as a sender-thread run can, in a narrow race, consume the update
+    on the runner's thread and leave the sender reading `Unhandled` — the
+    update IS handled durably; only the sender's synchronous view is stale.
