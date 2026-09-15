@@ -109,6 +109,12 @@ private[atomicflow] trait WorkflowExecution {
     */
   def currentScope: String
 
+  /** The instance's current run generation (incremented by `continueAsNew`).
+    * Used to derive child instance scopes (the `@generation` marker), so
+    * children started before and after a `continueAsNew` do not collide.
+    */
+  def generation: Long
+
   /** Pushes one already-escaped `Workflow.scoped` segment onto the current
     * thread's scope stack, so subsequent Step/Await IDs are prefixed with it.
     * Must be balanced by a matching [[popScope]] (paired in a `try/finally`).

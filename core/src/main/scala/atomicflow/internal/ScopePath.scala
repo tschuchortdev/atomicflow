@@ -1,5 +1,7 @@
 package atomicflow.internal
 
+import atomicflow.{WorkflowId, WorkflowInstanceKey}
+
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
@@ -26,6 +28,29 @@ private[atomicflow] object ScopePath {
 
   /** Joins already-escaped segments with the `/` delimiter, outer-to-inner. */
   def joinEscaped(escapedSegments: String*): String = escapedSegments.mkString("/")
+
+  /** Derives a child workflow instance's scope from its parent's identity and
+    * the current run context: the parent's own instance scope, the parent
+    * workflow id and instance key (backslash-escaped), the parent's current run
+    * generation as an `@generation` marker, and the parent's enclosing
+    * `Workflow.scoped` path. The result is injective because every user-supplied
+    * segment is escaped (see `spec/sub-workflows-iteration.md`, "Key
+    * derivation").
+    */
+  def deriveChildScope(
+      parentInstanceScope: String,
+      parentWorkflowId: WorkflowId,
+      parentKey: WorkflowInstanceKey,
+      parentGeneration: Long,
+      enclosingScopePath: String
+  ): String = {
+    val segments = Vector.newBuilder[String]
+    if (parentInstanceScope.nonEmpty) segments += parentInstanceScope
+    segments += escapeScopeSegment(parentWorkflowId)
+    segments += escapeScopeSegment(parentKey) + "@" + parentGeneration
+    if (enclosingScopePath.nonEmpty) segments += enclosingScopePath
+    joinEscaped(segments.result()*)
+  }
 
   /** Replaces an overlong scope portion with a marked stable hash, so all children
     * of one parent instance and generation begin with the same normalized prefix.

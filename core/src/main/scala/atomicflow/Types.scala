@@ -50,6 +50,27 @@ enum WorkflowTerminalState {
   case Completed, Failed, Cancelled, Terminated
 }
 
+/** What happens to a child workflow when its parent reaches a terminal state or
+  * calls `continueAsNew` (see `spec/sub-workflows-iteration.md`,
+  * "ParentClosePolicy"). `Cancel` delivers a cooperative cancellation;
+  * `Abandon` detaches the child, which continues independently.
+  */
+enum ParentClosePolicy {
+  case Cancel
+  case Abandon
+}
+
+/** Which signals addressed to a child's parent are visible to the child (see
+  * `spec/sub-workflows-iteration.md`, "Inherited signals"). Defaults to `none`;
+  * `some(prefixes)` permits matching key prefixes; `all` permits every key.
+  * Inheritance is transitive only when every parent-child edge permits the key.
+  */
+enum SignalInheritance {
+  case none
+  case all
+  case some(prefixes: Seq[SignalKey])
+}
+
 /** The public synchronous execution outcome of `run`/`createAndRun`/
   * `awaitResult`. Failures still propagate as exceptions.
   */

@@ -113,6 +113,34 @@ final class Workflow[In, Out] private[atomicflow] (
   ): WorkflowInstance[In, Out] =
     runtime.createAndSchedule(this, instanceKey, in)
 
+  /** Start a child workflow from within this workflow's body (see
+    * `spec/sub-workflows-iteration.md`, "startAsChild"). Create-if-absent a
+    * child under a scope derived from this parent's identity, generation, and
+    * enclosing `Workflow.scoped` path; record the parent relationship and
+    * inheritance configuration; and schedule the child's first wakeup. The
+    * child body is never executed inline on this parent's thread; run it via a
+    * job runner or `run` separately. Returns a handle whose `completion` can be
+    * awaited with `Step.await`.
+    */
+  def startAsChild(
+      childKey: WorkflowInstanceKey,
+      input: In,
+      parentClosePolicy: ParentClosePolicy = ParentClosePolicy.Cancel,
+      inheritSignals: SignalInheritance = SignalInheritance.none,
+      inheritPastEvents: Boolean = false
+  )(using ctx: WorkflowContext): WorkflowInstance[In, Out] =
+    ctx.runtime.startChild(
+      this,
+      childKey,
+      input,
+      parentClosePolicy,
+      inheritSignals,
+      inheritPastEvents,
+      ctx.instanceId,
+      ctx.execution.generation,
+      ctx.execution.currentScope
+    )(using inputCacheable)
+
   /** Run a previously created instance on the caller thread (no input param). */
   def run(instanceKey: WorkflowInstanceKey)(using
       runtime: WorkflowRuntime,

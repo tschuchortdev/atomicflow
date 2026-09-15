@@ -104,6 +104,31 @@ trait WorkflowRuntime {
       stepVersion: Long
   ): Option[atomicflow.internal.StoredStep]
 
+  /** Start a child workflow of an executing parent: create-if-absent a child
+    * instance under a scope derived from the parent's identity, generation, and
+    * enclosing `Workflow.scoped` path; record the parent relationship and
+    * inheritance configuration; and schedule the child's first wakeup. Never
+    * executes the child body on the parent's thread. Idempotent on parent
+    * replay (`startAsChild` returns the existing handle).
+    */
+  private[atomicflow] def startChild[In, Out](
+      workflow: Workflow[In, Out],
+      childKey: WorkflowInstanceKey,
+      input: In,
+      parentClosePolicy: ParentClosePolicy,
+      inheritSignals: SignalInheritance,
+      inheritPastEvents: Boolean,
+      parentId: WorkflowInstanceId,
+      parentGeneration: Long,
+      enclosingScopePath: String
+  )(using Cacheable[In]): WorkflowInstance[In, Out]
+
+  /** The active children of `parentId`: instances whose parent relationship
+    * still points at `parentId` (not yet cleared by a parent terminal
+    * transition).
+    */
+  def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info]
+
   /** Register and schedule the instance's first wakeup (due immediately). */
   final def createAndSchedule[In, Out](
       workflow: Workflow[In, Out],
