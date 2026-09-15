@@ -56,30 +56,56 @@ class DocumentProcessingAtomicflow(
       version = 1L,
       name = "document batch processing"
     ) { inputFilePath =>
-      val batch = readAndArchiveFile(inputFilePath)
+      val batch = readInputFile(inputFilePath)
+      archiveInputFile(inputFilePath)
+      // Documents are processed sequentially: per-document step ids are
+      // namespaced by `Workflow.scoped`, and a batch is small, so the old
+      // prototype's `parallelism = 4` concurrency is deliberately not ported.
       batch.documents.foreach { document =>
         Workflow.scoped(document.documentId) {
           processIndividualDocument(document)
         }
       }
-      resultReporter.reportResultSuccess(Path.of(inputFilePath)).unsafeRunSync()
+      reportResult(inputFilePath)
       batch.documents.size
     }
 
-  private def readAndArchiveFile(inputFilePath: String)(using ctx: WorkflowContext): FileWithDocumentBatch =
-    Step.atLeastOnce[FileWithDocumentBatch]("read-and-archive-file") {
-      val path = Path.of(inputFilePath)
+  /** Read and parse the input file. Kept as its own durable step so the parsed
+    * batch survives a crash after archiving; a genuinely missing input file
+    * (first run) is a real failure.
+    */
+  private def readInputFile(inputFilePath: String)(using ctx: WorkflowContext): FileWithDocumentBatch =
+    Step.atLeastOnce[FileWithDocumentBatch]("read-input-file") {
       val fileContent =
-        try Files.readString(path)
+        try Files.readString(Path.of(inputFilePath))
         catch { case e: java.io.IOException => throw Error.ReadingFileFailed(e.getMessage) }
-      val parsed =
-        try FileWithDocumentBatch.fromString(fileContent)
-        catch { case e: IllegalArgumentException => throw Error.ParsingFileFailed(e.getMessage) }
+      try FileWithDocumentBatch.fromString(fileContent)
+      catch { case e: IllegalArgumentException => throw Error.ParsingFileFailed(e.getMessage) }
+    }
+
+  /** Move the input file into the archive. On an at-least-once replay after a
+    * crash between `Files.move` and step commit, the file is already gone; that
+    * is treated as already-archived success (matching the workflow4s reference),
+    * not a workflow failure.
+    */
+  private def archiveInputFile(inputFilePath: String)(using ctx: WorkflowContext): Unit =
+    Step.atLeastOnce[Unit]("archive-input-file") {
+      val path = Path.of(inputFilePath)
       try {
         Files.createDirectories(archiveDir)
         Files.move(path, archiveDir.resolve(path.getFileName))
-      } catch { case e: java.io.IOException => throw Error.ArchivingFileFailed(e.getMessage) }
-      parsed
+      } catch {
+        case _: java.nio.file.NoSuchFileException => ()
+        case e: java.io.IOException               => throw Error.ArchivingFileFailed(e.getMessage)
+      }
+    }
+
+  /** Report the batch result as a durable at-most-once external effect: on a
+    * replay the report is never re-executed.
+    */
+  private def reportResult(inputFilePath: String)(using ctx: WorkflowContext): Unit =
+    Step.atMostOnce[Unit]("report-input-file-processing-status", ensureUnchanged = Seq("filePath" -> inputFilePath)) {
+      resultReporter.reportResultSuccess(Path.of(inputFilePath)).unsafeRunSync()
     }
 
   private def processIndividualDocument(document: DocumentFromInputFile)(using ctx: WorkflowContext): Unit = {
@@ -89,7 +115,12 @@ class DocumentProcessingAtomicflow(
     )
 
     val signed =
-      Step.atLeastOnce[Array[Byte]]("sign-document", ensureUnchanged = Seq("documentId" -> document.documentId)) {
+      Step.atLeastOnce[Array[Byte]](
+        "sign-document",
+        ensureUnchanged = Seq("documentId" -> document.documentId),
+        invalidateOn = Seq("documentContent" -> document.content),
+        invalidateAfter = EncryptionService.signatureValidityPeriod - 2.seconds
+      ) {
         encryptionService.signDocument(document.content).unsafeRunSync()
       }
 
@@ -117,17 +148,17 @@ class DocumentProcessingAtomicflow(
   private def pollUploadStatus(documentId: String)(using ctx: WorkflowContext): Unit =
     Workflow.loop[Int, Unit]("poll-upload-status", 0) { (attempts, loop) =>
       val outcome =
-        Step.atLeastOnce[String]("check-upload-status") {
+        Step.atLeastOnce[UploadPollOutcome]("check-upload-status") {
           documentUploadEndpoint.checkUploadProcessingStatus(documentId).unsafeRunSync() match {
-            case DocumentUploadEndpoint.ProcessingStatus.ProcessedSuccessfully => "success"
-            case DocumentUploadEndpoint.ProcessingStatus.ProcessedWithErrors(msg) => s"error:$msg"
-            case DocumentUploadEndpoint.ProcessingStatus.NoInfo => "noinfo"
+            case DocumentUploadEndpoint.ProcessingStatus.ProcessedSuccessfully => UploadPollOutcome.ProcessedSuccessfully
+            case DocumentUploadEndpoint.ProcessingStatus.ProcessedWithErrors(msg) => UploadPollOutcome.ProcessedWithErrors(msg)
+            case DocumentUploadEndpoint.ProcessingStatus.NoInfo => UploadPollOutcome.NoInfo
           }
         }
       outcome match {
-        case "success" => loop.break(())
-        case o if o.startsWith("error:") => throw Error.UploadProcessedWithErrors(o.drop("error:".length))
-        case _ =>
+        case UploadPollOutcome.ProcessedSuccessfully => loop.break(())
+        case UploadPollOutcome.ProcessedWithErrors(msg) => throw Error.UploadProcessedWithErrors(msg)
+        case UploadPollOutcome.NoInfo =>
           if (attempts >= MaxPollAttempts) throw Error.UploadStatusTimeoutExceeded
           else {
             Step.await[Unit]("poll-wait", Awaitable.Timer(PollInterval))
@@ -140,6 +171,29 @@ class DocumentProcessingAtomicflow(
 object DocumentProcessingAtomicflow {
   private[example] val PollInterval: FiniteDuration = 15.minutes
   private[example] val MaxPollAttempts: Int = 10
+
+  /** The durable outcome of one upload-status poll, modeled as an enum (rather
+    * than stringly-typed comparisons) so the step persists a well-typed value.
+    */
+  enum UploadPollOutcome {
+    case ProcessedSuccessfully
+    case ProcessedWithErrors(msg: String)
+    case NoInfo
+  }
+
+  given Cacheable[UploadPollOutcome] = new Cacheable[UploadPollOutcome] {
+    override def stableSerializedTypeId: String = "upload-poll-outcome"
+    override def write(value: UploadPollOutcome): String = value match {
+      case UploadPollOutcome.ProcessedSuccessfully   => "success"
+      case UploadPollOutcome.ProcessedWithErrors(msg) => s"error:$msg"
+      case UploadPollOutcome.NoInfo                    => "noinfo"
+    }
+    override def read(serialized: String): UploadPollOutcome = serialized match {
+      case "success"                            => UploadPollOutcome.ProcessedSuccessfully
+      case s if s.startsWith("error:")          => UploadPollOutcome.ProcessedWithErrors(s.drop("error:".length))
+      case _                                    => UploadPollOutcome.NoInfo
+    }
+  }
 
   /** Circe-backed codec for the parsed batch, so the read-and-archive step can
     * persist its result durably.

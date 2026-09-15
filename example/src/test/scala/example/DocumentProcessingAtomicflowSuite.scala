@@ -53,60 +53,72 @@ class DocumentProcessingAtomicflowSuite extends FunSuite {
 
   test("processes a small batch end-to-end") {
     val baseDir = Files.createTempDirectory("atomicflow-example")
-    val archiveDir = baseDir.resolve("archive")
-    val inputFile = baseDir.resolve("batch-1.json")
+    try {
+      val archiveDir = baseDir.resolve("archive")
+      val inputFile = baseDir.resolve("batch-1.json")
 
-    val documents = Vector(
-      DocumentFromInputFile("doc-1", "content-1".getBytes("UTF-8")),
-      DocumentFromInputFile("doc-2", "content-2".getBytes("UTF-8"))
-    )
-    Files.writeString(inputFile, FileWithDocumentBatch(documents).asJson.noSpaces)
+      val documents = Vector(
+        DocumentFromInputFile("doc-1", "content-1".getBytes("UTF-8")),
+        DocumentFromInputFile("doc-2", "content-2".getBytes("UTF-8"))
+      )
+      Files.writeString(inputFile, FileWithDocumentBatch(documents).asJson.noSpaces)
 
-    val uploads = new ConcurrentHashMap[String, Array[Byte]]()
-    val statusChecks = new AtomicInteger(0)
-    val reports = new AtomicInteger(0)
+      val uploads = new ConcurrentHashMap[String, Array[Byte]]()
+      val statusChecks = new AtomicInteger(0)
+      val reports = new AtomicInteger(0)
 
-    val virusCheckService = new VirusCheckService {
-      override def checkForVirus1(content: Array[Byte]): IO[Boolean] = IO.pure(true)
-      override def checkForVirus2(content: Array[Byte]): IO[Boolean] = IO.pure(true)
-    }
-    val encryptionService = new EncryptionService {
-      override def signDocument(content: Array[Byte]): IO[Array[Byte]] = IO.pure(content)
-    }
-    val documentUploadEndpoint = new DocumentUploadEndpoint {
-      override def uploadDocumentForProcessing(
-          documentId: String,
-          signedDocument: Array[Byte]
-      ): IO[Either[DocumentUploadEndpoint.SignatureError.type, Unit]] = {
-        uploads.put(documentId, signedDocument)
-        IO.pure(Right(()))
+      val virusCheckService = new VirusCheckService {
+        override def checkForVirus1(content: Array[Byte]): IO[Boolean] = IO.pure(true)
+        override def checkForVirus2(content: Array[Byte]): IO[Boolean] = IO.pure(true)
       }
-      override def checkUploadProcessingStatus(documentId: String): IO[DocumentUploadEndpoint.ProcessingStatus] = {
-        statusChecks.incrementAndGet()
-        IO.pure(DocumentUploadEndpoint.ProcessingStatus.ProcessedSuccessfully)
+      val encryptionService = new EncryptionService {
+        override def signDocument(content: Array[Byte]): IO[Array[Byte]] = IO.pure(content)
       }
+      val documentUploadEndpoint = new DocumentUploadEndpoint {
+        override def uploadDocumentForProcessing(
+            documentId: String,
+            signedDocument: Array[Byte]
+        ): IO[Either[DocumentUploadEndpoint.SignatureError.type, Unit]] = {
+          uploads.put(documentId, signedDocument)
+          IO.pure(Right(()))
+        }
+        override def checkUploadProcessingStatus(documentId: String): IO[DocumentUploadEndpoint.ProcessingStatus] = {
+          statusChecks.incrementAndGet()
+          IO.pure(DocumentUploadEndpoint.ProcessingStatus.ProcessedSuccessfully)
+        }
+      }
+      val resultReporter = new ResultReporter {
+        override def reportResultSuccess(filePath: Path): IO[Unit] = IO { reports.incrementAndGet(); () }
+      }
+
+      val flow = new DocumentProcessingAtomicflow(
+        archiveDir,
+        virusCheckService,
+        encryptionService,
+        documentUploadEndpoint,
+        resultReporter,
+        newDataSource
+      )
+
+      given WorkflowRuntime = flow.runtime
+
+      val result = flow.batchWorkflow.createAndRun("batch-1", inputFile.toString)
+
+      assertEquals(result, WorkflowRunResult.Result(2))
+      assertEquals(uploads.keySet().size, 2)
+      assertEquals(statusChecks.get(), 2)
+      assertEquals(reports.get(), 1)
+      assert(Files.exists(archiveDir.resolve("batch-1.json")), "the input file must be archived")
+    } finally {
+      deleteRecursively(baseDir)
     }
-    val resultReporter = new ResultReporter {
-      override def reportResultSuccess(filePath: Path): IO[Unit] = IO { reports.incrementAndGet(); () }
+  }
+
+  private def deleteRecursively(path: Path): Unit = {
+    import scala.jdk.CollectionConverters.*
+    if (Files.isDirectory(path)) {
+      Files.list(path).iterator().asScala.foreach(deleteRecursively)
     }
-
-    val flow = new DocumentProcessingAtomicflow(
-      archiveDir,
-      virusCheckService,
-      encryptionService,
-      documentUploadEndpoint,
-      resultReporter,
-      newDataSource
-    )
-
-    given WorkflowRuntime = flow.runtime
-
-    val result = flow.batchWorkflow.createAndRun("batch-1", inputFile.toString)
-
-    assertEquals(result, WorkflowRunResult.Result(2))
-    assertEquals(uploads.keySet().size, 2)
-    assertEquals(statusChecks.get(), 2)
-    assertEquals(reports.get(), 1)
-    assert(Files.exists(archiveDir.resolve("batch-1.json")), "the input file must be archived")
+    Files.deleteIfExists(path)
   }
 }
