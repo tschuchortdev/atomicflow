@@ -40,8 +40,6 @@ final class PostgresJobRunner private[atomicflow] (
 
   private val runnerWorker = runtime.workerIdFor("jobrunner")
 
-  private given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
-
   private val stopped = new AtomicBoolean(false)
 
   private val ownedPool: Option[ExecutorService] =
@@ -142,7 +140,7 @@ final class PostgresJobRunner private[atomicflow] (
         c.token,
         settings.leaseDuration,
         settings.leaseAcquireTimeout
-      )
+      )(using settings.throwableCacheable)
       result match {
         case WorkflowRunResult.WorkflowSuspended =>
           log.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
@@ -190,11 +188,129 @@ final class PostgresJobRunner private[atomicflow] (
     latch.await()
   }
 
-  private def runSweepStubs(): Unit = ()
+  private final case class TimerSweepRow(
+      subscriptionId: java.util.UUID,
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  )
+
+  private final case class InstanceRow(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  )
+
+  /** Path 1 timer firing: the scheduler sweep. Claims due, not-yet-fired timer
+    * subscriptions of non-terminal instances in deadline order, bounded by
+    * `timerBatchSize`, locking the subscription rows with `FOR UPDATE OF s SKIP
+    * LOCKED` (the claim; no delete). Each claimed row is then fired in its own
+    * transaction via the shared [[PostgresWorkflowRuntime.fireTimerSubscriptionIO]]
+    * primitive, which re-checks no event exists under the lock. The subscription
+    * row survives firing. Definition-agnostic: services every workflow in the
+    * shared tables. Returns the number of timers fired.
+    */
+  private[atomicflow] def runTimerSweep(): Int = {
+    val now = runtime.clock.instant()
+    val rows = runtime.runSync {
+      (fr"""
+        SELECT s.subscription_id, s.workflow_id, s.key, s.scope
+        FROM workflow_timer_subscriptions s
+        JOIN workflow_instances i
+          ON i.workflow_id = s.workflow_id AND i.key = s.key AND i.scope = s.scope
+        WHERE s.deadline <= $now
+          AND i.terminal_state IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM workflow_events e
+            WHERE e.workflow_id = s.workflow_id AND e.key = s.key AND e.scope = s.scope
+              AND e.event_kind = 'TimerFired' AND e.event_key = s.subscription_id::text
+          )
+        ORDER BY s.deadline
+        LIMIT ${settings.timerBatchSize}
+        FOR UPDATE OF s SKIP LOCKED
+      """).query[TimerSweepRow].to[Vector]
+    }
+    var fired = 0
+    rows.foreach { row =>
+      if (runtime.runSync(runtime.fireTimerSubscriptionIO(row.subscriptionId, row.workflowId, row.key, row.scope)))
+        fired += 1
+    }
+    if (fired > 0) log.debug(s"Timer sweep fired $fired due timers")
+    fired
+  }
+
+  /** Cancellation escalation: turns instances whose `cancel_requested_at` is past
+    * `cancelTimeout` and that are not yet terminal into `TERMINATED` via the same
+    * guarded transition as `runtime.terminate`. Bounded batch of 128. Idempotent.
+    * Returns the number of instances escalated.
+    */
+  private[atomicflow] def runEscalationSweep(): Int = {
+    val now = runtime.clock.instant()
+    val cutoff = now.minus(java.time.Duration.ofNanos(settings.cancelTimeout.toNanos))
+    val rows = runtime.runSync {
+      sql"""SELECT workflow_id, key, scope FROM workflow_instances
+            WHERE cancel_requested_at IS NOT NULL AND terminal_state IS NULL
+              AND cancel_requested_at <= $cutoff
+            LIMIT 128""".query[InstanceRow].to[Vector]
+    }
+    var escalated = 0
+    rows.foreach { row =>
+      if (runtime.escalateTerminated(WorkflowInstanceId(row.workflowId, row.key, row.scope)))
+        escalated += 1
+    }
+    if (escalated > 0) log.info(s"Escalation sweep escalated $escalated cancellations to TERMINATED")
+    escalated
+  }
+
+  /** Lease recovery: clears the owner of every non-terminal instance whose lease
+    * has expired (the crashed run is fenced out by the next acquire's
+    * fencing-token bump) and upserts the instance's wakeup so it is replayed
+    * from its Step cache. Bounded batch of 128. Idempotent. Returns the number
+    * of leases recovered.
+    */
+  private[atomicflow] def runRecoverySweep(): Int = {
+    val now = runtime.clock.instant()
+    val rows = runtime.runSync {
+      sql"""SELECT workflow_id, key, scope FROM workflow_instances
+            WHERE lease_owner IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
+            LIMIT 128""".query[InstanceRow].to[Vector]
+    }
+    var recovered = 0
+    rows.foreach { row =>
+      if (runtime.recoverLease(WorkflowInstanceId(row.workflowId, row.key, row.scope)))
+        recovered += 1
+    }
+    if (recovered > 0) log.info(s"Lease recovery sweep recovered $recovered expired leases")
+    recovered
+  }
+
+  private var lastTimerSweep: Long = 0L
+  private var lastEscalationSweep: Long = 0L
+  private var lastRecoverySweep: Long = 0L
+
+  /** Runs each sweep when its cadence has elapsed: the timer sweep on
+    * `timerSweepInterval`, escalation and recovery on `sweepInterval`. First
+    * cycle runs all three.
+    */
+  private def runSweepsDue(): Unit = {
+    val now = System.nanoTime()
+    if (now - lastTimerSweep >= settings.timerSweepInterval.toNanos) {
+      lastTimerSweep = now
+      runTimerSweep()
+    }
+    if (now - lastEscalationSweep >= settings.sweepInterval.toNanos) {
+      lastEscalationSweep = now
+      runEscalationSweep()
+    }
+    if (now - lastRecoverySweep >= settings.sweepInterval.toNanos) {
+      lastRecoverySweep = now
+      runRecoverySweep()
+    }
+  }
 
   private[atomicflow] def runDriverCycle(): Unit = {
     if (stopped.get) throw new IllegalStateException("Job runner is stopped")
-    runSweepStubs()
+    runSweepsDue()
     val claimed = claimOnce()
     lastClaimedBatch = claimed.map(_.instanceId)
     dispatchAndAwait(claimed)
@@ -218,7 +334,7 @@ final class PostgresJobRunner private[atomicflow] (
     var backoff = settings.pollInterval
     while (!stopped.get) {
       try {
-        runSweepStubs()
+        runSweepsDue()
         val claimed = claimOnce()
         if (claimed.isEmpty) {
           Thread.sleep(jittered(settings.pollInterval))

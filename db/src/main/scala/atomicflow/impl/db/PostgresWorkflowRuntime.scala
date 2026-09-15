@@ -311,35 +311,118 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val workflowId = instanceId.workflowId
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
+    val exists = runSync {
+      sql"""SELECT 1 FROM workflow_instances
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[Int].option
+    }
+    if (exists.isEmpty)
+      throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+    escalateTerminated(instanceId)
+    ()
+  }
+
+  /** The guarded `TERMINATED` terminal transition, shared by the public
+    * [[terminate]] and the cancellation-escalation sweep. Row-locks the
+    * instance; a missing or already-terminal instance is a no-op (returns
+    * `false`); otherwise the guarded status update plus the
+    * `WorkflowCompleted(Terminated)` event, completion-subscriber wakeups,
+    * lease revocation (fencing-token bump and clearing owner/expiry), and
+    * terminal cleanup commit in one transaction. Idempotent: a concurrent
+    * winner makes a later caller a no-op.
+    */
+  private[atomicflow] def escalateTerminated(instanceId: WorkflowInstanceId): Boolean = {
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
     val payload = Framing.write("terminated")
     runSync {
       for {
         terminal <- sql"""SELECT terminal_state FROM workflow_instances
                           WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
                           FOR UPDATE""".query[Option[String]].option
-        _ <- terminal match {
-          case None =>
-            throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-          case Some(Some(_)) =>
-            ().pure[ConnectionIO]
+        updated <- terminal match {
+          case None => false.pure[ConnectionIO]
+          case Some(Some(_)) => false.pure[ConnectionIO]
           case Some(None) =>
             for {
-              _ <- sql"""UPDATE workflow_instances
+              u <- sql"""UPDATE workflow_instances
                          SET terminal_state = 'terminated', terminal_outcome = $payload,
                              is_accepting_signals = false,
                              lease_owner = NULL, lease_expires_at = NULL,
                              fencing_token = fencing_token + 1
                          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
                            AND terminal_state IS NULL""".update.run
-              _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
-              _ <- appendCompletedEvent(workflowId, key, scope, payload)
-              _ <- wakeCompletionSubscribers(workflowId, key, scope)
-              _ <- terminalCleanupIO(workflowId, key, scope)
-            } yield ()
+              _ <- if (u == 1)
+                for {
+                  _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
+                  _ <- appendCompletedEvent(workflowId, key, scope, payload)
+                  _ <- wakeCompletionSubscribers(workflowId, key, scope)
+                  _ <- terminalCleanupIO(workflowId, key, scope)
+                } yield ()
+              else ().pure[ConnectionIO]
+            } yield u == 1
         }
-      } yield ()
+      } yield updated
     }
-    ()
+  }
+
+  /** The timer-firing primitive shared by the scheduler sweep (Path 1) and await
+    * evaluation (Path 2): lock the subscription row, re-check that no
+    * `TimerFired` event exists yet, then append the event (global append mutex)
+    * and upsert the owning instance's wakeup, all in the caller's transaction.
+    * Returns whether it fired; a subscription that was concurrently retired or
+    * already fired is a no-op. The subscription row survives firing.
+    */
+  private[atomicflow] def fireTimerSubscriptionIO(
+      subscriptionId: java.util.UUID,
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: String
+  ): ConnectionIO[Boolean] = {
+    val now = theClock.instant()
+    for {
+      locked <- sql"""SELECT deadline FROM workflow_timer_subscriptions
+                      WHERE subscription_id = $subscriptionId
+                      FOR UPDATE""".query[java.time.Instant].option
+      fired <- locked match {
+        case None => false.pure[ConnectionIO]
+        case Some(_) =>
+          for {
+            exists <- sql"""SELECT 1 FROM workflow_events
+                            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                              AND event_kind = 'TimerFired' AND event_key = ${subscriptionId.toString}""".query[Int].option
+            _ <- if (exists.isEmpty)
+              for {
+                _ <- appendEvent(workflowId, key, scope, "TimerFired", subscriptionId.toString, "")
+                _ <- upsertWakeupIO(workflowId, key, scope, now)
+              } yield ()
+            else ().pure[ConnectionIO]
+          } yield exists.isEmpty
+      }
+    } yield fired
+  }
+
+  /** Lease recovery of an instance whose lease expired while still owned: in one
+    * guarded transaction, clear `lease_owner`/`lease_expires_at` (without
+    * touching `fencing_token` — the next acquire bumps it) and upsert the
+    * instance's wakeup. Returns whether it recovered; a live or terminal lease
+    * is a no-op. Idempotent.
+    */
+  private[atomicflow] def recoverLease(instanceId: WorkflowInstanceId): Boolean = {
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
+    val now = theClock.instant()
+    runSync {
+      for {
+        updated <- sql"""UPDATE workflow_instances
+                         SET lease_owner = NULL, lease_expires_at = NULL
+                         WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                           AND lease_owner IS NOT NULL AND terminal_state IS NULL""".update.run
+        _ <- if (updated == 1) upsertWakeupIO(workflowId, key, scope, now)
+             else ().pure[ConnectionIO]
+      } yield updated == 1
+    }
   }
 
   override def runWorkflowInstance[In, Out](

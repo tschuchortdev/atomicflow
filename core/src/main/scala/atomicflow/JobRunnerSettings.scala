@@ -33,6 +33,8 @@ import scala.concurrent.duration.*
   *   bound an external run waits for a leased instance
   * @param cancelTimeout
   *   how long a cancellation may run before escalation to TERMINATED
+  * @param throwableCacheable
+  *   codec used to encode runner-driven terminal failure outcomes
   */
 final case class JobRunnerSettings(
     workerThreads: Int = 8,
@@ -47,7 +49,8 @@ final case class JobRunnerSettings(
     sweepInterval: FiniteDuration = 1.second,
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
-    cancelTimeout: FiniteDuration = 5.minutes
+    cancelTimeout: FiniteDuration = 5.minutes,
+    throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 )
 
 object JobRunnerSettings {
