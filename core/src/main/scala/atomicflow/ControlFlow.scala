@@ -35,6 +35,38 @@ final class ContinueAsNewException private[atomicflow] (val encoded: String) ext
   override def toString: String = "ContinueAsNewException"
 }
 
+/** Thrown by `RestartableScope.restart` to start the next generation of a
+  * `Workflow.restartable`/`Workflow.loop` region. Carries the [[serializedState]]
+  * of the next generation, encoded with the region's `Cacheable[S]` at the
+  * forwarder. The runtime's region loop catches it, commits the restart
+  * transition (replacing the region row's state and count, discarding the
+  * previous looping's nested rows and subscriptions, closing its children), and
+  * re-enters the body locally in the same run.
+  */
+final class RegionRestartException private[atomicflow] (val serializedState: String) extends WorkflowControlException {
+  override def toString: String = "RegionRestartException"
+}
+
+/** Thrown by `LoopScope.break` to complete a `Workflow.loop` region with a
+  * result. Carries the in-memory result `R` (not persisted at the region level);
+  * the region's loop catches it and returns the value as the function's result.
+  */
+final class RegionBreakException[R] private[atomicflow] (val result: R) extends WorkflowControlException {
+  override def toString: String = "RegionBreakException"
+}
+
+/** Internal wrapper used by `Workflow.parallel` to carry a library control-flow
+  * exception (restart, break, continue-as-new) out of an `ox.par` scope as a
+  * normal exception, so Ox cancels the sibling branches deterministically and
+  * rethrows it; `parallel` unwraps it and rethrows the underlying control-flow
+  * exception. It is always caught inside `parallel` and never escapes a workflow
+  * body.
+  */
+private[atomicflow] final class ParallelControlFlow(val underlying: WorkflowControlException)
+    extends RuntimeException(underlying) {
+  override def toString: String = "ParallelControlFlow"
+}
+
 /** A `NonFatal`-like extractor that excludes the library's control-flow exceptions
   * (and fatal JVM errors), so broad catches inside workflow code can handle
   * everything else and still rethrow suspension/reset/continue-as-new.

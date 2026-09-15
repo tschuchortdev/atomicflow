@@ -374,4 +374,31 @@ private[atomicflow] trait WorkflowExecution {
       payload: String,
       expiresAt: Option[java.time.Instant]
   ): Unit
+
+  /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
+    * located at `regionId` under `parentScopePath`: its encoded state and its
+    * committed `restartCount`. `None` when the region has never been created
+    * (first creation, so the by-name seed must be evaluated).
+    */
+  private[atomicflow] def readRegionState(regionId: String, parentScopePath: String): Option[(String, Long)]
+
+  /** Persist a `Workflow.restartable`/`Workflow.loop` region's row on its first
+    * creation, with `serializedState` and `restartCount` 0, fenced. Only the
+    * first creation calls this; replays read the persisted row instead.
+    */
+  private[atomicflow] def createRegion(regionId: String, parentScopePath: String, serializedState: String): Unit
+
+  /** The one-transaction restart transition of a region at `currentRestartCount`:
+    * discard the nested Step rows and subscriptions owned by the previous
+    * looping's scope subtree (a construct-isolated prefix delete), close children
+    * created in that looping per their `ParentClosePolicy`, and replace the
+    * region row's state with `serializedState` and its count with
+    * `currentRestartCount + 1`. Signal cursors are preserved. Fenced.
+    */
+  private[atomicflow] def restartRegion(
+      regionId: String,
+      parentScopePath: String,
+      currentRestartCount: Long,
+      serializedState: String
+  ): Unit
 }

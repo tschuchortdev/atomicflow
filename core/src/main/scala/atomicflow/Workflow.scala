@@ -156,6 +156,26 @@ final class Workflow[In, Out] private[atomicflow] (
     runtime.createAndRun(this, instanceKey, in)
 }
 
+/** The handle passed to a `Workflow.restartable` body. `restartCount` is the
+  * number of committed restart transitions (0 before any). `restart(nextState)`
+  * starts the next generation of the region and never returns (it is runtime
+  * control flow); the normal path is to return the region's result `R`.
+  */
+trait RestartableScope[S] {
+  def restartCount: Long
+  def restart(nextState: S): Nothing
+}
+
+/** The handle passed to a `Workflow.loop` body. `restartCount` is the number of
+  * committed restart transitions. `break(result)` completes the region with
+  * `result` and never returns (runtime control flow); the normal path is to
+  * return the next state `S` to continue the loop.
+  */
+trait LoopScope[R] {
+  def restartCount: Long
+  def break(result: R): Nothing
+}
+
 object Workflow {
   /** Passive waiter for an instance's terminal outcome, addressed by key; see
     * `WorkflowInstance.awaitResult`.
@@ -212,6 +232,113 @@ object Workflow {
   def continueAsNew[A: Cacheable](nextInput: A)(using ctx: WorkflowContext): Nothing = {
     val encoded = summon[Cacheable[A]].write(nextInput)
     throw new ContinueAsNewException(encoded)
+  }
+
+  /** Runs a restartable region: a subscope (like [[scoped]]) whose interior
+    * Step/Await records are reset on each restart, so an eternal loop such as a
+    * poller does not accumulate history. `initialState` is a by-name pure seed,
+    * evaluated and persisted only on first creation and ignored on replay.
+    *
+    * The body receives the current state `S` and a [[RestartableScope]].
+    * Calling `scope.restart(nextState)` starts the next generation: the region
+    * row's state and restart count are replaced, the previous generation's
+    * nested Step rows and subscriptions are discarded, and children created in
+    * it are closed per their `ParentClosePolicy`; the body then re-enters
+    * locally in the same run (the outer workflow is not replayed to begin the
+    * next generation). Returning normally completes the region with `R`; the
+    * final looping is kept, so on an outer replay the body re-runs and reuses
+    * its cached records rather than caching the whole region value.
+    *
+    * `restartCount` counts committed restarts, not crash replays. This is the
+    * dual of [[loop]]: use [[restartable]] when continuing is exceptional and
+    * returning the result is the normal path. Both expose the same durable
+    * transitions and the same `restartCount` metadata.
+    */
+  def restartable[S: Cacheable, R](id: String, initialState: => S)(body: (S, RestartableScope[S]) => R)(using
+      ctx: WorkflowContext
+  ): R =
+    regionLoop(id, initialState) { (state, scope) =>
+      body(state, scope)
+    }
+
+  /** Runs a looping region: the dual of [[restartable]] — use [[loop]] when
+    * continuing is the normal path and breaking with the result is exceptional.
+    * The body returns the next state `S` to continue, or calls
+    * `loop.break(result)` to complete the region with `R`. It has exactly the
+    * same durable transitions, region semantics, and `restartCount` metadata as
+    * [[restartable]]; a normal return starts the next generation and `break`
+    * completes the region. `initialState` is a by-name pure seed evaluated only
+    * on first creation.
+    */
+  def loop[S: Cacheable, R](id: String, initialState: => S)(body: (S, LoopScope[R]) => S)(using
+      ctx: WorkflowContext
+  ): R =
+    regionLoop(id, initialState) { (state, scope) =>
+      val loopScope = new LoopScope[R] {
+        override def restartCount: Long = scope.restartCount
+        override def break(result: R): Nothing = throw new RegionBreakException(result)
+      }
+      val next = body(state, loopScope)
+      scope.restart(next)
+    }
+
+  private def regionSegment(id: String, count: Long): String =
+    ScopePath.escapeScopeSegment(id) + "@" + count
+
+  /** The single shared implementation behind [[restartable]] and [[loop]]. The
+    * body uses a [[RestartableScope]]: a normal return completes the region with
+    * `R`; `scope.restart` throws [[RegionRestartException]] to start the next
+    * generation. [[loop]] adapts its own body onto this shape (a normal return
+    * becomes a restart, `break` throws [[RegionBreakException]]). Both control
+    * exceptions are caught here and unwound to the region boundary.
+    */
+  private def regionLoop[S: Cacheable, R](id: String, initialState: => S)(body: (S, RestartableScope[S]) => R)(using
+      ctx: WorkflowContext
+  ): R = {
+    val execution = ctx.execution
+    val cacheable = summon[Cacheable[S]]
+    val parentScope = execution.currentScope
+    val row = execution.readRegionState(id, parentScope)
+    val startCount = row.map(_._2).getOrElse(0L)
+    val firstState: S = row match {
+      case Some((state, _)) => cacheable.read(state)
+      case None =>
+        val seed = initialState
+        execution.createRegion(id, parentScope, cacheable.write(seed))
+        seed
+    }
+
+    execution.pushScope(regionSegment(id, startCount))
+    var state: S = firstState
+    var count: Long = startCount
+    var result: R = null.asInstanceOf[R]
+    var done = false
+    try {
+      while (!done) {
+        val scope = new RestartableScope[S] {
+          override def restartCount: Long = count
+          override def restart(nextState: S): Nothing =
+            throw new RegionRestartException(cacheable.write(nextState))
+        }
+        try {
+          result = body(state, scope)
+          done = true
+        } catch {
+          case e: RegionRestartException =>
+            execution.restartRegion(id, parentScope, count, e.serializedState)
+            execution.popScope()
+            count += 1
+            execution.pushScope(regionSegment(id, count))
+            state = cacheable.read(e.serializedState)
+          case e: RegionBreakException[R] =>
+            result = e.result
+            done = true
+        }
+      }
+      result
+    } finally {
+      execution.popScope()
+    }
   }
 
   /** A lexical region inside which cancellation delivery is suppressed: while
@@ -276,7 +403,8 @@ object Workflow {
     */
   def parallel[R](branches: Seq[() => R]): Seq[R] = {
     val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
-      ox.par(branches.map(branch => () => captureSuspension(branch())))
+      try ox.par(branches.map(branch => () => captureSuspension(branch())))
+      catch { case e: ParallelControlFlow => throw e.underlying }
     val suspensions = outcomes.collect { case Left(s) => s }
     if (suspensions.nonEmpty) throw new WorkflowSuspendedException(suspensions)
     else outcomes.collect { case Right(r) => r }
@@ -288,7 +416,10 @@ object Workflow {
 
   private def captureSuspension[R](run: => R): Either[WorkflowSuspendedException, R] =
     try Right(run)
-    catch { case e: WorkflowSuspendedException => Left(e) }
+    catch {
+      case e: WorkflowSuspendedException => Left(e)
+      case e: WorkflowControlException   => throw new ParallelControlFlow(e)
+    }
 
   def apply[In: Cacheable, Out: Cacheable](
       id: WorkflowId,

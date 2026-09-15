@@ -495,7 +495,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
       parentKey: WorkflowInstanceKey,
       parentScope: String
   ): ConnectionIO[Unit] = {
-    val now = theClock.instant()
     for {
       children <- sql"""SELECT workflow_id, key, scope, parent_close_policy, terminal_state, times_executed, lease_owner, lease_expires_at
                         FROM workflow_instances
@@ -505,36 +504,73 @@ class PostgresWorkflowRuntime private[atomicflow] (
                         FOR UPDATE""".query[
           (WorkflowId, WorkflowInstanceKey, String, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
         ].to[Vector]
-      _ <- children.traverse_ { case (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) =>
-        val clearPointer = sql"""UPDATE workflow_instances
-                                 SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_scope = NULL
-                                 WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope""".update.run.map(_ => ())
-        val deliver = policy match {
-          case Some("abandon") => ().pure[ConnectionIO]
-          case _ =>
-            terminal match {
-              case Some(_) => ().pure[ConnectionIO]
-              case None =>
+      _ <- children.traverse_(closeOneChildIO)
+    } yield ()
+  }
+
+  /** Closes one child per its `ParentClosePolicy` (see [[applyParentClosePoliciesIO]]
+    * for the per-child semantics). Shared by the whole-instance and the
+    * region-restart child-close paths.
+    */
+  private def closeOneChildIO(
+      child: (WorkflowId, WorkflowInstanceKey, String, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    val (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) = child
+    val clearPointer = sql"""UPDATE workflow_instances
+                             SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_scope = NULL
+                             WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope""".update.run.map(_ => ())
+    val deliver = policy match {
+      case Some("abandon") => ().pure[ConnectionIO]
+      case _ =>
+        terminal match {
+          case Some(_) => ().pure[ConnectionIO]
+          case None =>
+            for {
+              _ <- if (timesExecuted == 0)
+                finalizeCancelledWithoutLease(cwf, ckey, cscope)
+              else
                 for {
-                  _ <- if (timesExecuted == 0)
-                    finalizeCancelledWithoutLease(cwf, ckey, cscope)
-                  else
-                    for {
-                      _ <- sql"""UPDATE workflow_instances SET cancel_requested_at = $now
-                                 WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope
-                                   AND cancel_requested_at IS NULL""".update.run
-                      _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
-                        upsertWakeupIO(cwf, ckey, cscope, now)
-                      else ().pure[ConnectionIO]
-                    } yield ()
+                  _ <- sql"""UPDATE workflow_instances SET cancel_requested_at = $now
+                             WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope
+                               AND cancel_requested_at IS NULL""".update.run
+                  _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
+                    upsertWakeupIO(cwf, ckey, cscope, now)
+                  else ().pure[ConnectionIO]
                 } yield ()
-            }
+            } yield ()
         }
-        for {
-          _ <- clearPointer
-          _ <- deliver
-        } yield ()
-      }
+    }
+    for {
+      _ <- clearPointer
+      _ <- deliver
+    } yield ()
+  }
+
+  /** Region-restart variant of [[applyParentClosePoliciesIO]]: closes only the
+    * children created inside the discarded looping, i.e. those of this instance
+    * whose derived scope lies under `interiorBase` (the previous generation's
+    * region scope subtree). The escaping of scope segments guarantees the
+    * boundary: an ordinary `scoped` key cannot collide with a `key@count`
+    * marker, because its `@` is escaped.
+    */
+  private def applyRegionClosePoliciesIO(
+      parentWorkflowId: WorkflowId,
+      parentKey: WorkflowInstanceKey,
+      parentScope: String,
+      interiorBase: String
+  ): ConnectionIO[Unit] = {
+    for {
+      children <- sql"""SELECT workflow_id, key, scope, parent_close_policy, terminal_state, times_executed, lease_owner, lease_expires_at
+                        FROM workflow_instances
+                        WHERE parent_workflow_id = $parentWorkflowId
+                          AND parent_instance_key = $parentKey
+                          AND parent_scope = $parentScope
+                          AND scope LIKE ${"%/" + interiorBase + "%"}
+                        FOR UPDATE""".query[
+          (WorkflowId, WorkflowInstanceKey, String, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+        ].to[Vector]
+      _ <- children.traverse_(closeOneChildIO)
     } yield ()
   }
 
@@ -2166,6 +2202,105 @@ class PostgresWorkflowRuntime private[atomicflow] (
                       sourceCond ++ fr")" ++ window ++ fr" ORDER BY sequence_id").query[(Long, String, java.time.Instant)].to[Vector]
                   }
       } yield events
+
+    /** The step-scope subtree prefix of a region's interior at a given
+      * `restartCount`: the parent scope path followed by `escaped(regionId)@count`.
+      * Nested Step/Await rows and children of the looping live under this prefix;
+      * the region's own row lives at the parent scope path (one level up).
+      */
+    private def regionInteriorBase(regionId: String, parentScopePath: String, count: Long): String = {
+      val marker = ScopePath.escapeScopeSegment(regionId) + "@" + count
+      if (parentScopePath.isEmpty) marker else parentScopePath + "/" + marker
+    }
+
+    /** The wrapped payload of a region row: its committed `restartCount` and the
+      * encoded user state, stored in the step row's `state_payload`.
+      */
+    private case class RegionPayload(count: Long, state: String) derives upickle.default.ReadWriter
+
+    private def regionPayload(count: Long, state: String): String =
+      upickle.default.write(RegionPayload(count, state))
+
+    private def parseRegionPayload(p: String): (String, Long) = {
+      val r = upickle.default.read[RegionPayload](p)
+      (r.state, r.count)
+    }
+
+    private[atomicflow] override def readRegionState(
+        regionId: String,
+        parentScopePath: String
+    ): Option[(String, Long)] =
+      runSync {
+        sql"""SELECT state_payload FROM workflow_steps
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                AND step_id = $regionId AND step_scope_path = $parentScopePath
+                AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(parseRegionPayload))
+      }
+
+    private[atomicflow] override def createRegion(
+        regionId: String,
+        parentScopePath: String,
+        serializedState: String
+    ): Unit =
+      fenced {
+        val now = theClock.instant()
+        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+              VALUES ($workflowId, $key, ${instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(0L, serializedState)}, '', NULL, $now, $now)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO NOTHING""".update.run
+      }
+
+    private def deleteRegionNestedStepsIO(base: String): ConnectionIO[Unit] =
+      for {
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path = $base""".update.run
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+      } yield ()
+
+    private def deleteRegionNestedSubscriptionsIO(base: String): ConnectionIO[Unit] =
+      for {
+        _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path = $base""".update.run
+        _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path = $base""".update.run
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+        _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path = $base""".update.run
+        _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+      } yield ()
+
+    private[atomicflow] override def restartRegion(
+        regionId: String,
+        parentScopePath: String,
+        currentRestartCount: Long,
+        serializedState: String
+    ): Unit =
+      fenced {
+        val base = regionInteriorBase(regionId, parentScopePath, currentRestartCount)
+        val now = theClock.instant()
+        for {
+          _ <- deleteRegionNestedStepsIO(base)
+          _ <- deleteRegionNestedSubscriptionsIO(base)
+          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, base)
+          _ <- sql"""UPDATE workflow_steps
+                     SET state_payload = ${regionPayload(currentRestartCount + 1, serializedState)}, updated_at = $now
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
+                       AND step_id = $regionId AND step_scope_path = $parentScopePath
+                       AND step_kind = 'RestartableRegion'""".update.run
+        } yield ()
+      }
 
     /** Runs `write` inside one transaction, guarded by an exclusive lock on the
       * instance row and a fencing check; throws [[LeaseLostException]] if the
