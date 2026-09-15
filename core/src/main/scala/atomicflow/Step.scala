@@ -582,10 +582,12 @@ object Step {
     * Even when every branch suspends, the construct only behaves as expected when
     * the workflow is re-run for each incoming event individually. If the workflow
     * is re-run for multiple events at once (for example because of a long queue
-    * in the job runner), several branches may become unblocked in the same run
-    * and the code cannot tell which event came first: the winner is whichever the
-    * implementation observes first, NOT a spec-guaranteed order (though the
-    * recorded winner is durable first-wins).
+     * in the job runner), several branches may become unblocked in the same run
+     * and the code cannot tell which event came first: the winner is whichever the
+     * implementation observes first, NOT a spec-guaranteed order (though the
+     * recorded winner is durable first-wins). When several branches complete in
+     * the same run, the lowest-index completed branch is the deterministic
+     * tie-break winner.
     *
     * Each branch runs in its own branch-scoped identity, so two branches awaiting
     * the same key register distinct subscriptions and a losing branch's cleanup
@@ -645,7 +647,8 @@ object Step {
       }
     }
 
-    def branchSegment(i: Int): String = ScopePath.escapeScopeSegment("branch" + i)
+    def branchSegment(i: Int): String =
+      ScopePath.escapeScopeSegment(stepId) + "/" + ScopePath.escapeScopeSegment("branch" + i)
 
     def branchPath(base: String, i: Int): String = {
       val seg = branchSegment(i)

@@ -64,7 +64,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     assertEquals(
       signalSubscriptionKeys(wf.id, "k"),
-      Vector(("branch0", "s1"), ("branch1", "s2")),
+      Vector(("race/branch0", "s1"), ("race/branch1", "s2")),
       "each branch's await subscription remains registered while the workflow is suspended"
     )
   }
@@ -128,6 +128,11 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
     assert(payload.startsWith("0\n"), s"winner index 0 recorded exactly once, got payload: $payload")
     assertEquals(
+      signalSubscriptionKeys(wf.id, "k"),
+      Vector.empty,
+      "the winning branch's own await subscription (branch0) is cleaned up when it resolves via the pending await"
+    )
+    assertEquals(
       run(
         sql"""SELECT count(*) FROM workflow_steps
               WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'race'""".query[Int].unique
@@ -180,7 +185,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
         sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
               WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
       ),
-      Vector(("fast", "branch2", "succeeded")),
+      Vector(("fast", "race/branch2", "succeeded")),
       "the winner branch's own step row survives cleanup"
     )
   }
@@ -204,6 +209,56 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     holder.set(2)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 2, "a changed invalidateOn input re-runs the construct from scratch")
+  }
+
+  test("firstToRunWithoutSuspension with zero branches throws IllegalArgumentException") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "ftr-empty") { in =>
+      try {
+        Step.firstToRunWithoutSuspension[Int]("race")()
+        "no-error"
+      } catch {
+        case _: IllegalArgumentException => "empty"
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("empty"))
+  }
+
+  test("sibling constructs in parallel branches sharing a scope keep each other's branch subscriptions (no over-deletion)") {
+    val rt = newRuntime
+    val sA = Signal[String]("sA")
+    val sB = Signal[String]("sB")
+    val sC = Signal[String]("sC")
+    val sD = Signal[String]("sD")
+    val wf = Workflow[String, String](id = "ftr-sibling") { in =>
+      val results = Workflow.parallel[Int](
+        () => Step.firstToRunWithoutSuspension[Int]("raceA")(
+          () => { Step.await[String]("a0", Awaitable.SignalEvent(sA)); 1 },
+          () => { Step.await[String]("a1", Awaitable.SignalEvent(sB)); 2 }
+        ),
+        () => Step.firstToRunWithoutSuspension[Int]("raceB")(
+          () => { Step.await[String]("b0", Awaitable.SignalEvent(sC)); 10 },
+          () => { Step.await[String]("b1", Awaitable.SignalEvent(sD)); 20 }
+        )
+      )
+      results.mkString(",")
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "both constructs suspend on the first run")
+    assertEquals(
+      signalSubscriptionKeys(wf.id, "k").map(_._1).distinct.size,
+      4,
+      "each of the two constructs' branches registers a distinct (construct-qualified) subscription path"
+    )
+    sA.send(id, "x")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "construct A completes, construct B stays suspended")
+    sD.send(id, "y")(using rt)
+    assertEquals(
+      rt.runWorkflowInstance(wf, id),
+      WorkflowRunResult.Result("1,20"),
+      "construct B's branch (b1) is still woken by its signal even after construct A's loser cleanup ran"
+    )
   }
 
   test("ensureUnchanged conflict raises StepInputConflictException") {
