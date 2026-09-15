@@ -18,7 +18,9 @@ sealed trait WorkflowControlException extends ControlThrowable
   * exception: only the runtime's await evaluation throws it, and it must never
   * escape the workflow body.
   */
-final class WorkflowSuspendedException private[atomicflow] () extends WorkflowControlException {
+final class WorkflowSuspendedException private[atomicflow] (
+    val causes: Seq[WorkflowSuspendedException] = Nil
+) extends WorkflowControlException {
   override def toString: String = "WorkflowSuspendedException"
 }
 

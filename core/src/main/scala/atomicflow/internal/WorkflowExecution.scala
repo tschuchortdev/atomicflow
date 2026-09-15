@@ -105,9 +105,20 @@ private[atomicflow] trait WorkflowExecution {
   def fencingToken: Long
 
   /** The current step scope path (the enclosing `Workflow.scoped` path). `""`
-    * for top-level steps; `Workflow.scoped` sets it in a later task.
+    * for top-level steps.
     */
   def currentScope: String
+
+  /** Pushes one already-escaped `Workflow.scoped` segment onto the current
+    * thread's scope stack, so subsequent Step/Await IDs are prefixed with it.
+    * Must be balanced by a matching [[popScope]] (paired in a `try/finally`).
+    * The stack is per-thread transient state, so parallel branches with
+    * different scoped keys do not corrupt each other's Step IDs.
+    */
+  private[atomicflow] def pushScope(escapedSegment: String): Unit
+
+  /** Pops the innermost `Workflow.scoped` segment pushed by [[pushScope]]. */
+  private[atomicflow] def popScope(): Unit
 
   /** The runtime's notion of the current instant, from the injected clock. */
   def now: Instant

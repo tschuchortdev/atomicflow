@@ -1,6 +1,10 @@
 package atomicflow
 
+import atomicflow.impl.Sha256Fingerprinter
+import atomicflow.internal.ScopePath
+
 import java.time.Instant
+import scala.annotation.targetName
 import scala.concurrent.duration.FiniteDuration
 
 /** The typed handle of a workflow instance, obtained only from the runtime. It
@@ -176,6 +180,63 @@ object Workflow {
     try f(using ctx)
     finally ctx.execution.exitUncancellable()
   }
+
+  /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
+    * with `scopeKey` (see `spec/sub-workflows-iteration.md`, "Primitives"), so
+    * the same step definitions can execute independently per element. Scopes
+    * nest arbitrarily; the full prefix is the path of enclosing keys joined by
+    * `/`.
+    */
+  def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
+    withScope(ScopePath.escapeScopeSegment(scopeKey))(body)
+
+  /** Like [[scoped]] but the scope key is derived deterministically from the
+    * element's fingerprint, so equal elements share the same scope (reusing
+    * cached Steps) and distinct elements get distinct scopes.
+    */
+  def scoped[A: Fingerprintable, R](elem: A)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
+    withScope(
+      ScopePath.escapeScopeSegment(Fingerprintable[A].fingerprint(elem, Sha256Fingerprinter).toString)
+    )(body)
+
+  private def withScope[R](escapedSegment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
+    ctx.execution.pushScope(escapedSegment)
+    try body(using ctx)
+    finally ctx.execution.popScope()
+  }
+
+  /** Runs one by-name block, catches its suspension instead of propagating it,
+    * and returns `Either[WorkflowSuspendedException, R]`. The opt-in primitive
+    * for local suspension handling; most code should let suspensions propagate.
+    */
+  def runToSuspension[R](
+      body: WorkflowContext ?=> R
+  )(using ctx: WorkflowContext): Either[WorkflowSuspendedException, R] =
+    try Right(body(using ctx))
+    catch { case e: WorkflowSuspendedException => Left(e) }
+
+  /** Runs several branches concurrently (via Ox `par`), waiting for ALL of
+    * them. When some complete and others suspend, all results are collected
+    * first and then one combined [[WorkflowSuspendedException]] is thrown
+    * carrying each branch's suspension in `causes`. Returns `Seq[R]` in order
+    * when every branch completes. A non-suspension failure propagates (after
+    * the branches settle).
+    */
+  def parallel[R](branches: Seq[() => R]): Seq[R] = {
+    val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
+      ox.par(branches.map(branch => () => captureSuspension(branch())))
+    val suspensions = outcomes.collect { case Left(s) => s }
+    if (suspensions.nonEmpty) throw new WorkflowSuspendedException(suspensions)
+    else outcomes.collect { case Right(r) => r }
+  }
+
+  /** Vararg form of [[parallel]]. */
+  @targetName("parallelVararg")
+  def parallel[R](branches: (() => R)*): Seq[R] = parallel(branches.toVector)
+
+  private def captureSuspension[R](run: => R): Either[WorkflowSuspendedException, R] =
+    try Right(run)
+    catch { case e: WorkflowSuspendedException => Left(e) }
 
   def apply[In: Cacheable, Out: Cacheable](
       id: WorkflowId,
