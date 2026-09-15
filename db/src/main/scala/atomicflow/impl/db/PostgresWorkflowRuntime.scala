@@ -148,13 +148,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   /** Encodes a [[SignalInheritance]] configuration for the `inherit_signals`
-    * column. `none`/`all` are stored literally; `some(prefixes)` as a newline
-    * joined list.
+    * column. `none`/`all` are stored as simple tokens; `some(prefixes)` as
+    * `some:` followed by a JSON array of the prefixes (unambiguous for prefixes
+    * containing newlines or commas).
     */
   private def encodeSignalInheritance(si: SignalInheritance): String = si match {
     case SignalInheritance.none           => "none"
     case SignalInheritance.all            => "all"
-    case SignalInheritance.some(prefixes) => "some:" + prefixes.mkString("\n")
+    case SignalInheritance.some(prefixes) => "some:" + upickle.default.write(prefixes.toSeq)
   }
 
   /** Starts a child workflow: create-if-absent a child instance under the scope
@@ -208,7 +209,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
           sql"""SELECT input FROM workflow_instances
                 WHERE workflow_id = $childWorkflowId AND key = $childKey AND scope = $derivedScope""".query[String].option
         else Option.empty[String].pure[ConnectionIO]
-        _ <- upsertWakeupIO(childWorkflowId, childKey, derivedScope, theClock.instant())
+        _ <- if (inserted == 1)
+          upsertWakeupIO(childWorkflowId, childKey, derivedScope, theClock.instant())
+        else ().pure[ConnectionIO]
       } yield (inserted, existing)
     }
 
@@ -395,7 +398,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
                         FROM workflow_instances
                         WHERE parent_workflow_id = $parentWorkflowId
                           AND parent_instance_key = $parentKey
-                          AND parent_scope = $parentScope""".query[
+                          AND parent_scope = $parentScope
+                        FOR UPDATE""".query[
           (WorkflowId, WorkflowInstanceKey, String, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
         ].to[Vector]
       _ <- children.traverse_ { case (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) =>
@@ -1258,38 +1262,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  /** A child-instance row: `(workflow_id, scope)` plus the shared `InfoRow`
-    * columns, in query order.
-    */
-  private type ChildInfoRow = (
-      WorkflowId,
-      String,
-      WorkflowInstanceKey,
-      Long,
-      Long,
-      Option[WorkflowId],
-      Option[WorkflowInstanceKey],
-      Option[String],
-      java.time.Instant,
-      Option[java.time.Instant],
-      Int,
-      Option[String]
-    )
-
-  private def toChildInfo(r: ChildInfoRow): WorkflowInstance.Info = {
-    val (wf, scope, key, version, gen, pwf, pkey, pscope, created, lastRun, times, terminal) = r
-    WorkflowInstance.Info(
-      id = WorkflowInstanceId(wf, key, scope),
-      parentId = pwf.map(p => WorkflowInstanceId(p, pkey.getOrElse(""), pscope.getOrElse(""))),
-      generation = gen,
-      terminalState = terminal.map(terminalEnum),
-      workflowVersionAtCreation = version,
-      createdAt = created,
-      lastRunAt = lastRun,
-      timesExecuted = times
-    )
-  }
-
   override def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info] = {
     val rows = runSync {
       sql"""SELECT workflow_id, scope, key, workflow_version_at_creation, generation,
@@ -1298,9 +1270,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
             WHERE parent_workflow_id = ${parentId.workflowId}
               AND parent_instance_key = ${parentId.workflowInstanceKey}
               AND parent_scope = ${parentId.scope}
-            ORDER BY workflow_id, key, scope""".query[ChildInfoRow].to[Vector]
+            ORDER BY workflow_id, key, scope""".query[(WorkflowId, String, InfoRow)].to[Vector]
     }
-    rows.map(toChildInfo)
+    rows.map { case (wf, scope, r) => toInfo(wf, scope, r) }
   }
 
   private final class PostgresExecution(

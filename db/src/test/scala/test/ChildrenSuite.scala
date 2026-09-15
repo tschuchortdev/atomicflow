@@ -211,7 +211,6 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val childHandle = rt.getWorkflowInstance(childWf, childId)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
-    deleteWakeup(childWf.id, "worker-1", scope)
     parentGate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
@@ -319,5 +318,74 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentResult = rt.runWorkflowInstance(parentWf, parentId)
     assertEquals(parentResult, WorkflowRunResult.Result("HI"), "the parent resumes and reads the child's result")
     assertEquals(parentHandle.getInfo()(using rt).terminalState, Some(WorkflowTerminalState.Completed), "the parent completes; it is not cancelled by its child completing")
+  }
+
+  test("a terminal child's wakeup is not re-inserted by a later parent replay") {
+    val rt = newRuntime
+    val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      val child = childWf.startAsChild("worker-1", "hi")
+      val comp = Step.await[WorkflowCompletionResult[String]]("wait-child", child.completion)
+      comp match {
+        case WorkflowCompletionResult.Completed(v) => v
+        case _                                     => "?"
+      }
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val childId = rt.getChildWorkflowInstances(parentId).head.id
+    val childHandle = rt.getWorkflowInstance(childWf, childId)
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("HI"))
+
+    val scope = "orders/order-42@0"
+    assert(!hasWakeup(childWf.id, "worker-1", scope), "a terminal child has no wakeup after completion")
+
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("HI"))
+    assert(!hasWakeup(childWf.id, "worker-1", scope), "replaying the parent must not re-insert a terminal child's wakeup")
+  }
+
+  test("a conflicting startAsChild replay does not commit a wakeup side effect") {
+    val rt = newRuntime
+    val gate = Signal[String]("gate")
+    val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      childWf.startAsChild("worker-1", "hi")
+      Step.await[String]("gate", Awaitable.SignalEvent(gate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val scope = "orders/order-42@0"
+
+    val childId = rt.getChildWorkflowInstances(parentId).head.id
+    val childHandle = rt.getWorkflowInstance(childWf, childId)
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("HI"))
+    assert(!hasWakeup(childWf.id, "worker-1", scope), "terminal child wakeup is cleaned up")
+
+    run(sql"""UPDATE workflow_instances SET input = 'OTHER'
+              WHERE workflow_id = 'worker' AND key = 'worker-1' AND scope = $scope""".update.run)
+
+    intercept[StepFailed] {
+      rt.runWorkflowInstance(parentWf, parentId)
+    }
+    assert(!hasWakeup(childWf.id, "worker-1", scope), "a conflicting replay must not commit a wakeup side effect")
+  }
+
+  test("signal inheritance some(prefixes) is stored as an unambiguous JSON array") {
+    val rt = newRuntime
+    val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      childWf.startAsChild("worker-1", "hi", inheritSignals = SignalInheritance.some(Seq("a/\nb", "c,d")))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
+
+    val scope = "orders/order-42@0"
+    val stored = run(sql"""SELECT inherit_signals FROM workflow_instances
+                           WHERE workflow_id = 'worker' AND key = 'worker-1' AND scope = $scope""".query[String].option).get
+    assertEquals(stored, "some:" + upickle.default.write(Seq("a/\nb", "c,d")))
+    assert(!stored.contains('\n'), "prefixes containing newlines are JSON-escaped, not stored with literal newlines")
   }
 }
