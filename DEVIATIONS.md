@@ -192,3 +192,32 @@ implementation phase.
     affected subtree is woken and re-checks eligibility, re-suspending if
     newly ineligible). The spec requires wakeups only on broadening; the
     conservative extra wakeups are no-ops.
+
+## Phase 7 (continueAsNew, restartable regions, fork/reset)
+
+39. **`WorkflowRunResult.ContinueAsNew` outcome.** The spec requires the run
+    to end when `continueAsNew` fires but does not name the run outcome; the
+    outcome set gains this case (and the JobRunner treats it as terminal for
+    the claiming run).
+40. **Parallel control-flow crossing is join-then-propagate.** The spec says
+    parallel "handles cleanup of the other branches internally" without
+    pinning the mechanism. Interrupting sibling threads mid-DB-write is
+    unsafe under JDBC (interrupt-swallowing on a dead backend held a row
+    lock indefinitely), so `Workflow.parallel` collects every branch outcome
+    as a value, joins all branches to completion, then propagates: control-flow
+    exception first, then first non-suspension failure, then the combined
+    suspension.
+41. **Enclosing scope and `uncancellable` depth propagate into parallel
+    branch threads.** The spec is silent on branch-thread context; without
+    propagation, steps inside parallel would persist at the empty scope,
+    defeating region restarts and scoped isolation.
+42. **Reset keeps directly-addressed signal events and cursors** (it is a
+    history-erase operation only; only continueAsNew deletes events).
+43. **Fork is allowed from any source state; reset requires a non-terminal
+    instance.** The spec is silent on source states; these are the pinned
+    and documented semantics.
+44. **Fork/reset boundary ties count as "after"** (rows with `updated_at`
+    equal to the selected step's are re-executed — conservative).
+45. **Reset leaves subscriptions of erased steps in place when they have no
+    step row** (benign: re-registration reuses them via ON CONFLICT and
+    consumption is cursor-based).
