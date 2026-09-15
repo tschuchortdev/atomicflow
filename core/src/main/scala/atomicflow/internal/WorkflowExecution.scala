@@ -330,11 +330,15 @@ private[atomicflow] trait WorkflowExecution {
     */
   def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate]
 
-  /** Resolve an update await atomically, fenced: persist the `succeeded` step
-    * row (`stepKind`) carrying `encodedOutput`, mark the selected candidate's
-    * record handled by writing `encodedResponse` and `handled_at`, and delete
-    * the site's update subscriptions, all in one transaction. The written
-    * response is what the blocked sender reads as `UpdateSendResult.Success`.
+  /** Resolve an update await atomically, fenced: mark the selected candidate's
+    * record handled by writing `encodedResponse` and `handled_at` FIRST, gated
+    * on the row still being unhandled; only when the update affected a row
+    * (this branch won the record) persist the `succeeded` step row (`stepKind`)
+    * carrying `encodedOutput` and delete the site's update subscriptions — all
+    * in one transaction. The written response is what the blocked sender reads
+    * as `UpdateSendResult.Success`. Returns `true` when this branch handled the
+    * record, `false` when a concurrent branch already did (the caller should
+    * re-evaluate the await rather than commit a losing step row).
     */
   def resolveAwaitUpdate(
       stepId: StepId,
@@ -346,7 +350,7 @@ private[atomicflow] trait WorkflowExecution {
       encodedResponse: String,
       encodedOutput: String,
       expiresAt: Option[Instant]
-  ): Unit
+  ): Boolean
 
   /** Suspend an update await, fenced, in one transaction: register the pending
     * update subscription (idempotent), then re-read the unhandled records and

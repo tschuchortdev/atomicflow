@@ -1492,37 +1492,36 @@ class PostgresWorkflowRuntime private[atomicflow] (
     /** Ensures a `workflow_updates` record exists for this send and returns its
       * identity (`createdAt`, `idempotencyKey`). Reuses a pending record when
       * `idem` is non-empty and one already exists; otherwise inserts a fresh
-      * record. Called only after the lease is confirmed free, so the retry-from-
-      * the-beginning lease wait never inserts duplicates.
+      * record. Both paths `RETURNING created_at` so the caller keys on the
+      * record's durable identity rather than a Java `Instant` it generated (PG
+      * stores micros), and the non-empty path is `ON CONFLICT`-safe so two
+      * concurrent same-key senders join the winner instead of racing the
+      * SELECT→INSERT gap into a raw unique violation. Called only after the
+      * lease is confirmed free, so the retry-from-the-beginning lease wait never
+      * inserts duplicates.
       */
-    def ensureRecord(idem: String): (java.time.Instant, String) =
-      if (idem.isEmpty) {
-        val now = theClock.instant()
-        runSync {
-          sql"""INSERT INTO workflow_updates
-                  (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
-                VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)""".update.run
-        }
-        (now, "")
-      } else {
-        val existing = runSync {
-          sql"""SELECT created_at FROM workflow_updates
-                WHERE workflow_id = $wf AND key = $k AND scope = $s
-                  AND update_key = $updateKey AND idempotency_key = $idem
-                ORDER BY created_at""".query[java.time.Instant].option
-        }
-        existing match {
-          case Some(at) => (at, idem)
-          case None =>
-            val now = theClock.instant()
-            runSync {
-              sql"""INSERT INTO workflow_updates
-                      (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
-                    VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)""".update.run
-            }
-            (now, idem)
-        }
-      }
+    def ensureRecord(idem: String): (java.time.Instant, String) = {
+      val now = theClock.instant()
+      val createdAt =
+        if (idem.isEmpty)
+          runSync {
+            sql"""INSERT INTO workflow_updates
+                    (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
+                  VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)
+                  RETURNING created_at""".query[java.time.Instant].unique
+          }
+        else
+          runSync {
+            sql"""INSERT INTO workflow_updates
+                    (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
+                  VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)
+                  ON CONFLICT (workflow_id, key, scope, update_key, idempotency_key) WHERE idempotency_key <> ''
+                    DO UPDATE
+                    SET updated_at = workflow_updates.updated_at
+                  RETURNING created_at""".query[java.time.Instant].unique
+          }
+      (createdAt, idem)
+    }
 
     def isLeaseHeld: Boolean =
       runSync {
@@ -1567,6 +1566,18 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND handled_at IS NULL""".update.run
       }
 
+    /** Deletes the record by durable identity regardless of `handled_at`. Used to
+      * retire a handled record with an empty `idempotency_key`, which serves no
+      * future dedup purpose. Records are identity-unique by `created_at`, so this
+      * only ever touches this send's own row.
+      */
+    def deleteRecord(createdAt: java.time.Instant, idem: String): Unit =
+      runSync {
+        sql"""DELETE FROM workflow_updates
+              WHERE workflow_id = $wf AND key = $k AND scope = $s
+                AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt""".update.run
+      }
+
     var done = false
     var result: UpdateSendResult[R] = null.asInstanceOf[UpdateSendResult[R]]
     while (!done) {
@@ -1589,12 +1600,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
               true
             } catch {
               case _: LeaseUnavailableException =>
-                deleteUnhandled(createdAt, idem)
+                if (idem.isEmpty) deleteUnhandled(createdAt, idem)
                 false
             }
             if (runSucceeded) {
               readResult(createdAt, idem) match {
                 case Some(value) =>
+                  if (idem.isEmpty) deleteRecord(createdAt, idem)
                   result = UpdateSendResult.Success(value)
                   done = true
                 case None =>
@@ -2212,13 +2224,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
         encodedResponse: String,
         encodedOutput: String,
         expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
+    ): Boolean =
+      fencedVal {
         for {
-          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
-          _ <- handleUpdateRecordIO(updateKey, candidate, encodedResponse)
-          _ <- deleteUpdateSubscriptionsIO(stepId, stepVersion)
-        } yield ()
+          updated <- handleUpdateRecordIO(updateKey, candidate, encodedResponse)
+          won = updated == 1
+          _ <- if (won) writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
+               else ().pure[ConnectionIO]
+          _ <- if (won) deleteUpdateSubscriptionsIO(stepId, stepVersion) else ().pure[ConnectionIO]
+        } yield won
       }
 
     override def suspendAwaitUpdate(
@@ -2237,10 +2251,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
           resolved <- decision match {
             case Some(d) =>
               for {
-                _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
-                _ <- handleUpdateRecordIO(updateKey, d.candidate, d.encodedResponse)
-                _ <- deleteUpdateSubscriptionsIO(stepId, stepVersion)
-              } yield Some(d)
+                updated <- handleUpdateRecordIO(updateKey, d.candidate, d.encodedResponse)
+                won = updated == 1
+                _ <- if (won) writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
+                     else ().pure[ConnectionIO]
+                _ <- if (won) deleteUpdateSubscriptionsIO(stepId, stepVersion) else ().pure[ConnectionIO]
+              } yield if (won) Some(d) else None
             case None => Option.empty[AwaitUpdateDecision].pure[ConnectionIO]
           }
         } yield resolved
@@ -2257,13 +2273,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
         updateKey: String,
         candidate: UpdateCandidate,
         encodedResponse: String
-    ): ConnectionIO[Unit] = {
+    ): ConnectionIO[Int] = {
       val now = theClock.instant()
       sql"""UPDATE workflow_updates
             SET result = $encodedResponse, handled_at = $now, updated_at = $now
             WHERE workflow_id = $workflowId AND key = $key AND scope = ${instanceScope}
               AND update_key = $updateKey AND idempotency_key = ${candidate.idempotencyKey}
-              AND created_at = ${candidate.createdAt} AND handled_at IS NULL""".update.run.map(_ => ())
+              AND created_at = ${candidate.createdAt} AND handled_at IS NULL""".update.run
     }
 
     private def upsertUpdateSubscriptionIO(

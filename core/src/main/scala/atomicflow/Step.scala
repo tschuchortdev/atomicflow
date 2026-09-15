@@ -886,11 +886,12 @@ object Step {
       candidates.headOption match {
         case Some(winning) =>
           val decision = respondTo(winning)
-          execution.resolveAwaitUpdate(
+          val won = execution.resolveAwaitUpdate(
             stepId, 0L, "AwaitUpdate", fingerprints, u.key, winning, decision.encodedResponse,
             decision.encodedOutput, expiresAt
           )
-          decodeOutput(decision.encodedOutput)
+          if (won) decodeOutput(decision.encodedOutput)
+          else evaluate()
         case None =>
           execution.suspendAwaitUpdate(stepId, 0L, "AwaitUpdate", fingerprints, u.key, expiresAt) { recheck =>
             recheck.headOption.map(respondTo)

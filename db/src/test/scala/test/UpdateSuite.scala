@@ -101,6 +101,26 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rows.map(_._2), Vector(Some("r1:a"), Some("r2:b")))
   }
 
+  test("handled empty-idempotency-key records are deleted; non-empty ones are kept for dedup") {
+    val rt = newRuntime
+    val update = Update[String, String]("ask")
+    val wf = Workflow[String, String]("handled-cleanup") { in =>
+      Step.awaitUpdate[String, String, String]("upd", update)(input => (s"resp:$input", s"out:$input"))
+      "done"
+    }
+    val idEmpty = rt.createWorkflowInstance(wf, "k1", "in").id
+    val idIdem = rt.createWorkflowInstance(wf, "k2", "in").id
+
+    assertEquals(update.send(wf, idEmpty, "e", idempotencyKey = "")(using rt), UpdateSendResult.Success("resp:e"))
+    assertEquals(updates(wf.id, "k1", "", "ask"), Vector.empty, "handled empty-idem record is deleted")
+
+    assertEquals(update.send(wf, idIdem, "n", idempotencyKey = "ka")(using rt), UpdateSendResult.Success("resp:n"))
+    val rows = updates(wf.id, "k2", "", "ask")
+    assertEquals(rows.size, 1, "handled non-empty-idem record is kept")
+    assertEquals(rows.head._1, "ka")
+    assertEquals(rows.head._2, Some("resp:n"))
+  }
+
   test("persistUnhandledUpdates=true keeps an unhandled record for a later awaitUpdate to consume") {
     val rt = newRuntime
     val update = Update[String, String]("ask")
@@ -169,7 +189,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
             WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
     )
 
-    val res = update.send(wf, id, "hello")(using rt)
+    val res = update.send(wf, id, "hello", idempotencyKey = "lease-idem")(using rt)
     assertEquals(res, UpdateSendResult.Success("resp:hello"))
     assertEquals(updates(wf.id, "k", "", "ask").size, 1, "no duplicate record after the lease wait")
   }
