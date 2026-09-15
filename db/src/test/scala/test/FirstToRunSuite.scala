@@ -261,6 +261,52 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     )
   }
 
+  test("firstToRun branches persist step rows under the enclosing scoped prefix") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "ftr-scoped") { in =>
+      Workflow.scoped("outer") {
+        Step.firstToRunWithoutSuspension[Int]("race")(
+          () => Step.atLeastOnce[Int]("step") { 1 },
+          () => Step.atLeastOnce[Int]("step2") { 2 }
+        )
+      }
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    val paths = run(
+      sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
+            WHERE workflow_id = ${wf.id} AND key = 'k' ORDER BY step_scope_path""".query[String].to[Vector]
+    )
+    assert(paths.contains("outer/race/branch0"), s"the winner branch's step must persist under the enclosing scope, got: $paths")
+    assert(!paths.contains("race/branch0"), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
+    assert(paths.contains("outer/race/branch1"), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
+  }
+
+  test("firstToRun branches inherit an enclosing uncancellable depth") {
+    val rt = newRuntime
+    val sA = Signal[String]("sA")
+    val sB = Signal[String]("sB")
+    val wf = Workflow[String, String](id = "ftr-uncancellable-outer") { in =>
+      Workflow.uncancellable {
+        Step.firstToRunWithoutSuspension[Int]("race")(
+          () => { Step.await[String]("a", Awaitable.SignalEvent(sA)); 1 },
+          () => { Step.await[String]("b", Awaitable.SignalEvent(sB)); 2 }
+        )
+      }
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    rt.cancel(id)
+    sA.send(id, "go")(using rt)
+    assertEquals(
+      rt.runWorkflowInstance(wf, id),
+      WorkflowRunResult.Result("done"),
+      "a pending cancel must not interrupt the awaiting branches inside an enclosing uncancellable region"
+    )
+  }
+
   test("ensureUnchanged conflict raises StepInputConflictException") {
     val rt = newRuntime
     val holder = new AtomicInteger(1)

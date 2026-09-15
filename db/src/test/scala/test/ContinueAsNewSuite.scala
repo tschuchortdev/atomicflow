@@ -270,6 +270,43 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
   }
 
+  test("a run that waits out a live lease executes the newest generation's input after a concurrent continueAsNew") {
+    val clock = new MutableClock(Instant.parse("2024-01-01T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = Workflow[String, String](id = "can-stale") { in =>
+      Step.atLeastOnce[Int]("mark") { 1 }
+      s"gen-input:$in"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "old-input").id
+
+    run(
+      sql"""UPDATE workflow_instances
+            SET lease_owner = 'owner', fencing_token = 5, lease_expires_at = ${clock.instant().plus(java.time.Duration.ofSeconds(30))}
+            WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+    )
+
+    val results = new Array[WorkflowRunResult[String]](1)
+    val t = new Thread(() => results(0) = rt.runWorkflowInstance(wf, id))
+    t.start()
+    Thread.sleep(700)
+
+    run(
+      sql"""UPDATE workflow_instances
+            SET generation = generation + 1, input = ${Cacheable[String].write("new-input")}
+            WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+    )
+
+    clock.advance(31.seconds)
+    t.join(10000)
+    assert(!t.isAlive, "the waiting run must finish after the lease expires")
+    assertEquals(results(0), WorkflowRunResult.Result("gen-input:new-input"))
+    assertEquals(
+      run(sql"""SELECT generation FROM workflow_instances WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".query[Long].unique),
+      1L,
+      "the run observed the newest generation"
+    )
+  }
+
   test("a continueAsNew whose new-input codec fails to decode does not consume pending signals and leaves the instance runnable") {
     val rt = newRuntime
     val sig = Signal[String]("S")

@@ -89,6 +89,11 @@ enum ParentClosePolicy {
 enum SignalInheritance {
   case none
   case all
+  /** Permit every key matching one of `prefixes`. The prefixes are a `Seq`, so a
+    * multi-prefix selection is written `some(Seq("approval/", "order/cancelled"))`
+    * (the spec shows a varargs call shape, but enum case parameters cannot be
+    * varargs).
+    */
   case some(prefixes: Seq[SignalKey])
 }
 

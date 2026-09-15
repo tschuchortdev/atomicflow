@@ -952,7 +952,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
             ].option
         }
 
-        val (terminalState, terminalOutcome, inputSerialized, versionAtCreation, generation) = row match {
+        val (terminalState, terminalOutcome, _, _, _) = row match {
           case Some(r) => r
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
@@ -981,74 +981,101 @@ class PostgresWorkflowRuntime private[atomicflow] (
               }
               if (bumped != 1) throw LeaseLostException(instanceId)
 
-              val input = wf.inputCacheable.read(inputSerialized)
-              val execution = new PostgresExecution(worker, token, workflowId, key, scope, generation, runLeaseDuration)
-              val ctxInstanceId = instanceId
-              val ctxVersionAtCreation = versionAtCreation
-              val ctxRuntime: WorkflowRuntime = this
-              val ctxExecution = execution
-              val ctx = new WorkflowContext {
-                override def instanceId: WorkflowInstanceId = ctxInstanceId
-                override def versionAtCreation: Long = ctxVersionAtCreation
-                override def runtime: WorkflowRuntime = ctxRuntime
-                private[atomicflow] override def execution: WorkflowExecution = ctxExecution
+              // Re-read the instance row now that we hold the lease. A caller-thread
+              // run may have waited out a live lease, during which a concurrent
+              // continueAsNew/reset replaced the input and bumped the generation; the
+              // pre-acquisition read above would then be stale. Reading fenced by our
+              // owner+token guarantees we observe the current row (or detect we lost
+              // the lease). The generation, input, version, and terminal state below
+              // all come from this fresh read.
+              val freshRow = runSync {
+                sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation, generation
+                      FROM workflow_instances
+                      WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                        AND lease_owner = $worker AND fencing_token = $token""".query[
+                    (Option[String], Option[String], String, Long, Long)
+                  ].option
               }
-
-              log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
-
-              var outValue: o = null.asInstanceOf[o]
-              var suspended = false
-              try {
-                outValue = wf.body(input)(using ctx)
-              } catch {
-                case _: WorkflowSuspendedException =>
-                  suspended = true
-                case _: LeaseLostException =>
-                  throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
-                case e: ContinueAsNewException =>
-                  val newInput = wf.inputCacheable.read(e.encoded)
-                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
-                  val newSerializedInput = wf.inputCacheable.write(newInput)
-                  continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
-                  log.info(s"Workflow instance $instanceId continued as new")
-                  return WorkflowRunResult.ContinueAsNew
-                case _: WorkflowCancelledException =>
-                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
-                  val payload = Framing.write("cancelled")
-                  val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
-                  if (updated == 1) {
-                    log.info(s"Workflow instance $instanceId cancelled")
-                    return WorkflowRunResult.WorkflowCancelled
-                  } else {
-                    log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
-                    return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-                  }
-                case WorkflowNonFatal(t) =>
-                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
-                  val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
-                  val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
-                  if (updated == 1) {
-                    log.info(s"Workflow instance $instanceId failed", t)
-                    throw cacheableThrowable.read(cacheableThrowable.write(t))
-                  } else {
-                    log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
-                    return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-                  }
-              }
-
-              if (suspended) {
-                log.debug(s"Workflow instance $instanceId suspended")
-                WorkflowRunResult.WorkflowSuspended
-              } else {
-                runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
-                val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
-                val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
-                if (updated == 1) {
-                  log.debug(s"Workflow instance $instanceId completed")
-                  WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
-                } else {
-                  readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+              val (freshTerminal, freshOutcome, freshInputSerialized, freshVersionAtCreation, freshGeneration) =
+                freshRow match {
+                  case Some(r) => r
+                  case None    => throw LeaseLostException(instanceId)
                 }
+
+              freshTerminal match {
+                case Some(state) =>
+                  handleTerminalRead(state, freshOutcome, outCacheable, completionCodec, instanceId)
+                case None =>
+                  val input = wf.inputCacheable.read(freshInputSerialized)
+                  val execution =
+                    new PostgresExecution(worker, token, workflowId, key, scope, freshGeneration, runLeaseDuration)
+                  val ctxInstanceId = instanceId
+                  val ctxVersionAtCreation = freshVersionAtCreation
+                  val ctxRuntime: WorkflowRuntime = this
+                  val ctxExecution = execution
+                  val ctx = new WorkflowContext {
+                    override def instanceId: WorkflowInstanceId = ctxInstanceId
+                    override def versionAtCreation: Long = ctxVersionAtCreation
+                    override def runtime: WorkflowRuntime = ctxRuntime
+                    private[atomicflow] override def execution: WorkflowExecution = ctxExecution
+                  }
+
+                  log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
+
+                  var outValue: o = null.asInstanceOf[o]
+                  var suspended = false
+                  try {
+                    outValue = wf.body(input)(using ctx)
+                  } catch {
+                    case _: WorkflowSuspendedException =>
+                      suspended = true
+                    case _: LeaseLostException =>
+                      throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+                    case e: ContinueAsNewException =>
+                      val newInput = wf.inputCacheable.read(e.encoded)
+                      runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                      val newSerializedInput = wf.inputCacheable.write(newInput)
+                      continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
+                      log.info(s"Workflow instance $instanceId continued as new")
+                      return WorkflowRunResult.ContinueAsNew
+                    case _: WorkflowCancelledException =>
+                      runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                      val payload = Framing.write("cancelled")
+                      val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
+                      if (updated == 1) {
+                        log.info(s"Workflow instance $instanceId cancelled")
+                        return WorkflowRunResult.WorkflowCancelled
+                      } else {
+                        log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
+                        return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                      }
+                    case WorkflowNonFatal(t) =>
+                      runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                      val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
+                      val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
+                      if (updated == 1) {
+                        log.info(s"Workflow instance $instanceId failed", t)
+                        throw cacheableThrowable.read(cacheableThrowable.write(t))
+                      } else {
+                        log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
+                        return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                      }
+                  }
+
+                  if (suspended) {
+                    log.debug(s"Workflow instance $instanceId suspended")
+                    WorkflowRunResult.WorkflowSuspended
+                  } else {
+                    runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                    val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
+                    val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
+                    if (updated == 1) {
+                      log.debug(s"Workflow instance $instanceId completed")
+                      WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
+                    } else {
+                      readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                    }
+                  }
               }
             } finally {
               releaseLease(workflowId, key, scope, worker, token)
@@ -1805,21 +1832,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  /** Reads the terminal projection of an instance; `None` if the instance is
-    * absent or not yet terminal.
-    */
-  private def readTerminal(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: String
-  ): Option[(String, Option[String])] =
-    runSync {
-      sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
-          (Option[String], Option[String])
-        ].option
-    }.flatMap { case (state, outcome) => state.map(s => (s, outcome)) }
-
   override def awaitResult[Out](
       instance: WorkflowInstance[?, Out],
       timeout: FiniteDuration
@@ -1833,11 +1845,28 @@ class PostgresWorkflowRuntime private[atomicflow] (
     given Cacheable[Out] = outCacheable
     val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
 
+    def readTerminalOrThrowMissing(): Option[(String, Option[String])] = {
+      val row = runSync {
+        sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
+              WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
+            (Option[String], Option[String])
+          ].option
+      }
+      row match {
+        case None => throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+        case Some((state, outcome)) => state.map(s => (s, outcome))
+      }
+    }
+
     val deadlineNanos = System.nanoTime() + timeout.toNanos
     var terminal: Option[(String, Option[String])] = None
-    while (terminal.isEmpty && System.nanoTime() < deadlineNanos) {
-      terminal = readTerminal(workflowId, key, scope)
-      if (terminal.isEmpty && System.nanoTime() < deadlineNanos) Thread.sleep(AwaitResultPollIntervalMillis)
+    var expired = false
+    while (terminal.isEmpty && !expired) {
+      terminal = readTerminalOrThrowMissing()
+      if (terminal.isEmpty) {
+        if (System.nanoTime() >= deadlineNanos) expired = true
+        else Thread.sleep(AwaitResultPollIntervalMillis)
+      }
     }
 
     terminal match {

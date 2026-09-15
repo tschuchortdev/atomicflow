@@ -5,7 +5,9 @@ import java.time.{Clock, Instant}
 
 /** A durable description of something a workflow can wait on. The result type
   * `R` is what the successful await yields; it is invariant because the cases
-  * embed their value-producing witnesses (`Signal[R]`).
+  * embed their value-producing witnesses (a `SignalEvent`, `Timer`, or
+  * `WorkflowCompletion`, possibly wrapped by `Mapped`), so `Awaitable[A]` and
+  * `Awaitable[B]` are never interchangeable.
   *
   * The enum deliberately carries no `Cacheable` context bound: the `Cacheable`
   * needed to persist the awaited result is supplied at the `Step.await` call

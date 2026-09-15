@@ -191,6 +191,43 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(h.getInfo().terminalState, None)
   }
 
+  test("awaitResult with a zero timeout still performs one immediate poll, so a terminal instance is observed") {
+    val rt = newRuntime
+    val w = wf("wf-await-zero-terminal")
+    rt.createAndRun(w, "k", "a")
+    val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
+    assertEquals(rt.awaitResult(h, 0.millis), WorkflowRunResult.Result("out-a"))
+  }
+
+  test("awaitResult on a non-terminal instance with zero timeout times out without executing the body") {
+    val rt = newRuntime
+    val counter = new AtomicInteger(0)
+    val w = Workflow[String, String](id = "wf-await-zero-nonterminal") { in =>
+      counter.incrementAndGet()
+      s"out-$in"
+    }
+    rt.createWorkflowInstance(w, "k", "a")
+    given WorkflowRuntime = rt
+    val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
+    intercept[TimeoutException] {
+      rt.awaitResult(h, 0.millis)
+    }
+    assertEquals(counter.get(), 0, "a zero-timeout await must not execute the body")
+    assertEquals(h.getInfo().terminalState, None)
+  }
+
+  test("awaitResult on a missing instance throws WorkflowNotFoundException on the first poll") {
+    val rt = newRuntime
+    val w = wf("wf-await-missing")
+    rt.createWorkflowInstance(w, "k", "a")
+    given WorkflowRuntime = rt
+    val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
+    run(sql"""DELETE FROM workflow_instances WHERE workflow_id = ${w.id} AND key = 'k' AND scope = ''""".update.run)
+    intercept[WorkflowNotFoundException] {
+      rt.awaitResult(h, 5.seconds)
+    }
+  }
+
   test("instance.awaitResult and Workflow.awaitResult forward to the runtime") {
     val rt = newRuntime
     val w = wf("wf-forwarders")

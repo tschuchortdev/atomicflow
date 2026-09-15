@@ -691,15 +691,19 @@ object Step {
     def evaluate(): R = {
       execution.checkCancellation()
       val baseScope = execution.currentScope
+      val snapshot = execution.snapshotBranchContext()
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
+            val pristine = execution.snapshotBranchContext()
+            execution.restoreBranchContext(snapshot)
             try Right {
               execution.pushScope(branchSegment(i))
               try branches(i)()
               finally execution.popScope()
             }
             catch { case e: WorkflowSuspendedException => Left(e) }
+            finally execution.restoreBranchContext(pristine)
         })
       val suspensions = outcomes.collect { case Left(s) => s }
       if (suspensions.size == outcomes.size) {
