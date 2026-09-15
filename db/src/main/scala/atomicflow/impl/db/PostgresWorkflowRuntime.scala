@@ -158,6 +158,106 @@ class PostgresWorkflowRuntime private[atomicflow] (
     case SignalInheritance.some(prefixes) => "some:" + upickle.default.write(prefixes.toSeq)
   }
 
+  /** Decodes the `inherit_signals` column back into a [[SignalInheritance]].
+    * `none`/`all` are plain tokens; `some:` carries a JSON array of prefixes
+    * (the same unambiguous encoding produced by [[encodeSignalInheritance]]).
+    */
+  private def decodeSignalInheritance(s: Option[String]): SignalInheritance = s match {
+    case None | Some("none") => SignalInheritance.none
+    case Some("all")         => SignalInheritance.all
+    case Some(x) if x.startsWith("some:") =>
+      SignalInheritance.some(upickle.default.read[Seq[String]](x.drop("some:".length)))
+    case other => throw new StepSerializationFailed(s"Unknown inherit_signals value '$other'")
+  }
+
+  /** Whether a stored inheritance selector permits an awaited key. `all` permits
+    * every key; `some(prefixes)` permits keys with a matching prefix; `none`
+    * permits nothing. Synchronous `Update`s are never inherited regardless of
+    * the selector (they are not stored as `Signal` events).
+    */
+  private def inheritancePermits(si: SignalInheritance, key: SignalKey): Boolean = si match {
+    case SignalInheritance.none           => false
+    case SignalInheritance.all            => true
+    case SignalInheritance.some(prefixes) => prefixes.exists(key.startsWith)
+  }
+
+  /** Replays a child's inheritance configuration on a `startAsChild` re-run
+    * (replaying the parent replaces the current policy per the spec). When the
+    * stored configuration differs from the replayed one it is overwritten and a
+    * wakeup is durably scheduled for the affected descendant subtree, so a
+    * suspended descendant whose await now matches retained events is re-run and
+    * the run-time eligibility check exposes them. This is intentionally
+    * straightforward (a full descendant-subtree walk) rather than optimized; see
+    * the `child-signal-inheritance.md` caveat that policy updates may be
+    * expensive. Narrowing also schedules wakeups, which is harmless because the
+    * candidate query re-applies the narrowed policy.
+    */
+  private def updateChildInheritanceIO(
+      cwf: WorkflowId,
+      ckey: WorkflowInstanceKey,
+      cscope: String,
+      newPolicy: String,
+      newPast: Boolean
+  ): ConnectionIO[Unit] =
+    for {
+      cur <- sql"""SELECT inherit_signals, inherit_past_events FROM workflow_instances
+                   WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope""".query[(Option[String], Boolean)].option
+      _ <- cur match {
+        case Some((Some(p), past)) if p == newPolicy && past == newPast => ().pure[ConnectionIO]
+        case _ =>
+          for {
+            _ <- sql"""UPDATE workflow_instances SET inherit_signals = $newPolicy, inherit_past_events = $newPast
+                       WHERE workflow_id = $cwf AND key = $ckey AND scope = $cscope""".update.run
+            _ <- scheduleDescendantWakeupsIO(cwf, ckey, cscope)
+          } yield ()
+      }
+    } yield ()
+
+  /** Coalesced durable wakeups for the descendant subtree rooted at
+    * `(wf, k, s)`, including the root itself, for every node that has a pending
+    * signal subscription. Used on policy updates so suspended descendants
+    * re-evaluate their awaits under the new configuration.
+    */
+  private def scheduleDescendantWakeupsIO(
+      wf: WorkflowId,
+      k: WorkflowInstanceKey,
+      s: String
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    def childrenOf(
+        w: WorkflowId,
+        kk: WorkflowInstanceKey,
+        ss: String
+    ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] =
+      sql"""SELECT workflow_id, key, scope FROM workflow_instances
+            WHERE parent_workflow_id = $w AND parent_instance_key = $kk AND parent_scope = $ss""".query[
+          (WorkflowId, WorkflowInstanceKey, String)
+        ].to[Vector]
+    def wake(w: WorkflowId, kk: WorkflowInstanceKey, ss: String): ConnectionIO[Unit] =
+      for {
+        has <- sql"""SELECT 1 FROM workflow_signal_subscriptions
+                     WHERE workflow_id = $w AND key = $kk AND scope = $ss LIMIT 1""".query[Int].option
+        _ <- if (has.isDefined)
+          sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+                VALUES ($w, $kk, $ss, $now, $now, 0)
+                ON CONFLICT (workflow_id, key, scope) DO NOTHING""".update.run.map(_ => ())
+        else ().pure[ConnectionIO]
+      } yield ()
+    def loop(frontier: Vector[(WorkflowId, WorkflowInstanceKey, String)]): ConnectionIO[Unit] =
+      if (frontier.isEmpty) ().pure[ConnectionIO]
+      else
+        for {
+          _ <- frontier.traverse_ { case (w, kk, ss) => wake(w, kk, ss) }
+          next <- frontier.flatTraverse { case (w, kk, ss) => childrenOf(w, kk, ss) }
+          _ <- loop(next)
+        } yield ()
+    for {
+      _ <- wake(wf, k, s)
+      children <- childrenOf(wf, k, s)
+      _ <- loop(children)
+    } yield ()
+  }
+
   /** Starts a child workflow: create-if-absent a child instance under the scope
     * derived from the executing parent's identity, generation, and enclosing
     * `Workflow.scoped` path; record the parent relationship, close policy, and
@@ -206,8 +306,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
           ON CONFLICT (workflow_id, key, scope) DO NOTHING
         """.update.run
         existing <- if (inserted == 0)
-          sql"""SELECT input FROM workflow_instances
-                WHERE workflow_id = $childWorkflowId AND key = $childKey AND scope = $derivedScope""".query[String].option
+          for {
+            _ <- updateChildInheritanceIO(childWorkflowId, childKey, derivedScope, inheritSignalsStr, inheritPastEvents)
+            e <- sql"""SELECT input FROM workflow_instances
+                       WHERE workflow_id = $childWorkflowId AND key = $childKey AND scope = $derivedScope""".query[String].option
+          } yield e
         else Option.empty[String].pure[ConnectionIO]
         _ <- if (inserted == 1)
           upsertWakeupIO(childWorkflowId, childKey, derivedScope, theClock.instant())
@@ -988,6 +1091,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
             for {
               _ <- appendEvent(workflowId, instanceKey, scope, "Signal", key, payload)
               _ <- wakeMatchingSubscribers(workflowId, instanceKey, scope, key)
+              _ <- wakeInheritingDescendantsIO(workflowId, instanceKey, scope, key)
             } yield SignalSendResult.Success
         }
       } yield result
@@ -1016,6 +1120,61 @@ class PostgresWorkflowRuntime private[atomicflow] (
           ON CONFLICT (workflow_id, key, scope) DO NOTHING
         """.update.run.map(_ => ())
       else ().pure[ConnectionIO]
+    } yield ()
+  }
+
+  /** Upserts a wakeup for every currently eligible descendant of the addressed
+    * instance that is suspended on `signalKey`, so a single committed send is
+    * atomically readable by all descendants that inherit it. A descendant is
+    * eligible when every parent-child edge on the path from the sender down
+    * currently permits the key (evaluated here at send time; the awaiting
+    * descendant re-checks eligibility when it runs). Waking a superset is
+    * harmless because the run-time candidate query applies the policy again.
+    */
+  private def wakeInheritingDescendantsIO(
+      wf: WorkflowId,
+      k: WorkflowInstanceKey,
+      s: String,
+      signalKey: SignalKey
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    def childrenOf(
+        w: WorkflowId,
+        kk: WorkflowInstanceKey,
+        ss: String
+    ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String, Option[String])]] =
+      sql"""SELECT workflow_id, key, scope, inherit_signals FROM workflow_instances
+            WHERE parent_workflow_id = $w AND parent_instance_key = $kk AND parent_scope = $ss""".query[
+          (WorkflowId, WorkflowInstanceKey, String, Option[String])
+        ].to[Vector]
+    def wakeIfSubscribed(w: WorkflowId, kk: WorkflowInstanceKey, ss: String): ConnectionIO[Unit] =
+      for {
+        has <- sql"""SELECT 1 FROM workflow_signal_subscriptions
+                     WHERE workflow_id = $w AND key = $kk AND scope = $ss AND signal_key = $signalKey
+                     LIMIT 1""".query[Int].option
+        _ <- if (has.isDefined)
+          sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+                VALUES ($w, $kk, $ss, $now, $now, 0)
+                ON CONFLICT (workflow_id, key, scope) DO NOTHING""".update.run.map(_ => ())
+        else ().pure[ConnectionIO]
+      } yield ()
+    def loop(frontier: Vector[(WorkflowId, WorkflowInstanceKey, String)]): ConnectionIO[Unit] =
+      if (frontier.isEmpty) ().pure[ConnectionIO]
+      else
+        for {
+          _ <- frontier.traverse_ { case (w, kk, ss) => wakeIfSubscribed(w, kk, ss) }
+          next <- frontier.flatTraverse { case (w, kk, ss) =>
+            childrenOf(w, kk, ss).map(_.collect {
+              case (cw, ck, cs, policy) if inheritancePermits(decodeSignalInheritance(policy), signalKey) => (cw, ck, cs)
+            })
+          }
+          _ <- loop(next)
+        } yield ()
+    for {
+      children <- childrenOf(wf, k, s).map(_.collect {
+        case (cw, ck, cs, policy) if inheritancePermits(decodeSignalInheritance(policy), signalKey) => (cw, ck, cs)
+      })
+      _ <- loop(children)
     } yield ()
   }
 
@@ -1540,11 +1699,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
         for {
           cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
                           WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
-          events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+          direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
                           WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                             AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
                           ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-        } yield events.map { case (seq, payload, createdAt) => AwaitSignalCandidate(seq, payload, createdAt) }
+          inherited <- readInheritedCandidatesIO(signalKey, cursor)
+        } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
+          AwaitSignalCandidate(seq, payload, createdAt)
+        }
       }
 
     override def resolveAwaitSignal(
@@ -1757,11 +1919,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
       for {
         cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
                         WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = ${l.signalKey}""".query[Long].unique
-        events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+        direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
                         WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                           AND event_kind = 'Signal' AND event_key = ${l.signalKey} AND sequence_id > $cursor
                         ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-      } yield events.map { case (seq, payload, createdAt) =>
+        inherited <- readInheritedCandidatesIO(l.signalKey, cursor)
+      } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
         AwaitRaceCandidate(seq, l.leafIdx, payload, createdAt)
       }
 
@@ -1834,11 +1997,89 @@ class PostgresWorkflowRuntime private[atomicflow] (
       for {
         cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
                         WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
-        events <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+        direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
                         WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                           AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
                         ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-      } yield events.map { case (seq, payload, createdAt) => AwaitSignalCandidate(seq, payload, createdAt) }
+        inherited <- readInheritedCandidatesIO(signalKey, cursor)
+      } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
+        AwaitSignalCandidate(seq, payload, createdAt)
+      }
+
+    /** Walks the active-parent chain from this instance upward and returns the
+      * (workflow_id, key, scope) identities of the ancestor sources whose
+      * directly addressed events this instance may inherit for `signalKey`. An
+      * ancestor is a source only when every parent-child edge on the path
+      * currently permits the key; the policy governing the edge from an instance
+      * to its own parent is that instance's stored inheritance selector. A
+      * cleared or missing parent pointer (detachment) terminates the walk, so
+      * abandoned children inherit nothing.
+      */
+    private def inheritedSourceScopesIO(
+        signalKey: SignalKey
+    ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
+      def load(
+          w: WorkflowId,
+          kk: WorkflowInstanceKey,
+          ss: String
+      ): ConnectionIO[Option[(Option[String], Option[String], Option[String], Option[String])]] =
+        sql"""SELECT inherit_signals, parent_workflow_id, parent_instance_key, parent_scope
+              FROM workflow_instances WHERE workflow_id = $w AND key = $kk AND scope = $ss""".query[
+            (Option[String], Option[String], Option[String], Option[String])
+          ].option
+      def loop(
+          node: (Option[String], Option[String], Option[String], Option[String])
+      ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
+        val (policy, pwf, pkey, pscope) = node
+        (policy, pwf, pkey, pscope) match {
+          case (Some(p), Some(f), Some(k), Some(s)) if inheritancePermits(decodeSignalInheritance(Some(p)), signalKey) =>
+            for {
+              parent <- load(f, k, s)
+              rest <- parent match {
+                case Some(pn) => loop(pn)
+                case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+              }
+            } yield (f, k, s) +: rest
+          case _ => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+        }
+      }
+      for {
+        seed <- load(workflowId, key, instanceScope)
+        sources <- seed match {
+          case Some(sn) => loop(sn)
+          case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+        }
+      } yield sources
+    }
+
+    /** The inherited `Signal` candidates for `signalKey` on this instance: events
+      * stored on any currently eligible ancestor, after the instance's own cursor
+      * and (unless `inheritPastEvents`) after the inherited-events start
+      * sequence id captured at creation. With `inheritPastEvents` the retained
+      * older events remain visible while they are ahead of the instance's cursor.
+      */
+    private def readInheritedCandidatesIO(
+        signalKey: SignalKey,
+        cursor: Long
+    ): ConnectionIO[Vector[(Long, String, java.time.Instant)]] =
+      for {
+        cfg <- sql"""SELECT inherit_past_events, inherited_events_start_sequence_id FROM workflow_instances
+                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[(Boolean, Option[Long])].option
+        sources <- inheritedSourceScopesIO(signalKey)
+        events <- if (sources.isEmpty) Vector.empty[(Long, String, java.time.Instant)].pure[ConnectionIO]
+                  else {
+                    val sourceCond = sources
+                      .map { case (w, kk, ss) => fr"(workflow_id = $w AND key = $kk AND scope = $ss)" }
+                      .reduce(_ ++ fr" OR " ++ _)
+                    val (pastEvents, startSeq) = cfg.getOrElse((false, None))
+                    val window =
+                      if (pastEvents) Fragment.empty
+                      else startSeq.map(seq => fr"AND sequence_id > $seq").getOrElse(Fragment.empty)
+                    (fr"""SELECT sequence_id, payload, created_at FROM workflow_events
+                          WHERE event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor AND (""" ++
+                      sourceCond ++ fr")" ++ window ++ fr" ORDER BY sequence_id").query[(Long, String, java.time.Instant)].to[Vector]
+                  }
+      } yield events
 
     /** Runs `write` inside one transaction, guarded by an exclusive lock on the
       * instance row and a fencing check; throws [[LeaseLostException]] if the
