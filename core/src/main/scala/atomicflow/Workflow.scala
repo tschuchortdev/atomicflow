@@ -200,6 +200,7 @@ object Workflow {
     )(body)
 
   private def withScope[R](escapedSegment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
+    require(escapedSegment.nonEmpty, "Workflow.scoped requires a non-empty scope")
     ctx.execution.pushScope(escapedSegment)
     try body(using ctx)
     finally ctx.execution.popScope()

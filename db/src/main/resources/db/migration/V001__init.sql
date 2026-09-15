@@ -50,6 +50,7 @@ CREATE TABLE workflow_steps (
   key TEXT NOT NULL,
   scope TEXT NOT NULL,
   step_id TEXT NOT NULL,
+  step_scope_path TEXT NOT NULL DEFAULT '',
   step_version BIGINT NOT NULL,
   step_kind TEXT NOT NULL,
   state_kind TEXT NOT NULL,
@@ -58,7 +59,7 @@ CREATE TABLE workflow_steps (
   expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (workflow_id, key, scope, step_id, step_version),
+  PRIMARY KEY (workflow_id, key, scope, step_id, step_version, step_scope_path),
   FOREIGN KEY (workflow_id, key, scope)
     REFERENCES workflow_instances (workflow_id, key, scope)
     ON DELETE CASCADE
@@ -81,10 +82,13 @@ CREATE TABLE workflow_signal_subscriptions (
   key TEXT NOT NULL,
   scope TEXT NOT NULL,
   step_id TEXT NOT NULL,
+  step_scope_path TEXT NOT NULL DEFAULT '',
   step_version BIGINT NOT NULL,
   leaf_idx INT NOT NULL,
   signal_key TEXT NOT NULL,
-  PRIMARY KEY (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key),
+  PRIMARY KEY (
+    workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key, step_scope_path
+  ),
   FOREIGN KEY (workflow_id, key, scope)
     REFERENCES workflow_instances (workflow_id, key, scope)
     ON DELETE CASCADE
@@ -96,13 +100,14 @@ CREATE TABLE workflow_timer_subscriptions (
   key TEXT NOT NULL,
   scope TEXT NOT NULL,
   step_id TEXT NOT NULL,
+  step_scope_path TEXT NOT NULL DEFAULT '',
   step_version BIGINT NOT NULL,
   leaf_idx INT NOT NULL,
   deadline TIMESTAMPTZ NOT NULL,
   FOREIGN KEY (workflow_id, key, scope)
     REFERENCES workflow_instances (workflow_id, key, scope)
     ON DELETE CASCADE,
-  UNIQUE (workflow_id, key, scope, step_id, step_version, leaf_idx)
+  UNIQUE (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path)
 );
 
 CREATE INDEX workflow_timer_subscriptions_deadline
@@ -113,6 +118,7 @@ CREATE TABLE workflow_completion_subscriptions (
   key TEXT NOT NULL,
   scope TEXT NOT NULL,
   step_id TEXT NOT NULL,
+  step_scope_path TEXT NOT NULL DEFAULT '',
   step_version BIGINT NOT NULL,
   leaf_idx INT NOT NULL,
   completed_workflow_id TEXT NOT NULL,
@@ -120,7 +126,7 @@ CREATE TABLE workflow_completion_subscriptions (
   completed_scope TEXT NOT NULL,
   PRIMARY KEY (
     workflow_id, key, scope, step_id, step_version, leaf_idx,
-    completed_workflow_id, completed_key, completed_scope
+    completed_workflow_id, completed_key, completed_scope, step_scope_path
   ),
   FOREIGN KEY (workflow_id, key, scope)
     REFERENCES workflow_instances (workflow_id, key, scope)
