@@ -64,6 +64,8 @@ enum ParentClosePolicy {
   * `spec/sub-workflows-iteration.md`, "Inherited signals"). Defaults to `none`;
   * `some(prefixes)` permits matching key prefixes; `all` permits every key.
   * Inheritance is transitive only when every parent-child edge permits the key.
+  * Synchronous `Update`s are never inherited because multiple descendant
+  * responses would be ambiguous.
   */
 enum SignalInheritance {
   case none

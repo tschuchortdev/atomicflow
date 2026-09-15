@@ -172,8 +172,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** Whether a stored inheritance selector permits an awaited key. `all` permits
     * every key; `some(prefixes)` permits keys with a matching prefix; `none`
-    * permits nothing. Synchronous `Update`s are never inherited regardless of
-    * the selector (they are not stored as `Signal` events).
+    * permits nothing.
     */
   private def inheritancePermits(si: SignalInheritance, key: SignalKey): Boolean = si match {
     case SignalInheritance.none           => false
@@ -295,6 +294,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     val (inserted, existing) = runSync {
       for {
+        _ <- takeEventAppendLock
         maxSeq <- sql"SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events".query[Long].unique
         inserted <- sql"""
           INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation, generation,
