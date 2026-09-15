@@ -680,6 +680,45 @@ object Step:
 - A new update record table (V001): instance, key, encoded input, idempotency key, result (nullable), timestamps.
 - Update-visible-to-await concurrency: sender blocks until the run completes (bounded by lease waits).
 
+## Phase 9 — Evolution conformance, examples, final review
+
+Implements `spec/workflow-evolution.md` verification, the example rewrite, and the final spec-conformance pass.
+
+### Task 9.1: Evolution API conformance suite
+
+**Files:**
+- Test: `db/src/test/scala/test/EvolutionSuite.scala` (new; consolidate/verify — most machinery exists since Phases 1-2)
+
+**Behavior (tests, per workflow-evolution.md):**
+- `Workflow.versionAtCreation`: branch on it in a workflow body; instances created under version 1 vs 2 take different paths (durable observable); `Info.workflowVersionAtCreation` external inspection.
+- Unconditional code change applies to unfinished instances on next run (change a step body's output between runs via two workflow definitions sharing ids — cached results reused for completed steps).
+- Step version semantics: same version → compatible hotfix (cached results reused); version bump → fresh work (old cached result not reused, new row written); `atMostOnce` has NO version parameter (compile-level — already true; assert the API shape via a usage).
+- `Step.getExecutionState[QuoteV1]("quote", stepVersion = 1)` / `(charge)`: NeverStarted (no row), Started (body began, no result — simulate via a failed at-least-once retrying step and a crashed at-most-once), Failed(failure), Completed(value decoded via required Cacheable); retrying steps report Started; lookup by one exact step version, no version mixing.
+- Cacheable evolution: withFallback chains (v1 → v2 → current) decode old cached step results (write a row with the v1 codec, read with the fallback-chain codec); imap both directions required to adapt across types; serialization always uses the current serializer.
+
+### Task 9.2: Example rewrite — `DocumentProcessingAtomicflow`
+
+**Files:**
+- Modify: `example/src/main/scala/example/DocumentProcessingAtomicflow.scala` (full rewrite to the new API), possibly `DocumentProcessingCollaborators.scala` (only if signatures must adapt)
+- Test: `example/src/test/scala/example/DocumentProcessingAtomicflowSuite.scala` (new; testcontainers Postgres smoke test)
+
+**Behavior:**
+- Port the document-processing flow to the current API: `Workflow.apply` shape, `Step.atLeastOnce` with versions where the old code had retries, `Awaitable` timers for polling, `Signal`/`sendSignal` for endpoint interactions, at-most-once for external effects, `RetryPolicy` where the old code used retry schedulers, run via `PostgresWorkflowRuntime` + `JobRunner` for background work.
+- No in-memory runtime (commented out by user instruction — use Postgres in tests).
+- Smoke test: process a small batch end-to-end (create + run, await terminal state, assert reported results); keep it fast (one container, Flyway).
+- The old prototype-API code is fully replaced (un-comment means rewrite; the file is rewritten in place).
+
+### Task 9.3: Final conformance review + deferred-minors triage
+
+**Files:**
+- Review-only: all spec files vs implementation; `.superpowers/sdd/2026-09-14-atomicflow-postgres-runtime/progress.md` deferred-minors ledger
+- Possible small fixes surfaced by the review (fix rounds as needed)
+
+**Behavior:**
+- A comprehensive reviewer pass over each spec file (core-types, steps, signals-timers, running-workflows, sub-workflows-iteration, child-signal-inheritance, continue-as-new-fork-reset, restartable-regions-loops, workflow-evolution) against the implementation, producing a final conformance verdict with any Critical/Important gaps.
+- Triage the deferred minors from the SDD ledger: fix the cheap-and-valuable ones, record the rest as accepted deviations in DEVIATIONS.md.
+- DEVIATIONS.md final pass: numbering, wording, completeness.
+
 ## Phase 9 (expanded at phase boundary)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
