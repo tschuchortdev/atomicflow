@@ -1,27 +1,26 @@
 package atomicflow
 
-import atomicflow.Fingerprintable.Fingerprinter
-import atomicflow.internal.{SignalStore, StepCache, StepIdempotencyStore}
+import atomicflow.internal.WorkflowExecution
 
-import java.net.URLEncoder
-import java.nio.charset.StandardCharsets
-import java.util.Objects
-import scala.annotation.implicitNotFound
-import scala.concurrent.duration.FiniteDuration
+/** The runtime context materialized only during workflow execution. It carries
+  * the instance identity, the version of the definition captured at creation, the
+  * runtime services, and (via [[execution]]) the per-run engine seam.
+  *
+  * A new context is materialized for every run and is not retained between runs.
+  */
+trait WorkflowContext {
+  def instanceId: WorkflowInstanceId
 
+  /** The `Workflow.version` recorded when the instance was created. The current
+    * body may branch on it internally to adapt to the definition version that
+    * created the instance (see `spec/workflow-evolution.md`).
+    */
+  def versionAtCreation: Long
 
-@implicitNotFound("Cannot be used outside a Workflow definition: `Workflow(...) {  }`\nYou can require a WorkflowContext for the enclosing method by adding a using clause `(using WorkflowContext)` to its definition.")
-case class WorkflowContext(
-  workflowInstanceMeta: WorkflowInstanceMeta,
-  workflowRuntime: WorkflowRuntime,
-  defaultCacheTtl: Option[FiniteDuration] = None,
-  stepIdempotencyIdOverrides: Map[StepId, StepIdempotencyId] = Map.empty,
-  subworkflowScope: Vector[String] = Vector.empty
-) {
-  def withSubworkflowScope(scopeKey: String): WorkflowContext =
-    this.copy(subworkflowScope = this.subworkflowScope.appended(scopeKey))
-}
-object WorkflowContext {
-  // TODO: Muss man manchmal explizit importieren... sehr nervig.
-  given (ctx: WorkflowContext) => WorkflowInstanceMeta = ctx.workflowInstanceMeta
+  def runtime: WorkflowRuntime
+
+  /** The per-run engine seam: fencing identity and, in later tasks, the services
+    * a running body needs from the engine.
+    */
+  private[atomicflow] def execution: WorkflowExecution
 }

@@ -1,3 +1,9 @@
+// NOTE: Disabled during the spec-conformant rewrite (see spec/).
+// The in-memory backend will be re-implemented against the new runtime API
+// (running-workflows.md, "Settings and backends") in a follow-up.
+// The previous prototype implementation is kept below for reference.
+
+/*
 package atomicflow.impl.memory
 
 import atomicflow.*
@@ -448,3 +454,5 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
 object InMemoryWorkflowRuntime {
 
 }
+
+*/
