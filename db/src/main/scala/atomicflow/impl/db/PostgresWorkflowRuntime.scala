@@ -636,6 +636,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
               AND lease_owner = $worker AND fencing_token = $token""".update.run
     }
 
+  /** Runner-side lease release: clears the lease if it is still held by `worker`
+    * at `token`. The runner calls this in a `finally` so a fault-injected abort
+    * that never reached the run's own release cannot leak a lease.
+    */
+  private[atomicflow] def releaseLeaseIfOurs(
+      instanceId: WorkflowInstanceId,
+      worker: String,
+      token: Long
+  ): Unit =
+    releaseLease(instanceId.workflowId, instanceId.workflowInstanceKey, instanceId.scope, worker, token)
+
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
     * append and the deletion of this instance's directly addressed `Signal`
     * events: the guarded `terminal_state`/`terminal_outcome` update, the event

@@ -6,7 +6,7 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 import org.slf4j.LoggerFactory
 
-import java.util.concurrent.{CountDownLatch, Executor, ExecutorService, Executors, ThreadFactory}
+import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Executor, ExecutorService, Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.*
 import cats.syntax.all.*
@@ -41,6 +41,35 @@ final class PostgresJobRunner private[atomicflow] (
   private val runnerWorker = runtime.workerIdFor("jobrunner")
 
   private val stopped = new AtomicBoolean(false)
+
+  private val RequeueBackoffBase: FiniteDuration = 1.second
+  private val RequeueBackoffCap: FiniteDuration = 5.minutes
+
+  private def backoffDelay(attempts: Int): FiniteDuration = {
+    val baseNanos = RequeueBackoffBase.toNanos
+    val delayNanos = baseNanos * (1L << math.min(attempts, 30))
+    (delayNanos.nanos) min RequeueBackoffCap
+  }
+
+  private val permitCounts = new ConcurrentHashMap[WorkflowId, java.lang.Integer]()
+
+  private def atCapacity(workflowId: WorkflowId): Boolean =
+    permitCounts.getOrDefault(workflowId, java.lang.Integer.valueOf(0)).intValue() >=
+      settings.maxConcurrentInstances(workflowId)
+
+  private def acquirePermit(workflowId: WorkflowId): Unit =
+    permitCounts.merge(workflowId, java.lang.Integer.valueOf(1), (a: Integer, b: Integer) =>
+      java.lang.Integer.valueOf(a + b)
+    )
+
+  private def releasePermit(workflowId: WorkflowId): Unit =
+    permitCounts.computeIfPresent(
+      workflowId,
+      (_: WorkflowId, v: java.lang.Integer) => if (v <= 1) null else java.lang.Integer.valueOf(v - 1)
+    )
+
+  @volatile
+  private[atomicflow] var testRunWrapper: (() => Unit) => Unit = run => run()
 
   private val ownedPool: Option[ExecutorService] =
     if (settings.executor.isDefined) None
@@ -80,7 +109,8 @@ final class PostgresJobRunner private[atomicflow] (
   private final case class ClaimedInstance(
       instanceId: WorkflowInstanceId,
       worker: String,
-      token: Long
+      token: Long,
+      attempts: Int
   )
 
   /** The ranked claim: per-workflow ROW_NUMBER over due, non-terminal wakeups of
@@ -116,49 +146,91 @@ final class PostgresJobRunner private[atomicflow] (
     runtime.runSync {
       for {
         rows <- query.query[ClaimRow].to[Vector]
-        claimed <- rows.traverse { row =>
-          runtime.tryAcquireOnceIO(row.workflowId, row.key, row.scope, runnerWorker, settings.leaseDuration).flatMap {
-            case Some(token) =>
-              sql"""DELETE FROM workflow_wakeups
-                    WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
-                      AND scheduled_at = ${row.scheduledAt}""".update.run
-                .map(_ => Some(ClaimedInstance(WorkflowInstanceId(row.workflowId, row.key, row.scope), runnerWorker, token)))
-            case None => Option.empty[ClaimedInstance].pure[ConnectionIO]
-          }
+        claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
+          if (atCapacity(row.workflowId)) deferRowIO(row, now).as(acc)
+          else
+            runtime.tryAcquireOnceIO(row.workflowId, row.key, row.scope, runnerWorker, settings.leaseDuration).flatMap {
+              case Some(token) =>
+                sql"""DELETE FROM workflow_wakeups
+                      WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
+                        AND scheduled_at = ${row.scheduledAt}""".update.run.map { _ =>
+                  acquirePermit(row.workflowId)
+                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.key, row.scope), runnerWorker, token, row.attempts)
+                }
+              case None => acc.pure[ConnectionIO]
+            }
         }
-      } yield claimed.flatten
+      } yield claimed
     }
+  }
+
+  /** Defer a wakeup in place when its workflow is at capacity: push `scheduled_at`
+    * out by `capacityRetryDelay` (no lease taken, attempts untouched) so a hot
+    * workflow neither starves the FIFO batch nor pins a worker. Matches the row's
+    * seen `scheduled_at` so a concurrently requeued/future row is not clobbered.
+    */
+  private def deferRowIO(row: ClaimRow, now: java.time.Instant): ConnectionIO[Unit] = {
+    val deferred = now.plus(java.time.Duration.ofNanos(settings.capacityRetryDelay.toNanos))
+    sql"""UPDATE workflow_wakeups
+          SET scheduled_at = $deferred
+          WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
+            AND scheduled_at = ${row.scheduledAt}""".update.run.map(_ => ())
+  }
+
+  /** Requeues a claimed wakeup after a transient failure. One transaction: the
+    * row was deleted at claim, but a racing delivery may have re-inserted it, so
+    * an upsert preserves `created_at` when a row exists (else records `now`),
+    * pushes `scheduled_at` out to the capped exponential backoff (never earlier
+    * than an existing future time), and bumps `attempts` by one.
+    */
+  private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int): Unit = {
+    val now = runtime.clock.instant()
+    val scheduled = now.plus(java.time.Duration.ofNanos(backoffDelay(attempts).toNanos))
+    runtime.runSync {
+      sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $now, $scheduled, ${attempts + 1})
+            ON CONFLICT (workflow_id, key, scope) DO UPDATE
+            SET created_at = workflow_wakeups.created_at,
+                scheduled_at = GREATEST(workflow_wakeups.scheduled_at, EXCLUDED.scheduled_at),
+                attempts = workflow_wakeups.attempts + 1""".update.run
+    }
+    ()
   }
 
   private def dispatchRun(c: ClaimedInstance): Unit = {
     val workflow = registry(c.instanceId.workflowId)
     try {
-      val result = runtime.runClaimedInstance(
-        workflow,
-        c.instanceId,
-        c.worker,
-        c.token,
-        settings.leaseDuration,
-        settings.leaseAcquireTimeout
-      )(using settings.throwableCacheable)
-      result match {
-        case WorkflowRunResult.WorkflowSuspended =>
-          log.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
-        case other =>
-          log.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
-      }
+      testRunWrapper(() => {
+        val result = runtime.runClaimedInstance(
+          workflow,
+          c.instanceId,
+          c.worker,
+          c.token,
+          settings.leaseDuration,
+          settings.leaseAcquireTimeout
+        )(using settings.throwableCacheable)
+        result match {
+          case WorkflowRunResult.WorkflowSuspended =>
+            log.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
+          case other =>
+            log.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
+        }
+      })
     } catch {
       case _: WorkflowNotFoundException =>
         log.warn(s"Claimed workflow instance ${c.instanceId} was not found; wakeup already consumed")
       case e: Throwable =>
         classifyFailure(c, e)
+    } finally {
+      runtime.releaseLeaseIfOurs(c.instanceId, c.worker, c.token)
+      releasePermit(c.instanceId.workflowId)
     }
   }
 
   /** Classifies a run that ended by throwing, by the instance's durable state
     * rather than the exception type: terminal (including FAILED, which is logged
     * and never rescheduled), lease lost (new owner responsible), or transient
-    * (Task 5.3 requeues; for now logged with the wakeup left absent).
+    * (requeued with capped exponential backoff, unbounded retries).
     */
   private def classifyFailure(c: ClaimedInstance, e: Throwable): Unit =
     runtime.readTerminalState(c.instanceId) match {
@@ -167,9 +239,10 @@ final class PostgresJobRunner private[atomicflow] (
       case Some(_) =>
         log.debug(s"Workflow instance ${c.instanceId} reached a terminal state; adopting its outcome")
       case None =>
-        if (runtime.leaseStillOurs(c.instanceId, c.worker, c.token))
-          log.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; not requeued (Task 5.3)", e)
-        else
+        if (runtime.leaseStillOurs(c.instanceId, c.worker, c.token)) {
+          log.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
+          requeueTransient(c.instanceId, c.attempts)
+        } else
           log.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
     }
 

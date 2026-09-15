@@ -47,6 +47,24 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
             WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[(Option[String], Int)].option
     )
 
+  private def wakeupRow(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey
+  ): Option[(Instant, Instant, Int)] =
+    run(
+      sql"""SELECT created_at, scheduled_at, attempts FROM workflow_wakeups
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[(Instant, Instant, Int)].option
+    )
+
+  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Unit =
+    run(sql"""DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".update.run)
+
+  private def leaseOwner(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
+    run(
+      sql"""SELECT lease_owner FROM workflow_instances
+            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Option[String]].unique
+    )
+
   test("started runner claims the createAndSchedule wakeup and completes the instance autonomously") {
     val rt = newRuntime
     val runner = rt.startJobRunner(Seq(simpleWf("auto")), JobRunnerSettings.forTests)
@@ -219,6 +237,149 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       releaseA.countDown()
       runner.stop(1.second)
     }
+  }
+
+  test("a transient failure requeues the wakeup with backoff and attempts+1") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("req")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      val inst = wf.createAndSchedule("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch, Vector(inst.id))
+      val row = wakeupRow(wf.id, "k").get
+      assertEquals(row._3, 1, "first requeue must set attempts to 1")
+      assertEquals(row._1, clock.instant(), "first requeue (row deleted at claim) records created_at = now")
+      assert(row._2.isAfter(clock.instant()), "scheduled_at must be pushed into the future by backoff")
+    } finally runner.stop(1.second)
+  }
+
+  test("requeue preserves created_at across requeues while attempts and backoff grow") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("req2")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      val inst = wf.createAndSchedule("k", "x")(using rt)
+      deleteWakeup(wf.id, "k")
+      runner.requeueTransient(inst.id, 0)
+      val first = wakeupRow(wf.id, "k").get
+      assertEquals(first._3, 1)
+      val firstCreated = first._1
+      val firstScheduled = first._2
+      clock.advanceBy(1.second)
+      runner.requeueTransient(inst.id, 1)
+      val second = wakeupRow(wf.id, "k").get
+      assertEquals(second._3, 2, "the second requeue must bump attempts to 2")
+      assertEquals(second._1, firstCreated, "created_at must be unchanged across requeues")
+      assert(second._2.isAfter(firstScheduled), "backoff must grow with attempts")
+    } finally runner.stop(1.second)
+  }
+
+  test("after a transient requeue the next cycle runs the instance to completion") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("reqok")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      val inst = wf.createAndSchedule("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._3, 1)
+      runner.testRunWrapper = run => run()
+      clock.advanceBy(10.seconds)
+      runner.runDriverCycle()
+      val row = instanceRow(wf.id, "k").get
+      assertEquals(row._1, Some("completed"))
+      assertEquals(row._2, 1, "the injected failure never ran the body, so it executes exactly once")
+    } finally runner.stop(1.second)
+  }
+
+  test("a lease-lost run is not requeued; the new owner is responsible") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("leaselost")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      wf.createAndSchedule("k", "x")(using rt)
+      runner.testRunWrapper = { _ =>
+        run(
+          sql"""UPDATE workflow_instances SET lease_owner = 'other', fencing_token = fencing_token + 1,
+                lease_expires_at = now() + interval '1 hour'
+                WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+        )
+        throw new RuntimeException("simulated infrastructure failure")
+      }
+      runner.runDriverCycle()
+      assert(!wakeupExists(wf.id, "k"), "no requeue may occur when the lease was lost")
+    } finally runner.stop(1.second)
+  }
+
+  test("per-workflow cap defers excess due instances in place without a lease") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("cap")
+    val settings = JobRunnerSettings.forTests.copy(
+      maxConcurrentInstances = id => if (id == wf.id) 1 else Int.MaxValue,
+      capacityRetryDelay = 5.seconds
+    )
+    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
+    try {
+      wf.createAndSchedule("k1", "x")(using rt)
+      wf.createAndSchedule("k2", "x")(using rt)
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch.size, 1, "only one instance may be claimed under the cap")
+      val deferred = wakeupRow(wf.id, "k2").get
+      assertEquals(deferred._3, 0, "defer must not touch attempts")
+      assertEquals(deferred._2, clock.instant().plusSeconds(5), "deferred in place by capacityRetryDelay")
+      assertEquals(leaseOwner(wf.id, "k2"), None, "no lease may be taken on a deferred instance")
+      assertEquals(instanceRow(wf.id, "k1").get._1, Some("completed"))
+      clock.advanceBy(6.seconds)
+      runner.runDriverCycle()
+      assertEquals(instanceRow(wf.id, "k2").get._1, Some("completed"))
+    } finally runner.stop(1.second)
+  }
+
+  test("an injected failure releases its permit, so retries are not starved by the cap") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = simpleWf("caprel")
+    val settings = JobRunnerSettings.forTests.copy(
+      maxConcurrentInstances = id => if (id == wf.id) 1 else Int.MaxValue,
+      capacityRetryDelay = 5.seconds
+    )
+    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
+    try {
+      wf.createAndSchedule("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new RuntimeException("boom")
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._3, 1, "transient failure requeued the wakeup")
+      runner.testRunWrapper = run => run()
+      clock.advanceBy(10.seconds)
+      runner.runDriverCycle()
+      assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
+    } finally runner.stop(1.second)
+  }
+
+  test("a burst from one workflow cannot monopolize a claim batch") {
+    val rt = newRuntime
+    val wfA = simpleWf("bursta")
+    val wfB = simpleWf("burstb")
+    (1 to 10).foreach(i => wfA.createAndSchedule(s"a$i", "x")(using rt))
+    (1 to 10).foreach(i => wfB.createAndSchedule(s"b$i", "x")(using rt))
+    val runner = rt.startJobRunnerForTests(
+      Seq(wfA, wfB),
+      JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 4, wakeupBatchSize = 8)
+    )
+    try {
+      runner.runDriverCycle()
+      val claimed = runner.lastClaimedBatch
+      assertEquals(claimed.size, 8)
+      assertEquals(claimed.count(_.workflowId == wfA.id), 4, "workflow A must get at most its share")
+      assertEquals(claimed.count(_.workflowId == wfB.id), 4, "workflow B must get at most its share")
+    } finally runner.stop(1.second)
   }
 
   test("duplicate workflow ids in the registry are rejected at start") {
