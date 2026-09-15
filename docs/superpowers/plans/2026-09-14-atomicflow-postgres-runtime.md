@@ -487,7 +487,96 @@ Package-private test hook: `JobRunner.runDriverCycle(): Unit` (one driver-loop i
 - `capacityRetryDelay` from settings; caller-thread run bypasses caps.
 - Executor override honored (user-supplied `Executor` used instead of the daemon pool).
 
-## Phases 6–9 (expanded at phase boundaries)
+## Phase 6 — Children, inheritance, parallelism
+
+Implements `spec/sub-workflows-iteration.md` (complete), `spec/child-signal-inheritance.md`
+(complete), and the parallelism primitives. Scope derivation uses `ScopePath` (Phase 1).
+
+### Task 6.1: `Workflow.scoped`, `runToSuspension`, `Workflow.parallel`
+
+**Files:**
+- Modify: `core/.../Workflow.scala`, engine seam (scope tracking)
+- Test: `db/src/test/scala/test/ScopedParallelSuite.scala`
+
+**Interfaces:**
+```scala
+object Workflow:
+  def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R): WorkflowContext ?=> R
+  def scoped[A: Fingerprintable, R](elem: A)(body: WorkflowContext ?=> R): WorkflowContext ?=> R  // key derived from fingerprint
+  def runToSuspension[R](body: WorkflowContext ?=> R): Either[WorkflowSuspendedException, R]
+  def parallel[R](branches: Seq[() => R]): Seq[R]
+  def parallel[R](branches: (() => R)*): Seq[R]
+```
+
+**Behavior (tests, per sub-workflows-iteration.md "Primitives"):**
+- scoped prefixes Step/Await IDs (scope path joined by `/`); same step definitions execute independently per element; nests (path = enclosing + key).
+- runToSuspension: catches suspension, returns Left; used by tests/parallel.
+- parallel: all branches run concurrently (ox `par`/`mapPar`); waits for ALL; if some complete and others suspend, collects all results first, then throws one combined `WorkflowSuspendedException` carrying each branch's suspension (causes); returns Seq[R] when all complete; suspension propagates to the boundary; combined exception is still excluded by WorkflowNonFatal; `restart`/`break`/control-flow crossing a parallel boundary is Phase 7's concern.
+- Sequential iteration: plain loops with scoped — foreach/map/fold patterns work (no library helpers).
+
+### Task 6.2: `startAsChild` + scope derivation + `ParentClosePolicy` + `getChildWorkflowInstances`
+
+**Files:**
+- Modify: `core/.../Workflow.scala` (`startAsChild`), `core/.../WorkflowRuntime.scala`, `core/.../Types.scala` (SignalInheritance), `core/.../WorkflowInstance.scala` (Info parentId), runtime + migration columns (parent/inheritance already in V001)
+- Test: `db/src/test/scala/test/ChildrenSuite.scala`
+
+**Interfaces:**
+```scala
+enum SignalInheritance:
+  case None_, All, Some_(prefixes: Seq[SignalKey])  // naming: spec says `SignalInheritance.some("a/", ...)` / `.all`; default none
+final class Workflow[In, Out]:
+  def startAsChild(childKey: WorkflowInstanceKey, input: In, parentClosePolicy: ParentClosePolicy = ParentClosePolicy.Cancel,
+      inheritSignals: SignalInheritance = SignalInheritance.none, inheritPastEvents: Boolean = false)(using WorkflowContext): WorkflowInstance[In, Out]
+enum ParentClosePolicy: case Cancel, Abandon
+trait WorkflowRuntime:
+  def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info]
+```
+(Exact object/case naming for SignalInheritance is pinned in the brief.)
+
+**Behavior (tests):**
+- startAsChild: create-if-absent (idempotent on parent replay); derived scope from parent identity + generation + enclosing scope path (escaped, `@generation` markers); child's first wakeup upserted; children NEVER executed inline on the parent's thread (parent run does not run child bodies); parentId in Info.
+- Scope derivation per spec examples: parent (orders, order-42, "") → child (worker, worker-1, "orders/order-42@3/..."); collision-escaping verified via ScopePath (unit, Phase 1); key uniqueness (workflowId, key, scope).
+- Parent terminal → ParentClosePolicy applied in the same transaction: Cancel → cooperative cancel semantics per child state (CREATED → immediate CANCELLED; SUSPENDED → flag + wakeup; RUNNING → flag, next checkpoint); Abandon → active-parent pointer cleared only.
+- Idempotent application (re-triggering the policy is a no-op).
+- Child completing does not cancel parent; parent awaiting child completion works (3.4's completion awaitables).
+- getChildWorkflowInstances queries the ACTIVE parent relationship.
+
+### Task 6.3: Signal inheritance (ancestor queries, inheritPastEvents, policy updates)
+
+**Files:**
+- Modify: await-evaluation candidate gathering (runtime), `startAsChild` (policy fields on instance row)
+- Test: `db/src/test/scala/test/InheritanceSuite.scala`
+
+**Behavior (tests, per child-signal-inheritance.md):**
+- Inheritance defaults to none; `some(prefixes)` permits matching key prefixes; `all` permits every key.
+- An event addressed to an ancestor is visible only when EVERY parent-child edge on the path currently permits its key (recursive ancestor query; transitive).
+- `inheritPastEvents = false`: visibility starts after the child relationship's `inheritedEventsStartSequenceId` (recorded at child creation under the event append mutex — events after the commit have greater sequenceIds); `true`: retained older events visible if ahead of the child's cursor.
+- One committed send is atomically readable by all currently eligible descendants.
+- Policy broadening (replaying startAsChild with wider prefixes) durably schedules wakeups for the affected descendant subtree; narrowing hides unresolved events; cached results unaffected.
+- Detachment (Abandon / parent terminal): inherited visibility removed for unresolved awaits; cached results replayable.
+- Synchronous Updates never inherited (Phase 8 note — nothing to test yet).
+
+### Task 6.4: `Step.firstToRunWithoutSuspension`
+
+**Files:**
+- Modify: `core/.../Step.scala`, engine
+- Test: `db/src/test/scala/test/FirstToRunSuite.scala`
+
+**Interfaces:**
+```scala
+object Step:
+  @experimental def firstToRunWithoutSuspension[R](stepId: String, invalidateOn: Seq[StepInput[?]] = Seq.empty,
+      ensureUnchanged: Seq[StepInput[?]] = Seq.empty)(branches: Seq[() => R])(using WorkflowContext, Cacheable[Throwable]): R
+  @experimental def firstToRunWithoutSuspension[R](stepId: String, ...)(branches: (() => R)*)(using WorkflowContext, Cacheable[Throwable]): R
+```
+
+**Behavior (tests):**
+- Edge-triggered: all branches suspend → combined suspension; at least one completes → first result returned, other suspensions DISCARDED.
+- State saved in its own step row (stepKind `FirstToRunWithoutSuspension`) — on replay, the first-ever-completed branch's result is returned even if later reruns would unblock others in a different order.
+- Dangerous-pitfall Scaladoc: racing arbitrary code vs an await depends on when the code is run; and the batch-unblock caveat (spec text is NORMATIVE for the doc).
+- Branch cleanup TODOs from the spec (child cleanup, race-await cleanup when one branch completes) — implement best-effort: subscriptions of losing branches are cleaned when a winner completes.
+
+## Phases 7–9 (expanded at phase boundaries)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
