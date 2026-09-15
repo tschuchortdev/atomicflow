@@ -649,7 +649,38 @@ trait WorkflowRuntime:
 - Both: after the operation the instance is runnable (wakeup scheduled); runs and completes correctly from the replayed/preserved state.
 - Parallel-branch boundary caveat: single step ID only (spec TODO) — document the limitation in Scaladoc.
 
-## Phases 8–9 (expanded at phase boundaries)
+## Phase 8 — Updates
+
+Implements `spec/signals-timers.md` "Updates: signals that return a value" (the spec marks the concept as not fully thought out — the listed API shapes and semantics are binding; open choices get pinned and recorded in DEVIATIONS.md).
+
+### Task 8.1: `Update`, `sendUpdate`, `Step.awaitUpdate`
+
+**Files:**
+- Modify: `core/.../Signal.scala` or new `core/.../Update.scala`, `core/.../Step.scala` (awaitUpdate), `core/.../WorkflowRuntime.scala` (sendUpdate op), `core/.../WorkflowInstanceId.scala`/`WorkflowInstance.scala` (sendUpdate forwarders), V001 (update records table)
+- Test: `db/src/test/scala/test/UpdateSuite.scala`
+
+**Interfaces (spec shapes are binding):**
+```scala
+class Update[I, R](val key: String)(using val inputCacheable: Cacheable[I], responseCacheable: Cacheable[R])
+enum UpdateSendResult[+R]: case Success(value: R); case Unhandled; case InstanceAlreadyCompleted
+// Update.send / WorkflowInstanceId.sendUpdate / WorkflowInstance.sendUpdate forwarders (match Signal.send's runtime-threading pattern)
+trait WorkflowRuntime:
+  def sendUpdate[I, R](instanceId: WorkflowInstanceId, updateKey: String, input: I, idempotencyKey: String = "",
+      persistUnhandledUpdates: Boolean = false)(using u: Update[I, R]): UpdateSendResult[R]  // shape adapted to codebase conventions
+object Step:
+  def awaitUpdate[I, R, O](stepKey: String, u: Update[I, R])(respond: I => (R, O))(using WorkflowContext, Cacheable[Throwable]): O
+```
+
+**Behavior (tests, per spec):**
+- Updates addressed directly to one instance; never inherited (Scaladoc note — no inheritance machinery).
+- Send flow: workflow completed → `InstanceAlreadyCompleted`; subscribed/awaited + instance locked → wait for the lease to expire, retry from beginning; subscribed + free → run the workflow ON THE SENDER'S THREAD until finished; result set on the update's DB record → `Success(result)`; run finished without handling → `Unhandled`.
+- `awaitUpdate` awaits the update like a signal await (subscription, recheck-before-commit), then `respond` computes `(response, output)` — response is durably written to the update record (visible to the waiting sender), output returned to the workflow.
+- idempotencyKey: runtime deduplicates — same key twice → second send is idempotent, sender gets the same result.
+- persistUnhandledUpdates=false: unhandled update record deleted after the run; =true: kept (later `awaitUpdate` can consume a persisted-but-unhandled update; deleted after handling).
+- A new update record table (V001): instance, key, encoded input, idempotency key, result (nullable), timestamps.
+- Update-visible-to-await concurrency: sender blocks until the run completes (bounded by lease waits).
+
+## Phase 9 (expanded at phase boundary)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
