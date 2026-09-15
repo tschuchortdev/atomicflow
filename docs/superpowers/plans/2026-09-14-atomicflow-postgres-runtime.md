@@ -576,7 +576,80 @@ object Step:
 - Dangerous-pitfall Scaladoc: racing arbitrary code vs an await depends on when the code is run; and the batch-unblock caveat (spec text is NORMATIVE for the doc).
 - Branch cleanup TODOs from the spec (child cleanup, race-await cleanup when one branch completes) — implement best-effort: subscriptions of losing branches are cleaned when a winner completes.
 
-## Phases 7–9 (expanded at phase boundaries)
+## Phase 7 — continueAsNew, restartable regions/loops, fork/reset
+
+Implements `spec/continue-as-new-fork-reset.md` (complete) and `spec/restartable-regions-loops.md` (complete). Reuses Phase 6's parent-close machinery and scope derivation.
+
+### Task 7.1: `Workflow.continueAsNew`
+
+**Files:**
+- Modify: `core/.../Workflow.scala` (companion forwarder), `core/.../ControlFlow.scala` (new exception + WorkflowNonFatal), `core/.../WorkflowRuntime.scala` (internal primitive), engine seam, `db/.../PostgresWorkflowRuntime.scala` (in-place transition)
+- Test: `db/src/test/scala/test/ContinueAsNewSuite.scala`
+
+**Interfaces:**
+```scala
+object Workflow:
+  def continueAsNew[A: Cacheable](nextInput: A)(using WorkflowContext): Nothing
+// internal (private[atomicflow]) runtime primitive + ContinueAsNewException carrying the ENCODED nextInput
+// WorkflowRunResult gains a ContinueAsNew outcome (or equivalent — check existing outcome set)
+```
+
+**Behavior (tests, per continue-as-new-fork-reset.md):**
+- Control-flow exception: returns Nothing, body does not continue; excluded by WorkflowNonFatal; committed atomically: old-gen Step rows/subscriptions/wakeups erased (cursors kept), children closed per ParentClosePolicy (Cancel requests, Abandon detaches; continuation doesn't wait), generation incremented + new input installed, directly-addressed Signal events deleted — one in-place transition; `onUnconsumedSignals` runs BEFORE the transaction while signal acceptance is closed.
+- Key unique/unchanged; no separate old-gen instances; generation exposed only via Info.
+- Global event sequence not reset; new sequenceIds stay greater than all previously allocated (cursors may point into gaps).
+- Child that continues-as-new stays attached to ITS parent with unchanged inheritance config; ancestor events untouched.
+- New input flows: next run decodes nextInput as the workflow's input.
+- Next execution scheduled (wakeup upserted); manual `runWorkflowInstance` also works.
+
+### Task 7.2: `Workflow.restartable` / `Workflow.loop`
+
+**Files:**
+- Modify: `core/.../Workflow.scala` (both views + `RestartableScope`/`LoopScope`), `core/.../ControlFlow.scala` (restart/break exceptions + WorkflowNonFatal), engine seam (region scope entries carry restartCount), `db/.../PostgresWorkflowRuntime.scala` (region transitions)
+- Test: `db/src/test/scala/test/RestartableSuite.scala`
+
+**Interfaces (spec's conceptual shapes are binding):**
+```scala
+object Workflow:
+  def restartable[S: Cacheable, R](id: String, initialState: => S)(body: (S, RestartableScope[S]) => R)(using WorkflowContext): R
+  def loop[S: Cacheable, R](id: String, initialState: => S)(body: (S, LoopScope[R]) => S)(using WorkflowContext): R
+trait RestartableScope[S]: def restartCount: Long; def restart(nextState: S): Nothing
+trait LoopScope[R]: def restartCount: Long; def break(result: R): Nothing
+```
+
+**Behavior (tests, per restartable-regions-loops.md):**
+- Equivalent dual views (document in Scaladoc); internally convert one into the other.
+- Region = subscope via the scoped mechanism (region ID mandatory, stable); region row stores encoded current state + restartCount; `initialState` by-name, evaluated+persisted only on first creation, ignored on replay.
+- Restart: atomically replaces the region row's state and discards nested Step rows + subscriptions owned by the previous looping's scope subtree (region-scoped prefix delete — construct-isolated like 6.4); re-enters locally (outer workflow not replayed to begin the next looping); restartCount counts committed restarts only (not crash replays).
+- Normal return: restartable completes the region with R / loop starts next generation; `break(result)` completes with R; neither caches the whole region value; on outer replay the body re-runs reusing cached records.
+- Reusing Step/sleep IDs in the successor looping creates fresh work (polling intervals repeat).
+- Signal cursors survive across loopings (discarded await results don't make events re-consumable); global event sequence untouched.
+- Children created in a discarded looping: closed per ParentClosePolicy; successor loopings use distinct child identities — enclosing regions' key + restartCount contribute to child scope derivation (extend the seam's scope entries; see sub-workflows-iteration.md derivation rules).
+- restart/break crossing a `Workflow.parallel` boundary: parallel cleans up other branches and propagates (like other control-flow exceptions).
+- Thousands of iterations do not create unbounded state (SQL row-count assertion over a many-iteration loop).
+
+### Task 7.3: `forkWorkflow` + `resetWorkflow`
+
+**Files:**
+- Modify: `core/.../WorkflowRuntime.scala` (public ops), `db/.../PostgresWorkflowRuntime.scala` (copy/erase), V001 (ensure a last-updated timestamp on `workflow_steps` — add if missing)
+- Test: `db/src/test/scala/test/ForkResetSuite.scala`
+
+**Interfaces:**
+```scala
+trait WorkflowRuntime:
+  def forkWorkflow[In, Out](sourceInstanceId: WorkflowInstanceId, newInstanceKey: WorkflowInstanceKey,
+      restartFromStep: StepId)(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out]  // shape per existing create-op conventions
+  def resetWorkflow[In, Out](sourceInstanceId: WorkflowInstanceId, restartFromStep: StepId)(using workflow: Workflow[In, Out]): Unit
+```
+(Exact parameter/generic shape pinned in the brief from existing runtime-op conventions.)
+
+**Behavior (tests, per continue-as-new-fork-reset.md "Forking"/"Resetting"):**
+- Fork: brand-new instance id/key, generation 0, same input as source; independent top-level (no parent, no inherited signals, no inheritance columns); copies cached history STRICTLY BEFORE `restartFromStep` (boundary exclusive — selected step + subsequent history omitted so it re-executes); `restartFromStep` must identify an already-executed step (error otherwise); the workflow function still executes from its beginning (replays until the first uncopied operation; no jump); copied rows carry the new instance identity.
+- Reset: same instance identity, generation incremented in place, no old generation retained; history strictly before the boundary stays cached, selected + subsequent erased; replays from the top; boundary ordering by the step rows' last-updated timestamp (the spec's rule).
+- Both: after the operation the instance is runnable (wakeup scheduled); runs and completes correctly from the replayed/preserved state.
+- Parallel-branch boundary caveat: single step ID only (spec TODO) — document the limitation in Scaladoc.
+
+## Phases 8–9 (expanded at phase boundaries)
 
 - **Phase 3:** signals, timers, awaits, event log append protocol (advisory lock), cursors, subscriptions, wakeups, `Awaitable`, `Step.await`/`awaitRace`/`peekSignal`, durable step retries (`RetryPolicy`), `onUnconsumedSignals`, `Signal.send`, `TestClock` (public utility — deviation: shipped in `core`, not the in-memory backend).
 - **Phase 4:** cancellation & termination (`cancel`, checkpoint delivery, sticky redelivery, `Workflow.uncancellable`, `terminate`, `WorkflowCancelledException` flow into `WorkflowRunResult.WorkflowCancelled`).
