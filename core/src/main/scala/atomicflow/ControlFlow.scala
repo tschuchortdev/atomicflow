@@ -55,18 +55,6 @@ final class RegionBreakException[R] private[atomicflow] (val result: R) extends 
   override def toString: String = "RegionBreakException"
 }
 
-/** Internal wrapper used by `Workflow.parallel` to carry a library control-flow
-  * exception (restart, break, continue-as-new) out of an `ox.par` scope as a
-  * normal exception, so Ox cancels the sibling branches deterministically and
-  * rethrows it; `parallel` unwraps it and rethrows the underlying control-flow
-  * exception. It is always caught inside `parallel` and never escapes a workflow
-  * body.
-  */
-private[atomicflow] final class ParallelControlFlow(val underlying: WorkflowControlException)
-    extends RuntimeException(underlying) {
-  override def toString: String = "ParallelControlFlow"
-}
-
 /** A `NonFatal`-like extractor that excludes the library's control-flow exceptions
   * (and fatal JVM errors), so broad catches inside workflow code can handle
   * everything else and still rethrow suspension/reset/continue-as-new.

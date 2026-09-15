@@ -10,6 +10,7 @@ import atomicflow.internal.{
   AwaitRaceTimerLeaf,
   AwaitSignalCandidate,
   AwaitTimerCandidate,
+  BranchContextSnapshot,
   Framing,
   ScopePath,
   StoredStep,
@@ -550,23 +551,43 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Region-restart variant of [[applyParentClosePoliciesIO]]: closes only the
     * children created inside the discarded looping, i.e. those of this instance
     * whose derived scope lies under `interiorBase` (the previous generation's
-    * region scope subtree). The escaping of scope segments guarantees the
-    * boundary: an ordinary `scoped` key cannot collide with a `key@count`
-    * marker, because its `@` is escaped.
+    * region scope subtree).
+    *
+    * A child's full derived scope is `parentPrefix + "/" + enclosingScopePath`
+    * (see `ScopePath.deriveChildScope`), where `parentPrefix` is this instance's
+    * own fixed identity prefix and `enclosingScopePath` is the scope stack at the
+    * moment of `startAsChild`. So a child created under this region has scope
+    * exactly `parentPrefix + "/" + interiorBase`. Matching against that exact
+    * full scope (and its `interiorBase + "/..."` descendants) is construct
+    * isolation: it cannot over-close a same-id nested region inside a sibling
+    * subtree, because a sibling's child scope ends in `/S/R@0`, not `/R@0`, and
+    * the region's own id is LIKE-escaped so `%`/`_`/`\` in it cannot act as
+    * wildcards.
     */
   private def applyRegionClosePoliciesIO(
       parentWorkflowId: WorkflowId,
       parentKey: WorkflowInstanceKey,
       parentScope: String,
+      parentGeneration: Long,
       interiorBase: String
   ): ConnectionIO[Unit] = {
+    val prefix = {
+      val segs = Vector.newBuilder[String]
+      if (parentScope.nonEmpty) segs += parentScope
+      segs += ScopePath.escapeScopeSegment(parentWorkflowId)
+      segs += ScopePath.escapeScopeSegment(parentKey) + "@" + parentGeneration
+      segs.result().mkString("/")
+    }
+    val childBase = if (prefix.isEmpty) interiorBase else prefix + "/" + interiorBase
+    val childBaseLike = likeEscaped(childBase)
     for {
       children <- sql"""SELECT workflow_id, key, scope, parent_close_policy, terminal_state, times_executed, lease_owner, lease_expires_at
                         FROM workflow_instances
                         WHERE parent_workflow_id = $parentWorkflowId
                           AND parent_instance_key = $parentKey
                           AND parent_scope = $parentScope
-                          AND scope LIKE ${"%/" + interiorBase + "%"}
+                          AND (scope = $childBase
+                               OR scope LIKE ${childBaseLike + "/%"} ESCAPE '\')
                         FOR UPDATE""".query[
           (WorkflowId, WorkflowInstanceKey, String, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
         ].to[Vector]
@@ -1561,6 +1582,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     private[atomicflow] override def popScope(): Unit =
       scopeStack.set(scopeStack.get().dropRight(1))
 
+    private[atomicflow] override def snapshotBranchContext(): BranchContextSnapshot =
+      BranchContextSnapshot(scopeStack.get(), uncancellableDepth.get())
+
+    private[atomicflow] override def restoreBranchContext(snapshot: BranchContextSnapshot): Unit = {
+      scopeStack.set(snapshot.scopeStack)
+      uncancellableDepth.set(snapshot.uncancellableDepth)
+    }
+
     override def now: java.time.Instant = theClock.instant()
 
     override def durableRetryThreshold: FiniteDuration = PostgresWorkflowRuntime.this.durableRetryThreshold
@@ -2249,37 +2278,41 @@ class PostgresWorkflowRuntime private[atomicflow] (
               ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO NOTHING""".update.run
       }
 
-    private def deleteRegionNestedStepsIO(base: String): ConnectionIO[Unit] =
+    private def deleteRegionNestedStepsIO(base: String): ConnectionIO[Unit] = {
+      val escaped = likeEscaped(base)
       for {
         _ <- sql"""DELETE FROM workflow_steps
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                      AND step_scope_path = $base""".update.run
         _ <- sql"""DELETE FROM workflow_steps
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
       } yield ()
+    }
 
-    private def deleteRegionNestedSubscriptionsIO(base: String): ConnectionIO[Unit] =
+    private def deleteRegionNestedSubscriptionsIO(base: String): ConnectionIO[Unit] = {
+      val escaped = likeEscaped(base)
       for {
         _ <- sql"""DELETE FROM workflow_signal_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                      AND step_scope_path = $base""".update.run
         _ <- sql"""DELETE FROM workflow_signal_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
         _ <- sql"""DELETE FROM workflow_timer_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                      AND step_scope_path = $base""".update.run
         _ <- sql"""DELETE FROM workflow_timer_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
         _ <- sql"""DELETE FROM workflow_completion_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
                      AND step_scope_path = $base""".update.run
         _ <- sql"""DELETE FROM workflow_completion_subscriptions
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${base + "/%"}""".update.run
+                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
       } yield ()
+    }
 
     private[atomicflow] override def restartRegion(
         regionId: String,
@@ -2293,7 +2326,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         for {
           _ <- deleteRegionNestedStepsIO(base)
           _ <- deleteRegionNestedSubscriptionsIO(base)
-          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, base)
+          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, generation, base)
           _ <- sql"""UPDATE workflow_steps
                      SET state_payload = ${regionPayload(currentRestartCount + 1, serializedState)}, updated_at = $now
                      WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope

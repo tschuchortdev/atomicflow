@@ -339,4 +339,149 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(countNonRegionSteps(wfR.id, "k"), countNonRegionSteps(wfL.id, "k"))
     assertEquals(regionPayload(wfR.id, "k", "R"), regionPayload(wfL.id, "k", "R"), "identical region row (state + restartCount)")
   }
+
+  test("a restart from one parallel branch does not interrupt a sibling mid-DB-write; the run completes (no hang)") {
+    val rt = newRuntime
+    val stepRuns = new AtomicInteger(0)
+    val wf = Workflow[String, String]("rl-par-hang") { in =>
+      Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
+        Workflow.parallel[Int](
+          () => {
+            Step.atLeastOnce[Int]("sib") {
+              stepRuns.incrementAndGet()
+              Thread.sleep(120)
+              1
+            }
+            state
+          },
+          () => {
+            if (state < 2) scope.restart(state + 1) else state
+          }
+        )
+        "ok-" + state
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("ok-2"))
+    assertEquals(regionPayload(wf.id, "k", "R").map(_._1), Some(2L), "the region committed 2 restarts")
+    assertEquals(stepRuns.get(), 3, "the DB-working sibling's step completed in all 3 loopings")
+  }
+
+  test("a step inside parallel under a region persists with the region scope prefix") {
+    val rt = newRuntime
+    val wf = Workflow[String, String]("rl-par-scope") { in =>
+      Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
+        Workflow.parallel[Int](
+          () => {
+            Step.atLeastOnce[Int]("inner") { 1 }
+            state
+          },
+          () => state
+        )
+        "done"
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    val paths = run(
+      sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
+            WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'inner'""".query[String].to[Vector]
+    )
+    assert(paths.contains("R@0"), s"the parallel step's scope carries the enclosing region segment: $paths")
+  }
+
+  test("a step inside parallel re-executes each looping under a region (scope propagates into branch threads)") {
+    val rt = newRuntime
+    val stepRuns = new AtomicInteger(0)
+    val wf = Workflow[String, String]("rl-par-loop") { in =>
+      Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
+        Workflow.parallel[Int](
+          () => {
+            Step.atLeastOnce[Int]("inner") { stepRuns.incrementAndGet(); 1 }
+            state
+          },
+          () => state
+        )
+        if (state < 2) scope.restart(state + 1) else "done"
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    assertEquals(stepRuns.get(), 3, "the parallel step re-executes in each of the 3 loopings (no stale cache)")
+    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final looping's parallel step row remains")
+  }
+
+  test("children started inside a parallel branch under a region derive the region-scoped identity") {
+    val rt = newRuntime
+    val childWf = Workflow[String, String]("rl-par-child") { in => in }
+    val wf = Workflow[String, String]("rl-par-children") { in =>
+      Workflow.loop[Int, String]("R", 0) { (state, loop) =>
+        Workflow.parallel[Unit](
+          () => {
+            childWf.startAsChild("c", "hi-" + state)
+            ()
+          },
+          () => ()
+        )
+        if (state < 1) state + 1
+        else loop.break("done")
+      }
+    }
+    val id = rt.createWorkflowInstance(wf, "p", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+    val rows = childRows(childWf.id, "c")
+    assertEquals(rows.size, 2, "one distinct child identity per looping")
+    assert(rows.map(_._1).exists(_.contains("R@0")), "looping 0's child scope carries R@0")
+    assert(rows.map(_._1).exists(_.contains("R@1")), "looping 1's child scope carries R@1")
+  }
+
+  test("a restart of a region does not over-close children of a same-id nested region in a sibling subtree") {
+    val rt = newRuntime
+    val childWf = Workflow[String, String]("rl-nested-child") { in => in }
+    val gate = Signal[String]("gate")
+    val wf = Workflow[String, String]("rl-overclose") { in =>
+      Workflow.restartable[Int, String]("S", 0) { (_, _) =>
+        Workflow.restartable[Int, Unit]("R", 0) { (_, _) =>
+          childWf.startAsChild("nestedChild", "x")
+          ()
+        }
+        "s-done"
+      }
+      Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
+        if (state < 1) scope.restart(state + 1) else "done"
+      }
+      Step.await[String]("gate", Awaitable.SignalEvent(gate))
+      "all-done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val rows = childRows(childWf.id, "nestedChild")
+    assertEquals(rows.size, 1, "the sibling subtree's child is created once under S@0/R@0")
+    assert(rows.head._1.contains("S@0/R@0"), s"the child scope lies under the sibling region: ${rows.head._1}")
+    assertEquals(rows.head._2, None, "outer R's restart must not close the sibling subtree's child")
+    gate.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("all-done"))
+  }
+
+  test("a region id containing _ is LIKE-escaped: restart does not delete a sibling region's nested rows") {
+    val rt = newRuntime
+    val wf = Workflow[String, String]("rl-underscore") { in =>
+      Workflow.restartable[Int, String]("R11", 0) { (state, scope) =>
+        Workflow.scoped("sub") { Step.atLeastOnce[Int]("b") { 2 } }
+        "done2"
+      }
+      Workflow.restartable[Int, String]("R_1", 0) { (state, scope) =>
+        Step.atLeastOnce[Int]("a") { 1 }
+        if (state < 1) scope.restart(state + 1) else "done"
+      }
+      "all-done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("all-done"))
+    val bCount = run(
+      sql"""SELECT COUNT(*) FROM workflow_steps
+            WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'b'""".query[Int].unique
+    )
+    assertEquals(bCount, 1, "the sibling region's nested step survives the LIKE-wildcard restart")
+  }
 }

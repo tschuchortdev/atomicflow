@@ -6,6 +6,7 @@ import atomicflow.internal.ScopePath
 import java.time.Instant
 import scala.annotation.targetName
 import scala.concurrent.duration.FiniteDuration
+import scala.util.control.NonFatal
 
 /** The typed handle of a workflow instance, obtained only from the runtime. It
   * captures the [[Workflow]] definition it came from plus the instance's stable
@@ -394,31 +395,59 @@ object Workflow {
     try Right(body(using ctx))
     catch { case e: WorkflowSuspendedException => Left(e) }
 
+  /** The terminal outcome of one parallel branch, collected so that ALL branches
+    * can be joined to completion before `parallel` decides what to propagate.
+    * Because every branch outcome is returned as a value (never thrown), Ox never
+    * interrupts a sibling mid-branch, so a DB-working branch is never cut off by
+    * another branch's control-flow exception.
+    */
+  private sealed trait BranchOutcome[+R]
+  private final case class BranchResult[R](value: R) extends BranchOutcome[R]
+  private final case class BranchSuspended(suspension: WorkflowSuspendedException) extends BranchOutcome[Nothing]
+  private final case class BranchControlFlow(c: WorkflowControlException) extends BranchOutcome[Nothing]
+  private final case class BranchFailed(t: Throwable) extends BranchOutcome[Nothing]
+
   /** Runs several branches concurrently (via Ox `par`), waiting for ALL of
     * them. When some complete and others suspend, all results are collected
     * first and then one combined [[WorkflowSuspendedException]] is thrown
     * carrying each branch's suspension in `causes`. Returns `Seq[R]` in order
-    * when every branch completes. A non-suspension failure propagates (after
-    * the branches settle).
+    * when every branch completes. A non-suspension failure propagates.
+    *
+    * Control-flow exceptions (restart, break, continue-as-new) never interrupt a
+    * sibling: every branch is joined to completion first, then the winning
+    * control-flow exception is rethrown at the join point. The enclosing scope
+    * stack and `uncancellable` depth are propagated into each branch thread, so
+    * work inside a branch carries the enclosing `scoped`/region identity.
     */
-  def parallel[R](branches: Seq[() => R]): Seq[R] = {
-    val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
-      try ox.par(branches.map(branch => () => captureSuspension(branch())))
-      catch { case e: ParallelControlFlow => throw e.underlying }
-    val suspensions = outcomes.collect { case Left(s) => s }
+  def parallel[R](branches: Seq[() => R])(using ctx: WorkflowContext): Seq[R] = {
+    val snapshot = ctx.execution.snapshotBranchContext()
+    val outcomes: Seq[BranchOutcome[R]] = ox.par(
+      branches.map(branch => () => {
+        val pristine = ctx.execution.snapshotBranchContext()
+        ctx.execution.restoreBranchContext(snapshot)
+        try runBranch(branch)
+        finally ctx.execution.restoreBranchContext(pristine)
+      })
+    )
+    val controlFlows = outcomes.collect { case BranchControlFlow(c) => c }
+    if (controlFlows.nonEmpty) throw controlFlows.head
+    val failures = outcomes.collect { case BranchFailed(t) => t }
+    if (failures.nonEmpty) throw failures.head
+    val suspensions = outcomes.collect { case BranchSuspended(s) => s }
     if (suspensions.nonEmpty) throw new WorkflowSuspendedException(suspensions)
-    else outcomes.collect { case Right(r) => r }
+    outcomes.collect { case BranchResult(r) => r }
   }
 
   /** Vararg form of [[parallel]]. */
   @targetName("parallelVararg")
-  def parallel[R](branches: (() => R)*): Seq[R] = parallel(branches.toVector)
+  def parallel[R](branches: (() => R)*)(using ctx: WorkflowContext): Seq[R] = parallel(branches.toVector)
 
-  private def captureSuspension[R](run: => R): Either[WorkflowSuspendedException, R] =
-    try Right(run)
+  private def runBranch[R](branch: () => R): BranchOutcome[R] =
+    try BranchResult(branch())
     catch {
-      case e: WorkflowSuspendedException => Left(e)
-      case e: WorkflowControlException   => throw new ParallelControlFlow(e)
+      case e: WorkflowSuspendedException => BranchSuspended(e)
+      case e: WorkflowControlException   => BranchControlFlow(e)
+      case e if NonFatal(e)              => BranchFailed(e)
     }
 
   def apply[In: Cacheable, Out: Cacheable](

@@ -86,6 +86,15 @@ private[atomicflow] final case class AwaitRaceDecision(
     advanceSignalKey: Option[SignalKey]
 )
 
+/** A point-in-time capture of a thread's transient execution context (the
+  * `Workflow.scoped` scope stack and the `Workflow.uncancellable` depth), used
+  * to propagate the enclosing context into forked parallel-branch threads.
+  */
+private[atomicflow] final case class BranchContextSnapshot(
+    scopeStack: Vector[String],
+    uncancellableDepth: Int
+)
+
 /** The per-run engine seam, materialized only during execution and funneled to
   * workflow code through [[atomicflow.WorkflowContext.execution]]. It carries
   * the fencing identity of the current run so the engine can implement fenced
@@ -125,6 +134,19 @@ private[atomicflow] trait WorkflowExecution {
 
   /** Pops the innermost `Workflow.scoped` segment pushed by [[pushScope]]. */
   private[atomicflow] def popScope(): Unit
+
+  /** A point-in-time capture of this thread's transient execution context (the
+    * `Workflow.scoped` scope stack and the `Workflow.uncancellable` depth),
+    * used to propagate the enclosing context into forked parallel-branch
+    * threads. See [[snapshotBranchContext]] and [[restoreBranchContext]].
+    */
+  private[atomicflow] def snapshotBranchContext(): BranchContextSnapshot
+
+  /** Restore the scope stack and `uncancellable` depth captured by
+    * [[snapshotBranchContext]] onto the current thread, replacing whatever
+    * (usually empty) state a forked branch thread started with.
+    */
+  private[atomicflow] def restoreBranchContext(snapshot: BranchContextSnapshot): Unit
 
   /** The runtime's notion of the current instant, from the injected clock. */
   def now: Instant
