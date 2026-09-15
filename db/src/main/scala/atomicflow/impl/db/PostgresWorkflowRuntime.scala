@@ -78,15 +78,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private def clearInterrupt(): Unit = Thread.interrupted()
 
-  private def runSync[A](fa: ConnectionIO[A]): A = {
+  private[atomicflow] def runSync[A](fa: ConnectionIO[A]): A = {
     clearInterrupt()
     fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
   }
 
   private def workerId: String = s"$processUuid:${Thread.currentThread().getId}"
 
-  private def leaseExpiry(now: java.time.Instant): java.time.Instant =
-    now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
+  private[atomicflow] def workerIdFor(role: String): String = s"$processUuid:$role"
+
+  private[atomicflow] def leaseExpiry(now: java.time.Instant, duration: FiniteDuration): java.time.Instant =
+    now.plus(java.time.Duration.ofNanos(duration.toNanos))
 
   override def clock: Clock = theClock
 
@@ -343,140 +345,174 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
-  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
-    val workflowId = instanceId.workflowId
-    val key = instanceId.workflowInstanceKey
-    val scope = instanceId.scope
-    val outCacheable = workflow.outputCacheable
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] =
+    runInstanceInternal(workflow, instanceId, leaseDuration, leaseAcquireTimeout, preAcquired = None)
+      .asInstanceOf[WorkflowRunResult[Out]]
 
-    clearInterrupt()
-
-    given Cacheable[Out] = outCacheable
-    val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
-
-    val row = runSync {
-      sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation
-            FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
-          (Option[String], Option[String], String, Long)
-        ].option
-    }
-
-    val (terminalState, terminalOutcome, inputSerialized, versionAtCreation) = row match {
-      case Some(r) => r
-      case None =>
-        throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-    }
-
-    terminalState match {
-      case Some(state) =>
-        return handleTerminalRead(state, terminalOutcome, outCacheable, completionCodec, instanceId)
-      case None => ()
-    }
-
-    val worker = workerId
-    val token = acquireLease(workflowId, key, scope, worker) match {
-      case Some(t) => t
-      case None    => throw LeaseUnavailableException(instanceId)
-    }
-
-    try {
-      val now = theClock.instant()
-      val bumped = runSync {
-        sql"""UPDATE workflow_instances
-              SET times_executed = times_executed + 1, last_run_at = $now
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
-                AND lease_owner = $worker AND fencing_token = $token""".update.run
-      }
-      if (bumped != 1) throw LeaseLostException(instanceId)
-
-      val input = workflow.inputCacheable.read(inputSerialized)
-      val execution = new PostgresExecution(worker, token, workflowId, key, scope)
-      val ctxInstanceId = instanceId
-      val ctxVersionAtCreation = versionAtCreation
-      val ctxRuntime: WorkflowRuntime = this
-      val ctxExecution = execution
-      val ctx = new WorkflowContext {
-        override def instanceId: WorkflowInstanceId = ctxInstanceId
-        override def versionAtCreation: Long = ctxVersionAtCreation
-        override def runtime: WorkflowRuntime = ctxRuntime
-        private[atomicflow] override def execution: WorkflowExecution = ctxExecution
-      }
-
-      log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
-
-      var outValue: Out = null.asInstanceOf[Out]
-      var suspended = false
-      try {
-        outValue = workflow.body(input)(using ctx)
-      } catch {
-        case _: WorkflowSuspendedException =>
-          suspended = true
-        case _: LeaseLostException => throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
-        case _: WorkflowCancelledException =>
-          runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
-          val payload = Framing.write("cancelled")
-          val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
-          if (updated == 1) {
-            log.info(s"Workflow instance $instanceId cancelled")
-            return WorkflowRunResult.WorkflowCancelled
-          } else {
-            log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
-            return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-          }
-        case WorkflowNonFatal(t) =>
-          runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
-          val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
-          val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
-          if (updated == 1) {
-            log.info(s"Workflow instance $instanceId failed", t)
-            throw cacheableThrowable.read(cacheableThrowable.write(t))
-          } else {
-            log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
-            return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-          }
-      }
-
-      if (suspended) {
-        log.debug(s"Workflow instance $instanceId suspended")
-        WorkflowRunResult.WorkflowSuspended
-      } else {
-        runUnconsumedSignals(workflow, workflowId, key, scope, worker, token)
-        val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
-        val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
-        if (updated == 1) {
-          log.debug(s"Workflow instance $instanceId completed")
-          WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
-        } else {
-          readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-        }
-      }
-    } finally {
-      releaseLease(workflowId, key, scope, worker, token)
-    }
-  }
-
-  /** One conditional lease-acquire attempt; returns the new fencing token on
-    * success, `None` if the lease is held by a live owner or the instance is
-    * terminal. The acquire and the fencing-token read-back are a single
-    * `RETURNING` statement.
+  /** Runs an instance whose lease is already held by the job runner's claim
+    * (worker + fencing token supplied), skipping acquisition. Uses the same
+    * body-execution code path as the public [[runWorkflowInstance]]; the runner's
+    * lease settings override the runtime's defaults for this run.
     */
-  private def tryAcquireOnce(
+  private[atomicflow] def runClaimedInstance(
+      workflow: Workflow[?, ?],
+      instanceId: WorkflowInstanceId,
+      worker: String,
+      token: Long,
+      leaseDuration: FiniteDuration,
+      leaseAcquireTimeout: FiniteDuration
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[?] =
+    runInstanceInternal(workflow, instanceId, leaseDuration, leaseAcquireTimeout, preAcquired = Some((worker, token)))
+
+  /** The shared body-execution code path behind the public run API and the job
+    * runner. Decodes the persisted input with the definition's `Cacheable[In]`,
+    * reads `workflowVersionAtCreation` into the context, and executes the body
+    * under the given lease (either freshly acquired or pre-acquired by a claim).
+    */
+  private def runInstanceInternal(
+      workflow: Workflow[?, ?],
+      instanceId: WorkflowInstanceId,
+      runLeaseDuration: FiniteDuration,
+      runLeaseAcquireTimeout: FiniteDuration,
+      preAcquired: Option[(String, Long)]
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[?] =
+    workflow match {
+      case wf: Workflow[i, o] =>
+        val outCacheable: Cacheable[o] = wf.outputCacheable
+        given Cacheable[o] = outCacheable
+        val completionCodec = summon[Cacheable[WorkflowCompletionResult[o]]]
+        val workflowId = instanceId.workflowId
+        val key = instanceId.workflowInstanceKey
+        val scope = instanceId.scope
+
+        clearInterrupt()
+
+        val row = runSync {
+          sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation
+                FROM workflow_instances
+                WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
+              (Option[String], Option[String], String, Long)
+            ].option
+        }
+
+        val (terminalState, terminalOutcome, inputSerialized, versionAtCreation) = row match {
+          case Some(r) => r
+          case None =>
+            throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+        }
+
+        terminalState match {
+          case Some(state) =>
+            handleTerminalRead(state, terminalOutcome, outCacheable, completionCodec, instanceId)
+          case None =>
+            val (worker, token) = preAcquired.getOrElse {
+              val w = workerId
+              val t = acquireLease(workflowId, key, scope, w, runLeaseDuration, runLeaseAcquireTimeout) match {
+                case Some(t) => t
+                case None    => throw LeaseUnavailableException(instanceId)
+              }
+              (w, t)
+            }
+
+            try {
+              val now = theClock.instant()
+              val bumped = runSync {
+                sql"""UPDATE workflow_instances
+                      SET times_executed = times_executed + 1, last_run_at = $now
+                      WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+                        AND lease_owner = $worker AND fencing_token = $token""".update.run
+              }
+              if (bumped != 1) throw LeaseLostException(instanceId)
+
+              val input = wf.inputCacheable.read(inputSerialized)
+              val execution = new PostgresExecution(worker, token, workflowId, key, scope, runLeaseDuration)
+              val ctxInstanceId = instanceId
+              val ctxVersionAtCreation = versionAtCreation
+              val ctxRuntime: WorkflowRuntime = this
+              val ctxExecution = execution
+              val ctx = new WorkflowContext {
+                override def instanceId: WorkflowInstanceId = ctxInstanceId
+                override def versionAtCreation: Long = ctxVersionAtCreation
+                override def runtime: WorkflowRuntime = ctxRuntime
+                private[atomicflow] override def execution: WorkflowExecution = ctxExecution
+              }
+
+              log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
+
+              var outValue: o = null.asInstanceOf[o]
+              var suspended = false
+              try {
+                outValue = wf.body(input)(using ctx)
+              } catch {
+                case _: WorkflowSuspendedException =>
+                  suspended = true
+                case _: LeaseLostException =>
+                  throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+                case _: WorkflowCancelledException =>
+                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                  val payload = Framing.write("cancelled")
+                  val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
+                  if (updated == 1) {
+                    log.info(s"Workflow instance $instanceId cancelled")
+                    return WorkflowRunResult.WorkflowCancelled
+                  } else {
+                    log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
+                    return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                  }
+                case WorkflowNonFatal(t) =>
+                  runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                  val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
+                  val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
+                  if (updated == 1) {
+                    log.info(s"Workflow instance $instanceId failed", t)
+                    throw cacheableThrowable.read(cacheableThrowable.write(t))
+                  } else {
+                    log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
+                    return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                  }
+              }
+
+              if (suspended) {
+                log.debug(s"Workflow instance $instanceId suspended")
+                WorkflowRunResult.WorkflowSuspended
+              } else {
+                runUnconsumedSignals(wf, workflowId, key, scope, worker, token)
+                val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
+                val updated = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
+                if (updated == 1) {
+                  log.debug(s"Workflow instance $instanceId completed")
+                  WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
+                } else {
+                  readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
+                }
+              }
+            } finally {
+              releaseLease(workflowId, key, scope, worker, token)
+            }
+        }
+    }
+
+  /** One conditional lease-acquire attempt as a `ConnectionIO`, so a caller may
+    * run it inside its own transaction (the job runner's claim). Returns the new
+    * fencing token on success, `None` if the lease is held by a live owner or the
+    * instance is terminal. The acquire and the fencing-token read-back are a
+    * single `RETURNING` statement.
+    */
+  private[atomicflow] def tryAcquireOnceIO(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
-      worker: String
-  ): Option[Long] = {
+      worker: String,
+      leaseDuration: FiniteDuration
+  ): ConnectionIO[Option[Long]] = {
     val now = theClock.instant()
-    val expires = leaseExpiry(now)
-    runSync {
-      sql"""UPDATE workflow_instances
-            SET lease_owner = $worker, fencing_token = fencing_token + 1, lease_expires_at = $expires
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
-              AND terminal_state IS NULL
-              AND (lease_owner IS NULL OR lease_expires_at <= $now)
-            RETURNING fencing_token""".query[Long].option
-    }
+    val expires = leaseExpiry(now, leaseDuration)
+    sql"""UPDATE workflow_instances
+          SET lease_owner = $worker, fencing_token = fencing_token + 1, lease_expires_at = $expires
+          WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
+            AND terminal_state IS NULL
+            AND (lease_owner IS NULL OR lease_expires_at <= $now)
+          RETURNING fencing_token""".query[Long].option
   }
 
   /** Bounded poll of the conditional lease acquire, every 100ms up to
@@ -486,13 +522,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: String,
-      worker: String
+      worker: String,
+      leaseDuration: FiniteDuration,
+      leaseAcquireTimeout: FiniteDuration
   ): Option[Long] = {
     val pollIntervalMillis = 100L
     val deadlineNanos = System.nanoTime() + leaseAcquireTimeout.toNanos
     var acquired: Option[Long] = None
     while (acquired.isEmpty && System.nanoTime() < deadlineNanos) {
-      acquired = tryAcquireOnce(workflowId, key, scope, worker)
+      acquired = runSync(tryAcquireOnceIO(workflowId, key, scope, worker, leaseDuration))
       if (acquired.isEmpty && System.nanoTime() < deadlineNanos) Thread.sleep(pollIntervalMillis)
     }
     acquired
@@ -987,7 +1025,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
       val fencingToken: Long,
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      instanceScope: String
+      instanceScope: String,
+      runLeaseDuration: FiniteDuration
   ) extends WorkflowExecution {
 
     private val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
@@ -1008,7 +1047,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     override def renewLease(): Unit = {
       val now = theClock.instant()
-      val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
+      val expires = now.plus(java.time.Duration.ofNanos(runLeaseDuration.toNanos))
       val updated = runSync {
         sql"""UPDATE workflow_instances
               SET lease_expires_at = $expires
@@ -1574,4 +1613,55 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
     ()
   }
+
+  /** The instance's terminal state, or `None` if not yet terminal. Used by the
+    * job runner to classify a run's outcome by durable state rather than by
+    * exception type.
+    */
+  private[atomicflow] def readTerminalState(instanceId: WorkflowInstanceId): Option[String] =
+    runSync {
+      sql"""SELECT terminal_state FROM workflow_instances
+            WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}""".query[
+          Option[String]
+        ].unique
+    }
+
+  /** Whether the instance's lease is still held by `worker` at `token`. */
+  private[atomicflow] def leaseStillOurs(
+      instanceId: WorkflowInstanceId,
+      worker: String,
+      token: Long
+  ): Boolean =
+    runSync {
+      sql"""SELECT 1 FROM workflow_instances
+            WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}
+              AND lease_owner = $worker AND fencing_token = $token""".query[Int].option
+    }.isDefined
+
+  private val runnerGuard = new Object
+  @volatile private var activeRunner: PostgresJobRunner = null
+
+  private[atomicflow] def isRunnerActive: Boolean = {
+    val r = activeRunner
+    r != null && r.isActive
+  }
+
+  private[atomicflow] def clearActiveRunner(runner: PostgresJobRunner): Unit =
+    runnerGuard.synchronized {
+      if (activeRunner eq runner) activeRunner = null
+    }
+
+  override def startJobRunner(
+      definitions: Seq[Workflow[?, ?]],
+      settings: JobRunnerSettings = JobRunnerSettings.default
+  ): JobRunner =
+    runnerGuard.synchronized {
+      if (isRunnerActive)
+        throw new IllegalStateException(
+          "This runtime already has an active job runner; stop it before starting another"
+        )
+      val runner = new PostgresJobRunner(this, definitions, settings)
+      activeRunner = runner
+      runner
+    }
 }
