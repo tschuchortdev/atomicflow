@@ -137,3 +137,28 @@ implementation phase.
     ties it to "before the instance is marked complete"); a throwing handler
     on the failure path masks the original exception (unspecified edge,
     documented behavior).
+
+## Phases 4-5 (cancellation, job runner)
+
+27. **CREATED-cancel predicate.** "Cancel before first start" finalizes CANCELLED
+    when the instance has no execution state at all (`times_executed = 0` and
+    no rows in workflow_steps/subscriptions/wakeups) — the spec says "has
+    never started and has no execution state to deliver into" without
+    pinning the predicate.
+28. **`JobRunnerSettings` gains a `throwableCacheable` field** (default
+    `forThrowable.genericStringMessageSerializer`). Runner-driven failure
+    terminal outcomes need an explicit codec choice; the spec's settings field
+    list omits one, and hard-coding it silently would violate "choosing the
+    throwable codec is part of workflow behavior and must be explicit".
+29. **Requeue backoff constants** (base 1 second, cap 5 minutes, factor 2) are
+    internal; the spec pins only "capped exponential backoff, unbounded
+    retries". The escalation/recovery sweep batch size (128) is likewise
+    internal (the spec pins only `timerBatchSize`).
+30. **Package-private test hooks**: `JobRunner.runDriverCycle`,
+    `runTimerSweep`/`runEscalationSweep`/`runRecoverySweep`, a loop-less
+    runner constructor, and a `testRunWrapper` fault-injection point. All
+    `private[atomicflow]` — the spec's "Runtime-internal test hooks" category.
+31. **The driver loop dispatches a whole claimed batch to the bounded pool and
+    processes outcomes before claiming again** (bounded pool = backpressure).
+    The spec's pseudocode leaves the await semantics of the dispatch loop
+    open.
