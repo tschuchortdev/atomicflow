@@ -191,7 +191,7 @@ private[atomicflow] trait WorkflowExecution {
     * right before any new work (a Step body about to execute, or an await about
     * to be evaluated); cached replays never call it, so they never deliver.
     */
-  def checkCancellation(): Unit
+  def throwIfCancelled(): Unit
 
   /** Enters a `Workflow.uncancellable` region: increments a per-run transient
     * counter so `checkCancellation` suppresses delivery while it is non-zero.

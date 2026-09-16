@@ -1967,7 +1967,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       if (updated != 1) throw LeaseLostException(instanceId)
     }
 
-    override def checkCancellation(): Unit = {
+    override def throwIfCancelled(): Unit = {
       if (!inUncancellableRegion) {
         val requestedAt = runSync {
           sql"""SELECT cancel_requested_at FROM workflow_instances
