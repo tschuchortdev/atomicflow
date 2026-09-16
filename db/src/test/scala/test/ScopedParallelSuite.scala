@@ -285,4 +285,57 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assert(rows.exists { case (stepId, _, _) => stepId == "shielded" }, "the shielded step row exists (its checkpoint suppressed delivery)")
     assert(!rows.exists { case (stepId, _, _) => stepId == "exposed" }, "the exposed step row is absent (its body never ran)")
   }
+
+  test("a step applied from a captured context on a foreign thread records the enclosing scope") {
+    val rt = newRuntime
+    val counter = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "foreign-thread-scope") { in =>
+      Workflow.scoped("outer") {
+        val body: WorkflowContext ?=> String =
+          Step.atLeastOnce[String]("foreign") { counter.incrementAndGet(); "v" }
+        val ctx = summon[WorkflowContext]
+        val thread = new Thread(() => { body(using ctx); () })
+        thread.start()
+        thread.join()
+      }
+      "done"
+    }
+    rt.createWorkflowInstance(wf, "k", "in")
+    assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("done"))
+    assertEquals(counter.get(), 1, "the step body executes exactly once")
+    assertEquals(
+      stepScopePaths(wf.id, "k"),
+      Vector("outer"),
+      "the step row lands under the enclosing scope carried by the context, not the foreign thread's empty scope"
+    )
+  }
+
+  test("uncancellable suppression travels with the context onto a foreign thread") {
+    val rt = newRuntime
+    val sig = Signal[String]("gate")
+    val counter = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "foreign-thread-uncancellable") { in =>
+      Workflow.uncancellable {
+        Step.await[String]("gate", Awaitable.SignalEvent(sig))
+        val body: WorkflowContext ?=> String =
+          Step.atLeastOnce[String]("compensate") { counter.incrementAndGet(); "ok" }
+        val ctx = summon[WorkflowContext]
+        val thread = new Thread(() => try { body(using ctx); () } catch { case _: WorkflowCancelledException => () })
+        thread.start()
+        thread.join()
+      }
+      Step.atLeastOnce[Int]("after") { 2 }
+      "finished"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    rt.cancel(id)
+    sig.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
+    assertEquals(
+      counter.get(),
+      1,
+      "the compensation step executes despite the pending cancel: the uncancellable depth travels with the context"
+    )
+  }
 }
