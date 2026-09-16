@@ -158,7 +158,7 @@ final class Workflow[In, Out] private[atomicflow] (
       inheritPastEvents,
       ctx.instanceId,
       ctx.execution.generation,
-      ctx.execution.currentScope
+      ctx.currentScope
     )(using inputCacheable)
 
   /** Run a previously created instance on the caller thread (no input param). */
@@ -274,7 +274,9 @@ object Workflow {
     * returning the result is the normal path. Both expose the same durable
     * transitions and the same `restartCount` metadata.
     */
-  def restartable[S: Cacheable, R](id: String, initialState: => S)(body: (S, RestartableScope[S]) => R)(using
+  def restartable[S: Cacheable, R](id: String, initialState: => S)(
+      body: (S, RestartableScope[S]) => WorkflowContext ?=> R
+  )(using
       ctx: WorkflowContext
   ): R =
     regionLoop(id, initialState) { (state, scope) =>
@@ -290,7 +292,9 @@ object Workflow {
     * completes the region. `initialState` is a by-name pure seed evaluated only
     * on first creation.
     */
-  def loop[S: Cacheable, R](id: String, initialState: => S)(body: (S, LoopScope[R]) => S)(using
+  def loop[S: Cacheable, R](id: String, initialState: => S)(
+      body: (S, LoopScope[R]) => WorkflowContext ?=> S
+  )(using
       ctx: WorkflowContext
   ): R =
     regionLoop(id, initialState) { (state, scope) =>
@@ -298,7 +302,7 @@ object Workflow {
         override def restartCount: Long = scope.restartCount
         override def break(result: R): Nothing = throw new RegionBreakException(result)
       }
-      val next = body(state, loopScope)
+      val next = body(state, loopScope)(using summon[WorkflowContext])
       scope.restart(next)
     }
 
@@ -312,12 +316,15 @@ object Workflow {
     * becomes a restart, `break` throws [[RegionBreakException]]). Both control
     * exceptions are caught here and unwound to the region boundary.
     */
-  private def regionLoop[S: Cacheable, R](id: String, initialState: => S)(body: (S, RestartableScope[S]) => R)(using
+  private def regionLoop[S: Cacheable, R](id: String, initialState: => S)(
+      body: (S, RestartableScope[S]) => WorkflowContext ?=> R
+  )(using
       ctx: WorkflowContext
   ): R = {
     val execution = ctx.execution
     val cacheable = summon[Cacheable[S]]
-    val parentScope = execution.currentScope
+    val parentScopePath = ctx.scopePath
+    val parentScope = ctx.currentScope
     val row = execution.readRegionState(id, parentScope)
     val startCount = row.map(_._2).getOrElse(0L)
     val firstState: S = row match {
@@ -328,37 +335,31 @@ object Workflow {
         seed
     }
 
-    execution.pushScope(regionSegment(id, startCount))
     var state: S = firstState
     var count: Long = startCount
     var result: R = null.asInstanceOf[R]
     var done = false
-    try {
-      while (!done) {
-        val scope = new RestartableScope[S] {
-          override def restartCount: Long = count
-          override def restart(nextState: S): Nothing =
-            throw new RegionRestartException(cacheable.write(nextState))
-        }
-        try {
-          result = body(state, scope)
-          done = true
-        } catch {
-          case e: RegionRestartException =>
-            execution.restartRegion(id, parentScope, count, e.serializedState)
-            execution.popScope()
-            count += 1
-            execution.pushScope(regionSegment(id, count))
-            state = cacheable.read(e.serializedState)
-          case e: RegionBreakException[R] =>
-            result = e.result
-            done = true
-        }
+    while (!done) {
+      val regionCtx = ctx.derive(scopePath = parentScopePath :+ regionSegment(id, count))
+      val scope = new RestartableScope[S] {
+        override def restartCount: Long = count
+        override def restart(nextState: S): Nothing =
+          throw new RegionRestartException(cacheable.write(nextState))
       }
-      result
-    } finally {
-      execution.popScope()
+      try {
+        result = body(state, scope)(using regionCtx)
+        done = true
+      } catch {
+        case e: RegionRestartException =>
+          execution.restartRegion(id, parentScope, count, e.serializedState)
+          count += 1
+          state = cacheable.read(e.serializedState)
+        case e: RegionBreakException[R] =>
+          result = e.result
+          done = true
+      }
     }
+    result
   }
 
   /** A lexical region inside which cancellation delivery is suppressed: while
@@ -369,15 +370,12 @@ object Workflow {
     *
     * The region is lexical and re-entrant. It does not clear `cancel_requested_at`;
     * after it exits, the next new-work checkpoint throws again. Heartbeats are
-    * not suppressed inside it. It is per-execution transient state, so replay
+    * not suppressed inside it. It is transient per-run state carried by the context, so replay
     * re-enters the region as ordinary user code and already-completed
     * compensation Steps are returned from the cache.
     */
-  def uncancellable[R](f: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
-    ctx.execution.enterUncancellable()
-    try f(using ctx)
-    finally ctx.execution.exitUncancellable()
-  }
+  def uncancellable[R](f: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
+    f(using ctx.derive(uncancellableDepth = ctx.uncancellableDepth + 1))
 
   /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
     * with `scopeKey` (see `spec/sub-workflows-iteration.md`, "Primitives"), so
@@ -399,9 +397,7 @@ object Workflow {
 
   private def withScope[R](escapedSegment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
     require(escapedSegment.nonEmpty, "Workflow.scoped requires a non-empty scope")
-    ctx.execution.pushScope(escapedSegment)
-    try body(using ctx)
-    finally ctx.execution.popScope()
+    body(using ctx.derive(scopePath = ctx.scopePath :+ escapedSegment))
   }
 
   /** Runs one by-name block, catches its suspension instead of propagating it,
@@ -434,19 +430,14 @@ object Workflow {
     *
     * Control-flow exceptions (restart, break, continue-as-new) never interrupt a
     * sibling: every branch is joined to completion first, then the winning
-    * control-flow exception is rethrown at the join point. The enclosing scope
-    * stack and `uncancellable` depth are propagated into each branch thread, so
-    * work inside a branch carries the enclosing `scoped`/region identity.
+    * control-flow exception is rethrown at the join point. Each branch runs
+    * with the context of the `parallel` call site: its scope path and
+    * `uncancellable` depth travel with the context value, so work inside a
+    * branch carries the enclosing `scoped`/region identity on any thread.
     */
-  def parallel[R](branches: Seq[() => R])(using ctx: WorkflowContext): Seq[R] = {
-    val snapshot = ctx.execution.snapshotBranchContext()
+  def parallel[R](branches: Seq[WorkflowContext ?=> R])(using ctx: WorkflowContext): Seq[R] = {
     val outcomes: Seq[BranchOutcome[R]] = ox.par(
-      branches.map(branch => () => {
-        val pristine = ctx.execution.snapshotBranchContext()
-        ctx.execution.restoreBranchContext(snapshot)
-        try runBranch(branch)
-        finally ctx.execution.restoreBranchContext(pristine)
-      })
+      branches.map(branch => () => runBranch(branch))
     )
     val controlFlows = outcomes.collect { case BranchControlFlow(c) => c }
     if (controlFlows.nonEmpty) throw controlFlows.head
@@ -459,10 +450,11 @@ object Workflow {
 
   /** Vararg form of [[parallel]]. */
   @targetName("parallelVararg")
-  def parallel[R](branches: (() => R)*)(using ctx: WorkflowContext): Seq[R] = parallel(branches.toVector)
+  def parallel[R](branches: (WorkflowContext ?=> R)*)(using ctx: WorkflowContext): Seq[R] =
+    parallel(branches.toVector)
 
-  private def runBranch[R](branch: () => R): BranchOutcome[R] =
-    try BranchResult(branch())
+  private def runBranch[R](branch: WorkflowContext ?=> R)(using ctx: WorkflowContext): BranchOutcome[R] =
+    try BranchResult(branch(using ctx))
     catch {
       case e: WorkflowSuspendedException => BranchSuspended(e)
       case e: WorkflowControlException   => BranchControlFlow(e)

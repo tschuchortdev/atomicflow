@@ -223,7 +223,7 @@ object Step {
       retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
     val execution = ctx.execution
-    val stepId = StepId(key, execution.currentScope)
+    val stepId = StepId(key, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
@@ -291,7 +291,7 @@ object Step {
       */
     def execute(): A = {
       execution.renewLease()
-      execution.throwIfCancelled()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
       execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body
@@ -327,7 +327,7 @@ object Step {
       while (result.isEmpty) {
         try {
           execution.renewLease()
-          execution.throwIfCancelled()
+          execution.throwIfCancelled(ctx.uncancellableDepth)
           val value = body
           val serialized =
             try valueCodec.write(value)
@@ -435,7 +435,7 @@ object Step {
       ctx: WorkflowContext,
       throwableCodec: Cacheable[Throwable]
   ): StepExecutionState[A] = {
-    val stepId = StepId(key, ctx.execution.currentScope)
+    val stepId = StepId(key, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     ctx.runtime.readStep(ctx.instanceId, stepId, stepVersion) match {
       case None => StepExecutionState.NeverStarted
@@ -644,7 +644,7 @@ object Step {
       stepId: String,
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]]
-  )(branches: Seq[() => R])(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
+  )(branches: Seq[WorkflowContext ?=> R])(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
     firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
 
   /** Vararg form of [[firstToRunWithoutSuspension]]. */
@@ -654,18 +654,18 @@ object Step {
       stepId: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-  )(branches: (() => R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
+  )(branches: (WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
     firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
 
   private def firstToRun0[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]],
-      branches: Vector[() => R]
+      branches: Vector[WorkflowContext ?=> R]
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R = {
     require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepId') requires at least one branch")
     val execution = ctx.execution
-    val stepIdv = StepId(stepId, execution.currentScope)
+    val stepIdv = StepId(stepId, ctx.currentScope)
     val valueCodec = summon[Cacheable[R]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
@@ -689,21 +689,15 @@ object Step {
     }
 
     def evaluate(): R = {
-      execution.throwIfCancelled()
-      val baseScope = execution.currentScope
-      val snapshot = execution.snapshotBranchContext()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
+      val baseScope = ctx.currentScope
+      val baseScopePath = ctx.scopePath
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
-            val pristine = execution.snapshotBranchContext()
-            execution.restoreBranchContext(snapshot)
-            try Right {
-              execution.pushScope(branchSegment(i))
-              try branches(i)()
-              finally execution.popScope()
-            }
+            val branchCtx = ctx.derive(scopePath = baseScopePath :+ branchSegment(i))
+            try Right(branches(i)(using branchCtx))
             catch { case e: WorkflowSuspendedException => Left(e) }
-            finally execution.restoreBranchContext(pristine)
         })
       val suspensions = outcomes.collect { case Left(s) => s }
       if (suspensions.size == outcomes.size) {
@@ -769,7 +763,7 @@ object Step {
       invalidateAfter: Duration
   )(using ctx: WorkflowContext): A = {
     val execution = ctx.execution
-    val stepId = StepId(stepKey, execution.currentScope)
+    val stepId = StepId(stepKey, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
@@ -796,7 +790,7 @@ object Step {
     def serializedOf(c: AwaitSignalCandidate): (Long, String) = (c.sequenceId, valueCodec.write(decode(c.payload)))
 
     def evaluate(): A = {
-      execution.throwIfCancelled()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
       val candidates = execution.readAwaitSignalCandidates(signal.key)
       candidates.find(accept) match {
         case Some(winning) =>
@@ -850,7 +844,7 @@ object Step {
       respond: I => (R, O)
   )(using ctx: WorkflowContext): O = {
     val execution = ctx.execution
-    val stepId = StepId(stepKey, execution.currentScope)
+    val stepId = StepId(stepKey, ctx.currentScope)
     val outCodec = summon[Cacheable[O]]
     val fingerprints = encodeFingerprints(Seq.empty)
     val now = execution.now
@@ -885,7 +879,7 @@ object Step {
     }
 
     def evaluate(): O = {
-      execution.throwIfCancelled()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
       val candidates = execution.readAwaitUpdateCandidates(u.key)
       candidates.headOption match {
         case Some(winning) =>
@@ -930,7 +924,7 @@ object Step {
       invalidateAfter: Duration
   )(using ctx: WorkflowContext): Unit = {
     val execution = ctx.execution
-    val stepId = StepId(stepKey, execution.currentScope)
+    val stepId = StepId(stepKey, ctx.currentScope)
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
     val expiresAt = invalidateAfter match {
@@ -939,7 +933,7 @@ object Step {
     }
 
     def evaluate(): Unit = {
-      execution.throwIfCancelled()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
       execution.fireDueTimers(stepId, 0L)
       if (execution.readAwaitTimerCandidates(stepId, 0L).nonEmpty) {
         execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
@@ -998,7 +992,7 @@ object Step {
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
     require(awaits.nonEmpty, s"awaitRace('$stepKey') requires at least one awaitable")
     val execution = ctx.execution
-    val stepId = StepId(stepKey, execution.currentScope)
+    val stepId = StepId(stepKey, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = execution.now
@@ -1017,7 +1011,7 @@ object Step {
       }
 
     def evaluate(): A = {
-      execution.throwIfCancelled()
+      execution.throwIfCancelled(ctx.uncancellableDepth)
       execution.fireDueTimerLeaves(stepId, 0L)
       val decided: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] =
         pickRaceWinner(leaves)

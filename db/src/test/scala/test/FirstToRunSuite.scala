@@ -37,8 +37,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-all-suspend") { in =>
       val caught = Workflow.runToSuspension {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          () => { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
-          () => { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
+          { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
+          { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
         )
       }
       caught.left.toOption.map(_.causes.size).getOrElse(-1).toString
@@ -54,8 +54,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s2 = Signal[String]("s2")
     val wf = Workflow[String, String](id = "ftr-all-suspend-durable") { in =>
       Step.firstToRunWithoutSuspension[Int]("race")(
-        () => { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
-        () => { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
+        { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
+        { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
       )
       "unreachable"
     }
@@ -74,8 +74,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s2 = Signal[String]("s2")
     val wf = Workflow[String, String](id = "ftr-winner") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        () => { Step.atLeastOnce[Int]("fast") { 42 } },
-        () => { Step.await[String]("wait", Awaitable.SignalEvent(s2)); 99 }
+        { Step.atLeastOnce[Int]("fast") { 42 } },
+        { Step.await[String]("wait", Awaitable.SignalEvent(s2)); 99 }
       )
       result.toString
     }
@@ -94,8 +94,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-durable") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        () => { counter.incrementAndGet(); Step.atLeastOnce[Int]("fast") { 1 } },
-        () => { Step.await[String]("wait", Awaitable.SignalEvent(sig)); counter.incrementAndGet(); 2 }
+        { counter.incrementAndGet(); Step.atLeastOnce[Int]("fast") { 1 } },
+        { Step.await[String]("wait", Awaitable.SignalEvent(sig)); counter.incrementAndGet(); 2 }
       )
       result.toString
     }
@@ -115,8 +115,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-retry") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        () => { Step.await[String]("a", Awaitable.SignalEvent(s1)); counter.incrementAndGet(); 1 },
-        () => { Step.await[String]("b", Awaitable.SignalEvent(s2)); counter.incrementAndGet(); 2 }
+        { Step.await[String]("a", Awaitable.SignalEvent(s1)); counter.incrementAndGet(); 1 },
+        { Step.await[String]("b", Awaitable.SignalEvent(s2)); counter.incrementAndGet(); 2 }
       )
       result.toString
     }
@@ -147,8 +147,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-failure") { in =>
       try {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          () => { Step.atLeastOnce[Int]("ok") { 1 } },
-          () => { throw new RuntimeException("boom"); 2 }
+          { Step.atLeastOnce[Int]("ok") { 1 } },
+          { throw new RuntimeException("boom"); 2 }
         )
         "no-failure"
       } catch {
@@ -165,9 +165,9 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s = Signal[String]("shared")
     val wf = Workflow[String, String](id = "ftr-loser-cleanup") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        () => { Step.await[String]("l1", Awaitable.SignalEvent(s)); 1 },
-        () => { Step.await[String]("l2", Awaitable.SignalEvent(s)); 2 },
-        () => { Step.atLeastOnce[Int]("fast") { 3 } }
+        { Step.await[String]("l1", Awaitable.SignalEvent(s)); 1 },
+        { Step.await[String]("l2", Awaitable.SignalEvent(s)); 2 },
+        { Step.atLeastOnce[Int]("fast") { 3 } }
       )
       result.toString
     }
@@ -196,7 +196,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-invalidate") { in =>
       Step.firstToRunWithoutSuspension[Int]("race", invalidateOn = Seq(StepInput("v", holder.get())))(
-        () => { counter.incrementAndGet(); holder.get() * 10 }
+        { counter.incrementAndGet(); holder.get() * 10 }
       )
       TestControlFlow.suspend()
       "unreachable"
@@ -233,13 +233,13 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val sD = Signal[String]("sD")
     val wf = Workflow[String, String](id = "ftr-sibling") { in =>
       val results = Workflow.parallel[Int](
-        () => Step.firstToRunWithoutSuspension[Int]("raceA")(
-          () => { Step.await[String]("a0", Awaitable.SignalEvent(sA)); 1 },
-          () => { Step.await[String]("a1", Awaitable.SignalEvent(sB)); 2 }
+        Step.firstToRunWithoutSuspension[Int]("raceA")(
+          { Step.await[String]("a0", Awaitable.SignalEvent(sA)); 1 },
+          { Step.await[String]("a1", Awaitable.SignalEvent(sB)); 2 }
         ),
-        () => Step.firstToRunWithoutSuspension[Int]("raceB")(
-          () => { Step.await[String]("b0", Awaitable.SignalEvent(sC)); 10 },
-          () => { Step.await[String]("b1", Awaitable.SignalEvent(sD)); 20 }
+        Step.firstToRunWithoutSuspension[Int]("raceB")(
+          { Step.await[String]("b0", Awaitable.SignalEvent(sC)); 10 },
+          { Step.await[String]("b1", Awaitable.SignalEvent(sD)); 20 }
         )
       )
       results.mkString(",")
@@ -266,8 +266,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-scoped") { in =>
       Workflow.scoped("outer") {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          () => Step.atLeastOnce[Int]("step") { 1 },
-          () => Step.atLeastOnce[Int]("step2") { 2 }
+          Step.atLeastOnce[Int]("step") { 1 },
+          Step.atLeastOnce[Int]("step2") { 2 }
         )
       }
       "done"
@@ -290,8 +290,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-uncancellable-outer") { in =>
       Workflow.uncancellable {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          () => { Step.await[String]("a", Awaitable.SignalEvent(sA)); 1 },
-          () => { Step.await[String]("b", Awaitable.SignalEvent(sB)); 2 }
+          { Step.await[String]("a", Awaitable.SignalEvent(sA)); 1 },
+          { Step.await[String]("b", Awaitable.SignalEvent(sB)); 2 }
         )
       }
       "done"
@@ -315,7 +315,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-ensure") { in =>
       try {
         Step.firstToRunWithoutSuspension[Int]("race", ensureUnchanged = Seq(StepInput("v", holder.get())))(
-          () => { counter.incrementAndGet(); holder.get() * 10 }
+          { counter.incrementAndGet(); holder.get() * 10 }
         )
       } catch {
         case _: StepInputConflictException => conflict = true

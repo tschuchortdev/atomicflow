@@ -107,15 +107,6 @@ private[atomicflow] final case class AwaitRaceDecision(
     advanceSignalKey: Option[SignalKey]
 )
 
-/** A point-in-time capture of a thread's transient execution context (the
-  * `Workflow.scoped` scope stack and the `Workflow.uncancellable` depth), used
-  * to propagate the enclosing context into forked parallel-branch threads.
-  */
-private[atomicflow] final case class BranchContextSnapshot(
-    scopeStack: Vector[String],
-    uncancellableDepth: Int
-)
-
 /** The per-run engine seam, materialized only during execution and funneled to
   * workflow code through [[atomicflow.WorkflowContext.execution]]. It carries
   * the fencing identity of the current run so the engine can implement fenced
@@ -134,40 +125,11 @@ private[atomicflow] trait WorkflowExecution {
     */
   def fencingToken: Long
 
-  /** The current step scope path (the enclosing `Workflow.scoped` path). `""`
-    * for top-level steps.
-    */
-  def currentScope: String
-
   /** The instance's current run generation (incremented by `continueAsNew`).
     * Used to derive child instance scopes (the `@generation` marker), so
     * children started before and after a `continueAsNew` do not collide.
     */
   def generation: Long
-
-  /** Pushes one already-escaped `Workflow.scoped` segment onto the current
-    * thread's scope stack, so subsequent Step/Await IDs are prefixed with it.
-    * Must be balanced by a matching [[popScope]] (paired in a `try/finally`).
-    * The stack is per-thread transient state, so parallel branches with
-    * different scoped keys do not corrupt each other's Step IDs.
-    */
-  private[atomicflow] def pushScope(escapedSegment: String): Unit
-
-  /** Pops the innermost `Workflow.scoped` segment pushed by [[pushScope]]. */
-  private[atomicflow] def popScope(): Unit
-
-  /** A point-in-time capture of this thread's transient execution context (the
-    * `Workflow.scoped` scope stack and the `Workflow.uncancellable` depth),
-    * used to propagate the enclosing context into forked parallel-branch
-    * threads. See [[snapshotBranchContext]] and [[restoreBranchContext]].
-    */
-  private[atomicflow] def snapshotBranchContext(): BranchContextSnapshot
-
-  /** Restore the scope stack and `uncancellable` depth captured by
-    * [[snapshotBranchContext]] onto the current thread, replacing whatever
-    * (usually empty) state a forked branch thread started with.
-    */
-  private[atomicflow] def restoreBranchContext(snapshot: BranchContextSnapshot): Unit
 
   /** The runtime's notion of the current instant, from the injected clock. */
   def now: Instant
@@ -187,22 +149,13 @@ private[atomicflow] trait WorkflowExecution {
 
   /** A cancellation checkpoint: re-reads the durable `cancel_requested_at` flag
     * and throws [[atomicflow.WorkflowCancelledException]] when set, unless the
-    * execution is inside a [[atomicflow.Workflow.uncancellable]] region. Called
-    * right before any new work (a Step body about to execute, or an await about
-    * to be evaluated); cached replays never call it, so they never deliver.
+    * `Workflow.uncancellable` depth of the current call site (the
+    * `uncancellableDepth` carried by the `WorkflowContext` there) is non-zero.
+    * Called right before any new work (a Step body about to execute, or an await
+    * about to be evaluated); cached replays never call it, so they never
+    * deliver.
     */
-  def throwIfCancelled(): Unit
-
-  /** Enters a `Workflow.uncancellable` region: increments a per-run transient
-    * counter so `checkCancellation` suppresses delivery while it is non-zero.
-    * Not durable; replay re-enters the region as ordinary user code.
-    */
-  private[atomicflow] def enterUncancellable(): Unit
-
-  /** Leaves a `Workflow.uncancellable` region, decrementing the per-run counter.
-    * Must balance every [[enterUncancellable]] (paired in a `try/finally`).
-    */
-  private[atomicflow] def exitUncancellable(): Unit
+  def throwIfCancelled(uncancellableDepth: Int): Unit
 
   /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
     * Reports the stored row even if it has expired.

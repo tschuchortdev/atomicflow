@@ -213,12 +213,12 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par") { in =>
       Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
         val results = Workflow.parallel[Int](
-          () => {
+          {
             Step.atLeastOnce[Int]("sib") { 1 }
             if (state < 2) scope.restart(state + 1)
             else state
           },
-          () => 99
+          99
         )
         "ok-" + results(0)
       }
@@ -233,12 +233,12 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par-break") { in =>
       Workflow.loop[Int, String]("R", 0) { (state, loop) =>
         val results = Workflow.parallel[Int](
-          () => {
+          {
             Step.atLeastOnce[Int]("a") { 1 }
             if (state < 1) state + 1
             else loop.break("done-" + state)
           },
-          () => 99
+          99
         )
         results(0)
       }
@@ -346,7 +346,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par-hang") { in =>
       Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
         Workflow.parallel[Int](
-          () => {
+          {
             Step.atLeastOnce[Int]("sib") {
               stepRuns.incrementAndGet()
               Thread.sleep(120)
@@ -354,7 +354,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
             }
             state
           },
-          () => {
+          {
             if (state < 2) scope.restart(state + 1) else state
           }
         )
@@ -372,11 +372,11 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par-scope") { in =>
       Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
         Workflow.parallel[Int](
-          () => {
+          {
             Step.atLeastOnce[Int]("inner") { 1 }
             state
           },
-          () => state
+          state
         )
         "done"
       }
@@ -396,11 +396,11 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par-loop") { in =>
       Workflow.restartable[Int, String]("R", 0) { (state, scope) =>
         Workflow.parallel[Int](
-          () => {
+          {
             Step.atLeastOnce[Int]("inner") { stepRuns.incrementAndGet(); 1 }
             state
           },
-          () => state
+          state
         )
         if (state < 2) scope.restart(state + 1) else "done"
       }
@@ -417,11 +417,11 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String]("rl-par-children") { in =>
       Workflow.loop[Int, String]("R", 0) { (state, loop) =>
         Workflow.parallel[Unit](
-          () => {
+          {
             childWf.startAsChild("c", "hi-" + state)
             ()
           },
-          () => ()
+          ()
         )
         if (state < 1) state + 1
         else loop.break("done")
