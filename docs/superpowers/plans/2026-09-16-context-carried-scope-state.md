@@ -17,8 +17,8 @@
 - New `WorkflowContext` members are `private[atomicflow]`; no public API additions.
 - Behavior must be identical for all sanctioned paths: identical `StepId`s, identical scope strings, identical DB rows. The 24 existing db test suites must pass unchanged (modulo the mechanical `() =>` removal at branch call sites required by the new branch types).
 - Branch/bodies of `Workflow.parallel`, `Step.firstToRunWithoutSuspension`, `Workflow.restartable`, and `Workflow.loop` become context functions; `Workflow.scoped`/`uncancellable`/`runToSuspension` signatures are unchanged (already context functions).
-- The working tree contains a pre-existing uncommitted rename `checkCancellation` → `throwIfCancelled` (Step.scala, WorkflowExecution.scala, PostgresWorkflowRuntime.scala). It will be committed as a standalone commit before Task 1; build on it, do not revert it.
-- Build/test commands (from repo root; Docker must be running for testcontainers): `sbt "core/compile"`, `sbt "db/compile"`, `sbt "example/compile"`, `sbt "db/testOnly test.ScopedParallelSuite"`, `sbt test`. Sbt uses slash syntax for project axes (`core/compile`, NOT `core:compile`).
+- The working tree's rename `checkCancellation` → `throwIfCancelled` is already committed (1fa9615). Build on it.
+- Build/test commands (from repo root; Docker must be running for testcontainers). The PATH `java` is 11 — ALL sbt invocations must pass `--java-home /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home` (JDK 21). Munit's `-z` filter does not work through this sbt invocation — run whole suites instead: `sbt --java-home /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home "db/testOnly test.ScopedParallelSuite"`.
 - Formatting follows `.scalafmt.conf` (maxColumn 120, no scalafmt sbt plugin — format by hand in the existing style).
 - Do not touch the commented-out `core/src/main/scala/atomicflow/impl/memory/InMemoryWorkflowRuntime.scala` (kept for reference per DEVIATIONS.md entry 1).
 - Do not modify anything under `spec/`. Record the signature changes in `DEVIATIONS.md` (Task 3).
@@ -47,7 +47,7 @@ Append inside `class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite { 
         val body: WorkflowContext ?=> String =
           Step.atLeastOnce[String]("foreign") { counter.incrementAndGet(); "v" }
         val ctx = summon[WorkflowContext]
-        val thread = new Thread(() => body(using ctx))
+        val thread = new Thread(() => { body(using ctx); () })
         thread.start()
         thread.join()
       }
@@ -73,7 +73,7 @@ Append inside `class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite { 
         val body: WorkflowContext ?=> String =
           Step.atLeastOnce[String]("compensate") { counter.incrementAndGet(); "ok" }
         val ctx = summon[WorkflowContext]
-        val thread = new Thread(() => try body(using ctx) catch { case _: WorkflowCancelledException => () })
+        val thread = new Thread(() => try { body(using ctx); () } catch { case _: WorkflowCancelledException => () })
         thread.start()
         thread.join()
       }
@@ -95,8 +95,8 @@ Append inside `class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite { 
 
 - [ ] **Step 2: Run them and verify both FAIL (red)**
 
-Run: `sbt "db/testOnly test.ScopedParallelSuite -- -z foreign thread"`
-Expected: 2 failures. Test 1 fails at `stepScopePaths` (row under scope `""` instead of `"outer"` — the foreign thread's ThreadLocal is empty). Test 2 fails at `counter.get()` (cancellation is delivered on the foreign thread, depth 0 there, so the body never runs; `WorkflowCancelledException` is caught by the try in the Runnable). The run results themselves are already as asserted in both.
+Run: `sbt --java-home /opt/homebrew/opt/openjdk/libexec/openjdk.jdk/Contents/Home "db/testOnly test.ScopedParallelSuite"`
+Expected: `Failed: Total 16, Failed 2, Passed 14`. Test 1 fails at `stepScopePaths` (row under scope `""` instead of `"outer"` — the foreign thread's ThreadLocal is empty). Test 2 fails at `counter.get()` (cancellation is delivered on the foreign thread, depth 0 there, so the body never runs; `WorkflowCancelledException` is caught by the try in the Runnable). The run results themselves are already as asserted in both.
 
 - [ ] **Step 3: Commit**
 
