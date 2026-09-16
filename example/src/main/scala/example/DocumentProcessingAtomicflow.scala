@@ -110,8 +110,8 @@ class DocumentProcessingAtomicflow(
 
   private def processIndividualDocument(document: DocumentFromInputFile)(using ctx: WorkflowContext): Unit = {
     Workflow.parallel(
-      () => virusCheck(document.content, "virus-check-1", virusCheckService.checkForVirus1),
-      () => virusCheck(document.content, "virus-check-2", virusCheckService.checkForVirus2)
+      virusCheck(document.content, "virus-check-1", virusCheckService.checkForVirus1),
+      virusCheck(document.content, "virus-check-2", virusCheckService.checkForVirus2)
     )
 
     val signed =

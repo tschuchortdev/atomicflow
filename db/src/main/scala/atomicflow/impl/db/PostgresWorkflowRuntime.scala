@@ -11,7 +11,6 @@ import atomicflow.internal.{
   AwaitSignalCandidate,
   AwaitTimerCandidate,
   AwaitUpdateDecision,
-  BranchContextSnapshot,
   Framing,
   ScopePath,
   StoredStep,
@@ -1918,38 +1917,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     private val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
 
-    private val uncancellableDepth = new ThreadLocal[Int] {
-      override def initialValue(): Int = 0
-    }
-
-    private val scopeStack = new ThreadLocal[Vector[String]] {
-      override def initialValue(): Vector[String] = Vector.empty
-    }
-
-    private def inUncancellableRegion: Boolean = uncancellableDepth.get() > 0
-
-    private[atomicflow] override def enterUncancellable(): Unit =
-      uncancellableDepth.set(uncancellableDepth.get() + 1)
-
-    private[atomicflow] override def exitUncancellable(): Unit =
-      uncancellableDepth.set(uncancellableDepth.get() - 1)
-
-    override def currentScope: String = scopeStack.get().mkString("/")
-
-    private[atomicflow] override def pushScope(escapedSegment: String): Unit =
-      scopeStack.set(scopeStack.get() :+ escapedSegment)
-
-    private[atomicflow] override def popScope(): Unit =
-      scopeStack.set(scopeStack.get().dropRight(1))
-
-    private[atomicflow] override def snapshotBranchContext(): BranchContextSnapshot =
-      BranchContextSnapshot(scopeStack.get(), uncancellableDepth.get())
-
-    private[atomicflow] override def restoreBranchContext(snapshot: BranchContextSnapshot): Unit = {
-      scopeStack.set(snapshot.scopeStack)
-      uncancellableDepth.set(snapshot.uncancellableDepth)
-    }
-
     override def now: java.time.Instant = theClock.instant()
 
     override def durableRetryThreshold: FiniteDuration = PostgresWorkflowRuntime.this.durableRetryThreshold
@@ -1967,8 +1934,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
       if (updated != 1) throw LeaseLostException(instanceId)
     }
 
-    override def throwIfCancelled(): Unit = {
-      if (!inUncancellableRegion) {
+    override def throwIfCancelled(uncancellableDepth: Int): Unit = {
+      if (uncancellableDepth == 0) {
         val requestedAt = runSync {
           sql"""SELECT cancel_requested_at FROM workflow_instances
                 WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[

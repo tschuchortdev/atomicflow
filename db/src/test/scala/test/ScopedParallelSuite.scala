@@ -88,9 +88,9 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "par-happy") { in =>
       val results = Workflow.parallel(
-        () => Step.atLeastOnce[Int]("a") { 1 },
-        () => Step.atLeastOnce[Int]("b") { 2 },
-        () => Step.atLeastOnce[Int]("c") { 3 }
+        Step.atLeastOnce[Int]("a") { 1 },
+        Step.atLeastOnce[Int]("b") { 2 },
+        Step.atLeastOnce[Int]("c") { 3 }
       )
       results.mkString(",")
     }
@@ -104,10 +104,10 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "par-suspend") { in =>
       val results = Workflow.parallel(
-        () => {
+        {
           Step.atLeastOnce[Int]("fast") { counter.incrementAndGet(); 1 }
         },
-        () => {
+        {
           Step.await[String]("wait", Awaitable.SignalEvent(signal))
           "done"
         }
@@ -129,8 +129,8 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "par-all-suspend") { in =>
       val caught = Workflow.runToSuspension {
         Workflow.parallel(
-          () => Step.await[String]("a", Awaitable.SignalEvent(s1)),
-          () => Step.await[String]("b", Awaitable.SignalEvent(s2))
+          Step.await[String]("a", Awaitable.SignalEvent(s1)),
+          Step.await[String]("b", Awaitable.SignalEvent(s2))
         )
       }
       caught.left.toOption.map(_.causes.size).getOrElse(-1).toString
@@ -143,9 +143,9 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "par-threadsafe") { in =>
       val results = Workflow.parallel(
-        () => Workflow.scoped("A") { Step.atLeastOnce[String]("step") { "a" } },
-        () => Workflow.scoped("B") { Step.atLeastOnce[String]("step") { "b" } },
-        () => Workflow.scoped("C") { Step.atLeastOnce[String]("step") { "c" } }
+        Workflow.scoped("A") { Step.atLeastOnce[String]("step") { "a" } },
+        Workflow.scoped("B") { Step.atLeastOnce[String]("step") { "b" } },
+        Workflow.scoped("C") { Step.atLeastOnce[String]("step") { "c" } }
       )
       results.mkString(",")
     }
@@ -209,8 +209,8 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "par-nonfatal") { in =>
       Workflow.runToSuspension {
         Workflow.parallel(
-          () => Step.await[String]("a", Awaitable.SignalEvent(s1)),
-          () => Step.await[String]("b", Awaitable.SignalEvent(s2))
+          Step.await[String]("a", Awaitable.SignalEvent(s1)),
+          Step.await[String]("b", Awaitable.SignalEvent(s2))
         )
       } match {
         case Left(combined) =>
@@ -230,8 +230,8 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "par-failure") { in =>
       try {
         Workflow.parallel(
-          () => Step.atLeastOnce[Int]("ok") { 1 },
-          () => Step.atLeastOnce[Int]("bad") { throw new RuntimeException("boom"); 2 }
+          Step.atLeastOnce[Int]("ok") { 1 },
+          Step.atLeastOnce[Int]("bad") { throw new RuntimeException("boom"); 2 }
         )
         "no-failure"
       } catch {
@@ -252,10 +252,10 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
         Step.await[String]("gate", Awaitable.SignalEvent(sig))
       }
       val results = Workflow.parallel(
-        () => Workflow.uncancellable {
+        Workflow.uncancellable {
           Step.atLeastOnce[Int]("shielded") { shieldedCounter.incrementAndGet(); 1 }
         },
-        () => {
+        {
           try {
             Step.atLeastOnce[Int]("exposed") { exposedCounter.incrementAndGet(); 2 }
             "exposed-completed"
