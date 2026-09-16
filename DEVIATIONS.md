@@ -275,3 +275,26 @@ implementation phase.
     manifests with broken user codecs).
 75. **Started rows persist an empty `state_payload` sentinel** (arbitrary
     placeholder for the pre-body state).
+
+## Phase 10 (context-carried scope state)
+
+76. **`WorkflowContext` carries the transient scope/uncancellable state;
+    `PostgresExecution` no longer uses ThreadLocals.** The spec does not
+    detail how `Workflow.scoped`/`Workflow.uncancellable` state reaches Step
+    registrations; the implementation used per-thread ThreadLocals in
+    `PostgresExecution` plus a snapshot/restore protocol for parallel-branch
+    threads. Per the design intent (the `local` of a reader monad), the state
+    now lives immutably on `WorkflowContext` (`scopePath`,
+    `uncancellableDepth`, both `private[atomicflow]`), and every region
+    function passes a derived context to its body. Consequence: the branch
+    parameters of `Workflow.parallel` and `Step.firstToRunWithoutSuspension`
+    and the bodies of `Workflow.restartable`/`Workflow.loop` are context
+    functions (`WorkflowContext ?=> R`) — a public signature change from the
+    spec's `Seq[() => R]` (sub-workflows-iteration.md,
+    restartable-regions-loops.md): call sites drop the `() =>` (behavior
+    is otherwise identical; branch bodies are still evaluated at application
+    time). Benefit: Step IDs and cancellation suppression travel with the
+    context value, so code that hops threads and carries the context (e.g.
+    applies a captured `WorkflowContext ?=> R` on another thread) records
+    the correct scope instead of silently corrupting Step IDs; branch fork
+    sites no longer need the snapshot/restore choreography.
