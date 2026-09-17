@@ -301,3 +301,35 @@ implementation phase.
     applies a captured `WorkflowContext ?=> R` on another thread) records
     the correct scope instead of silently corrupting Step IDs; branch fork
     sites no longer need the snapshot/restore choreography.
+
+## Phase 11 (engine operations on the public runtime SPI)
+
+77. **The durable engine operations live on the public `WorkflowRuntime`
+    trait, behind an opaque per-run handle, instead of on a separate
+    `private[atomicflow]` trait.** The operations previously lived on a
+    `private[atomicflow]` trait `WorkflowExecution` (now deleted), and the
+    spec's `running-workflows.md` framed the public `WorkflowRuntime` trait
+    as deliberately omitting exactly these backend-internal operations. They
+    are now ~35 public methods on `WorkflowRuntime`, each taking the run's
+    handle as its first parameter: the runtime-defined opaque
+    `type CurrentExecution` — created by the runtime at run start,
+    identity-stable for the run's lifetime, contents owned and updatable by
+    the runtime — which workflow code reaches as
+    `WorkflowContext.currentExecution` (path-dependent on the context's
+    runtime, so `runtime` is now a `val`: a `def` cannot prefix a dependent
+    type). The four members that were `private[atomicflow]`
+    (`upsertWakeup`, `readStep`, `startChild`, `getWorkflowInstanceInfo`)
+    are public; `startChild` takes the per-run handle instead of
+    `(parentId, parentGeneration)`. The record types these operations
+    traffic in (`StoredStep`, the `Await*`/update candidate types, the race
+    leaf/candidate/decision types) are public in package `atomicflow`. Only
+    the runner-internal operations (wakeup claiming, lease acquisition, the
+    sweeps) remain off the public trait. This entry records the API change;
+    the spec text that previously kept these operations off the trait
+    (`running-workflows.md`, and the `WorkflowContext` sketch in
+    `core-types.md`) was edited in the same change, so no lasting deviation
+    remains. Consequence: workflow and application code see one runtime
+    type, but every engine call needs that runtime's own opaque handle, so
+    the operations cannot be invoked against a foreign runtime. Benefit:
+    core workflow/step code depends only on the public `WorkflowRuntime`;
+    each backend implements one trait instead of a public/private pair.

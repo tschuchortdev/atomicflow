@@ -67,15 +67,28 @@ enum WorkflowRunResult[+A]:
 
 Workflow execution runs on two kinds of threads: **caller threads**, which execute the blocking `run`/`createAndRun` API, and **runner threads**, which belong to a started **JobRunner**. The JobRunner is a **driver loop** plus an **executor**: each cycle it invokes the runtime's sweep operations — fire due timers, escalate overlong cancellations, recover expired leases — on their cadences, and claims due wakeups to execute instances. The sweep operations are *definition-agnostic operations of the runtime* (like `sendSignal`), not sub-components of the runner: any runner services every workflow in the shared tables, including other applications'. The executor is the only part that knows workflow code — it resolves definitions from the runner's registry.
 
-**The runner and its runtime are one implementation family.** The driver loop executes backend-internal operations — wakeup claiming, conditional lease acquisition, fenced writes, the timer-firing primitive, the sweeps — that are deliberately absent from the public `WorkflowRuntime` trait. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
+**The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal, cancellation checkpoints — are public methods on the `WorkflowRuntime` trait, each taking an opaque per-run handle: the runtime's `CurrentExecution` type member, created at run start and carried by `WorkflowContext.currentExecution`. What remains deliberately absent from the public trait are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
 
 Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.**
 
 ```scala
 trait WorkflowRuntime {
+  /** The opaque per-run execution handle: created by the runtime at run
+    * start, identity-stable for the run, contents runtime-owned. Carried by
+    * `WorkflowContext.currentExecution` and passed back to every engine
+    * operation. */
+  type CurrentExecution
+
+  /** Durable engine operations — Step rows, awaits, timers, regions, lease
+    * renewal, cancellation checkpoints — each taking the run's handle.
+    * (Two representative members; the full surface is much larger.) */
+  def renewLease(run: CurrentExecution): Unit
+  def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit
+
   /** Creates and starts this process's job runner. Implemented per backend:
-    * the runner executes backend-internal operations and is bound to this
-    * runtime — runners and runtimes cannot be mixed and matched. */
+    * the runner executes the runner-internal operations (wakeup claiming,
+    * lease acquisition, the sweeps) and is bound to this runtime — runners
+    * and runtimes cannot be mixed and matched. */
   def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
@@ -302,7 +315,7 @@ case class JobRunnerSettings(
 - **Evaluation is self-sufficient; the scheduler is only latency.** Every await a run reaches resolves from durable state alone — including its own due timers, which the evaluation materializes itself. Sweeps and wakeups never affect correctness, only how quickly an unattended instance is noticed; the timer *subscription* is the deliberate exception — durable semantic state, not scheduling (`signals-timers.md`). That is what lets tests drive a workflow with `run` alone and what keeps production progress independent of any single mechanism.
 - **Sweeps are runtime operations, not sub-components.** Timer firing, cancellation escalation, and lease recovery are definition-agnostic operations of the runtime, driven on a cadence by the runner's loop. None is public API — await evaluation's self-sufficiency removes the need for on-demand firing, and escalation/recovery are never needed by caller threads. There is deliberately no way to manage sweeps as a separate component: a gateway needs no background machinery, and production always needs everything together.
 - **The sweep pre-fires timers for race predictability** — why, and how firing stays exactly-once, is specified in `signals-timers.md` ("Timer firing: two paths, one primitive"); this document only states the scheduling consequence above: manual mode progresses timers without any sweep.
-- **Runner and runtime are one implementation family.** The runner executes backend-internal operations (claiming, lease acquisition, sweeps, timer firing) that the public `WorkflowRuntime` trait deliberately omits; a generic runner parameterized by the public trait could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
+- **Runner and runtime are one implementation family.** The durable engine operations are public `WorkflowRuntime` methods, each taking the run's opaque `CurrentExecution` handle; what the public trait deliberately omits are the runner-internal operations (wakeup claiming, lease acquisition, the sweeps), so a generic runner parameterized by the public trait alone could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
 - **Registration on the runner, permissive call sites.** The executor is the only consumer that starts from an id alone, so the id→definition registry is passed to `startJobRunner`, lives on the runner object, and is validated once at start. Direct API calls keep working with any in-hand definition object; a workflow known to no runner anywhere surfaces through wakeup-age alerting instead of failing anywhere.
 
 ## Testing
