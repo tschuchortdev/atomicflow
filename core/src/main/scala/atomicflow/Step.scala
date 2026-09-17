@@ -2,18 +2,7 @@ package atomicflow
 
 import atomicflow.Cacheable.Simple.given
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.{
-  AwaitRaceCandidate,
-  AwaitRaceCompletionLeaf,
-  AwaitRaceDecision,
-  AwaitRaceLeaf,
-  AwaitRaceSignalLeaf,
-  AwaitRaceTimerLeaf,
-  AwaitSignalCandidate,
-  AwaitUpdateDecision,
-  ScopePath,
-  UpdateCandidate
-}
+import atomicflow.internal.ScopePath
 
 import java.nio.charset.StandardCharsets
 import scala.annotation.experimental
@@ -222,16 +211,17 @@ object Step {
       invalidateAfter: Duration,
       retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepId = StepId(key, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
-    val now = execution.now
+    val now = rt.clock.instant()
     val expiresAt = invalidateAfter match {
       case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
       case _                 => None
     }
-    val threshold = execution.durableRetryThreshold
+    val threshold = rt.durableRetryThreshold
     val useRetry = guarantee == Guarantee.AtLeastOnce && (retry ne Step.RetryPolicy.never)
 
     final case class RetryBookkeeping(
@@ -290,9 +280,9 @@ object Step {
       * `Started` row, run the body once, and persist its outcome.
       */
     def execute(): A = {
-      execution.renewLease()
-      execution.throwIfCancelled(ctx.uncancellableDepth)
-      execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
+      rt.renewLease(run)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      rt.writeStepStarted(run, stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body
         val serialized =
@@ -301,14 +291,14 @@ object Step {
         val decoded =
           try valueCodec.read(serialized)
           catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
-        execution.writeStepSucceeded(stepId, stepVersion, stepKind, fingerprints, serialized, expiresAt)
+        rt.writeStepSucceeded(run, stepId, stepVersion, stepKind, fingerprints, serialized, expiresAt)
         decoded
       } catch {
         case t if isNonCacheable(t) => throw t
         case t =>
           throw encodeAndPersistFailure(
             t,
-            s => execution.writeStepFailed(stepId, stepVersion, stepKind, fingerprints, s, expiresAt)
+            s => rt.writeStepFailed(run, stepId, stepVersion, stepKind, fingerprints, s, expiresAt)
           )
       }
     }
@@ -326,8 +316,8 @@ object Step {
       var result: Option[A] = None
       while (result.isEmpty) {
         try {
-          execution.renewLease()
-          execution.throwIfCancelled(ctx.uncancellableDepth)
+          rt.renewLease(run)
+          rt.throwIfCancelled(run, ctx.uncancellableDepth)
           val value = body
           val serialized =
             try valueCodec.write(value)
@@ -335,7 +325,7 @@ object Step {
           val decoded =
             try valueCodec.read(serialized)
             catch { case _: Throwable => throw new StepSerializationFailed(s"Step '$key' result could not be decoded") }
-          execution.resolveStepRetry(stepId, stepVersion, stepKind, "succeeded", fingerprints, serialized, expiresAt)
+          rt.resolveStepRetry(run, stepId, stepVersion, stepKind, "succeeded", fingerprints, serialized, expiresAt)
           result = Some(decoded)
         } catch {
           case t if isNonCacheable(t) => throw t
@@ -344,7 +334,7 @@ object Step {
               case None =>
                 throw encodeAndPersistFailure(
                   t,
-                  s => execution.resolveStepRetry(stepId, stepVersion, stepKind, "failed", fingerprints, s, expiresAt)
+                  s => rt.resolveStepRetry(run, stepId, stepVersion, stepKind, "failed", fingerprints, s, expiresAt)
                 )
               case Some(delay) =>
                 val nb = RetryBookkeeping(b.failedAttempts + 1, b.cumulativeDelay + delay, Some(delay))
@@ -352,9 +342,9 @@ object Step {
                   java.util.concurrent.TimeUnit.NANOSECONDS.sleep(delay.toNanos)
                   b = nb
                 } else {
-                  val deadline = execution.now.plus(java.time.Duration.ofNanos(delay.toNanos))
-                  execution.suspendStepRetry(
-                    stepId, stepVersion, stepKind, fingerprints, encodeRetry(nb), deadline, expiresAt
+                  val deadline = rt.clock.instant().plus(java.time.Duration.ofNanos(delay.toNanos))
+                  rt.suspendStepRetry(
+                    run, stepId, stepVersion, stepKind, fingerprints, encodeRetry(nb), deadline, expiresAt
                   )
                   throw new WorkflowSuspendedException
                 }
@@ -368,14 +358,14 @@ object Step {
       * starts empty) then run the first attempt.
       */
     def executeWithRetry(): A = {
-      execution.renewLease()
-      execution.writeStepStarted(stepId, stepVersion, stepKind, fingerprints)
+      rt.renewLease(run)
+      rt.writeStepStarted(run, stepId, stepVersion, stepKind, fingerprints)
       attempt(RetryBookkeeping(0, 0.seconds, None))
     }
 
-    val rawExisting = execution.lookupStep(stepId, stepVersion)
+    val rawExisting = rt.lookupStep(run, stepId, stepVersion)
     val expired = rawExisting.exists(_.expiresAt.exists(!_.isAfter(now)))
-    if (expired) execution.deleteStepRetry(stepId, stepVersion)
+    if (expired) rt.deleteStepRetry(run, stepId, stepVersion)
     val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
@@ -393,7 +383,7 @@ object Step {
         val shouldReexecute = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
 
         if (shouldReexecute) {
-          execution.deleteStepRetry(stepId, stepVersion)
+          rt.deleteStepRetry(run, stepId, stepVersion)
           if (useRetry) Some(executeWithRetry()) else Some(execute())
         } else {
           row.stateKind match {
@@ -407,8 +397,8 @@ object Step {
               guarantee match {
                 case Guarantee.AtLeastOnce =>
                   if (useRetry && row.statePayload.startsWith("retry:")) {
-                    execution.fireDueStepRetries(stepId, stepVersion)
-                    if (execution.readStepRetryCandidates(stepId, stepVersion).nonEmpty)
+                    rt.fireDueStepRetries(run, stepId, stepVersion)
+                    if (rt.readStepRetryCandidates(run, stepId, stepVersion).nonEmpty)
                       Some(attempt(decodeRetry(row.statePayload)))
                     else
                       throw new WorkflowSuspendedException
@@ -550,7 +540,7 @@ object Step {
     * decoded signal payloads.
     */
   def peekSignal[A](s: Signal[A])(using ctx: WorkflowContext): Seq[A] =
-    ctx.execution.readAwaitSignalCandidates(s.key).map { c =>
+    ctx.runtime.readAwaitSignalCandidates(ctx.currentExecution, s.key).map { c =>
       try s.cacheable.read(c.payload)
       catch {
         case _: Throwable => throw new StepSerializationFailed(s"Signal '${s.key}' payload could not be decoded")
@@ -664,11 +654,12 @@ object Step {
       branches: Vector[WorkflowContext ?=> R]
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R = {
     require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepId') requires at least one branch")
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepIdv = StepId(stepId, ctx.currentScope)
     val valueCodec = summon[Cacheable[R]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
-    val now = execution.now
+    val now = rt.clock.instant()
 
     def decodeWinner(payload: String): R = {
       val nl = payload.indexOf('\n')
@@ -689,7 +680,7 @@ object Step {
     }
 
     def evaluate(): R = {
-      execution.throwIfCancelled(ctx.uncancellableDepth)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
       val baseScope = ctx.currentScope
       val baseScopePath = ctx.scopePath
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
@@ -718,14 +709,21 @@ object Step {
         val loserPathsToClean = outcomes.zipWithIndex.collect {
           case (Left(_), i) if i != winnerIdx => branchPath(baseScope, i)
         }
-        execution.resolveFirstToRun(
-          stepIdv, 0L, "FirstToRunWithoutSuspension", fingerprints, loserPathsToClean, s"$winnerIdx\n$serialized", None
+        rt.resolveFirstToRun(
+          run,
+          stepIdv,
+          0L,
+          "FirstToRunWithoutSuspension",
+          fingerprints,
+          loserPathsToClean,
+          s"$winnerIdx\n$serialized",
+          None
         )
         decoded
       }
     }
 
-    val rawExisting = execution.lookupStep(stepIdv, 0L)
+    val rawExisting = rt.lookupStep(run, stepIdv, 0L)
     val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
@@ -740,7 +738,7 @@ object Step {
         }
         val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
         if (shouldReevaluate) {
-          execution.deleteStep(stepIdv, 0L)
+          rt.deleteStep(run, stepIdv, 0L)
           evaluate()
         } else {
           row.stateKind match {
@@ -762,11 +760,12 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]],
       invalidateAfter: Duration
   )(using ctx: WorkflowContext): A = {
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
-    val now = execution.now
+    val now = rt.clock.instant()
     val expiresAt = invalidateAfter match {
       case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
       case _                 => None
@@ -790,17 +789,17 @@ object Step {
     def serializedOf(c: AwaitSignalCandidate): (Long, String) = (c.sequenceId, valueCodec.write(decode(c.payload)))
 
     def evaluate(): A = {
-      execution.throwIfCancelled(ctx.uncancellableDepth)
-      val candidates = execution.readAwaitSignalCandidates(signal.key)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      val candidates = rt.readAwaitSignalCandidates(run, signal.key)
       candidates.find(accept) match {
         case Some(winning) =>
           val serialized = valueCodec.write(decode(winning.payload))
-          execution.resolveAwaitSignal(
-            stepId, 0L, "Await", fingerprints, signal.key, winning.sequenceId, serialized, expiresAt
+          rt.resolveAwaitSignal(
+            run, stepId, 0L, "Await", fingerprints, signal.key, winning.sequenceId, serialized, expiresAt
           )
           decode(serialized)
         case None =>
-          execution.suspendAwaitSignal(stepId, 0L, "Await", fingerprints, signal.key, expiresAt) { recheck =>
+          rt.suspendAwaitSignal(run, stepId, 0L, "Await", fingerprints, signal.key, expiresAt) { recheck =>
             recheck.find(accept).map(serializedOf)
           } match {
             case Some(serialized) => decode(serialized)
@@ -809,7 +808,7 @@ object Step {
       }
     }
 
-    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
       case None => evaluate()
@@ -823,7 +822,7 @@ object Step {
         }
         val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
         if (shouldReevaluate) {
-          execution.deleteStep(stepId, 0L)
+          rt.deleteStep(run, stepId, 0L)
           evaluate()
         } else {
           row.stateKind match {
@@ -843,11 +842,12 @@ object Step {
       u: Update[I, R],
       respond: I => (R, O)
   )(using ctx: WorkflowContext): O = {
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
     val outCodec = summon[Cacheable[O]]
     val fingerprints = encodeFingerprints(Seq.empty)
-    val now = execution.now
+    val now = rt.clock.instant()
     val expiresAt = None
 
     def decodeInput(encoded: String): I =
@@ -879,19 +879,19 @@ object Step {
     }
 
     def evaluate(): O = {
-      execution.throwIfCancelled(ctx.uncancellableDepth)
-      val candidates = execution.readAwaitUpdateCandidates(u.key)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      val candidates = rt.readAwaitUpdateCandidates(run, u.key)
       candidates.headOption match {
         case Some(winning) =>
           val decision = respondTo(winning)
-          val won = execution.resolveAwaitUpdate(
-            stepId, 0L, "AwaitUpdate", fingerprints, u.key, winning, decision.encodedResponse,
+          val won = rt.resolveAwaitUpdate(
+            run, stepId, 0L, "AwaitUpdate", fingerprints, u.key, winning, decision.encodedResponse,
             decision.encodedOutput, expiresAt
           )
           if (won) decodeOutput(decision.encodedOutput)
           else evaluate()
         case None =>
-          execution.suspendAwaitUpdate(stepId, 0L, "AwaitUpdate", fingerprints, u.key, expiresAt) { recheck =>
+          rt.suspendAwaitUpdate(run, stepId, 0L, "AwaitUpdate", fingerprints, u.key, expiresAt) { recheck =>
             recheck.headOption.map(respondTo)
           } match {
             case Some(decision) => decodeOutput(decision.encodedOutput)
@@ -900,7 +900,7 @@ object Step {
       }
     }
 
-    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
       case None => evaluate()
@@ -923,32 +923,33 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]],
       invalidateAfter: Duration
   )(using ctx: WorkflowContext): Unit = {
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
-    val now = execution.now
+    val now = rt.clock.instant()
     val expiresAt = invalidateAfter match {
       case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
       case _                 => None
     }
 
     def evaluate(): Unit = {
-      execution.throwIfCancelled(ctx.uncancellableDepth)
-      execution.fireDueTimers(stepId, 0L)
-      if (execution.readAwaitTimerCandidates(stepId, 0L).nonEmpty) {
-        execution.resolveAwaitTimer(stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      rt.fireDueTimers(run, stepId, 0L)
+      if (rt.readAwaitTimerCandidates(run, stepId, 0L).nonEmpty) {
+        rt.resolveAwaitTimer(run, stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
       } else {
-        execution.suspendAwaitTimer(stepId, 0L, "Await", fingerprints, deadline, expiresAt)
+        rt.suspendAwaitTimer(run, stepId, 0L, "Await", fingerprints, deadline, expiresAt)
         throw new WorkflowSuspendedException
       }
     }
 
     def retireAndSuspend(): Nothing = {
-      execution.invalidateTimer(stepId, 0L, deadline)
+      rt.invalidateTimer(run, stepId, 0L, deadline)
       throw new WorkflowSuspendedException
     }
 
-    val rawExisting = execution.lookupStep(stepId, 0L)
+    val rawExisting = rt.lookupStep(run, stepId, 0L)
     val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
@@ -991,11 +992,12 @@ object Step {
       invalidateAfter: Duration
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
     require(awaits.nonEmpty, s"awaitRace('$stepKey') requires at least one awaitable")
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
     val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
-    val now = execution.now
+    val now = rt.clock.instant()
     val expiresAt = invalidateAfter match {
       case d: FiniteDuration => Some(now.plus(java.time.Duration.ofNanos(d.toNanos)))
       case _                 => None
@@ -1011,17 +1013,17 @@ object Step {
       }
 
     def evaluate(): A = {
-      execution.throwIfCancelled(ctx.uncancellableDepth)
-      execution.fireDueTimerLeaves(stepId, 0L)
+      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      rt.fireDueTimerLeaves(run, stepId, 0L)
       val decided: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] =
         pickRaceWinner(leaves)
-      execution.evaluateAwaitRace(stepId, 0L, "AwaitRace", fingerprints, leaves.map(_._1), expiresAt)(decided) match {
+      rt.evaluateAwaitRace(run, stepId, 0L, "AwaitRace", fingerprints, leaves.map(_._1), expiresAt)(decided) match {
         case Some(payload) => decode(payload)
         case None          => throw new WorkflowSuspendedException
       }
     }
 
-    val existing = execution.lookupStep(stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
+    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
 
     existing match {
       case None => evaluate()
@@ -1035,7 +1037,7 @@ object Step {
         }
         val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
         if (shouldReevaluate) {
-          execution.deleteStep(stepId, 0L)
+          rt.deleteStep(run, stepId, 0L)
           evaluate()
         } else {
           row.stateKind match {

@@ -1,10 +1,9 @@
 package atomicflow
 
-import atomicflow.internal.WorkflowExecution
-
 /** The runtime context materialized only during workflow execution. It carries
   * the instance identity, the version of the definition captured at creation, the
-  * runtime services, and (via [[execution]]) the per-run engine seam.
+  * runtime services, and (via [[currentExecution]]) the runtime's per-run
+  * execution handle.
   *
   * A new context is materialized for every run and is not retained between runs.
   * The context is immutable: the transient lexical state of the run — the
@@ -24,12 +23,16 @@ trait WorkflowContext {
     */
   def versionAtCreation: Long
 
-  def runtime: WorkflowRuntime
-
-  /** The per-run engine seam: fencing identity and, in later tasks, the services
-    * a running body needs from the engine.
+  /** The runtime executing this run. Declared as a `val` so that
+    * [[currentExecution]]'s dependent result type can be prefixed by it.
     */
-  private[atomicflow] def execution: WorkflowExecution
+  val runtime: WorkflowRuntime
+
+  /** The runtime's per-run execution handle: an opaque value this runtime
+    * created when the run started, passed back to the runtime's engine
+    * operations (see [[WorkflowRuntime.CurrentExecution]]).
+    */
+  def currentExecution: runtime.CurrentExecution
 
   /** The path of enclosing `Workflow.scoped` (and region / parallel-branch)
     * segments at this context's lexical position; `Vector.empty` at the top
@@ -44,7 +47,7 @@ trait WorkflowContext {
   /** The depth of enclosing `Workflow.uncancellable` regions at this context's
     * lexical position; `0` outside any region. Transient per-run state carried
     * immutably through derived contexts; a non-zero depth suppresses
-    * cancellation delivery at checkpoints (`WorkflowExecution.throwIfCancelled`).
+    * cancellation delivery at checkpoints (`WorkflowRuntime.throwIfCancelled`).
     */
   private[atomicflow] def uncancellableDepth: Int = 0
 
@@ -76,6 +79,11 @@ private[atomicflow] final class DerivedWorkflowContext(
 ) extends WorkflowContext {
   def instanceId: WorkflowInstanceId = underlying.instanceId
   def versionAtCreation: Long = underlying.versionAtCreation
-  def runtime: WorkflowRuntime = underlying.runtime
-  private[atomicflow] def execution: WorkflowExecution = underlying.execution
+  val runtime: WorkflowRuntime = underlying.runtime
+
+  // The two contexts share one runtime object, so the underlying handle is the
+  // handle of this context's runtime too; the types are unrelated only because
+  // they are prefixed by different paths.
+  def currentExecution: runtime.CurrentExecution =
+    underlying.currentExecution.asInstanceOf[runtime.CurrentExecution]
 }
