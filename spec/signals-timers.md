@@ -17,11 +17,11 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 
 ### Why timer awaits need a subscription — and why the scheduler must not delete it
 
-Every pending timer await owns one row in `workflow_timer_subscriptions` (site, subscription ID, absolute deadline). It is not a wakeup hint; it is load-bearing in three ways:
+Every pending timer await owns one row in `workflow_timer_subscriptions` (site, subscription ID, absolute deadline). It is not a wakeup hint; it matters in three ways:
 
 1. **It is the durable deadline record.** The deadline is computed once (`now + delay`, runtime clock) and stored absolutely; every replay of the await-site reads it from the row. Recomputing it from code would push timeouts forward — with a test clock advanced between runs, the recomputed deadline would land in the future again and the await would suspend forever instead of resolving.
 2. **It is the scheduling source.** The timer sweep's only input is this row's stored deadline; without the row, due timers of unattended instances would never produce a wakeup and no runner would ever come.
-3. **It is the firing identity.** `TimerFired` events are keyed by the subscription ID, which is minted at registration and reused on replay. The ID versions the *registration incarnation*: `invalidateOn` invalidation re-registers the site with a recomputed deadline and a fresh ID, so the old incarnation's `TimerFired` event is structurally inert — it can never satisfy the new evaluation ("recomputes later → as if never executed"). The partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` — exactly one event per subscription — is the exactly-once guarantee for concurrent firing.
+3. **It is the firing identity.** `TimerFired` events are keyed by the subscription ID, which is assigned at registration and reused on replay. The ID versions the *registration incarnation*: `invalidateOn` invalidation re-registers the site with a recomputed deadline and a fresh ID, so the old incarnation's `TimerFired` event is structurally inert — it can never satisfy the new evaluation ("recomputes later → as if never executed"). The partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` — exactly one event per subscription — is the exactly-once guarantee for concurrent firing.
 
 **The scheduler must not delete the subscription when it fires.** Firing appends the `TimerFired` event; deleting the row would (a) make the existing event unmatchable, because evaluation correlates events to the site via the row's subscription ID, and (b) destroy the stored deadline, forcing the replay recomputation of point 1. Both break the resume that the fired event was supposed to enable. The row survives firing and is retired **only when its await resolves** — atomically with the step row and cursor moves — or by terminal cleanup. Until then, the "no existing event" re-check under the subscription row lock keeps repeated sweeps idempotent no-ops. Deletion is therefore exclusively the await's retirement decision, never the scheduler's.
 
@@ -541,7 +541,7 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
   not retained.
 - The three subscription tables contain only pending awaits and are never event
   rows. A timer subscription holds its absolute deadline and its subscription
-  ID (minted at registration, reused on replay); firing — by the scheduler or
+  ID (assigned at registration, reused on replay); firing — by the scheduler or
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded
   by the partial unique index on `(workflowInstanceId, eventKey) WHERE
   eventKind = 'TimerFired'`. The subscription row survives firing and is

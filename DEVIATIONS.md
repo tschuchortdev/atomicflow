@@ -330,6 +330,9 @@ implementation phase.
     `core-types.md`) was edited in the same change, so no lasting deviation
     remains. Consequence: workflow and application code see one runtime
     type, but every engine call needs that runtime's own opaque handle, so
-    the operations cannot be invoked against a foreign runtime. Benefit:
+    the operations cannot be invoked across backends. (A handle from one
+    Postgres runtime instance still typechecks against another instance of
+    the same backend — the database-side lease fence rejects that
+    cross-instance misuse, not the type system.) Benefit:
     core workflow/step code depends only on the public `WorkflowRuntime`;
     each backend implements one trait instead of a public/private pair.

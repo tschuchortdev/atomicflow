@@ -68,7 +68,7 @@ final class PostgresJobRunner private[atomicflow] (
       (_: WorkflowId, v: java.lang.Integer) => if (v <= 1) null else java.lang.Integer.valueOf(v - 1)
     )
 
-  /** Fault-injection seam around a dispatched run: by default identity, a test may
+  /** Fault-injection point around a dispatched run: by default identity, a test may
     * replace it to simulate an infrastructure failure that aborts a claimed run
     * before the body runs (producing a transient, terminal-unset, lease-still-ours
     * outcome). Package-private test hook; write from test threads only.
