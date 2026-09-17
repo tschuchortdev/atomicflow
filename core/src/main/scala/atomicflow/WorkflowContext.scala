@@ -14,42 +14,40 @@ package atomicflow
   * passes a derived copy to its body (the `local` of a reader monad). The state
   * therefore travels with the context value, not with the executing thread.
   */
-trait WorkflowContext {
-  def instanceId: WorkflowInstanceId
-
-  /** The `Workflow.version` recorded when the instance was created. The current
-    * body may branch on it internally to adapt to the definition version that
-    * created the instance (see `spec/workflow-evolution.md`).
-    */
-  def versionAtCreation: Long
-
-  /** The runtime executing this run. Declared as a `val` so that
-    * [[currentExecution]]'s dependent result type can be prefixed by it.
-    */
-  val runtime: WorkflowRuntime
-
-  /** The runtime's per-run execution handle: an opaque value this runtime
-    * created when the run started, passed back to the runtime's engine
-    * operations (see [[WorkflowRuntime.CurrentExecution]]).
-    */
-  def currentExecution: runtime.CurrentExecution
-
-  /** The path of enclosing `Workflow.scoped` (and region / parallel-branch)
-    * segments at this context's lexical position; `Vector.empty` at the top
-    * level. Transient per-run state carried immutably through derived
-    * contexts; never persisted directly. The exact contents are an
-    * implementation detail of the runtime and are not portable across runtime
-    * implementations — [[currentScope]] is the composed string the durable
-    * records key on.
-    */
-  private[atomicflow] def scopePath: Vector[String] = Vector.empty
-
-  /** The depth of enclosing `Workflow.uncancellable` regions at this context's
-    * lexical position; `0` outside any region. Transient per-run state carried
-    * immutably through derived contexts; a non-zero depth suppresses
-    * cancellation delivery at checkpoints (`WorkflowRuntime.throwIfCancelled`).
-    */
-  private[atomicflow] def uncancellableDepth: Int = 0
+final class WorkflowContext(
+    val instanceId: WorkflowInstanceId,
+    /** The `Workflow.version` recorded when the instance was created. The current
+      * body may branch on it internally to adapt to the definition version that
+      * created the instance (see `spec/workflow-evolution.md`).
+      */
+    val versionAtCreation: Long,
+    /** The runtime executing this run. Declared as a `val` so that
+      * [[currentExecution]]'s dependent type can be prefixed by it.
+      */
+    val runtime: WorkflowRuntime
+)(
+    /** The runtime's per-run execution handle: an opaque value this runtime
+      * created when the run started, passed back to the runtime's engine
+      * operations (see [[WorkflowRuntime.CurrentExecution]]). Lives in a second,
+      * dependent parameter list so its type can be prefixed by [[runtime]].
+      */
+    val currentExecution: runtime.CurrentExecution,
+    /** The path of enclosing `Workflow.scoped` (and region / parallel-branch)
+      * segments at this context's lexical position; `Vector.empty` at the top
+      * level. Transient per-run state carried immutably through derived
+      * contexts; never persisted directly. The exact contents are an
+      * implementation detail of the runtime and are not portable across runtime
+      * implementations — [[currentScope]] is the composed string the durable
+      * records key on.
+      */
+    private[atomicflow] val scopePath: Vector[String] = Vector.empty,
+    /** The depth of enclosing `Workflow.uncancellable` regions at this context's
+      * lexical position; `0` outside any region. Transient per-run state carried
+      * immutably through derived contexts; a non-zero depth suppresses
+      * cancellation delivery at checkpoints (`WorkflowRuntime.throwIfCancelled`).
+      */
+    private[atomicflow] val uncancellableDepth: Int = 0
+) {
 
   /** The current step scope path: [[scopePath]]'s segments joined by `/` (`""`
     * at the top level). Step/Await IDs and derived child scopes key on this
@@ -65,25 +63,5 @@ trait WorkflowContext {
       scopePath: Vector[String] = scopePath,
       uncancellableDepth: Int = uncancellableDepth
   ): WorkflowContext =
-    new DerivedWorkflowContext(this, scopePath, uncancellableDepth)
-}
-
-/** The [[WorkflowContext.derive]] implementation: an immutable wrapper that
-  * overrides exactly the two transient state members and delegates everything
-  * else to the underlying context.
-  */
-private[atomicflow] final class DerivedWorkflowContext(
-    underlying: WorkflowContext,
-    override val scopePath: Vector[String],
-    override val uncancellableDepth: Int
-) extends WorkflowContext {
-  def instanceId: WorkflowInstanceId = underlying.instanceId
-  def versionAtCreation: Long = underlying.versionAtCreation
-  val runtime: WorkflowRuntime = underlying.runtime
-
-  // The two contexts share one runtime object, so the underlying handle is the
-  // handle of this context's runtime too; the types are unrelated only because
-  // they are prefixed by different paths.
-  def currentExecution: runtime.CurrentExecution =
-    underlying.currentExecution.asInstanceOf[runtime.CurrentExecution]
+    new WorkflowContext(instanceId, versionAtCreation, runtime)(currentExecution, scopePath, uncancellableDepth)
 }
