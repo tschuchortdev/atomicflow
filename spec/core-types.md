@@ -52,7 +52,10 @@ final class Signal[A](
 trait WorkflowContext {
   def instanceId: WorkflowInstanceId
   def versionAtCreation: Long
-  def runtime: WorkflowRuntime
+  val runtime: WorkflowRuntime
+  // The runtime's opaque per-run execution handle: created by the runtime,
+  // identity-stable for the run, contents runtime-owned.
+  def currentExecution: runtime.CurrentExecution
 }
 
 trait StepContext[Out] {
