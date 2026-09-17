@@ -3,6 +3,7 @@ package atomicflow
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.{Duration, FiniteDuration}
 import java.time.Clock
+import java.time.Instant
 
 /** The canonical home of all single-instance workflow operations. Implemented per
   * backend (in-memory, Postgres, ...). Convenience methods are `final`, built
@@ -17,6 +18,349 @@ trait WorkflowRuntime {
     * clock with workflow code.
     */
   def clock: Clock
+
+  /** The runtime's per-run execution handle. The runtime creates a value of this
+    * type when a run starts and hands it to workflow code through
+    * [[WorkflowContext.currentExecution]]; the type is opaque to callers — a
+    * value is only ever passed back to this runtime's own engine operations.
+    *
+    * Contract:
+    *   - The runtime creates the handle at run start, and its identity is stable
+    *     for the run's lifetime.
+    *   - Its contents are owned and updatable by the runtime (a lease protocol
+    *     may rotate fencing values during the run, for example).
+    *   - The same handle may be shared across the parallel-branch threads of one
+    *     run, so any internal mutation must be thread-safe.
+    *   - It should carry only what the runtime cannot derive from its own
+    *     configuration.
+    */
+  type CurrentExecution
+
+  /** The durable-retry threshold of this runtime: a step retry whose computed
+    * delay is at or below this sleeps inline inside the run; one whose delay is
+    * above it becomes a durable suspension (an ordinary timer subscription).
+    */
+  def durableRetryThreshold: FiniteDuration
+
+  /** Renews the execution lease of run `run`, extending `lease_expires_at` by
+    * the runtime's `leaseDuration`. A fenced write that does not bump the
+    * fencing token; throws [[atomicflow.LeaseLostException]] if the lease no
+    * longer belongs to this run.
+    */
+  def renewLease(run: CurrentExecution): Unit
+
+  /** A cancellation checkpoint for run `run`: re-reads the durable
+    * `cancel_requested_at` flag and throws [[atomicflow.WorkflowCancelledException]]
+    * when set, unless the `Workflow.uncancellable` depth of the current call
+    * site (the `uncancellableDepth` carried by the `WorkflowContext` there) is
+    * non-zero. Called right before any new work (a Step body about to execute,
+    * or an await about to be evaluated); cached replays never call it, so they
+    * never deliver.
+    */
+  def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit
+
+  /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
+    * Reports the stored row even if it has expired.
+    */
+  def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep]
+
+  /** Replace (or create) the `started` row for the step, fenced. */
+  def writeStepStarted(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String
+  ): Unit
+
+  /** Replace (or create) the `succeeded` row for the step, fenced. */
+  def writeStepSucceeded(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Replace (or create) the `failed` row for the step, fenced. */
+  def writeStepFailed(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Delete the step row, fenced. */
+  def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
+  /** Durably suspend an at-least-once step for a retry, fenced, in one
+    * transaction: persist (or refresh) the `started` step row carrying the
+    * runtime-owned retry bookkeeping in `retryPayload` and its `expiresAt`, and
+    * register the retry's timer subscription (deadline = `now + delay`) under a
+    * reserved subscription identity that cannot collide with user awaits of the
+    * same site. The step body is NOT executed until the subscription is due.
+    */
+  def suspendStepRetry(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      retryPayload: String,
+      deadline: Instant,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Fire this step-site's own due retry timer subscriptions, fenced, in one
+    * transaction (the same "two paths, one primitive" as user timer awaits): for
+    * each retry subscription with `deadline <= now`, row-lock it, re-check that
+    * no `TimerFired` event exists yet, and append one. The subscription row
+    * survives firing; only resolution retires it.
+    */
+  def fireDueStepRetries(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `TimerFired` events matching this step-site's pending retry
+    * timer subscription (plain durable read; no lock or fence).
+    */
+  def readStepRetryCandidates(run: CurrentExecution, stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
+
+  /** Resolve a retrying step to a terminal state, fenced: persist the
+    * `stateKind` (`succeeded` or `failed`) step row and delete the retry timer
+    * subscription, in one transaction.
+    */
+  def resolveStepRetry(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      stateKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Delete the step row and its retry timer subscription atomically, fenced.
+    * Used to invalidate an ongoing retry "as if the step never executed".
+    */
+  def deleteStepRetry(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `Signal` events of `signalKey` that are visible to this
+    * instance (after its shared exact-key cursor), in sequence order. A plain
+    * read of durable facts; no lease or fence is involved and the cursor is not
+    * advanced.
+    */
+  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[AwaitSignalCandidate]
+
+  /** Resolve a signal await atomically, fenced: persist the `succeeded` step row
+    * (`stepKind`), advance the exact-key cursor to `winningSequenceId`, and
+    * delete the site's pending subscriptions, all in one transaction.
+    */
+  def resolveAwaitSignal(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      winningSequenceId: Long,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Suspend a signal await, fenced, in one transaction: register/refresh the
+    * pending subscription (idempotent), then re-read the visible events and
+    * apply `decide`. If `decide` selects a satisfying candidate, resolve the
+    * await (succeeded step row + cursor advance + subscription deletion) and
+    * return the persisted payload; otherwise return `None` (suspended, cursor
+    * unchanged). The re-read within the transaction closes the lost-wakeup gap
+    * between event gathering and the suspension commit.
+    */
+  def suspendAwaitSignal(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      expiresAt: Option[Instant]
+  )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String]
+
+  /** Read the unhandled `Update` records of `updateKey` addressed directly to
+    * this instance, oldest first, without handling any of them. A plain durable
+    * read; no lease, fence, or write. Updates are never inherited, so only this
+    * instance's own rows are consulted.
+    */
+  def readAwaitUpdateCandidates(run: CurrentExecution, updateKey: String): Vector[UpdateCandidate]
+
+  /** Resolve an update await atomically, fenced: mark the selected candidate's
+    * record handled by writing `encodedResponse` and `handled_at` FIRST, gated
+    * on the row still being unhandled; only when the update affected a row
+    * (this branch won the record) persist the `succeeded` step row (`stepKind`)
+    * carrying `encodedOutput` and delete the site's update subscriptions — all
+    * in one transaction. The written response is what the blocked sender reads
+    * as `UpdateSendResult.Success`. Returns `true` when this branch handled the
+    * record, `false` when a concurrent branch already did (the caller should
+    * re-evaluate the await rather than commit a losing step row).
+    */
+  def resolveAwaitUpdate(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      candidate: UpdateCandidate,
+      encodedResponse: String,
+      encodedOutput: String,
+      expiresAt: Option[Instant]
+  ): Boolean
+
+  /** Suspend an update await, fenced, in one transaction: register the pending
+    * update subscription (idempotent), then re-read the unhandled records and
+    * apply `decide`. If `decide` selects a candidate, resolve the await
+    * (succeeded step row + handled record + subscription deletion) and return
+    * the decision; otherwise return `None` (suspended, subscriptions remain).
+    * The re-read within the transaction closes the lost-wakeup gap between
+    * candidate gathering and the suspension commit, so two awaits cannot
+    * double-consume the same record.
+    */
+  def suspendAwaitUpdate(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      expiresAt: Option[Instant]
+  )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision]
+
+  /** Fire this await-site's own due timer subscriptions, fenced, in one
+    * transaction: for each subscription with `deadline <= now`, row-lock it,
+    * re-check that no `TimerFired` event exists yet, and append one via the
+    * global append protocol. The subscription row survives firing; only
+    * resolution retires it.
+    */
+  def fireDueTimers(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
+  /** Read the durable `TimerFired` events matching this await-site's pending
+    * timer subscriptions (plain durable read; no lock or fence).
+    */
+  def readAwaitTimerCandidates(run: CurrentExecution, stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
+
+  /** Resolve a timer await atomically, fenced: persist the `succeeded` step row
+    * (`stepKind`) and delete the site's timer subscriptions in one transaction
+    * (timers have no cursor).
+    */
+  def resolveAwaitTimer(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Suspend a timer await, fenced: register the pending subscription
+    * idempotently. The subscription id is generated on first registration with
+    * the given absolute `deadline` and reused on replay (the row persists and
+    * its stored deadline is never recomputed).
+    */
+  def suspendAwaitTimer(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      deadline: Instant,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Retire an invalidated/expired timer await atomically, fenced: discard the
+    * site's `succeeded` step row, delete its old timer subscriptions, and
+    * register a fresh subscription (new id, `deadline`) — all in one
+    * transaction, so no crash window can leave the old incarnation live. The
+    * fresh deadline is recomputed (`now + delay`), so its old `TimerFired`
+    * event is structurally inert.
+    */
+  def invalidateTimer(run: CurrentExecution, stepId: StepId, stepVersion: Long, deadline: Instant): Unit
+
+  /** Fire this race-site's own due timer leaves, fenced, in one transaction: for
+    * each leaf's subscription with `deadline <= now`, row-lock it, re-check that
+    * no `TimerFired` event exists yet, and append one via the global append
+    * protocol. Appends happen in deadline order so the earliest due timer leaf
+    * receives the lowest sequence id and wins deterministically among timers.
+    */
+  def fireDueTimerLeaves(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
+  /** Evaluate a race atomically, fenced: register every leaf's subscription
+    * (idempotent), read all leaves' candidates, apply `decide` to select the
+    * earliest satisfying candidate by global `sequenceId`, and if satisfied
+    * persist the `succeeded` step row (`stepKind`), advance ONLY the winning
+    * signal key's cursor, and delete every leaf's subscription — all in one
+    * transaction. If no candidate is satisfiable, no cursor advances and the
+    * subscriptions remain. Returns the persisted payload when resolved.
+    */
+  def evaluateAwaitRace(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      leaves: Vector[AwaitRaceLeaf],
+      expiresAt: Option[Instant]
+  )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String]
+
+  /** Resolve a `Step.firstToRunWithoutSuspension` construct atomically, fenced:
+    * persist the `succeeded` step row (`stepKind`) recording the winner, and in
+    * the same transaction best-effort delete the pending subscriptions of every
+    * losing branch (identified by their branch scope paths), so a losing await
+    * cannot wake the workflow later. The winner's own subscriptions were already
+    * retired when its branch completed, so only the losers' rows are touched.
+    */
+  def resolveFirstToRun(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      loserScopePaths: Seq[String],
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit
+
+  /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
+    * located at `regionId` under `parentScopePath`: its encoded state and its
+    * committed `restartCount`. `None` when the region has never been created
+    * (first creation, so the by-name seed must be evaluated).
+    */
+  def readRegionState(run: CurrentExecution, regionId: String, parentScopePath: String): Option[(String, Long)]
+
+  /** Persist a `Workflow.restartable`/`Workflow.loop` region's row on its first
+    * creation, with `serializedState` and `restartCount` 0, fenced. Only the
+    * first creation calls this; replays read the persisted row instead.
+    */
+  def createRegion(run: CurrentExecution, regionId: String, parentScopePath: String, serializedState: String): Unit
+
+  /** The one-transaction restart transition of a region at `currentRestartCount`:
+    * discard the nested Step rows and subscriptions owned by the previous
+    * looping's scope subtree (a construct-isolated prefix delete), close children
+    * created in that looping per their `ParentClosePolicy`, and replace the
+    * region row's state with `serializedState` and its count with
+    * `currentRestartCount + 1`. Signal cursors are preserved. Fenced.
+    */
+  def restartRegion(
+      run: CurrentExecution,
+      regionId: String,
+      parentScopePath: String,
+      currentRestartCount: Long,
+      serializedState: String
+  ): Unit
 
   /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
     * briefly row-locks the instance and checks `is_accepting_signals`, then
@@ -176,33 +520,33 @@ trait WorkflowRuntime {
     * existing row's timestamps are never reset. The backend derives `scheduled_at`
     * from its own clock (`clock.now + delay`).
     */
-  private[atomicflow] def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
+  def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
   /** Read a step's durable facts without acquiring a lease or fence (a pure
     * lookup of durable state, used by `Step.getExecutionState`).
     */
-  private[atomicflow] def readStep(
+  def readStep(
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
-  ): Option[atomicflow.internal.StoredStep]
+  ): Option[StoredStep]
 
   /** Start a child workflow of an executing parent: create-if-absent a child
     * instance under a scope derived from the parent's identity, generation, and
     * enclosing `Workflow.scoped` path; record the parent relationship and
     * inheritance configuration; and schedule the child's first wakeup. Never
     * executes the child body on the parent's thread. Idempotent on parent
-    * replay (`startAsChild` returns the existing handle).
+    * replay (`startAsChild` returns the existing handle). The parent's identity
+    * and generation come from `run`.
     */
-  private[atomicflow] def startChild[In, Out](
+  def startChild[In, Out](
       workflow: Workflow[In, Out],
       childKey: WorkflowInstanceKey,
       input: In,
       parentClosePolicy: ParentClosePolicy,
       inheritSignals: SignalInheritance,
       inheritPastEvents: Boolean,
-      parentId: WorkflowInstanceId,
-      parentGeneration: Long,
+      run: CurrentExecution,
       enclosingScopePath: String
   )(using Cacheable[In]): WorkflowInstance[In, Out]
 
@@ -294,7 +638,7 @@ trait WorkflowRuntime {
   )(using Cacheable[Throwable]): WorkflowRunResult[Out]
 
   /** The persisted data view of an instance, fresh from the database. */
-  private[atomicflow] def getWorkflowInstanceInfo[In, Out](
+  def getWorkflowInstanceInfo[In, Out](
       instance: WorkflowInstance[In, Out]
   ): WorkflowInstance.Info
 

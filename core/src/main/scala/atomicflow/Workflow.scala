@@ -156,8 +156,7 @@ final class Workflow[In, Out] private[atomicflow] (
       parentClosePolicy,
       inheritSignals,
       inheritPastEvents,
-      ctx.instanceId,
-      ctx.execution.generation,
+      ctx.currentExecution,
       ctx.currentScope
     )(using inputCacheable)
 
@@ -223,7 +222,7 @@ object Workflow {
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
   def heartbeat()(using ctx: WorkflowContext): Unit =
-    ctx.execution.renewLease()
+    ctx.runtime.renewLease(ctx.currentExecution)
 
   /** The `Workflow.version` recorded when the instance was created. The current
     * body may branch on it internally to adapt to the definition version that
@@ -321,17 +320,18 @@ object Workflow {
   )(using
       ctx: WorkflowContext
   ): R = {
-    val execution = ctx.execution
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
     val cacheable = summon[Cacheable[S]]
     val parentScopePath = ctx.scopePath
     val parentScope = ctx.currentScope
-    val row = execution.readRegionState(id, parentScope)
+    val row = rt.readRegionState(run, id, parentScope)
     val startCount = row.map(_._2).getOrElse(0L)
     val firstState: S = row match {
       case Some((state, _)) => cacheable.read(state)
       case None =>
         val seed = initialState
-        execution.createRegion(id, parentScope, cacheable.write(seed))
+        rt.createRegion(run, id, parentScope, cacheable.write(seed))
         seed
     }
 
@@ -351,7 +351,7 @@ object Workflow {
         done = true
       } catch {
         case e: RegionRestartException =>
-          execution.restartRegion(id, parentScope, count, e.serializedState)
+          rt.restartRegion(run, id, parentScope, count, e.serializedState)
           count += 1
           state = cacheable.read(e.serializedState)
         case e: RegionBreakException[R] =>

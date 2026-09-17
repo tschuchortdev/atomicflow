@@ -1,22 +1,7 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.{
-  AwaitRaceCandidate,
-  AwaitRaceCompletionLeaf,
-  AwaitRaceDecision,
-  AwaitRaceLeaf,
-  AwaitRaceSignalLeaf,
-  AwaitRaceTimerLeaf,
-  AwaitSignalCandidate,
-  AwaitTimerCandidate,
-  AwaitUpdateDecision,
-  Framing,
-  ScopePath,
-  StoredStep,
-  UpdateCandidate,
-  WorkflowExecution
-}
+import atomicflow.internal.{Framing, ScopePath}
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -26,6 +11,7 @@ import org.flywaydb.core.Flyway
 import org.slf4j.LoggerFactory
 
 import java.time.Clock
+import java.time.Instant
 import javax.sql.DataSource
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
@@ -61,7 +47,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     theClock: Clock,
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
-    private val durableRetryThreshold: FiniteDuration = 30.seconds
+    durableRetryThresholdSetting: FiniteDuration = 30.seconds
 )(using ec: ExecutionContext)
     extends WorkflowRuntime {
 
@@ -94,6 +80,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
     now.plus(java.time.Duration.ofNanos(duration.toNanos))
 
   override def clock: Clock = theClock
+
+  /** This runtime's per-run handle: the fencing identity of one run (worker,
+    * fencing token, generation) plus the instance identity, created when the
+    * run's lease is acquired. The alias targets the class projection so the
+    * member type does not depend on a particular runtime instance.
+    */
+  override type CurrentExecution = PostgresWorkflowRuntime#PostgresCurrentExecution
+
+  def durableRetryThreshold: FiniteDuration = durableRetryThresholdSetting
 
   override def createWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
@@ -400,10 +395,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
       parentClosePolicy: ParentClosePolicy,
       inheritSignals: SignalInheritance,
       inheritPastEvents: Boolean,
-      parentId: WorkflowInstanceId,
-      parentGeneration: Long,
+      run: CurrentExecution,
       enclosingScopePath: String
   )(using cacheable: Cacheable[In]): WorkflowInstance[In, Out] = {
+    val parentId = run.instanceId
+    val parentGeneration = run.generation
     val childWorkflowId = workflow.id
     val serializedInput = cacheable.write(input)
     val derivedScope = ScopePath.deriveChildScope(
@@ -1006,17 +1002,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   handleTerminalRead(state, freshOutcome, outCacheable, completionCodec, instanceId)
                 case None =>
                   val input = wf.inputCacheable.read(freshInputSerialized)
-                  val execution =
-                    new PostgresExecution(worker, token, workflowId, key, scope, freshGeneration, runLeaseDuration)
                   val ctxInstanceId = instanceId
                   val ctxVersionAtCreation = freshVersionAtCreation
-                  val ctxRuntime: WorkflowRuntime = this
-                  val ctxExecution = execution
+                  val ctxExecution = new PostgresCurrentExecution(worker, token, workflowId, key, scope, freshGeneration)
                   val ctx = new WorkflowContext {
                     override def instanceId: WorkflowInstanceId = ctxInstanceId
                     override def versionAtCreation: Long = ctxVersionAtCreation
-                    override def runtime: WorkflowRuntime = ctxRuntime
-                    private[atomicflow] override def execution: WorkflowExecution = ctxExecution
+                    override val runtime: PostgresWorkflowRuntime = PostgresWorkflowRuntime.this
+                    override def currentExecution: runtime.CurrentExecution = ctxExecution
                   }
 
                   log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
@@ -1703,7 +1696,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  private[atomicflow] override def readStep(
+  override def readStep(
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
@@ -1877,7 +1870,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  private[atomicflow] override def getWorkflowInstanceInfo[In, Out](
+  override def getWorkflowInstanceInfo[In, Out](
       instance: WorkflowInstance[In, Out]
   ): WorkflowInstance.Info = {
     val instanceId = instance.id
@@ -1905,25 +1898,254 @@ class PostgresWorkflowRuntime private[atomicflow] (
     rows.map { case (wf, scope, r) => toInfo(wf, scope, r) }
   }
 
-  private final class PostgresExecution(
+  // ---- Engine operations of the public WorkflowRuntime SPI. Each forwards to
+  // ---- this run's PostgresCurrentExecution handle, which owns the body.
+
+  override def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep] =
+    run.lookupStep(stepId, stepVersion)
+
+  override def writeStepStarted(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String
+  ): Unit =
+    run.writeStepStarted(stepId, stepVersion, stepKind, inputFingerprints)
+
+  override def writeStepSucceeded(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.writeStepSucceeded(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+
+  override def writeStepFailed(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.writeStepFailed(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+
+  override def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+    run.deleteStep(stepId, stepVersion)
+
+  override def suspendStepRetry(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      retryPayload: String,
+      deadline: Instant,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.suspendStepRetry(stepId, stepVersion, stepKind, inputFingerprints, retryPayload, deadline, expiresAt)
+
+  override def fireDueStepRetries(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+    run.fireDueStepRetries(stepId, stepVersion)
+
+  override def readStepRetryCandidates(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long
+  ): Vector[AwaitTimerCandidate] =
+    run.readStepRetryCandidates(stepId, stepVersion)
+
+  override def resolveStepRetry(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      stateKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.resolveStepRetry(stepId, stepVersion, stepKind, stateKind, inputFingerprints, payload, expiresAt)
+
+  override def deleteStepRetry(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+    run.deleteStepRetry(stepId, stepVersion)
+
+  override def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[AwaitSignalCandidate] =
+    run.readAwaitSignalCandidates(signalKey)
+
+  override def resolveAwaitSignal(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      winningSequenceId: Long,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.resolveAwaitSignal(
+      stepId, stepVersion, stepKind, inputFingerprints, signalKey, winningSequenceId, payload, expiresAt
+    )
+
+  override def suspendAwaitSignal(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      signalKey: SignalKey,
+      expiresAt: Option[Instant]
+  )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String] =
+    run.suspendAwaitSignal(stepId, stepVersion, stepKind, inputFingerprints, signalKey, expiresAt)(decide)
+
+  override def readAwaitUpdateCandidates(run: CurrentExecution, updateKey: String): Vector[UpdateCandidate] =
+    run.readAwaitUpdateCandidates(updateKey)
+
+  override def resolveAwaitUpdate(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      candidate: UpdateCandidate,
+      encodedResponse: String,
+      encodedOutput: String,
+      expiresAt: Option[Instant]
+  ): Boolean =
+    run.resolveAwaitUpdate(
+      stepId, stepVersion, stepKind, inputFingerprints, updateKey, candidate, encodedResponse, encodedOutput, expiresAt
+    )
+
+  override def suspendAwaitUpdate(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      updateKey: String,
+      expiresAt: Option[Instant]
+  )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision] =
+    run.suspendAwaitUpdate(stepId, stepVersion, stepKind, inputFingerprints, updateKey, expiresAt)(decide)
+
+  override def fireDueTimers(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+    run.fireDueTimers(stepId, stepVersion)
+
+  override def readAwaitTimerCandidates(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long
+  ): Vector[AwaitTimerCandidate] =
+    run.readAwaitTimerCandidates(stepId, stepVersion)
+
+  override def resolveAwaitTimer(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.resolveAwaitTimer(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+
+  override def suspendAwaitTimer(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      deadline: Instant,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.suspendAwaitTimer(stepId, stepVersion, stepKind, inputFingerprints, deadline, expiresAt)
+
+  override def invalidateTimer(run: CurrentExecution, stepId: StepId, stepVersion: Long, deadline: Instant): Unit =
+    run.invalidateTimer(stepId, stepVersion, deadline)
+
+  override def fireDueTimerLeaves(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+    run.fireDueTimerLeaves(stepId, stepVersion)
+
+  override def evaluateAwaitRace(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      leaves: Vector[AwaitRaceLeaf],
+      expiresAt: Option[Instant]
+  )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String] =
+    run.evaluateAwaitRace(stepId, stepVersion, stepKind, inputFingerprints, leaves, expiresAt)(decide)
+
+  override def resolveFirstToRun(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      loserScopePaths: Seq[String],
+      payload: String,
+      expiresAt: Option[Instant]
+  ): Unit =
+    run.resolveFirstToRun(
+      stepId, stepVersion, stepKind, inputFingerprints, loserScopePaths, payload, expiresAt
+    )
+
+  override def readRegionState(
+      run: CurrentExecution,
+      regionId: String,
+      parentScopePath: String
+  ): Option[(String, Long)] =
+    run.readRegionState(regionId, parentScopePath)
+
+  override def createRegion(
+      run: CurrentExecution,
+      regionId: String,
+      parentScopePath: String,
+      serializedState: String
+  ): Unit =
+    run.createRegion(regionId, parentScopePath, serializedState)
+
+  override def restartRegion(
+      run: CurrentExecution,
+      regionId: String,
+      parentScopePath: String,
+      currentRestartCount: Long,
+      serializedState: String
+  ): Unit =
+    run.restartRegion(regionId, parentScopePath, currentRestartCount, serializedState)
+
+  override def renewLease(run: CurrentExecution): Unit = run.renewLease()
+
+  override def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit =
+    run.throwIfCancelled(uncancellableDepth)
+
+  /** The per-run execution handle of this runtime: the fencing identity of one
+    * run (worker, fencing token, generation) plus the instance identity. The
+    * runtime creates it when a run's lease is acquired; workflow code only
+    * passes it back to this runtime's engine operations. The engine operations
+    * themselves are visible only to the enclosing runtime.
+    */
+  final class PostgresCurrentExecution(
       val workerId: String,
       val fencingToken: Long,
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       instanceScope: String,
-      val generation: Long,
-      runLeaseDuration: FiniteDuration
-  ) extends WorkflowExecution {
+      val generation: Long
+  ) {
 
-    private val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
+    private[PostgresWorkflowRuntime] val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
 
-    override def now: java.time.Instant = theClock.instant()
-
-    override def durableRetryThreshold: FiniteDuration = PostgresWorkflowRuntime.this.durableRetryThreshold
-
-    override def renewLease(): Unit = {
+    private[PostgresWorkflowRuntime] def renewLease(): Unit = {
       val now = theClock.instant()
-      val expires = now.plus(java.time.Duration.ofNanos(runLeaseDuration.toNanos))
+      val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
       val updated = runSync {
         sql"""UPDATE workflow_instances
               SET lease_expires_at = $expires
@@ -1934,7 +2156,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       if (updated != 1) throw LeaseLostException(instanceId)
     }
 
-    override def throwIfCancelled(uncancellableDepth: Int): Unit = {
+    private[PostgresWorkflowRuntime] def throwIfCancelled(uncancellableDepth: Int): Unit = {
       if (uncancellableDepth == 0) {
         val requestedAt = runSync {
           sql"""SELECT cancel_requested_at FROM workflow_instances
@@ -1946,10 +2168,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
       }
     }
 
-    override def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =
+    private[PostgresWorkflowRuntime] def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =
       readStepRow(workflowId, key, instanceScope, stepId.key, stepId.scope, stepVersion)
 
-    override def writeStepStarted(
+    private[PostgresWorkflowRuntime] def writeStepStarted(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -1976,7 +2198,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       )
     }
 
-    override def writeStepSucceeded(
+    private[PostgresWorkflowRuntime] def writeStepSucceeded(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2005,7 +2227,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       )
     }
 
-    override def writeStepFailed(
+    private[PostgresWorkflowRuntime] def writeStepFailed(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2034,7 +2256,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       )
     }
 
-    override def deleteStep(stepId: StepId, stepVersion: Long): Unit =
+    private[PostgresWorkflowRuntime] def deleteStep(stepId: StepId, stepVersion: Long): Unit =
       fenced {
         sql"""DELETE FROM workflow_steps
               WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
@@ -2053,7 +2275,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run
       } yield ()
 
-    override def suspendStepRetry(
+    private[PostgresWorkflowRuntime] def suspendStepRetry(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2069,7 +2291,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def fireDueStepRetries(stepId: StepId, stepVersion: Long): Unit =
+    private[PostgresWorkflowRuntime] def fireDueStepRetries(stepId: StepId, stepVersion: Long): Unit =
       fenced {
         val now = theClock.instant()
         for {
@@ -2091,7 +2313,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def readStepRetryCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate] =
+    private[PostgresWorkflowRuntime] def readStepRetryCandidates(
+        stepId: StepId,
+        stepVersion: Long
+    ): Vector[AwaitTimerCandidate] =
       runSync {
         for {
           subIds <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
@@ -2113,7 +2338,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield events
       }
 
-    override def resolveStepRetry(
+    private[PostgresWorkflowRuntime] def resolveStepRetry(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2132,7 +2357,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def deleteStepRetry(stepId: StepId, stepVersion: Long): Unit =
+    private[PostgresWorkflowRuntime] def deleteStepRetry(stepId: StepId, stepVersion: Long): Unit =
       fenced {
         for {
           _ <- sql"""DELETE FROM workflow_steps
@@ -2141,7 +2366,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def readAwaitSignalCandidates(signalKey: SignalKey): Vector[AwaitSignalCandidate] =
+    private[PostgresWorkflowRuntime] def readAwaitSignalCandidates(signalKey: SignalKey): Vector[AwaitSignalCandidate] =
       runSync {
         for {
           cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
@@ -2156,7 +2381,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         }
       }
 
-    override def resolveAwaitSignal(
+    private[PostgresWorkflowRuntime] def resolveAwaitSignal(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2174,7 +2399,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def suspendAwaitSignal(
+    private[PostgresWorkflowRuntime] def suspendAwaitSignal(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2199,10 +2424,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield resolved
       }
 
-    override def fireDueTimers(stepId: StepId, stepVersion: Long): Unit =
+    private[PostgresWorkflowRuntime] def fireDueTimers(stepId: StepId, stepVersion: Long): Unit =
       fireDueTimerLeaves(stepId, stepVersion)
 
-    override def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate] =
+    private[PostgresWorkflowRuntime] def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate] =
       runSync {
         sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
               WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
@@ -2210,7 +2435,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
       }.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) }
 
-    override def resolveAwaitUpdate(
+    private[PostgresWorkflowRuntime] def resolveAwaitUpdate(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2231,7 +2456,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield won
       }
 
-    override def suspendAwaitUpdate(
+    private[PostgresWorkflowRuntime] def suspendAwaitUpdate(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2296,7 +2521,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
         _ => ()
       )
 
-    override def readAwaitTimerCandidates(stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate] =
+    private[PostgresWorkflowRuntime] def readAwaitTimerCandidates(
+        stepId: StepId,
+        stepVersion: Long
+    ): Vector[AwaitTimerCandidate] =
       runSync {
         for {
           subIds <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
@@ -2318,7 +2546,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield events
       }
 
-    override def resolveAwaitTimer(
+    private[PostgresWorkflowRuntime] def resolveAwaitTimer(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2333,7 +2561,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def suspendAwaitTimer(
+    private[PostgresWorkflowRuntime] def suspendAwaitTimer(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2359,7 +2587,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def invalidateTimer(stepId: StepId, stepVersion: Long, deadline: java.time.Instant): Unit =
+    private[PostgresWorkflowRuntime] def invalidateTimer(
+        stepId: StepId,
+        stepVersion: Long,
+        deadline: java.time.Instant
+    ): Unit =
       fenced {
         for {
           _ <- sql"""DELETE FROM workflow_steps
@@ -2373,7 +2605,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def fireDueTimerLeaves(stepId: StepId, stepVersion: Long): Unit =
+    private[PostgresWorkflowRuntime] def fireDueTimerLeaves(stepId: StepId, stepVersion: Long): Unit =
       fenced {
         val now = theClock.instant()
         for {
@@ -2395,7 +2627,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield ()
       }
 
-    override def evaluateAwaitRace(
+    private[PostgresWorkflowRuntime] def evaluateAwaitRace(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2420,7 +2652,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         } yield resolved
       }
 
-    override def resolveFirstToRun(
+    private[PostgresWorkflowRuntime] def resolveFirstToRun(
         stepId: StepId,
         stepVersion: Long,
         stepKind: String,
@@ -2676,7 +2908,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       (r.state, r.count)
     }
 
-    private[atomicflow] override def readRegionState(
+    private[PostgresWorkflowRuntime] def readRegionState(
         regionId: String,
         parentScopePath: String
     ): Option[(String, Long)] =
@@ -2687,7 +2919,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(parseRegionPayload))
       }
 
-    private[atomicflow] override def createRegion(
+    private[PostgresWorkflowRuntime] def createRegion(
         regionId: String,
         parentScopePath: String,
         serializedState: String
@@ -2735,7 +2967,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       } yield ()
     }
 
-    private[atomicflow] override def restartRegion(
+    private[PostgresWorkflowRuntime] def restartRegion(
         regionId: String,
         parentScopePath: String,
         currentRestartCount: Long,
@@ -2787,7 +3019,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  private[atomicflow] override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
+  override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
     val now = theClock.instant()
     val scheduledAt = now.plus(java.time.Duration.ofNanos(delay.toNanos))
     runSync {
