@@ -686,7 +686,7 @@ object Step {
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
-            val branchCtx = ctx.derive(scopePath = baseScopePath :+ branchSegment(i))
+            val branchCtx = ctx.copy(scopePath = baseScopePath :+ branchSegment(i))
             try Right(branches(i)(using branchCtx))
             catch { case e: WorkflowSuspendedException => Left(e) }
         })

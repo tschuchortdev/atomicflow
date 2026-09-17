@@ -340,7 +340,7 @@ object Workflow {
     var result: R = null.asInstanceOf[R]
     var done = false
     while (!done) {
-      val regionCtx = ctx.derive(scopePath = parentScopePath :+ regionSegment(id, count))
+      val regionCtx = ctx.copy(scopePath = parentScopePath :+ regionSegment(id, count))
       val scope = new RestartableScope[S] {
         override def restartCount: Long = count
         override def restart(nextState: S): Nothing =
@@ -375,7 +375,7 @@ object Workflow {
     * compensation Steps are returned from the cache.
     */
   def uncancellable[R](f: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
-    f(using ctx.derive(uncancellableDepth = ctx.uncancellableDepth + 1))
+    f(using ctx.copy(uncancellableDepth = ctx.uncancellableDepth + 1))
 
   /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
     * with `scopeKey` (see `spec/sub-workflows-iteration.md`, "Primitives"), so
@@ -397,7 +397,7 @@ object Workflow {
 
   private def withScope[R](escapedSegment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
     require(escapedSegment.nonEmpty, "Workflow.scoped requires a non-empty scope")
-    body(using ctx.derive(scopePath = ctx.scopePath :+ escapedSegment))
+    body(using ctx.copy(scopePath = ctx.scopePath :+ escapedSegment))
   }
 
   /** Runs one by-name block, catches its suspension instead of propagating it,

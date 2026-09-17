@@ -59,7 +59,7 @@ final class WorkflowContext(
     * leaving everything else identical — the `local` of a reader monad. Region
     * functions call this and pass the derived context to their body.
     */
-  private[atomicflow] def derive(
+  private[atomicflow] def copy(
       scopePath: Vector[String] = scopePath,
       uncancellableDepth: Int = uncancellableDepth
   ): WorkflowContext =
