@@ -1005,12 +1005,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   val ctxInstanceId = instanceId
                   val ctxVersionAtCreation = freshVersionAtCreation
                   val ctxExecution = new PostgresCurrentExecution(worker, token, workflowId, key, scope, freshGeneration)
-                  val ctx = new WorkflowContext {
-                    override def instanceId: WorkflowInstanceId = ctxInstanceId
-                    override def versionAtCreation: Long = ctxVersionAtCreation
-                    override val runtime: PostgresWorkflowRuntime = PostgresWorkflowRuntime.this
-                    override def currentExecution: runtime.CurrentExecution = ctxExecution
-                  }
+                  val ctx = new WorkflowContext(
+                    ctxInstanceId,
+                    ctxVersionAtCreation,
+                    PostgresWorkflowRuntime.this
+                  )(ctxExecution)
 
                   log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
 
