@@ -335,4 +335,39 @@ implementation phase.
     the same backend — the database-side lease fence rejects that
     cross-instance misuse, not the type system.) Benefit:
     core workflow/step code depends only on the public `WorkflowRuntime`;
-    each backend implements one trait instead of a public/private pair.
+     each backend implements one trait instead of a public/private pair.
+
+## Phase 12 (durable wait-site unification)
+
+78. **The await-specific engine operations are collapsed into one
+     `evaluateWait` protocol.** The nine await operations previously on the
+     public `WorkflowRuntime` trait (`resolveAwaitSignal`,
+     `suspendAwaitSignal`, `fireDueTimers`, `readAwaitTimerCandidates`,
+     `resolveAwaitTimer`, `suspendAwaitTimer`, `fireDueTimerLeaves`,
+     `evaluateAwaitRace`, and the await use of `readAwaitSignalCandidates`)
+     are replaced by a single
+     `evaluateWait(run, site, interests)(decide): Option[String]` taking the
+     new public records `WaitSite`, `WaitInterest` (enum: Signal / Timer /
+     Completion), `WaitCandidate`, and `WaitResolution`. `readAwaitSignalCandidates`
+     remains on the trait (it serves `Step.peekSignal`, a plain durable
+     read rather than a wait) and now returns `Vector[WaitCandidate]` with
+     `leafIdx = 0`; `invalidateTimer`, the update-await operations, and the
+     step-retry operations are unchanged; the `AwaitRace*` and
+     `AwaitSignalCandidate` record types are deleted. Consequence: all three
+     await kinds (signal, timer, race) now evaluate through one protocol —
+     fire the site's due timer subscriptions in a separate committed
+     transaction (preserving the old global-append mutex width), then one
+     fenced transaction of registration + candidate read + `decide` +
+     atomic resolution — where previously only the race path had this
+     shape and the plain-await fast paths resolved from unfenced reads.
+     `decide` therefore runs while the instance row lock is held (as it
+     always did for races) and must be fast and pure; the scaladoc states
+     this. In `Step.scala`, the four await functions' hand-rolled
+     cached-row replay wrappers are deduplicated into one private
+     `replayCachedAwait` parameterized on their genuine policy differences
+     (timer's retire-and-suspend vs. delete-and-reevaluate; the
+     failure-message prefix). Benefit: one wait-site state machine instead
+     of three parallel orchestration algorithms; adding a wait source means
+     implementing registration and candidate reading for one `WaitInterest`
+     case, not a new registration-to-resolution pipeline.
+

@@ -749,6 +749,62 @@ object Step {
     }
   }
 
+  /** The shared cached-await replay for the four await kinds: a stored
+    * non-expired `succeeded` row replays via `decode`, an `ensureUnchanged`
+    * fingerprint conflict throws, an `invalidateOn` fingerprint change triggers
+    * the site's `onDrift` policy, and a row that exists but has expired triggers
+    * the site's `onExpired` policy (`evaluate` for most sites; `awaitTimer`
+    * retires and suspends). `now`, the raw `rt.lookupStep`, and the expiry
+    * filter run here in the same order the sites used to do them, so the raw
+    * lookup result is available for the `awaitTimer` expired-row branch.
+    * `failedAwaitKind` is the prefix used in the stored-failure
+    * `StepSerializationFailed` message: `awaitUpdate0` passes "AwaitUpdate"
+    * while the other three sites pass "Await", because each site's original
+    * message text is preserved byte-for-byte — the parameter exists so a future
+    * await kind cannot silently change an existing message.
+    */
+  private def replayCachedAwait[A](
+      stepKey: String,
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateOn: Seq[StepInput[?]],
+      failedAwaitKind: String
+  )(using ctx: WorkflowContext)(
+      decode: String => A,
+      onDrift: () => A,
+      onExpired: () => A,
+      evaluate: () => A
+  ): A = {
+    val rt: ctx.runtime.type = ctx.runtime
+    val run = ctx.currentExecution
+    val stepId = StepId(stepKey, ctx.currentScope)
+    val now = rt.clock.instant()
+    val rawExisting = rt.lookupStep(run, stepId, 0L)
+    val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
+
+    existing match {
+      case None =>
+        if (rawExisting.exists(_.expiresAt.exists(!_.isAfter(now)))) onExpired()
+        else evaluate()
+      case Some(row) =>
+        val stored = parseFingerprints(row.inputFingerprints)
+        for (input <- ensureUnchanged) {
+          if (stored.get(input.name) != Some(fingerprintOf(input)))
+            throw new StepInputConflictException(
+              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
+            )
+        }
+        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
+        if (shouldReevaluate) onDrift()
+        else
+          row.stateKind match {
+            case "succeeded" => decode(row.statePayload)
+            case "failed" =>
+              throw new StepSerializationFailed(s"$failedAwaitKind '$stepKey' stored a failure without a failed await")
+            case _ => evaluate()
+          }
+    }
+  }
+
   /** The runtime-computed step machinery for a [[Awaitable.SignalEvent]].
     */
   private def awaitSignal[A: Cacheable](
@@ -777,7 +833,7 @@ object Step {
         case _: Throwable => throw new StepSerializationFailed(s"Await '$stepKey' result could not be decoded")
       }
 
-    def accept(c: AwaitSignalCandidate): Boolean = {
+    def accept(c: WaitCandidate): Boolean = {
       val withinLookBack = lookBack match {
         case d: FiniteDuration =>
           !c.createdAt.isBefore(now.minus(java.time.Duration.ofNanos(d.toNanos)))
@@ -786,53 +842,28 @@ object Step {
       withinLookBack && filter(decode(c.payload))
     }
 
-    def serializedOf(c: AwaitSignalCandidate): (Long, String) = (c.sequenceId, valueCodec.write(decode(c.payload)))
-
     def evaluate(): A = {
       rt.throwIfCancelled(run, ctx.uncancellableDepth)
-      val candidates = rt.readAwaitSignalCandidates(run, signal.key)
-      candidates.find(accept) match {
-        case Some(winning) =>
-          val serialized = valueCodec.write(decode(winning.payload))
-          rt.resolveAwaitSignal(
-            run, stepId, 0L, "Await", fingerprints, signal.key, winning.sequenceId, serialized, expiresAt
-          )
-          decode(serialized)
-        case None =>
-          rt.suspendAwaitSignal(run, stepId, 0L, "Await", fingerprints, signal.key, expiresAt) { recheck =>
-            recheck.find(accept).map(serializedOf)
-          } match {
-            case Some(serialized) => decode(serialized)
-            case None             => throw new WorkflowSuspendedException
-          }
+      val site = WaitSite(stepId, 0L, "Await", fingerprints, expiresAt)
+      rt.evaluateWait(run, site, Vector(WaitInterest.Signal(0, signal.key))) { candidates =>
+        candidates.find(accept).map(c =>
+          WaitResolution(valueCodec.write(decode(c.payload)), Some(signal.key, c.sequenceId))
+        )
+      } match {
+        case Some(payload) => decode(payload)
+        case None          => throw new WorkflowSuspendedException
       }
     }
 
-    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
-
-    existing match {
-      case None => evaluate()
-      case Some(row) =>
-        val stored = parseFingerprints(row.inputFingerprints)
-        for (input <- ensureUnchanged) {
-          if (stored.get(input.name) != Some(fingerprintOf(input)))
-            throw new StepInputConflictException(
-              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
-            )
-        }
-        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
-        if (shouldReevaluate) {
-          rt.deleteStep(run, stepId, 0L)
-          evaluate()
-        } else {
-          row.stateKind match {
-            case "succeeded" => decode(row.statePayload)
-            case "failed" =>
-              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
-            case _ => evaluate()
-          }
-        }
-    }
+    replayCachedAwait[A](stepKey, ensureUnchanged, invalidateOn, "Await")(
+      decode,
+      () => {
+        rt.deleteStep(run, stepId, 0L)
+        evaluate()
+      },
+      evaluate,
+      evaluate
+    )
   }
 
   /** The runtime-computed step machinery for an [[Update]] await.
@@ -847,7 +878,6 @@ object Step {
     val stepId = StepId(stepKey, ctx.currentScope)
     val outCodec = summon[Cacheable[O]]
     val fingerprints = encodeFingerprints(Seq.empty)
-    val now = rt.clock.instant()
     val expiresAt = None
 
     def decodeInput(encoded: String): I =
@@ -900,18 +930,12 @@ object Step {
       }
     }
 
-    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
-
-    existing match {
-      case None => evaluate()
-      case Some(row) =>
-        row.stateKind match {
-          case "succeeded" => decodeOutput(row.statePayload)
-          case "failed" =>
-            throw new StepSerializationFailed(s"AwaitUpdate '$stepKey' stored a failure without a failed await")
-          case _ => evaluate()
-        }
-    }
+    replayCachedAwait[O](stepKey, Seq.empty, Seq.empty, "AwaitUpdate")(
+      decodeOutput,
+      evaluate,
+      evaluate,
+      evaluate
+    )
   }
 
   /** The runtime-computed step machinery for a [[Awaitable.Timer]].
@@ -935,12 +959,12 @@ object Step {
 
     def evaluate(): Unit = {
       rt.throwIfCancelled(run, ctx.uncancellableDepth)
-      rt.fireDueTimers(run, stepId, 0L)
-      if (rt.readAwaitTimerCandidates(run, stepId, 0L).nonEmpty) {
-        rt.resolveAwaitTimer(run, stepId, 0L, "Await", fingerprints, summon[Cacheable[Unit]].write(()), expiresAt)
-      } else {
-        rt.suspendAwaitTimer(run, stepId, 0L, "Await", fingerprints, deadline, expiresAt)
-        throw new WorkflowSuspendedException
+      val site = WaitSite(stepId, 0L, "Await", fingerprints, expiresAt)
+      rt.evaluateWait(run, site, Vector(WaitInterest.Timer(0, deadline))) { candidates =>
+        candidates.headOption.map(_ => WaitResolution(summon[Cacheable[Unit]].write(()), None))
+      } match {
+        case Some(_) => ()
+        case None    => throw new WorkflowSuspendedException
       }
     }
 
@@ -949,33 +973,12 @@ object Step {
       throw new WorkflowSuspendedException
     }
 
-    val rawExisting = rt.lookupStep(run, stepId, 0L)
-    val existing = rawExisting.filterNot(_.expiresAt.exists(!_.isAfter(now)))
-
-    existing match {
-      case None =>
-        if (rawExisting.exists(_.expiresAt.exists(!_.isAfter(now)))) retireAndSuspend()
-        else evaluate()
-      case Some(row) =>
-        val stored = parseFingerprints(row.inputFingerprints)
-        for (input <- ensureUnchanged) {
-          if (stored.get(input.name) != Some(fingerprintOf(input)))
-            throw new StepInputConflictException(
-              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
-            )
-        }
-        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
-        if (shouldReevaluate) {
-          retireAndSuspend()
-        } else {
-          row.stateKind match {
-            case "succeeded" => ()
-            case "failed" =>
-              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
-            case _ => evaluate()
-          }
-        }
-    }
+    replayCachedAwait[Unit](stepKey, ensureUnchanged, invalidateOn, "Await")(
+      _ => (),
+      retireAndSuspend,
+      retireAndSuspend,
+      evaluate
+    )
   }
 
   /** The shared drift-aware machinery for `awaitRace` and for a plain completion
@@ -1003,7 +1006,7 @@ object Step {
       case _                 => None
     }
 
-    val leaves: Vector[(AwaitRaceLeaf, RaceLeafPicker[A])] =
+    val leaves: Vector[(WaitInterest, RaceLeafPicker[A])] =
       awaits.zipWithIndex.map { case (a, idx) => buildRaceLeaf(a, idx, valueCodec, now) }.toVector
 
     def decode(payload: String): A =
@@ -1014,40 +1017,22 @@ object Step {
 
     def evaluate(): A = {
       rt.throwIfCancelled(run, ctx.uncancellableDepth)
-      rt.fireDueTimerLeaves(run, stepId, 0L)
-      val decided: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] =
-        pickRaceWinner(leaves)
-      rt.evaluateAwaitRace(run, stepId, 0L, "AwaitRace", fingerprints, leaves.map(_._1), expiresAt)(decided) match {
+      val site = WaitSite(stepId, 0L, "AwaitRace", fingerprints, expiresAt)
+      rt.evaluateWait(run, site, leaves.map(_._1))(pickRaceWinner(leaves)) match {
         case Some(payload) => decode(payload)
         case None          => throw new WorkflowSuspendedException
       }
     }
 
-    val existing = rt.lookupStep(run, stepId, 0L).filterNot(_.expiresAt.exists(!_.isAfter(now)))
-
-    existing match {
-      case None => evaluate()
-      case Some(row) =>
-        val stored = parseFingerprints(row.inputFingerprints)
-        for (input <- ensureUnchanged) {
-          if (stored.get(input.name) != Some(fingerprintOf(input)))
-            throw new StepInputConflictException(
-              s"Await '$stepKey' input '${input.name}' changed between runs and is pinned with ensureUnchanged; refusing to re-evaluate"
-            )
-        }
-        val shouldReevaluate = invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
-        if (shouldReevaluate) {
-          rt.deleteStep(run, stepId, 0L)
-          evaluate()
-        } else {
-          row.stateKind match {
-            case "succeeded" => decode(row.statePayload)
-            case "failed" =>
-              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
-            case _ => evaluate()
-          }
-        }
-    }
+    replayCachedAwait[A](stepKey, ensureUnchanged, invalidateOn, "Await")(
+      decode,
+      () => {
+        rt.deleteStep(run, stepId, 0L)
+        evaluate()
+      },
+      evaluate,
+      evaluate
+    )
   }
 
   /** Flattens the `Mapped` wrappers of an awaitable down to its raw base
@@ -1067,13 +1052,13 @@ object Step {
     * the cursor key to advance.
     */
   private def pickRaceWinner[A](
-      pickers: Vector[(AwaitRaceLeaf, RaceLeafPicker[A])]
-  ): Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision] = { candidates =>
+      pickers: Vector[(WaitInterest, RaceLeafPicker[A])]
+  ): Vector[WaitCandidate] => Option[WaitResolution] = { candidates =>
     val picks = pickers.flatMap { case (_, picker) => picker.pick(candidates) }
     if (picks.isEmpty) None
     else {
       val (seq, payload, key) = picks.minBy(_._1)
-      Some(AwaitRaceDecision(seq, payload, key))
+      Some(WaitResolution(payload, key.map(k => (k, seq))))
     }
   }
 
@@ -1081,7 +1066,7 @@ object Step {
     * candidates it is handed.
     */
   private trait RaceLeafPicker[A] {
-    def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])]
+    def pick(candidates: Vector[WaitCandidate]): Option[(Long, String, Option[SignalKey])]
   }
 
   private def buildRaceLeaf[A](
@@ -1089,14 +1074,14 @@ object Step {
       leafIdx: Int,
       valueCodec: Cacheable[A],
       now: java.time.Instant
-  ): (AwaitRaceLeaf, RaceLeafPicker[A]) = {
+  ): (WaitInterest, RaceLeafPicker[A]) = {
     val (base, toA) = flattenAwaitable(a)
     base match {
       case Awaitable.SignalEvent(signal, filter, lookBack) =>
-        val leaf = AwaitRaceSignalLeaf(leafIdx, signal.key)
+        val leaf = WaitInterest.Signal(leafIdx, signal.key)
         val signalCodec = signal.cacheable
         val picker = new RaceLeafPicker[A] {
-          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] = {
+          override def pick(candidates: Vector[WaitCandidate]): Option[(Long, String, Option[SignalKey])] = {
             val matching = candidates.filter(_.leafIdx == leafIdx).find { c =>
               val withinLookBack = lookBack match {
                 case d: FiniteDuration =>
@@ -1118,9 +1103,9 @@ object Step {
         }
         (leaf, picker)
       case Awaitable.Timer(deadline) =>
-        val leaf = AwaitRaceTimerLeaf(leafIdx, deadline)
+        val leaf = WaitInterest.Timer(leafIdx, deadline)
         val picker = new RaceLeafPicker[A] {
-          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] =
+          override def pick(candidates: Vector[WaitCandidate]): Option[(Long, String, Option[SignalKey])] =
             candidates.find(_.leafIdx == leafIdx).map { c =>
               val serialized =
                 try valueCodec.write(toA(()))
@@ -1133,14 +1118,14 @@ object Step {
         }
         (leaf, picker)
       case wc @ Awaitable.WorkflowCompletion(_) =>
-        val leaf = AwaitRaceCompletionLeaf(
+        val leaf = WaitInterest.Completion(
           leafIdx,
           wc.workflowInstanceId.workflowId,
           wc.workflowInstanceId.workflowInstanceKey,
           wc.workflowInstanceId.scope
         )
         val picker = new RaceLeafPicker[A] {
-          override def pick(candidates: Vector[AwaitRaceCandidate]): Option[(Long, String, Option[SignalKey])] =
+          override def pick(candidates: Vector[WaitCandidate]): Option[(Long, String, Option[SignalKey])] =
             candidates.find(_.leafIdx == leafIdx).map { c =>
               val decoded =
                 try wc.completionCacheable.read(c.payload)

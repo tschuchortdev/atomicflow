@@ -152,43 +152,10 @@ trait WorkflowRuntime {
   /** Read the durable `Signal` events of `signalKey` that are visible to this
     * instance (after its shared exact-key cursor), in sequence order. A plain
     * read of durable facts; no lease or fence is involved and the cursor is not
-    * advanced.
+    * advanced. Serves `Step.peekSignal`, so `leafIdx` is always `0` on the
+    * returned candidates.
     */
-  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[AwaitSignalCandidate]
-
-  /** Resolve a signal await atomically, fenced: persist the `succeeded` step row
-    * (`stepKind`), advance the exact-key cursor to `winningSequenceId`, and
-    * delete the site's pending subscriptions, all in one transaction.
-    */
-  def resolveAwaitSignal(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      signalKey: SignalKey,
-      winningSequenceId: Long,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Suspend a signal await, fenced, in one transaction: register/refresh the
-    * pending subscription (idempotent), then re-read the visible events and
-    * apply `decide`. If `decide` selects a satisfying candidate, resolve the
-    * await (succeeded step row + cursor advance + subscription deletion) and
-    * return the persisted payload; otherwise return `None` (suspended, cursor
-    * unchanged). The re-read within the transaction closes the lost-wakeup gap
-    * between event gathering and the suspension commit.
-    */
-  def suspendAwaitSignal(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      signalKey: SignalKey,
-      expiresAt: Option[Instant]
-  )(decide: Vector[AwaitSignalCandidate] => Option[(Long, String)]): Option[String]
+  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[WaitCandidate]
 
   /** Read the unhandled `Update` records of `updateKey` addressed directly to
     * this instance, oldest first, without handling any of them. A plain durable
@@ -239,48 +206,6 @@ trait WorkflowRuntime {
       expiresAt: Option[Instant]
   )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision]
 
-  /** Fire this await-site's own due timer subscriptions, fenced, in one
-    * transaction: for each subscription with `deadline <= now`, row-lock it,
-    * re-check that no `TimerFired` event exists yet, and append one via the
-    * global append protocol. The subscription row survives firing; only
-    * resolution retires it.
-    */
-  def fireDueTimers(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
-
-  /** Read the durable `TimerFired` events matching this await-site's pending
-    * timer subscriptions (plain durable read; no lock or fence).
-    */
-  def readAwaitTimerCandidates(run: CurrentExecution, stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
-
-  /** Resolve a timer await atomically, fenced: persist the `succeeded` step row
-    * (`stepKind`) and delete the site's timer subscriptions in one transaction
-    * (timers have no cursor).
-    */
-  def resolveAwaitTimer(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Suspend a timer await, fenced: register the pending subscription
-    * idempotently. The subscription id is generated on first registration with
-    * the given absolute `deadline` and reused on replay (the row persists and
-    * its stored deadline is never recomputed).
-    */
-  def suspendAwaitTimer(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      deadline: Instant,
-      expiresAt: Option[Instant]
-  ): Unit
-
   /** Retire an invalidated/expired timer await atomically, fenced: discard the
     * site's `succeeded` step row, delete its old timer subscriptions, and
     * register a fresh subscription (new id, `deadline`) — all in one
@@ -290,31 +215,35 @@ trait WorkflowRuntime {
     */
   def invalidateTimer(run: CurrentExecution, stepId: StepId, stepVersion: Long, deadline: Instant): Unit
 
-  /** Fire this race-site's own due timer leaves, fenced, in one transaction: for
-    * each leaf's subscription with `deadline <= now`, row-lock it, re-check that
-    * no `TimerFired` event exists yet, and append one via the global append
-    * protocol. Appends happen in deadline order so the earliest due timer leaf
-    * receives the lowest sequence id and wins deterministically among timers.
+  /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
+    * own transaction, fire the site's own due timer subscriptions
+    * (`deadline <= now`), row-locked in deadline order
+    * (`ORDER BY deadline, subscription_id`), appending a `TimerFired` event per
+    * due subscription that has none yet under the global append protocol (no
+    * wakeup upsert); this commits immediately, so a fired event persists even if
+    * the evaluation that follows rolls back (a re-fire on a later evaluation is
+    * an idempotent event-exists no-op). Then, in a second transaction, register
+    * every interest idempotently (`ON CONFLICT DO NOTHING`), preserving an
+    * existing timer subscription's id and stored deadline; read all interests'
+    * candidates and apply `decide` to the candidates merged across interests and
+    * sorted by global `sequenceId`. `decide` runs inside this second transaction
+    * while the instance row lock is held, so it must be fast and pure (no I/O,
+    * no blocking). If `decide` returns `Some(resolution)`, persist the
+    * `succeeded` step row (`site.stepKind`), advance the winning signal key's
+    * cursor when the resolution requests it, and delete the site's rows in all
+    * three subscription tables — all atomically with the registration and
+    * candidate read (this registration + read + resolution atomicity is what
+    * makes the await lost-wakeup-free). If it returns `None`, the registrations
+    * commit and no cursor moves (the await durably suspends). Returns the
+    * persisted payload when resolved, `None` when suspended. A `decide`
+    * exception rolls the evaluation transaction back entirely; the earlier fire
+    * transaction already committed.
     */
-  def fireDueTimerLeaves(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
-
-  /** Evaluate a race atomically, fenced: register every leaf's subscription
-    * (idempotent), read all leaves' candidates, apply `decide` to select the
-    * earliest satisfying candidate by global `sequenceId`, and if satisfied
-    * persist the `succeeded` step row (`stepKind`), advance ONLY the winning
-    * signal key's cursor, and delete every leaf's subscription — all in one
-    * transaction. If no candidate is satisfiable, no cursor advances and the
-    * subscriptions remain. Returns the persisted payload when resolved.
-    */
-  def evaluateAwaitRace(
+  def evaluateWait(
       run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      leaves: Vector[AwaitRaceLeaf],
-      expiresAt: Option[Instant]
-  )(decide: Vector[AwaitRaceCandidate] => Option[AwaitRaceDecision]): Option[String]
+      site: WaitSite,
+      interests: Vector[WaitInterest]
+  )(decide: Vector[WaitCandidate] => Option[WaitResolution]): Option[String]
 
   /** Resolve a `Step.firstToRunWithoutSuspension` construct atomically, fenced:
     * persist the `succeeded` step row (`stepKind`) recording the winner, and in
