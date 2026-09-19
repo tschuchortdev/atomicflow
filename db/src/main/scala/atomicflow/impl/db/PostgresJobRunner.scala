@@ -150,7 +150,7 @@ final class PostgresJobRunner private[atomicflow] (
         LIMIT ${settings.wakeupBatchSize}
         FOR UPDATE OF w SKIP LOCKED
       """
-    runtime.runSync {
+    runtime.runTransaction {
       for {
         rows <- query.query[ClaimRow].to[Vector]
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
@@ -194,7 +194,7 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int, createdAt: java.time.Instant): Unit = {
     val now = runtime.clock.instant()
     val scheduled = now.plus(java.time.Duration.ofNanos(backoffDelay(attempts).toNanos))
-    runtime.runSync {
+    runtime.runTransaction {
       sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
             VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduled, ${attempts + 1})
             ON CONFLICT (workflow_id, key, scope) DO UPDATE
@@ -302,7 +302,7 @@ final class PostgresJobRunner private[atomicflow] (
     */
   private[atomicflow] def runTimerSweep(): Int = {
     val now = runtime.clock.instant()
-    val rows = runtime.runSync {
+    val rows = runtime.runTransaction {
       (fr"""
         SELECT s.subscription_id, s.workflow_id, s.key, s.scope
         FROM workflow_timer_subscriptions s
@@ -322,7 +322,7 @@ final class PostgresJobRunner private[atomicflow] (
     }
     var fired = 0
     rows.foreach { row =>
-      if (runtime.runSync(runtime.fireTimerSubscriptionIO(row.subscriptionId, row.workflowId, row.key, row.scope)))
+      if (runtime.runTransaction(runtime.fireTimerSubscriptionIO(row.subscriptionId, row.workflowId, row.key, row.scope)))
         fired += 1
     }
     if (fired > 0) log.debug(s"Timer sweep fired $fired due timers")
@@ -337,7 +337,7 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def runEscalationSweep(): Int = {
     val now = runtime.clock.instant()
     val cutoff = now.minus(java.time.Duration.ofNanos(settings.cancelTimeout.toNanos))
-    val rows = runtime.runSync {
+    val rows = runtime.runTransaction {
       sql"""SELECT workflow_id, key, scope FROM workflow_instances
             WHERE cancel_requested_at IS NOT NULL AND terminal_state IS NULL
               AND cancel_requested_at <= $cutoff
@@ -360,7 +360,7 @@ final class PostgresJobRunner private[atomicflow] (
     */
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
-    val rows = runtime.runSync {
+    val rows = runtime.runTransaction {
       sql"""SELECT workflow_id, key, scope FROM workflow_instances
             WHERE lease_owner IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
             LIMIT 128""".query[InstanceRow].to[Vector]
