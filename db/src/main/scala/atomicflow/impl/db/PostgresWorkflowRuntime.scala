@@ -2038,22 +2038,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Option[(String, Long)] =
     run.readRegionState(regionId, parentScopePath)
 
-  override def createRegion(
+  override def upsertRegion(
       run: CurrentExecution,
       regionId: String,
       parentScopePath: String,
+      restartCount: Long,
       serializedState: String
   ): Unit =
-    run.createRegion(regionId, parentScopePath, serializedState)
-
-  override def restartRegion(
-      run: CurrentExecution,
-      regionId: String,
-      parentScopePath: String,
-      currentRestartCount: Long,
-      serializedState: String
-  ): Unit =
-    run.restartRegion(regionId, parentScopePath, currentRestartCount, serializedState)
+    run.upsertRegion(regionId, parentScopePath, restartCount, serializedState)
 
   override def heartbeat(run: CurrentExecution): Unit = run.renewLease()
 
@@ -2691,16 +2683,24 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(parseRegionPayload))
       }
 
-    private[PostgresWorkflowRuntime] def createRegion(
+    private[PostgresWorkflowRuntime] def upsertRegion(
         regionId: String,
         parentScopePath: String,
+        restartCount: Long,
         serializedState: String
     ): Unit =
       fenced {
+        val base = regionInteriorBase(regionId, parentScopePath, restartCount - 1)
         val now = theClock.instant()
-        sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES ($workflowId, $key, $instanceScope, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(0L, serializedState)}, '', NULL, $now, $now)
-              ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO NOTHING""".update.run
+        for {
+          _ <- deleteRegionNestedStepsIO(base)
+          _ <- deleteRegionNestedSubscriptionsIO(base)
+          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, generation, base)
+          _ <- sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+                VALUES ($workflowId, $key, $instanceScope, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(restartCount, serializedState)}, '', NULL, $now, $now)
+                ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path)
+                DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
+        } yield ()
       }
 
     private def deleteRegionNestedStepsIO(base: String): ConnectionIO[Unit] = {
@@ -2738,27 +2738,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
       } yield ()
     }
-
-    private[PostgresWorkflowRuntime] def restartRegion(
-        regionId: String,
-        parentScopePath: String,
-        currentRestartCount: Long,
-        serializedState: String
-    ): Unit =
-      fenced {
-        val base = regionInteriorBase(regionId, parentScopePath, currentRestartCount)
-        val now = theClock.instant()
-        for {
-          _ <- deleteRegionNestedStepsIO(base)
-          _ <- deleteRegionNestedSubscriptionsIO(base)
-          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, generation, base)
-          _ <- sql"""UPDATE workflow_steps
-                     SET state_payload = ${regionPayload(currentRestartCount + 1, serializedState)}, updated_at = $now
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_id = $regionId AND step_scope_path = $parentScopePath
-                       AND step_kind = 'RestartableRegion'""".update.run
-        } yield ()
-      }
 
     /** Runs `write` inside one transaction, guarded by an exclusive lock on the
       * instance row and a fencing check; throws [[LeaseLostException]] if the

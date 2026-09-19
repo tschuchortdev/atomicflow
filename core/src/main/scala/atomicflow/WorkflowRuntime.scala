@@ -266,24 +266,22 @@ trait WorkflowRuntime {
     */
   def readRegionState(run: CurrentExecution, regionId: String, parentScopePath: String): Option[(String, Long)]
 
-  /** Persist a `Workflow.restartable`/`Workflow.loop` region's row on its first
-    * creation, with `serializedState` and `restartCount` 0, fenced. Only the
-    * first creation calls this; replays read the persisted row instead.
+  /** The single writer of a `Workflow.restartable`/`Workflow.loop` region's row:
+    * persist exactly `restartCount` and `serializedState`, creating the row if
+    * it does not exist (UPSERT, last writer wins). Before writing, discard the
+    * nested Step rows and subscriptions owned by generation `restartCount - 1`'s
+    * scope subtree (a construct-isolated prefix delete; a no-op when that
+    * generation left nothing behind, which is always the case at
+    * `restartCount == 0`) and close children created in that generation per
+    * their `ParentClosePolicy`. Signal cursors are preserved. Fenced. The caller
+    * invokes this only on first creation (`restartCount` 0, with the seed) or
+    * on a restart (with the next count); replays read the persisted row instead.
     */
-  def createRegion(run: CurrentExecution, regionId: String, parentScopePath: String, serializedState: String): Unit
-
-  /** The one-transaction restart transition of a region at `currentRestartCount`:
-    * discard the nested Step rows and subscriptions owned by the previous
-    * looping's scope subtree (a construct-isolated prefix delete), close children
-    * created in that looping per their `ParentClosePolicy`, and replace the
-    * region row's state with `serializedState` and its count with
-    * `currentRestartCount + 1`. Signal cursors are preserved. Fenced.
-    */
-  def restartRegion(
+  def upsertRegion(
       run: CurrentExecution,
       regionId: String,
       parentScopePath: String,
-      currentRestartCount: Long,
+      restartCount: Long,
       serializedState: String
   ): Unit
 
