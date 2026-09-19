@@ -331,7 +331,7 @@ object Workflow {
       case Some((state, _)) => cacheable.read(state)
       case None =>
         val seed = initialState
-        rt.createRegion(run, id, parentScope, cacheable.write(seed))
+        rt.upsertRegion(run, id, parentScope, 0L, cacheable.write(seed))
         seed
     }
 
@@ -351,7 +351,7 @@ object Workflow {
         done = true
       } catch {
         case e: RegionRestartException =>
-          rt.restartRegion(run, id, parentScope, count, e.serializedState)
+          rt.upsertRegion(run, id, parentScope, count + 1, e.serializedState)
           count += 1
           state = cacheable.read(e.serializedState)
         case e: RegionBreakException[R] =>
