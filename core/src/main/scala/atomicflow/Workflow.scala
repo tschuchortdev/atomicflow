@@ -222,7 +222,7 @@ object Workflow {
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
   def heartbeat()(using ctx: WorkflowContext): Unit =
-    ctx.runtime.renewLease(ctx.currentExecution)
+    ctx.runtime.heartbeat(ctx.currentExecution)
 
   /** The `Workflow.version` recorded when the instance was created. The current
     * body may branch on it internally to adapt to the definition version that

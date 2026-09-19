@@ -280,7 +280,7 @@ object Step {
       * `Started` row, run the body once, and persist its outcome.
       */
     def execute(): A = {
-      rt.renewLease(run)
+      rt.heartbeat(run)
       rt.throwIfCancelled(run, ctx.uncancellableDepth)
       rt.writeStepStarted(run, stepId, stepVersion, stepKind, fingerprints)
       try {
@@ -316,7 +316,7 @@ object Step {
       var result: Option[A] = None
       while (result.isEmpty) {
         try {
-          rt.renewLease(run)
+          rt.heartbeat(run)
           rt.throwIfCancelled(run, ctx.uncancellableDepth)
           val value = body
           val serialized =
@@ -358,7 +358,7 @@ object Step {
       * starts empty) then run the first attempt.
       */
     def executeWithRetry(): A = {
-      rt.renewLease(run)
+      rt.heartbeat(run)
       rt.writeStepStarted(run, stepId, stepVersion, stepKind, fingerprints)
       attempt(RetryBookkeeping(0, 0.seconds, None))
     }
