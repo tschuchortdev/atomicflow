@@ -2032,9 +2032,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     )
 
   override def readRegionState(
-      run: CurrentExecution,
-      regionId: String,
-      parentScopePath: String
+                                run: CurrentExecution,
+                                regionId: String,
+                                parentScopePath: String
   ): Option[(String, Long)] =
     run.readRegionState(regionId, parentScopePath)
 
@@ -2055,7 +2055,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Unit =
     run.restartRegion(regionId, parentScopePath, currentRestartCount, serializedState)
 
-  override def renewLease(run: CurrentExecution): Unit = run.renewLease()
+  override def heartbeat(run: CurrentExecution): Unit = run.renewLease()
 
   override def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit =
     run.throwIfCancelled(uncancellableDepth)

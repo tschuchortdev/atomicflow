@@ -42,12 +42,8 @@ trait WorkflowRuntime {
     */
   def durableRetryThreshold: FiniteDuration
 
-  /** Renews the execution lease of run `run`, extending `lease_expires_at` by
-    * the runtime's `leaseDuration`. A fenced write that does not bump the
-    * fencing token; throws [[atomicflow.LeaseLostException]] if the lease no
-    * longer belongs to this run.
-    */
-  def renewLease(run: CurrentExecution): Unit
+  /** Renews the lock on the workflow instance. */
+  def heartbeat(run: CurrentExecution): Unit
 
   /** A cancellation checkpoint for run `run`: re-reads the durable
     * `cancel_requested_at` flag and throws [[atomicflow.WorkflowCancelledException]]
