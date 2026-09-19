@@ -67,7 +67,7 @@ enum WorkflowRunResult[+A]:
 
 Workflow execution runs on two kinds of threads: **caller threads**, which execute the blocking `run`/`createAndRun` API, and **runner threads**, which belong to a started **JobRunner**. The JobRunner is a **driver loop** plus an **executor**: each cycle it invokes the runtime's sweep operations — fire due timers, escalate overlong cancellations, recover expired leases — on their cadences, and claims due wakeups to execute instances. The sweep operations are *definition-agnostic operations of the runtime* (like `sendSignal`), not sub-components of the runner: any runner services every workflow in the shared tables, including other applications'. The executor is the only part that knows workflow code — it resolves definitions from the runner's registry.
 
-**The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal, cancellation checkpoints — are public methods on the `WorkflowRuntime` trait, each taking an opaque per-run handle: the runtime's `CurrentExecution` type member, created at run start and carried by `WorkflowContext.currentExecution`. What remains deliberately absent from the public trait are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
+**The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal — are public methods on the `WorkflowRuntime` trait, each taking an opaque per-run handle: the runtime's `CurrentExecution` type member, created at run start and carried by `WorkflowContext.currentExecution`. (Cancellation delivery is not a runtime operation: Step's checkpoints read the durable flag through `isCancellationRequested` and throw.) What remains deliberately absent from the public trait are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
 
 Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.**
 
@@ -80,10 +80,12 @@ trait WorkflowRuntime {
   type CurrentExecution
 
   /** Durable engine operations — Step rows, awaits, timers, regions, lease
-    * renewal, cancellation checkpoints — each taking the run's handle.
-    * (Two representative members; the full surface is much larger.) */
+    * renewal — each taking the run's handle. `isCancellationRequested` is a
+    * plain durable read keyed by instance, consulted by Step's cancellation
+    * checkpoints. (Three representative members; the full surface is much
+    * larger.) */
   def renewLease(run: CurrentExecution): Unit
-  def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit
+  def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
   /** Creates and starts this process's job runner. Implemented per backend:
     * the runner executes the runner-internal operations (wakeup claiming,
