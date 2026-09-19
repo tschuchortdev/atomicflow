@@ -67,7 +67,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private def clearInterrupt(): Unit = Thread.interrupted()
 
-  private[atomicflow] def runSync[A](fa: ConnectionIO[A]): A = {
+  private[atomicflow] def runTransaction[A](fa: ConnectionIO[A]): A = {
     clearInterrupt()
     fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
   }
@@ -99,7 +99,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val instanceId = WorkflowInstanceId(workflowId, instanceKey)
     val serializedInput = cacheable.write(in)
 
-    val (inserted, existing) = runSync {
+    val (inserted, existing) = runTransaction {
       for {
         inserted <- sql"""
           INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation)
@@ -129,7 +129,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   )(using cacheable: Cacheable[In]): Boolean = {
     val workflowId = workflow.id
     val serializedInput = cacheable.write(in)
-    val deleted = runSync {
+    val deleted = runTransaction {
       for {
         deleted <- sql"""
           DELETE FROM workflow_instances
@@ -172,7 +172,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val newWorkflowId = workflow.id
     val newId = WorkflowInstanceId(newWorkflowId, newInstanceKey, "")
 
-    runSync {
+    runTransaction {
       for {
         sourceInput <- sql"""SELECT input FROM workflow_instances
                              WHERE workflow_id = $sourceWf AND key = $sourceKey AND scope = $sourceScope
@@ -219,7 +219,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = sourceInstanceId.workflowInstanceKey
     val scope = sourceInstanceId.scope
     val now = theClock.instant()
-    runSync {
+    runTransaction {
       for {
         terminal <- sql"""SELECT terminal_state FROM workflow_instances
                           WHERE workflow_id = $wf AND key = $key AND scope = $scope
@@ -416,7 +416,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
     val inheritSignalsStr = encodeSignalInheritance(inheritSignals)
 
-    val (inserted, existing) = runSync {
+    val (inserted, existing) = runTransaction {
       for {
         _ <- takeEventAppendLock
         maxSeq <- sql"SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events".query[Long].unique
@@ -462,7 +462,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
     val now = theClock.instant()
-    runSync {
+    runTransaction {
       for {
         row <- sql"""SELECT terminal_state, times_executed, lease_owner, lease_expires_at
                      FROM workflow_instances
@@ -731,7 +731,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val workflowId = instanceId.workflowId
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
-    val exists = runSync {
+    val exists = runTransaction {
       sql"""SELECT 1 FROM workflow_instances
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[Int].option
     }
@@ -760,7 +760,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       newSerializedInput: String
   ): Unit = {
     val now = theClock.instant()
-    val res = runSync {
+    val res = runTransaction {
       for {
         _ <- sql"""SELECT 1 FROM workflow_instances
                    WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
@@ -803,7 +803,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
     val payload = Framing.write("terminated")
-    runSync {
+    runTransaction {
       for {
         terminal <- sql"""SELECT terminal_state FROM workflow_instances
                           WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
@@ -882,7 +882,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
     val now = theClock.instant()
-    runSync {
+    runTransaction {
       for {
         updated <- sql"""UPDATE workflow_instances
                          SET lease_owner = NULL, lease_expires_at = NULL
@@ -939,7 +939,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
         clearInterrupt()
 
-        val row = runSync {
+        val row = runTransaction {
           sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation, generation
                 FROM workflow_instances
                 WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
@@ -968,7 +968,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
             try {
               val now = theClock.instant()
-              val bumped = runSync {
+              val bumped = runTransaction {
                 sql"""UPDATE workflow_instances
                       SET times_executed = times_executed + 1, last_run_at = $now
                       WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
@@ -983,7 +983,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               // owner+token guarantees we observe the current row (or detect we lost
               // the lease). The generation, input, version, and terminal state below
               // all come from this fresh read.
-              val freshRow = runSync {
+              val freshRow = runTransaction {
                 sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation, generation
                       FROM workflow_instances
                       WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
@@ -1112,7 +1112,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val deadlineNanos = System.nanoTime() + leaseAcquireTimeout.toNanos
     var acquired: Option[Long] = None
     while (acquired.isEmpty && System.nanoTime() < deadlineNanos) {
-      acquired = runSync(tryAcquireOnceIO(workflowId, key, scope, worker, leaseDuration))
+      acquired = runTransaction(tryAcquireOnceIO(workflowId, key, scope, worker, leaseDuration))
       if (acquired.isEmpty && System.nanoTime() < deadlineNanos) Thread.sleep(pollIntervalMillis)
     }
     acquired
@@ -1128,7 +1128,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       worker: String,
       token: Long
   ): Unit =
-    runSync {
+    runTransaction {
       sql"""UPDATE workflow_instances
             SET lease_owner = NULL, lease_expires_at = NULL
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
@@ -1167,7 +1167,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       state: String,
       payload: String
   ): Int =
-    runSync {
+    runTransaction {
       for {
         updated <- sql"""UPDATE workflow_instances
               SET terminal_state = $state, terminal_outcome = $payload, is_accepting_signals = false
@@ -1196,7 +1196,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       worker: String,
       token: Long
   ): Unit =
-    runSync {
+    runTransaction {
       sql"""UPDATE workflow_instances SET is_accepting_signals = false
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
               AND lease_owner = $worker AND fencing_token = $token""".update.run
@@ -1212,7 +1212,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       key: WorkflowInstanceKey,
       scope: String
   ): Map[SignalKey, Seq[String]] =
-    runSync {
+    runTransaction {
       sql"""SELECT event_key, payload FROM workflow_events
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
               AND event_kind = 'Signal'
@@ -1336,7 +1336,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val scope = workflowInstanceId.scope
     val cacheable = summon[Cacheable[A]]
     val payload = cacheable.write(value)
-    runSync {
+    runTransaction {
       for {
         accepting <- sql"""SELECT is_accepting_signals FROM workflow_instances
               WHERE workflow_id = $workflowId AND key = $instanceKey AND scope = $scope
@@ -1522,14 +1522,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
       val now = theClock.instant()
       val createdAt =
         if (idem.isEmpty)
-          runSync {
+          runTransaction {
             sql"""INSERT INTO workflow_updates
                     (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
                   VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)
                   RETURNING created_at""".query[java.time.Instant].unique
           }
         else
-          runSync {
+          runTransaction {
             sql"""INSERT INTO workflow_updates
                     (workflow_id, key, scope, update_key, encoded_input, idempotency_key, created_at, updated_at)
                   VALUES ($wf, $k, $s, $updateKey, $encodedInput, $idem, $now, $now)
@@ -1542,7 +1542,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
     def isLeaseHeld: Boolean =
-      runSync {
+      runTransaction {
         sql"""SELECT lease_owner IS NOT NULL AND lease_expires_at > ${theClock.instant()}
               FROM workflow_instances
               WHERE workflow_id = $wf AND key = $k AND scope = $s""".query[Boolean].unique
@@ -1558,7 +1558,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
     def upsertWakeupForUpdate(): Unit =
-      runSync {
+      runTransaction {
         for {
           has <- sql"""SELECT 1 FROM workflow_update_subscriptions
                        WHERE workflow_id = $wf AND key = $k AND scope = $s AND update_key = $updateKey
@@ -1568,7 +1568,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       }
 
     def readResult(createdAt: java.time.Instant, idem: String): Option[R] =
-      runSync {
+      runTransaction {
         sql"""SELECT result FROM workflow_updates
               WHERE workflow_id = $wf AND key = $k AND scope = $s
                 AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt""".query[
@@ -1577,7 +1577,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       }.flatten.map(respCacheable.read)
 
     def deleteUnhandled(createdAt: java.time.Instant, idem: String): Unit =
-      runSync {
+      runTransaction {
         sql"""DELETE FROM workflow_updates
               WHERE workflow_id = $wf AND key = $k AND scope = $s
                 AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt
@@ -1590,7 +1590,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       * only ever touches this send's own row.
       */
     def deleteRecord(createdAt: java.time.Instant, idem: String): Unit =
-      runSync {
+      runTransaction {
         sql"""DELETE FROM workflow_updates
               WHERE workflow_id = $wf AND key = $k AND scope = $s
                 AND update_key = $updateKey AND idempotency_key = $idem AND created_at = $createdAt""".update.run
@@ -1599,7 +1599,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     var done = false
     var result: UpdateSendResult[R] = null.asInstanceOf[UpdateSendResult[R]]
     while (!done) {
-      val outcome = runSync(readOutcome(idempotencyKey))
+      val outcome = runTransaction(readOutcome(idempotencyKey))
       outcome match {
         case SendOutcome.InstanceCompleted =>
           result = UpdateSendResult.InstanceAlreadyCompleted
@@ -1647,7 +1647,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       completionCodec: Cacheable[WorkflowCompletionResult[Out]],
       instanceId: WorkflowInstanceId
   ): WorkflowRunResult[Out] = {
-    val (state, outcome) = runSync {
+    val (state, outcome) = runTransaction {
       sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[(String, Option[String])].unique
     }
@@ -1717,7 +1717,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepScopePath: String,
       stepVersion: Long
   ): Option[StoredStep] =
-    runSync {
+    runTransaction {
       sql"""SELECT state_kind, state_payload, input_fingerprints, expires_at FROM workflow_steps
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope
               AND step_id = $stepId AND step_scope_path = $stepScopePath AND step_version = $stepVersion""".query[
@@ -1787,7 +1787,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: String = ""
   ): Vector[WorkflowInstance.Info] = {
     val pattern = likeEscaped(keyPrefix) + "%"
-    runSync {
+    runTransaction {
       (InfoSelect ++ fr"WHERE workflow_id = $workflowId AND scope = $scope AND key LIKE $pattern ESCAPE '\' ORDER BY key")
         .query[InfoRow]
         .to[Vector]
@@ -1801,7 +1801,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Vector[WorkflowInstance.Info] = {
     val waitingCond = if (includeWaiting) Fragment.empty else fr"AND times_executed = 0"
     val limitFrag = if (limit > 0) fr"LIMIT $limit" else Fragment.empty
-    runSync {
+    runTransaction {
       (InfoSelect ++ fr"WHERE workflow_id = $workflowId AND scope = '' AND terminal_state IS NULL " ++
         waitingCond ++ fr"ORDER BY key " ++ limitFrag).query[InfoRow].to[Vector]
     }.map(toInfo(workflowId, "", _))
@@ -1813,7 +1813,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: String = ""
   ): Long = {
     val pattern = likeEscaped(keyPrefix) + "%"
-    runSync {
+    runTransaction {
       for {
         _ <- sql"""DELETE FROM workflow_events
                    WHERE workflow_id = $workflowId AND scope = $scope AND key LIKE $pattern ESCAPE '\'""".update.run
@@ -1837,7 +1837,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
 
     def readTerminalOrThrowMissing(): Option[(String, Option[String])] = {
-      val row = runSync {
+      val row = runTransaction {
         sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
               WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
             (Option[String], Option[String])
@@ -1873,7 +1873,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       instance: WorkflowInstance[In, Out]
   ): WorkflowInstance.Info = {
     val instanceId = instance.id
-    val row = runSync {
+    val row = runTransaction {
       (InfoSelect ++ fr"WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}")
         .query[InfoRow]
         .option
@@ -1885,7 +1885,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   override def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info] = {
-    val rows = runSync {
+    val rows = runTransaction {
       sql"""SELECT workflow_id, scope, key, workflow_version_at_creation, generation,
                    parent_workflow_id, parent_instance_key, parent_scope, created_at, last_run_at, times_executed, terminal_state
             FROM workflow_instances
@@ -1897,11 +1897,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     rows.map { case (wf, scope, r) => toInfo(wf, scope, r) }
   }
 
-  // ---- Engine operations of the public WorkflowRuntime SPI. Each forwards to
-  // ---- this run's PostgresCurrentExecution handle, which owns the body.
+  // ---- Engine operations of the public WorkflowRuntime SPI. Each takes this
+  // ---- run's PostgresCurrentExecution handle carrying the run's fencing identity.
 
   override def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep] =
-    run.lookupStep(stepId, stepVersion)
+    readStepRow(run.workflowId, run.key, run.instanceScope, stepId.key, stepId.scope, stepVersion)
 
   override def writeStepStarted(
       run: CurrentExecution,
@@ -1910,7 +1910,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepKind: String,
       inputFingerprints: String
   ): Unit =
-    run.writeStepStarted(stepId, stepVersion, stepKind, inputFingerprints)
+    fenced(run) {
+      writeStepStartedIO(run, stepId, stepVersion, stepKind, inputFingerprints, "", None)
+    }
 
   override def writeStepSucceeded(
       run: CurrentExecution,
@@ -1921,7 +1923,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       payload: String,
       expiresAt: Option[Instant]
   ): Unit =
-    run.writeStepSucceeded(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+    fenced(run) {
+      writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+    }
 
   override def writeStepFailed(
       run: CurrentExecution,
@@ -1932,10 +1936,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
       payload: String,
       expiresAt: Option[Instant]
   ): Unit =
-    run.writeStepFailed(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+    fenced(run) {
+      writeStepFailedIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+    }
 
   override def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
-    run.deleteStep(stepId, stepVersion)
+    fenced(run) {
+      sql"""DELETE FROM workflow_steps
+            WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+    }
 
   override def suspendStepRetry(
       run: CurrentExecution,
@@ -1947,17 +1956,60 @@ class PostgresWorkflowRuntime private[atomicflow] (
       deadline: Instant,
       expiresAt: Option[Instant]
   ): Unit =
-    run.suspendStepRetry(stepId, stepVersion, stepKind, inputFingerprints, retryPayload, deadline, expiresAt)
+    fenced(run) {
+      for {
+        _ <- writeStepStartedIO(run, stepId, stepVersion, stepKind, inputFingerprints, retryPayload, expiresAt)
+        _ <- insertRetrySubscriptionIO(run, stepId, stepVersion, deadline)
+      } yield ()
+    }
 
   override def fireDueStepRetries(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
-    run.fireDueStepRetries(stepId, stepVersion)
+    fenced(run) {
+      val now = theClock.instant()
+      for {
+        due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                     WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                       AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx
+                       AND deadline <= $now
+                     ORDER BY deadline, subscription_id
+                     FOR UPDATE""".query[java.util.UUID].to[Vector]
+        _ <- due.traverse_ { subId =>
+          for {
+            exists <- sql"""SELECT 1 FROM workflow_events
+                            WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                              AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
+            _ <- if (exists.isEmpty) appendEvent(run.workflowId, run.key, run.instanceScope, "TimerFired", subId.toString, "")
+                 else ().pure[ConnectionIO]
+          } yield ()
+        }
+      } yield ()
+    }
 
   override def readStepRetryCandidates(
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long
   ): Vector[AwaitTimerCandidate] =
-    run.readStepRetryCandidates(stepId, stepVersion)
+    runTransaction {
+      for {
+        subIds <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                        WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                          AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx""".query[
+            java.util.UUID
+          ].to[List]
+        events <- if (subIds.isEmpty) Vector.empty[AwaitTimerCandidate].pure[ConnectionIO]
+                  else {
+                    val idStrings = subIds.map(_.toString)
+                    fr"""SELECT sequence_id, event_key, created_at FROM workflow_events
+                          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                            AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
+                          ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+                      .map(_.map { case (seq, ek, createdAt) =>
+                        AwaitTimerCandidate(seq, java.util.UUID.fromString(ek), createdAt)
+                      })
+                  }
+      } yield events
+    }
 
   override def resolveStepRetry(
       run: CurrentExecution,
@@ -1969,16 +2021,47 @@ class PostgresWorkflowRuntime private[atomicflow] (
       payload: String,
       expiresAt: Option[Instant]
   ): Unit =
-    run.resolveStepRetry(stepId, stepVersion, stepKind, stateKind, inputFingerprints, payload, expiresAt)
+    fenced(run) {
+      for {
+        _ <- if (stateKind == "succeeded")
+          writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+        else
+          writeStepFailedIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
+      } yield ()
+    }
 
   override def deleteStepRetry(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
-    run.deleteStepRetry(stepId, stepVersion)
+    fenced(run) {
+      for {
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
+      } yield ()
+    }
 
   override def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[WaitCandidate] =
-    run.readAwaitSignalCandidates(signalKey)
+    runTransaction {
+      for {
+        cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                        WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope} AND signal_key = $signalKey""".query[Long].unique
+        direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                        WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                          AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
+                        ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+        inherited <- readInheritedCandidatesIO(run, signalKey, cursor)
+      } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
+        WaitCandidate(0, seq, payload, createdAt)
+      }
+    }
 
   override def readAwaitUpdateCandidates(run: CurrentExecution, updateKey: String): Vector[UpdateCandidate] =
-    run.readAwaitUpdateCandidates(updateKey)
+    runTransaction {
+      sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
+            WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+              AND update_key = $updateKey AND handled_at IS NULL
+            ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
+    }.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) }
 
   override def resolveAwaitUpdate(
       run: CurrentExecution,
@@ -1992,9 +2075,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
       encodedOutput: String,
       expiresAt: Option[Instant]
   ): Boolean =
-    run.resolveAwaitUpdate(
-      stepId, stepVersion, stepKind, inputFingerprints, updateKey, candidate, encodedResponse, encodedOutput, expiresAt
-    )
+    fenced(run) {
+      for {
+        updated <- handleUpdateRecordIO(run, updateKey, candidate, encodedResponse)
+        won = updated == 1
+        _ <- if (won) writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
+             else ().pure[ConnectionIO]
+        _ <- if (won) deleteUpdateSubscriptionsIO(run, stepId, stepVersion) else ().pure[ConnectionIO]
+      } yield won
+    }
 
   override def suspendAwaitUpdate(
       run: CurrentExecution,
@@ -2005,17 +2094,63 @@ class PostgresWorkflowRuntime private[atomicflow] (
       updateKey: String,
       expiresAt: Option[Instant]
   )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision] =
-    run.suspendAwaitUpdate(stepId, stepVersion, stepKind, inputFingerprints, updateKey, expiresAt)(decide)
+    fenced(run) {
+      for {
+        _ <- upsertUpdateSubscriptionIO(run, stepId, stepVersion, updateKey)
+        candidates <- readUpdateCandidatesIO(run, updateKey)
+        decision = decide(candidates)
+        resolved <- decision match {
+          case Some(d) =>
+            for {
+              updated <- handleUpdateRecordIO(run, updateKey, d.candidate, d.encodedResponse)
+              won = updated == 1
+              _ <- if (won) writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
+                   else ().pure[ConnectionIO]
+              _ <- if (won) deleteUpdateSubscriptionsIO(run, stepId, stepVersion) else ().pure[ConnectionIO]
+            } yield if (won) Some(d) else None
+          case None => Option.empty[AwaitUpdateDecision].pure[ConnectionIO]
+        }
+      } yield resolved
+    }
 
   override def invalidateTimer(run: CurrentExecution, stepId: StepId, stepVersion: Long, deadline: Instant): Unit =
-    run.invalidateTimer(stepId, stepVersion, deadline)
+    fenced(run) {
+      for {
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
+        _ <- sql"""INSERT INTO workflow_timer_subscriptions
+                    (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
+                  VALUES (gen_random_uuid(), ${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, 0, $deadline)
+                  ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run
+      } yield ()
+    }
 
   override def evaluateWait(
       run: CurrentExecution,
       site: WaitSite,
       interests: Vector[WaitInterest]
-  )(decide: Vector[WaitCandidate] => Option[WaitResolution]): Option[String] =
-    run.evaluateWait(site, interests)(decide)
+  )(decide: Vector[WaitCandidate] => Option[WaitResolution]): Option[String] = {
+    fenced(run)(fireDueTimerSubscriptionsIO(run, site.stepId, site.stepVersion))
+    fenced(run) {
+      for {
+        _ <- interests.traverse_(registerInterestIO(run, site, _))
+        candidates <- interests.traverse(readInterestCandidatesIO(run, site, _)).map(_.flatten)
+        resolution = decide(candidates.sortBy(_.sequenceId))
+        result <- resolution match {
+          case Some(r) =>
+            for {
+              _ <- writeStepSucceededIO(run, site.stepId, site.stepVersion, site.stepKind,
+                    site.inputFingerprints, r.payload, site.expiresAt)
+              _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorIO(run, k, seq) }
+              _ <- deleteSiteSubscriptionsIO(run, site.stepId, site.stepVersion)
+            } yield Some(r.payload)
+          case None => Option.empty[String].pure[ConnectionIO]
+        }
+      } yield result
+    }
+  }
 
   override def resolveFirstToRun(
       run: CurrentExecution,
@@ -2027,16 +2162,24 @@ class PostgresWorkflowRuntime private[atomicflow] (
       payload: String,
       expiresAt: Option[Instant]
   ): Unit =
-    run.resolveFirstToRun(
-      stepId, stepVersion, stepKind, inputFingerprints, loserScopePaths, payload, expiresAt
-    )
+    fenced(run) {
+      for {
+        _ <- writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+        _ <- deleteBranchSubscriptionsIO(run, loserScopePaths)
+      } yield ()
+    }
 
   override def readRegionState(
-                                run: CurrentExecution,
-                                regionId: String,
-                                parentScopePath: String
+      run: CurrentExecution,
+      regionId: String,
+      parentScopePath: String
   ): Option[(String, Long)] =
-    run.readRegionState(regionId, parentScopePath)
+    runTransaction {
+      sql"""SELECT state_payload FROM workflow_steps
+            WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+              AND step_id = $regionId AND step_scope_path = $parentScopePath
+              AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(parseRegionPayload))
+    }
 
   override def upsertRegion(
       run: CurrentExecution,
@@ -2045,15 +2188,27 @@ class PostgresWorkflowRuntime private[atomicflow] (
       restartCount: Long,
       serializedState: String
   ): Unit =
-    run.upsertRegion(regionId, parentScopePath, restartCount, serializedState)
+    fenced(run) {
+      val base = regionInteriorBase(regionId, parentScopePath, restartCount - 1)
+      val now = theClock.instant()
+      for {
+        _ <- deleteRegionNestedStepsIO(run, base)
+        _ <- deleteRegionNestedSubscriptionsIO(run, base)
+        _ <- applyRegionClosePoliciesIO(run.workflowId, run.key, run.instanceScope, run.generation, base)
+        _ <- sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+              VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(restartCount, serializedState)}, '', NULL, $now, $now)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path)
+              DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
+      } yield ()
+    }
 
-  override def heartbeat(run: CurrentExecution): Unit = run.renewLease()
+  override def heartbeat(run: CurrentExecution): Unit = renewLease(run)
 
   override def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean = {
     val workflowId = instanceId.workflowId
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
-    runSync {
+    runTransaction {
       sql"""SELECT cancel_requested_at FROM workflow_instances
             WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
           Option[java.time.Instant]
@@ -2061,709 +2216,436 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }.isDefined
   }
 
+  private def renewLease(run: CurrentExecution): Unit = {
+    val now = theClock.instant()
+    val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
+    val updated = runTransaction {
+      sql"""UPDATE workflow_instances
+            SET lease_expires_at = $expires
+            WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+              AND lease_owner = ${run.workerId} AND fencing_token = ${run.fencingToken}
+              AND terminal_state IS NULL""".update.run
+    }
+    if (updated != 1) throw LeaseLostException(run.instanceId)
+  }
+
+  /** Runs `write` inside one transaction, guarded by an exclusive lock on the
+    * instance row and a fencing check; throws [[LeaseLostException]] if the
+    * lease no longer belongs to this run, affecting no rows. Callers that do
+    * not need the result simply discard it.
+    */
+  private def fenced[A](run: CurrentExecution)(write: ConnectionIO[A]): A = {
+    val res: Option[A] = runTransaction {
+      for {
+        _ <- sql"""SELECT 1 FROM workflow_instances
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   FOR UPDATE""".query[Int].unique
+        fenceOk <- sql"""SELECT 1 FROM workflow_instances
+                         WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                           AND lease_owner = ${run.workerId} AND fencing_token = ${run.fencingToken}""".query[Int].option
+        r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]
+      } yield r
+    }
+    res match {
+      case Some(a) => a
+      case None    => throw LeaseLostException(run.instanceId)
+    }
+  }
+
+  private val RetryLeafIdx: Int = Int.MaxValue
+
+  private def writeStepStartedIO(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[java.time.Instant]
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+          VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'started', $payload, $inputFingerprints, $expiresAt, $now, $now)
+          ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
+          SET state_kind = 'started', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+      _ => ()
+    )
+  }
+
+  private def writeStepSucceededIO(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[java.time.Instant]
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+          VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
+          ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
+          SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+      _ => ()
+    )
+  }
+
+  private def writeStepFailedIO(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      stepKind: String,
+      inputFingerprints: String,
+      payload: String,
+      expiresAt: Option[java.time.Instant]
+  ): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
+          VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'failed', $payload, $inputFingerprints, $expiresAt, $now, $now)
+          ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
+          SET state_kind = 'failed', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+      _ => ()
+    )
+  }
+
+  private def insertRetrySubscriptionIO(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      deadline: java.time.Instant
+  ): ConnectionIO[Unit] =
+    for {
+      _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx""".update.run
+      _ <- sql"""INSERT INTO workflow_timer_subscriptions
+                  (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
+                VALUES (gen_random_uuid(), ${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetryLeafIdx, $deadline)
+                ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run
+    } yield ()
+
+  private def readUpdateCandidatesIO(run: CurrentExecution, updateKey: String): ConnectionIO[Vector[UpdateCandidate]] =
+    sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
+          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+            AND update_key = $updateKey AND handled_at IS NULL
+          ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
+      .map(_.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) })
+
+  private def handleUpdateRecordIO(
+      run: CurrentExecution,
+      updateKey: String,
+      candidate: UpdateCandidate,
+      encodedResponse: String
+  ): ConnectionIO[Int] = {
+    val now = theClock.instant()
+    sql"""UPDATE workflow_updates
+          SET result = $encodedResponse, handled_at = $now, updated_at = $now
+          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+            AND update_key = $updateKey AND idempotency_key = ${candidate.idempotencyKey}
+            AND created_at = ${candidate.createdAt} AND handled_at IS NULL""".update.run
+  }
+
+  private def upsertUpdateSubscriptionIO(
+      run: CurrentExecution,
+      stepId: StepId,
+      stepVersion: Long,
+      updateKey: String
+  ): ConnectionIO[Unit] =
+    sql"""INSERT INTO workflow_update_subscriptions
+            (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, update_key)
+          VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, 0, $updateKey)
+          ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, update_key, step_scope_path)
+            DO NOTHING""".update.run.map(_ => ())
+
+  private def deleteUpdateSubscriptionsIO(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+    sql"""DELETE FROM workflow_update_subscriptions
+          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+            AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(
+      _ => ()
+    )
+
+  private def fireDueTimerSubscriptionsIO(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] = {
+    val now = theClock.instant()
+    for {
+      due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion
+                     AND deadline <= $now
+                   ORDER BY deadline, subscription_id
+                   FOR UPDATE""".query[java.util.UUID].to[Vector]
+      _ <- due.traverse_ { subId =>
+        for {
+          exists <- sql"""SELECT 1 FROM workflow_events
+                          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                            AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
+          _ <- if (exists.isEmpty) appendEvent(run.workflowId, run.key, run.instanceScope, "TimerFired", subId.toString, "")
+               else ().pure[ConnectionIO]
+        } yield ()
+      }
+    } yield ()
+  }
+
+  private def registerInterestIO(run: CurrentExecution, site: WaitSite, interest: WaitInterest): ConnectionIO[Unit] =
+    interest match {
+      case WaitInterest.Signal(leafIdx, signalKey) =>
+        sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, signal_key)
+              VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $signalKey)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, signal_key) DO NOTHING""".update.run.map(_ => ())
+      case WaitInterest.Timer(leafIdx, deadline) =>
+        sql"""INSERT INTO workflow_timer_subscriptions
+                (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
+              VALUES (gen_random_uuid(), ${run.workflowId}, ${run.key}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $deadline)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run.map(_ => ())
+      case WaitInterest.Completion(leafIdx, completedWorkflowId, completedKey, completedScope) =>
+        sql"""INSERT INTO workflow_completion_subscriptions
+                (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope)
+              VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $completedWorkflowId, $completedKey, $completedScope)
+              ON CONFLICT (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope) DO NOTHING""".update.run.map(_ => ())
+    }
+
+  private def readInterestCandidatesIO(run: CurrentExecution, site: WaitSite, interest: WaitInterest): ConnectionIO[Vector[WaitCandidate]] =
+    interest match {
+      case WaitInterest.Signal(leafIdx, signalKey) =>
+        for {
+          cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
+                          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope} AND signal_key = $signalKey""".query[Long].unique
+          direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+                          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                            AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
+                          ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+          inherited <- readInheritedCandidatesIO(run, signalKey, cursor)
+        } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
+          WaitCandidate(leafIdx, seq, payload, createdAt)
+        }
+      case WaitInterest.Timer(leafIdx, _) =>
+        for {
+          subId <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
+                         WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                           AND step_id = ${site.stepId.key} AND step_scope_path = ${site.stepId.scope} AND step_version = ${site.stepVersion} AND leaf_idx = $leafIdx""".query[java.util.UUID].option
+          events <- subId match {
+            case None => Vector.empty[WaitCandidate].pure[ConnectionIO]
+            case Some(id) =>
+              sql"""SELECT sequence_id, created_at FROM workflow_events
+                    WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                      AND event_kind = 'TimerFired' AND event_key = ${id.toString}
+                    ORDER BY sequence_id""".query[(Long, java.time.Instant)].to[Vector]
+                .map(_.map { case (seq, createdAt) => WaitCandidate(leafIdx, seq, "", createdAt) })
+          }
+        } yield events
+      case WaitInterest.Completion(leafIdx, completedWorkflowId, completedKey, completedScope) =>
+        sql"""SELECT sequence_id, payload, created_at FROM workflow_events
+              WHERE workflow_id = $completedWorkflowId AND key = $completedKey AND scope = $completedScope
+                AND event_kind = 'WorkflowCompleted' AND event_key = ''
+              ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
+          .map(_.map { case (seq, payload, createdAt) => WaitCandidate(leafIdx, seq, payload, createdAt) })
+    }
+
+  private def deleteSiteSubscriptionsIO(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+    for {
+      _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+      _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+      _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+    } yield ()
+
+  private def deleteBranchSubscriptionsIO(run: CurrentExecution, loserScopePaths: Seq[String]): ConnectionIO[Unit] =
+    loserScopePaths.traverse_ { path =>
+      for {
+        _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                     AND step_scope_path = $path""".update.run
+        _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                     AND step_scope_path = $path""".update.run
+        _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                     AND step_scope_path = $path""".update.run
+      } yield ()
+    }
+
+  private def deleteTimerSubscriptionsIO(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+    sql"""DELETE FROM workflow_timer_subscriptions
+          WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+            AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(_ => ())
+
+  private def advanceCursorIO(run: CurrentExecution, signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
+    sql"""INSERT INTO signal_cursor (workflow_id, key, scope, signal_key, sequence_id)
+          VALUES (${run.workflowId}, ${run.key}, ${run.instanceScope}, $signalKey, $sequenceId)
+          ON CONFLICT (workflow_id, key, scope, signal_key) DO UPDATE
+          SET sequence_id = EXCLUDED.sequence_id""".update.run.map(_ => ())
+
+  /** Walks the active-parent chain from this instance upward and returns the
+    * (workflow_id, key, scope) identities of the ancestor sources whose
+    * directly addressed events this instance may inherit for `signalKey`. An
+    * ancestor is a source only when every parent-child edge on the path
+    * currently permits the key; the policy governing the edge from an instance
+    * to its own parent is that instance's stored inheritance selector. A
+    * cleared or missing parent pointer (detachment) terminates the walk, so
+    * abandoned children inherit nothing.
+    */
+  private def inheritedSourceScopesIO(
+      run: CurrentExecution,
+      signalKey: SignalKey
+  ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
+    def load(
+        w: WorkflowId,
+        kk: WorkflowInstanceKey,
+        ss: String
+    ): ConnectionIO[Option[(Option[String], Option[String], Option[String], Option[String])]] =
+      sql"""SELECT inherit_signals, parent_workflow_id, parent_instance_key, parent_scope
+            FROM workflow_instances WHERE workflow_id = $w AND key = $kk AND scope = $ss""".query[
+          (Option[String], Option[String], Option[String], Option[String])
+        ].option
+    def loop(
+        node: (Option[String], Option[String], Option[String], Option[String])
+    ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
+      val (policy, pwf, pkey, pscope) = node
+      (policy, pwf, pkey, pscope) match {
+        case (Some(p), Some(f), Some(k), Some(s)) if inheritancePermits(decodeSignalInheritance(Some(p)), signalKey) =>
+          for {
+            parent <- load(f, k, s)
+            rest <- parent match {
+              case Some(pn) => loop(pn)
+              case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+            }
+          } yield (f, k, s) +: rest
+        case _ => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+      }
+    }
+    for {
+      seed <- load(run.workflowId, run.key, run.instanceScope)
+      sources <- seed match {
+        case Some(sn) => loop(sn)
+        case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
+      }
+    } yield sources
+  }
+
+  /** The inherited `Signal` candidates for `signalKey` on this instance: events
+    * stored on any currently eligible ancestor, after the instance's own cursor
+    * and (unless `inheritPastEvents`) after the inherited-events start
+    * sequence id captured at creation. With `inheritPastEvents` the retained
+    * older events remain visible while they are ahead of the instance's cursor.
+    */
+  private def readInheritedCandidatesIO(
+      run: CurrentExecution,
+      signalKey: SignalKey,
+      cursor: Long
+  ): ConnectionIO[Vector[(Long, String, java.time.Instant)]] =
+    for {
+      cfg <- sql"""SELECT inherit_past_events, inherited_events_start_sequence_id FROM workflow_instances
+                   WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}""".query[(Boolean, Option[Long])].option
+      sources <- inheritedSourceScopesIO(run, signalKey)
+      events <- if (sources.isEmpty) Vector.empty[(Long, String, java.time.Instant)].pure[ConnectionIO]
+                else {
+                  val sourceCond = sources
+                    .map { case (w, kk, ss) => fr"(workflow_id = $w AND key = $kk AND scope = $ss)" }
+                    .reduce(_ ++ fr" OR " ++ _)
+                  val (pastEvents, startSeq) = cfg.getOrElse((false, None))
+                  val window =
+                    if (pastEvents) Fragment.empty
+                    else startSeq.map(seq => fr"AND sequence_id > $seq").getOrElse(Fragment.empty)
+                  (fr"""SELECT sequence_id, payload, created_at FROM workflow_events
+                        WHERE event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor AND (""" ++
+                    sourceCond ++ fr")" ++ window ++ fr" ORDER BY sequence_id").query[(Long, String, java.time.Instant)].to[Vector]
+                }
+    } yield events
+
+  /** The step-scope subtree prefix of a region's interior at a given
+    * `restartCount`: the parent scope path followed by `escaped(regionId)@count`.
+    * Nested Step/Await rows and children of the looping live under this prefix;
+    * the region's own row lives at the parent scope path (one level up).
+    */
+  private def regionInteriorBase(regionId: String, parentScopePath: String, count: Long): String = {
+    val marker = ScopePath.escapeScopeSegment(regionId) + "@" + count
+    if (parentScopePath.isEmpty) 
+      marker 
+    else 
+      parentScopePath + "/" + marker
+  }
+
+  /** The wrapped payload of a region row: its committed `restartCount` and the
+    * encoded user state, stored in the step row's `state_payload`.
+    */
+  private case class RegionPayload(count: Long, state: String) derives upickle.default.ReadWriter
+
+  private def regionPayload(count: Long, state: String): String =
+    upickle.default.write(RegionPayload(count, state))
+
+  private def parseRegionPayload(p: String): (String, Long) = {
+    val r = upickle.default.read[RegionPayload](p)
+    (r.state, r.count)
+  }
+
+  private def deleteRegionNestedStepsIO(run: CurrentExecution, base: String): ConnectionIO[Unit] = {
+    val escaped = likeEscaped(base)
+    for {
+      _ <- sql"""DELETE FROM workflow_steps
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path = $base""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_steps
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
+    } yield ()
+  }
+
+  private def deleteRegionNestedSubscriptionsIO(run: CurrentExecution, base: String): ConnectionIO[Unit] = {
+    val escaped = likeEscaped(base)
+    for {
+      _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path = $base""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_signal_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path = $base""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_timer_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path = $base""".update.run
+      
+      _ <- sql"""DELETE FROM workflow_completion_subscriptions
+                 WHERE workflow_id = ${run.workflowId} AND key = ${run.key} AND scope = ${run.instanceScope}
+                   AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
+    } yield ()
+  }
+
   /** The per-run execution handle of this runtime: the fencing identity of one
     * run (worker, fencing token, generation) plus the instance identity. The
     * runtime creates it when a run's lease is acquired; workflow code only
-    * passes it back to this runtime's engine operations. The engine operations
-    * themselves are visible only to the enclosing runtime.
+    * passes it back to this runtime's engine operations, which are direct
+    * members of the runtime taking the handle as their first parameter.
     */
   final class PostgresCurrentExecution(
       val workerId: String,
       val fencingToken: Long,
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      instanceScope: String,
+      val workflowId: WorkflowId,
+      val key: WorkflowInstanceKey,
+      val instanceScope: String,
       val generation: Long
   ) {
 
     private[PostgresWorkflowRuntime] val instanceId = WorkflowInstanceId(workflowId, key, instanceScope)
-
-    private[PostgresWorkflowRuntime] def renewLease(): Unit = {
-      val now = theClock.instant()
-      val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
-      val updated = runSync {
-        sql"""UPDATE workflow_instances
-              SET lease_expires_at = $expires
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                AND lease_owner = $workerId AND fencing_token = $fencingToken
-                AND terminal_state IS NULL""".update.run
-      }
-      if (updated != 1) throw LeaseLostException(instanceId)
-    }
-
-    private[PostgresWorkflowRuntime] def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =
-      readStepRow(workflowId, key, instanceScope, stepId.key, stepId.scope, stepVersion)
-
-    private[PostgresWorkflowRuntime] def writeStepStarted(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String
-    ): Unit =
-      fenced {
-        writeStepStartedIO(stepId, stepVersion, stepKind, inputFingerprints, "", None)
-      }
-
-    private def writeStepStartedIO(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): ConnectionIO[Unit] = {
-      val now = theClock.instant()
-      sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'started', $payload, $inputFingerprints, $expiresAt, $now, $now)
-            ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
-            SET state_kind = 'started', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-        _ => ()
-      )
-    }
-
-    private[PostgresWorkflowRuntime] def writeStepSucceeded(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
-        writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-      }
-
-    private def writeStepSucceededIO(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): ConnectionIO[Unit] = {
-      val now = theClock.instant()
-      sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
-            ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
-            SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-        _ => ()
-      )
-    }
-
-    private[PostgresWorkflowRuntime] def writeStepFailed(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
-        writeStepFailedIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-      }
-
-    private def writeStepFailedIO(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): ConnectionIO[Unit] = {
-      val now = theClock.instant()
-      sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'failed', $payload, $inputFingerprints, $expiresAt, $now, $now)
-            ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path) DO UPDATE
-            SET state_kind = 'failed', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-        _ => ()
-      )
-    }
-
-    private[PostgresWorkflowRuntime] def deleteStep(stepId: StepId, stepVersion: Long): Unit =
-      fenced {
-        sql"""DELETE FROM workflow_steps
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-      }
-
-    private val RetryLeafIdx: Int = Int.MaxValue
-
-    private def insertRetrySubscriptionIO(stepId: StepId, stepVersion: Long, deadline: java.time.Instant): ConnectionIO[Unit] =
-      for {
-        _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx""".update.run
-        _ <- sql"""INSERT INTO workflow_timer_subscriptions
-                    (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
-                  VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetryLeafIdx, $deadline)
-                  ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run
-      } yield ()
-
-    private[PostgresWorkflowRuntime] def suspendStepRetry(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        retryPayload: String,
-        deadline: java.time.Instant,
-        expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
-        for {
-          _ <- writeStepStartedIO(stepId, stepVersion, stepKind, inputFingerprints, retryPayload, expiresAt)
-          _ <- insertRetrySubscriptionIO(stepId, stepVersion, deadline)
-        } yield ()
-      }
-
-    private[PostgresWorkflowRuntime] def fireDueStepRetries(stepId: StepId, stepVersion: Long): Unit =
-      fenced {
-        val now = theClock.instant()
-        for {
-          due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
-                       WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                         AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx
-                         AND deadline <= $now
-                       ORDER BY deadline, subscription_id
-                       FOR UPDATE""".query[java.util.UUID].to[Vector]
-          _ <- due.traverse_ { subId =>
-            for {
-              exists <- sql"""SELECT 1 FROM workflow_events
-                              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                                AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-              _ <- if (exists.isEmpty) appendEvent(workflowId, key, instanceScope, "TimerFired", subId.toString, "")
-                   else ().pure[ConnectionIO]
-            } yield ()
-          }
-        } yield ()
-      }
-
-    private[PostgresWorkflowRuntime] def readStepRetryCandidates(
-        stepId: StepId,
-        stepVersion: Long
-    ): Vector[AwaitTimerCandidate] =
-      runSync {
-        for {
-          subIds <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
-                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                            AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND leaf_idx = $RetryLeafIdx""".query[
-              java.util.UUID
-            ].to[List]
-          events <- if (subIds.isEmpty) Vector.empty[AwaitTimerCandidate].pure[ConnectionIO]
-                    else {
-                      val idStrings = subIds.map(_.toString)
-                      fr"""SELECT sequence_id, event_key, created_at FROM workflow_events
-                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                              AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
-                            ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-                        .map(_.map { case (seq, ek, createdAt) =>
-                          AwaitTimerCandidate(seq, java.util.UUID.fromString(ek), createdAt)
-                        })
-                    }
-        } yield events
-      }
-
-    private[PostgresWorkflowRuntime] def resolveStepRetry(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        stateKind: String,
-        inputFingerprints: String,
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
-        for {
-          _ <- if (stateKind == "succeeded")
-            writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-          else
-            writeStepFailedIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-          _ <- deleteTimerSubscriptionsIO(stepId, stepVersion)
-        } yield ()
-      }
-
-    private[PostgresWorkflowRuntime] def deleteStepRetry(stepId: StepId, stepVersion: Long): Unit =
-      fenced {
-        for {
-          _ <- sql"""DELETE FROM workflow_steps
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-          _ <- deleteTimerSubscriptionsIO(stepId, stepVersion)
-        } yield ()
-      }
-
-    private[PostgresWorkflowRuntime] def readAwaitSignalCandidates(signalKey: SignalKey): Vector[WaitCandidate] =
-      runSync {
-        for {
-          cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
-                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
-          direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
-                          WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                            AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
-                          ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-          inherited <- readInheritedCandidatesIO(signalKey, cursor)
-        } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
-          WaitCandidate(0, seq, payload, createdAt)
-        }
-      }
-
-    private[PostgresWorkflowRuntime] def readAwaitUpdateCandidates(updateKey: String): Vector[UpdateCandidate] =
-      runSync {
-        sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                AND update_key = $updateKey AND handled_at IS NULL
-              ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
-      }.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) }
-
-    private[PostgresWorkflowRuntime] def resolveAwaitUpdate(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        updateKey: String,
-        candidate: UpdateCandidate,
-        encodedResponse: String,
-        encodedOutput: String,
-        expiresAt: Option[java.time.Instant]
-    ): Boolean =
-      fenced {
-        for {
-          updated <- handleUpdateRecordIO(updateKey, candidate, encodedResponse)
-          won = updated == 1
-          _ <- if (won) writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
-               else ().pure[ConnectionIO]
-          _ <- if (won) deleteUpdateSubscriptionsIO(stepId, stepVersion) else ().pure[ConnectionIO]
-        } yield won
-      }
-
-    private[PostgresWorkflowRuntime] def suspendAwaitUpdate(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        updateKey: String,
-        expiresAt: Option[java.time.Instant]
-    )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision] =
-      fenced {
-        for {
-          _ <- upsertUpdateSubscriptionIO(stepId, stepVersion, updateKey)
-          candidates <- readUpdateCandidatesIO(updateKey)
-          decision = decide(candidates)
-          resolved <- decision match {
-            case Some(d) =>
-              for {
-                updated <- handleUpdateRecordIO(updateKey, d.candidate, d.encodedResponse)
-                won = updated == 1
-                _ <- if (won) writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
-                     else ().pure[ConnectionIO]
-                _ <- if (won) deleteUpdateSubscriptionsIO(stepId, stepVersion) else ().pure[ConnectionIO]
-              } yield if (won) Some(d) else None
-            case None => Option.empty[AwaitUpdateDecision].pure[ConnectionIO]
-          }
-        } yield resolved
-      }
-
-    private def readUpdateCandidatesIO(updateKey: String): ConnectionIO[Vector[UpdateCandidate]] =
-      sql"""SELECT created_at, idempotency_key, encoded_input FROM workflow_updates
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-              AND update_key = $updateKey AND handled_at IS NULL
-            ORDER BY created_at""".query[(java.time.Instant, String, String)].to[Vector]
-        .map(_.map { case (createdAt, idem, encodedInput) => UpdateCandidate(createdAt, idem, encodedInput) })
-
-    private def handleUpdateRecordIO(
-        updateKey: String,
-        candidate: UpdateCandidate,
-        encodedResponse: String
-    ): ConnectionIO[Int] = {
-      val now = theClock.instant()
-      sql"""UPDATE workflow_updates
-            SET result = $encodedResponse, handled_at = $now, updated_at = $now
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-              AND update_key = $updateKey AND idempotency_key = ${candidate.idempotencyKey}
-              AND created_at = ${candidate.createdAt} AND handled_at IS NULL""".update.run
-    }
-
-    private def upsertUpdateSubscriptionIO(
-        stepId: StepId,
-        stepVersion: Long,
-        updateKey: String
-    ): ConnectionIO[Unit] =
-      sql"""INSERT INTO workflow_update_subscriptions
-              (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, update_key)
-            VALUES ($workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, 0, $updateKey)
-            ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, update_key, step_scope_path)
-              DO NOTHING""".update.run.map(_ => ())
-
-    private def deleteUpdateSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
-      sql"""DELETE FROM workflow_update_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-              AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(
-        _ => ()
-      )
-
-    private[PostgresWorkflowRuntime] def invalidateTimer(
-        stepId: StepId,
-        stepVersion: Long,
-        deadline: java.time.Instant
-    ): Unit =
-      fenced {
-        for {
-          _ <- sql"""DELETE FROM workflow_steps
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-          _ <- deleteTimerSubscriptionsIO(stepId, stepVersion)
-          _ <- sql"""INSERT INTO workflow_timer_subscriptions
-                      (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
-                    VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${stepId.key}, ${stepId.scope}, $stepVersion, 0, $deadline)
-                    ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run
-        } yield ()
-      }
-
-    private[PostgresWorkflowRuntime] def evaluateWait(
-        site: WaitSite,
-        interests: Vector[WaitInterest]
-    )(decide: Vector[WaitCandidate] => Option[WaitResolution]): Option[String] = {
-      fenced(fireDueTimerSubscriptionsIO(site.stepId, site.stepVersion))
-      fenced {
-        for {
-          _ <- interests.traverse_(registerInterestIO(site, _))
-          candidates <- interests.traverse(readInterestCandidatesIO(site, _)).map(_.flatten)
-          resolution = decide(candidates.sortBy(_.sequenceId))
-          result <- resolution match {
-            case Some(r) =>
-              for {
-                _ <- writeStepSucceededIO(site.stepId, site.stepVersion, site.stepKind,
-                      site.inputFingerprints, r.payload, site.expiresAt)
-                _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorIO(k, seq) }
-                _ <- deleteSiteSubscriptionsIO(site.stepId, site.stepVersion)
-              } yield Some(r.payload)
-            case None => Option.empty[String].pure[ConnectionIO]
-          }
-        } yield result
-      }
-    }
-
-    private def fireDueTimerSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] = {
-      val now = theClock.instant()
-      for {
-        due <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion
-                       AND deadline <= $now
-                     ORDER BY deadline, subscription_id
-                     FOR UPDATE""".query[java.util.UUID].to[Vector]
-        _ <- due.traverse_ { subId =>
-          for {
-            exists <- sql"""SELECT 1 FROM workflow_events
-                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                              AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-            _ <- if (exists.isEmpty) appendEvent(workflowId, key, instanceScope, "TimerFired", subId.toString, "")
-                 else ().pure[ConnectionIO]
-          } yield ()
-        }
-      } yield ()
-    }
-
-    private def registerInterestIO(site: WaitSite, interest: WaitInterest): ConnectionIO[Unit] =
-      interest match {
-        case WaitInterest.Signal(leafIdx, signalKey) =>
-          sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, signal_key)
-                VALUES ($workflowId, $key, $instanceScope, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $signalKey)
-                ON CONFLICT (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, signal_key) DO NOTHING""".update.run.map(_ => ())
-        case WaitInterest.Timer(leafIdx, deadline) =>
-          sql"""INSERT INTO workflow_timer_subscriptions
-                  (subscription_id, workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, deadline)
-                VALUES (gen_random_uuid(), $workflowId, $key, $instanceScope, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $deadline)
-                ON CONFLICT (workflow_id, key, scope, step_id, step_version, leaf_idx, step_scope_path) DO NOTHING""".update.run.map(_ => ())
-        case WaitInterest.Completion(leafIdx, completedWorkflowId, completedKey, completedScope) =>
-          sql"""INSERT INTO workflow_completion_subscriptions
-                  (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope)
-                VALUES ($workflowId, $key, $instanceScope, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $leafIdx, $completedWorkflowId, $completedKey, $completedScope)
-                ON CONFLICT (workflow_id, key, scope, step_id, step_scope_path, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope) DO NOTHING""".update.run.map(_ => ())
-      }
-
-    private def readInterestCandidatesIO(site: WaitSite, interest: WaitInterest): ConnectionIO[Vector[WaitCandidate]] =
-      interest match {
-        case WaitInterest.Signal(leafIdx, signalKey) =>
-          for {
-            cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
-                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope AND signal_key = $signalKey""".query[Long].unique
-            direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
-                            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                              AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
-                            ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-            inherited <- readInheritedCandidatesIO(signalKey, cursor)
-          } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
-            WaitCandidate(leafIdx, seq, payload, createdAt)
-          }
-        case WaitInterest.Timer(leafIdx, _) =>
-          for {
-            subId <- sql"""SELECT subscription_id FROM workflow_timer_subscriptions
-                           WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                             AND step_id = ${site.stepId.key} AND step_scope_path = ${site.stepId.scope} AND step_version = ${site.stepVersion} AND leaf_idx = $leafIdx""".query[java.util.UUID].option
-            events <- subId match {
-              case None => Vector.empty[WaitCandidate].pure[ConnectionIO]
-              case Some(id) =>
-                sql"""SELECT sequence_id, created_at FROM workflow_events
-                      WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                        AND event_kind = 'TimerFired' AND event_key = ${id.toString}
-                      ORDER BY sequence_id""".query[(Long, java.time.Instant)].to[Vector]
-                  .map(_.map { case (seq, createdAt) => WaitCandidate(leafIdx, seq, "", createdAt) })
-            }
-          } yield events
-        case WaitInterest.Completion(leafIdx, completedWorkflowId, completedKey, completedScope) =>
-          sql"""SELECT sequence_id, payload, created_at FROM workflow_events
-                WHERE workflow_id = $completedWorkflowId AND key = $completedKey AND scope = $completedScope
-                  AND event_kind = 'WorkflowCompleted' AND event_key = ''
-                ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-            .map(_.map { case (seq, payload, createdAt) => WaitCandidate(leafIdx, seq, payload, createdAt) })
-      }
-
-    private def deleteSiteSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
-      for {
-        _ <- sql"""DELETE FROM workflow_signal_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-        _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-        _ <- sql"""DELETE FROM workflow_completion_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-      } yield ()
-
-    private[PostgresWorkflowRuntime] def resolveFirstToRun(
-        stepId: StepId,
-        stepVersion: Long,
-        stepKind: String,
-        inputFingerprints: String,
-        loserScopePaths: Seq[String],
-        payload: String,
-        expiresAt: Option[java.time.Instant]
-    ): Unit =
-      fenced {
-        for {
-          _ <- writeStepSucceededIO(stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-          _ <- deleteBranchSubscriptionsIO(loserScopePaths)
-        } yield ()
-      }
-
-    private def deleteBranchSubscriptionsIO(loserScopePaths: Seq[String]): ConnectionIO[Unit] =
-      loserScopePaths.traverse_ { path =>
-        for {
-          _ <- sql"""DELETE FROM workflow_signal_subscriptions
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_scope_path = $path""".update.run
-          _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_scope_path = $path""".update.run
-          _ <- sql"""DELETE FROM workflow_completion_subscriptions
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                       AND step_scope_path = $path""".update.run
-        } yield ()
-      }
-
-    private def deleteTimerSubscriptionsIO(stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
-      sql"""DELETE FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-              AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(_ => ())
-
-    private def advanceCursorIO(signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
-      sql"""INSERT INTO signal_cursor (workflow_id, key, scope, signal_key, sequence_id)
-            VALUES ($workflowId, $key, $instanceScope, $signalKey, $sequenceId)
-            ON CONFLICT (workflow_id, key, scope, signal_key) DO UPDATE
-            SET sequence_id = EXCLUDED.sequence_id""".update.run.map(_ => ())
-
-    /** Walks the active-parent chain from this instance upward and returns the
-      * (workflow_id, key, scope) identities of the ancestor sources whose
-      * directly addressed events this instance may inherit for `signalKey`. An
-      * ancestor is a source only when every parent-child edge on the path
-      * currently permits the key; the policy governing the edge from an instance
-      * to its own parent is that instance's stored inheritance selector. A
-      * cleared or missing parent pointer (detachment) terminates the walk, so
-      * abandoned children inherit nothing.
-      */
-    private def inheritedSourceScopesIO(
-        signalKey: SignalKey
-    ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
-      def load(
-          w: WorkflowId,
-          kk: WorkflowInstanceKey,
-          ss: String
-      ): ConnectionIO[Option[(Option[String], Option[String], Option[String], Option[String])]] =
-        sql"""SELECT inherit_signals, parent_workflow_id, parent_instance_key, parent_scope
-              FROM workflow_instances WHERE workflow_id = $w AND key = $kk AND scope = $ss""".query[
-            (Option[String], Option[String], Option[String], Option[String])
-          ].option
-      def loop(
-          node: (Option[String], Option[String], Option[String], Option[String])
-      ): ConnectionIO[Vector[(WorkflowId, WorkflowInstanceKey, String)]] = {
-        val (policy, pwf, pkey, pscope) = node
-        (policy, pwf, pkey, pscope) match {
-          case (Some(p), Some(f), Some(k), Some(s)) if inheritancePermits(decodeSignalInheritance(Some(p)), signalKey) =>
-            for {
-              parent <- load(f, k, s)
-              rest <- parent match {
-                case Some(pn) => loop(pn)
-                case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
-              }
-            } yield (f, k, s) +: rest
-          case _ => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
-        }
-      }
-      for {
-        seed <- load(workflowId, key, instanceScope)
-        sources <- seed match {
-          case Some(sn) => loop(sn)
-          case None     => Vector.empty[(WorkflowId, WorkflowInstanceKey, String)].pure[ConnectionIO]
-        }
-      } yield sources
-    }
-
-    /** The inherited `Signal` candidates for `signalKey` on this instance: events
-      * stored on any currently eligible ancestor, after the instance's own cursor
-      * and (unless `inheritPastEvents`) after the inherited-events start
-      * sequence id captured at creation. With `inheritPastEvents` the retained
-      * older events remain visible while they are ahead of the instance's cursor.
-      */
-    private def readInheritedCandidatesIO(
-        signalKey: SignalKey,
-        cursor: Long
-    ): ConnectionIO[Vector[(Long, String, java.time.Instant)]] =
-      for {
-        cfg <- sql"""SELECT inherit_past_events, inherited_events_start_sequence_id FROM workflow_instances
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[(Boolean, Option[Long])].option
-        sources <- inheritedSourceScopesIO(signalKey)
-        events <- if (sources.isEmpty) Vector.empty[(Long, String, java.time.Instant)].pure[ConnectionIO]
-                  else {
-                    val sourceCond = sources
-                      .map { case (w, kk, ss) => fr"(workflow_id = $w AND key = $kk AND scope = $ss)" }
-                      .reduce(_ ++ fr" OR " ++ _)
-                    val (pastEvents, startSeq) = cfg.getOrElse((false, None))
-                    val window =
-                      if (pastEvents) Fragment.empty
-                      else startSeq.map(seq => fr"AND sequence_id > $seq").getOrElse(Fragment.empty)
-                    (fr"""SELECT sequence_id, payload, created_at FROM workflow_events
-                          WHERE event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor AND (""" ++
-                      sourceCond ++ fr")" ++ window ++ fr" ORDER BY sequence_id").query[(Long, String, java.time.Instant)].to[Vector]
-                  }
-      } yield events
-
-    /** The step-scope subtree prefix of a region's interior at a given
-      * `restartCount`: the parent scope path followed by `escaped(regionId)@count`.
-      * Nested Step/Await rows and children of the looping live under this prefix;
-      * the region's own row lives at the parent scope path (one level up).
-      */
-    private def regionInteriorBase(regionId: String, parentScopePath: String, count: Long): String = {
-      val marker = ScopePath.escapeScopeSegment(regionId) + "@" + count
-      if (parentScopePath.isEmpty) marker else parentScopePath + "/" + marker
-    }
-
-    /** The wrapped payload of a region row: its committed `restartCount` and the
-      * encoded user state, stored in the step row's `state_payload`.
-      */
-    private case class RegionPayload(count: Long, state: String) derives upickle.default.ReadWriter
-
-    private def regionPayload(count: Long, state: String): String =
-      upickle.default.write(RegionPayload(count, state))
-
-    private def parseRegionPayload(p: String): (String, Long) = {
-      val r = upickle.default.read[RegionPayload](p)
-      (r.state, r.count)
-    }
-
-    private[PostgresWorkflowRuntime] def readRegionState(
-        regionId: String,
-        parentScopePath: String
-    ): Option[(String, Long)] =
-      runSync {
-        sql"""SELECT state_payload FROM workflow_steps
-              WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                AND step_id = $regionId AND step_scope_path = $parentScopePath
-                AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(parseRegionPayload))
-      }
-
-    private[PostgresWorkflowRuntime] def upsertRegion(
-        regionId: String,
-        parentScopePath: String,
-        restartCount: Long,
-        serializedState: String
-    ): Unit =
-      fenced {
-        val base = regionInteriorBase(regionId, parentScopePath, restartCount - 1)
-        val now = theClock.instant()
-        for {
-          _ <- deleteRegionNestedStepsIO(base)
-          _ <- deleteRegionNestedSubscriptionsIO(base)
-          _ <- applyRegionClosePoliciesIO(workflowId, key, instanceScope, generation, base)
-          _ <- sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-                VALUES ($workflowId, $key, $instanceScope, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(restartCount, serializedState)}, '', NULL, $now, $now)
-                ON CONFLICT (workflow_id, key, scope, step_id, step_version, step_scope_path)
-                DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
-        } yield ()
-      }
-
-    private def deleteRegionNestedStepsIO(base: String): ConnectionIO[Unit] = {
-      val escaped = likeEscaped(base)
-      for {
-        _ <- sql"""DELETE FROM workflow_steps
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path = $base""".update.run
-        _ <- sql"""DELETE FROM workflow_steps
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
-      } yield ()
-    }
-
-    private def deleteRegionNestedSubscriptionsIO(base: String): ConnectionIO[Unit] = {
-      val escaped = likeEscaped(base)
-      for {
-        _ <- sql"""DELETE FROM workflow_signal_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path = $base""".update.run
-        _ <- sql"""DELETE FROM workflow_signal_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
-        _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path = $base""".update.run
-        _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
-        _ <- sql"""DELETE FROM workflow_completion_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path = $base""".update.run
-        _ <- sql"""DELETE FROM workflow_completion_subscriptions
-                   WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     AND step_scope_path LIKE ${escaped + "/%"} ESCAPE '\'""".update.run
-      } yield ()
-    }
-
-    /** Runs `write` inside one transaction, guarded by an exclusive lock on the
-      * instance row and a fencing check; throws [[LeaseLostException]] if the
-      * lease no longer belongs to this run, affecting no rows. Callers that do
-      * not need the result simply discard it.
-      */
-    private def fenced[A](write: ConnectionIO[A]): A = {
-      val res: Option[A] = runSync {
-        for {
-          _ <- sql"""SELECT 1 FROM workflow_instances
-                     WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                     FOR UPDATE""".query[Int].unique
-          fenceOk <- sql"""SELECT 1 FROM workflow_instances
-                           WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope
-                             AND lease_owner = $workerId AND fencing_token = $fencingToken""".query[Int].option
-          r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]
-        } yield r
-      }
-      res match {
-        case Some(a) => a
-        case None    => throw LeaseLostException(instanceId)
-      }
-    }
   }
 
   override def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit = {
     val now = theClock.instant()
     val scheduledAt = now.plus(java.time.Duration.ofNanos(delay.toNanos))
-    runSync {
+    runTransaction {
       sql"""
         INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
         VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $now, $scheduledAt, 0)
@@ -2778,11 +2660,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * exception type.
     */
   private[atomicflow] def readTerminalState(instanceId: WorkflowInstanceId): Option[String] =
-    runSync {
+    runTransaction {
       sql"""SELECT terminal_state FROM workflow_instances
-            WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}""".query[
-          Option[String]
-        ].unique
+            WHERE workflow_id = ${instanceId.workflowId} 
+              AND key = ${instanceId.workflowInstanceKey}
+               AND scope = ${instanceId.scope}
+      """.query[Option[String]].unique
     }
 
   /** Whether the instance's lease is still held by `worker` at `token`. */
@@ -2791,7 +2674,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       worker: String,
       token: Long
   ): Boolean =
-    runSync {
+    runTransaction {
       sql"""SELECT 1 FROM workflow_instances
             WHERE workflow_id = ${instanceId.workflowId} AND key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}
               AND lease_owner = $worker AND fencing_token = $token""".query[Int].option
