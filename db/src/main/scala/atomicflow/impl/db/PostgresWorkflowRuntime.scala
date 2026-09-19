@@ -2049,8 +2049,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   override def heartbeat(run: CurrentExecution): Unit = run.renewLease()
 
-  override def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit =
-    run.throwIfCancelled(uncancellableDepth)
+  override def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean = {
+    val workflowId = instanceId.workflowId
+    val key = instanceId.workflowInstanceKey
+    val scope = instanceId.scope
+    runSync {
+      sql"""SELECT cancel_requested_at FROM workflow_instances
+            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[
+          Option[java.time.Instant]
+        ].unique
+    }.isDefined
+  }
 
   /** The per-run execution handle of this runtime: the fencing identity of one
     * run (worker, fencing token, generation) plus the instance identity. The
@@ -2080,18 +2089,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND terminal_state IS NULL""".update.run
       }
       if (updated != 1) throw LeaseLostException(instanceId)
-    }
-
-    private[PostgresWorkflowRuntime] def throwIfCancelled(uncancellableDepth: Int): Unit = {
-      if (uncancellableDepth == 0) {
-        val requestedAt = runSync {
-          sql"""SELECT cancel_requested_at FROM workflow_instances
-                WHERE workflow_id = $workflowId AND key = $key AND scope = $instanceScope""".query[
-              Option[java.time.Instant]
-            ].unique
-        }
-        if (requestedAt.isDefined) throw WorkflowCancelledException()
-      }
     }
 
     private[PostgresWorkflowRuntime] def lookupStep(stepId: StepId, stepVersion: Long): Option[StoredStep] =

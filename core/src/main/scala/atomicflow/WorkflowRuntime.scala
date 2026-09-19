@@ -45,15 +45,15 @@ trait WorkflowRuntime {
   /** Renews the lock on the workflow instance. */
   def heartbeat(run: CurrentExecution): Unit
 
-  /** A cancellation checkpoint for run `run`: re-reads the durable
-    * `cancel_requested_at` flag and throws [[atomicflow.WorkflowCancelledException]]
-    * when set, unless the `Workflow.uncancellable` depth of the current call
-    * site (the `uncancellableDepth` carried by the `WorkflowContext` there) is
-    * non-zero. Called right before any new work (a Step body about to execute,
-    * or an await about to be evaluated); cached replays never call it, so they
-    * never deliver.
+  /** Whether cooperative cancellation has been durably requested for the
+    * instance: its `cancel_requested_at` flag is set. The flag is a level —
+    * [[cancel]] sets it once and it is never reset. A plain durable read; no
+    * lease or fence. Consulted at the new-work checkpoints (a Step body about
+    * to execute, or an await about to be evaluated) to deliver
+    * [[atomicflow.WorkflowCancelledException]]; cached replays never deliver,
+    * so they never read the flag.
     */
-  def throwIfCancelled(run: CurrentExecution, uncancellableDepth: Int): Unit
+  def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
   /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
     * Reports the stored row even if it has expired.

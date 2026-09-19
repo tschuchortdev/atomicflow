@@ -190,6 +190,17 @@ object Step {
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
     runStep(Guarantee.AtMostOnce, key, 0L, "AtMostOnce", ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
+  /** The cancellation checkpoint for new work (a Step body about to execute, or
+    * an await about to be evaluated): unless the `Workflow.uncancellable` depth
+    * of the call site's context is non-zero, re-reads the durable
+    * `cancel_requested_at` flag via the runtime and throws
+    * [[WorkflowCancelledException]] when set. Cached replays never call it, so
+    * they never deliver.
+    */
+  private def throwIfCancelled(using ctx: WorkflowContext): Unit =
+    if (ctx.uncancellableDepth == 0 && ctx.runtime.isCancellationRequested(ctx.instanceId))
+      throw WorkflowCancelledException()
+
   /** The shared machinery for both execution guarantees. Both persist a
     * `Started` record before the body executes and replace it with a durable
     * outcome; the guarantees differ only in how an unresolved `Started` record
@@ -281,7 +292,7 @@ object Step {
       */
     def execute(): A = {
       rt.heartbeat(run)
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       rt.writeStepStarted(run, stepId, stepVersion, stepKind, fingerprints)
       try {
         val value = body
@@ -317,7 +328,7 @@ object Step {
       while (result.isEmpty) {
         try {
           rt.heartbeat(run)
-          rt.throwIfCancelled(run, ctx.uncancellableDepth)
+          throwIfCancelled
           val value = body
           val serialized =
             try valueCodec.write(value)
@@ -680,7 +691,7 @@ object Step {
     }
 
     def evaluate(): R = {
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       val baseScope = ctx.currentScope
       val baseScopePath = ctx.scopePath
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
@@ -843,7 +854,7 @@ object Step {
     }
 
     def evaluate(): A = {
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       val site = WaitSite(stepId, 0L, "Await", fingerprints, expiresAt)
       rt.evaluateWait(run, site, Vector(WaitInterest.Signal(0, signal.key))) { candidates =>
         candidates.find(accept).map(c =>
@@ -909,7 +920,7 @@ object Step {
     }
 
     def evaluate(): O = {
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       val candidates = rt.readAwaitUpdateCandidates(run, u.key)
       candidates.headOption match {
         case Some(winning) =>
@@ -958,7 +969,7 @@ object Step {
     }
 
     def evaluate(): Unit = {
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       val site = WaitSite(stepId, 0L, "Await", fingerprints, expiresAt)
       rt.evaluateWait(run, site, Vector(WaitInterest.Timer(0, deadline))) { candidates =>
         candidates.headOption.map(_ => WaitResolution(summon[Cacheable[Unit]].write(()), None))
@@ -1016,7 +1027,7 @@ object Step {
       }
 
     def evaluate(): A = {
-      rt.throwIfCancelled(run, ctx.uncancellableDepth)
+      throwIfCancelled
       val site = WaitSite(stepId, 0L, "AwaitRace", fingerprints, expiresAt)
       rt.evaluateWait(run, site, leaves.map(_._1))(pickRaceWinner(leaves)) match {
         case Some(payload) => decode(payload)

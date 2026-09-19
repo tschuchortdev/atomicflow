@@ -44,7 +44,7 @@ final class WorkflowContext(
     /** The depth of enclosing `Workflow.uncancellable` regions at this context's
       * lexical position; `0` outside any region. Transient per-run state carried
       * immutably through derived contexts; a non-zero depth suppresses
-      * cancellation delivery at checkpoints (`WorkflowRuntime.throwIfCancelled`).
+      * cancellation delivery at checkpoints (`Step.throwIfCancelled`).
       */
     private[atomicflow] val uncancellableDepth: Int = 0
 ) {
@@ -54,11 +54,7 @@ final class WorkflowContext(
     * string.
     */
   private[atomicflow] def currentScope: String = scopePath.mkString("/")
-
-  /** Derives a copy of this context carrying the given transient lexical state,
-    * leaving everything else identical — the `local` of a reader monad. Region
-    * functions call this and pass the derived context to their body.
-    */
+  
   private[atomicflow] def copy(
       scopePath: Vector[String] = scopePath,
       uncancellableDepth: Int = uncancellableDepth
