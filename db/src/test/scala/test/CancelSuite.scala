@@ -16,7 +16,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   private def cancelRequestedAt(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
       sql"""SELECT cancel_requested_at FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Option[Instant]].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Option[Instant]].unique
     )
 
   private def terminalRow(
@@ -25,7 +25,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(Option[String], Option[String])] =
     run(
       sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String])
         ].option
     )
@@ -33,14 +33,14 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
     run(
       sql"""SELECT event_kind, event_key, payload FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND event_kind = 'WorkflowCompleted'""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'WorkflowCompleted'""".query[
           (String, String, String)
         ].option
     )
 
   private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].option
+      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].option
     ).isDefined
 
   test("cancel before first start finalizes CANCELLED immediately and the body never runs") {

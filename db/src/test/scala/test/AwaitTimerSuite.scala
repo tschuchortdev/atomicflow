@@ -19,8 +19,8 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(java.util.UUID, Instant)] =
     run(
-      sql"""SELECT subscription_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+      sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (java.util.UUID, Instant)
         ].to[Vector]
     )
@@ -28,14 +28,14 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   private def timerFiredEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
     run(
       sql"""SELECT event_key FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
               AND event_kind = 'TimerFired' ORDER BY sequence_id""".query[String].to[Vector]
     )
 
-  private def timerFiredCount(subscriptionId: java.util.UUID): Int =
+  private def timerFiredCount(timerId: java.util.UUID): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE event_kind = 'TimerFired' AND event_key = ${subscriptionId.toString}""".query[Int].unique
+            WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}""".query[Int].unique
     )
 
   test("a timer not yet due suspends and records an absolute-deadline subscription with no event") {

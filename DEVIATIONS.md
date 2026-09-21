@@ -122,17 +122,19 @@ implementation phase.
     codecs contextually"). This makes mapped completion leaves decodable —
     the spec's named use case for `map` — by decoding via the source's own
     codec and persisting with the call-site codec.
-23. **Timer subscriptions are backed by a UNIQUE (site, leaf) constraint**, and
-    each durable retry attempt mints a fresh subscription (new id, new
-    deadline) atomically with its started-row write — the spec is silent on
-    both; idempotency otherwise rested on the lease fence alone.
+23. **Timer subscriptions are backed by a UNIQUE (site, subscriber_key)
+    constraint**, and each durable retry attempt mints a fresh subscription
+    (new timer id, new deadline) atomically with its started-row write — the
+    spec is silent on both; idempotency otherwise rested on the lease fence
+    alone.
 24. **The durable-retry delay threshold is a `PostgresWorkflowRuntime`
     constructor parameter (`durableRetryThreshold`, default 30 seconds).**
     The spec attributes it to a `WorkflowRunSettings` type that does not
     exist in the new API.
-25. **An empty `awaitRace` fails fast** (`require(awaits.nonEmpty)`): a
-    zero-leaf race can never satisfy and would violate the
-    suspended-instance invariant.
+25. **An empty `awaitRace` fails fast** (`require(members.nonEmpty)`): a
+    zero-member race can never satisfy and would violate the
+    suspended-instance invariant. Member keys are validated too: non-empty,
+    unique within the race, and not starting with the reserved `"__"` prefix.
 26. **The unconsumed-signals handler also runs on the failure path** (the spec
     ties it to "before the instance is marked complete"); a throwing handler
     on the failure path masks the original exception (unspecified edge,
@@ -322,7 +324,7 @@ implementation phase.
     are public; `startChild` takes the per-run handle instead of
     `(parentId, parentGeneration)`. The record types these operations
     traffic in (`StoredStep`, the `Await*`/update candidate types, the race
-    leaf/candidate/decision types) are public in package `atomicflow`. Only
+    subscriber/match/decision types) are public in package `atomicflow`. Only
     the runner-internal operations (wakeup claiming, lease acquisition, the
     sweeps) remain off the public trait. This entry records the API change;
     the spec text that previously kept these operations off the trait
@@ -346,12 +348,12 @@ implementation phase.
      `resolveAwaitTimer`, `suspendAwaitTimer`, `fireDueTimerLeaves`,
      `evaluateAwaitRace`, and the await use of `readAwaitSignalCandidates`)
      are replaced by a single
-     `evaluateWait(run, site, interests)(decide): Option[String]` taking the
-     new public records `WaitSite`, `WaitInterest` (enum: Signal / Timer /
-     Completion), `WaitCandidate`, and `WaitResolution`. `readAwaitSignalCandidates`
+     `evaluateWait(run, site, subscribers)(decide): Option[String]` taking the
+     new public records `WaitSite`, `Subscriber` (enum: Signal / Timer /
+     Completion), `SubscriberMatch`, and `WaitResolution`. `readAwaitSignalCandidates`
      remains on the trait (it serves `Step.peekSignal`, a plain durable
-     read rather than a wait) and now returns `Vector[WaitCandidate]` with
-     `leafIdx = 0`; `invalidateTimer`, the update-await operations, and the
+     read rather than a wait) and now returns `Vector[SubscriberMatch]` with
+     `subscriberKey = ""`; `invalidateTimer`, the update-await operations, and the
      step-retry operations are unchanged; the `AwaitRace*` and
      `AwaitSignalCandidate` record types are deleted. Consequence: all three
      await kinds (signal, timer, race) now evaluate through one protocol —
@@ -368,6 +370,35 @@ implementation phase.
      (timer's retire-and-suspend vs. delete-and-reevaluate; the
      failure-message prefix). Benefit: one wait-site state machine instead
      of three parallel orchestration algorithms; adding a wait source means
-     implementing registration and candidate reading for one `WaitInterest`
+     implementing registration and candidate reading for one `Subscriber`
      case, not a new registration-to-resolution pipeline.
+79. **Race members carry stable, user-chosen subscriber keys; the positional
+     `leaf_idx` is gone.** `Step.awaitRace(stepKey)(members: (String, Awaitable[A])*)`
+     requires each member to be named. The name is a **subscriber key**, a
+     stable identity independent of the member's position, so reordering members
+     cannot re-bind durable subscriptions. Keys must be non-empty, unique within
+     the race, and must not start with the reserved `"__"` prefix; the empty key
+     `""` is reserved for single-subscriber sites (plain `Step.await`, update
+     awaits, `peekSignal`), and step retries use the reserved
+     `"__retry__"`. Schema-wide, `leaf_idx` becomes `subscriber_key` in the
+     three subscription tables and `workflow_update_subscriptions`, and the
+     bare `key` column (the workflow-instance key) is renamed
+     `workflow_instance_key` everywhere; `completed_key` becomes
+     `completed_workflow_instance_key`. The timer subscription's opaque
+     per-incarnation token `subscription_id` is renamed `timer_id`, which
+     keeps it clearly distinct from `subscriber_key` (stable member identity)
+     — `timer_id` names the `TimerFired` event and versions the registration
+     incarnation. `V001__init.sql` is rewritten in place (no migration), as
+     the schema is pre-release.
+80. **Await drift/expiry retires the site's subscriptions, not just its step
+     row.** `retireAwaitSite` (delete the step row and the site's rows in all
+     three subscription tables, in one fenced transaction) replaces
+     `deleteStep` in the `invalidateOn`-drift and `invalidateAfter`-expiry
+     branches of `awaitSignal` and `awaitRace0`. Rationale: make the "a fresh
+     timer id makes the previous incarnation's `TimerFired` structurally
+     inert" guarantee locally evident and robust rather than resting on the
+     fact that await resolution happens to retire subscriptions already.
+     Today's await rows exist only after resolution (a suspended await has no
+     cached row, so drift/expiry cannot fire mid-suspension), which makes the
+     retirement defensive rather than an observable fix.
 

@@ -20,13 +20,13 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String = ""): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[Int].unique
     )
 
   private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String = ""): Set[String] =
     run(
       sql"""SELECT step_id FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope""".query[String].to[Set]
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[String].to[Set]
     )
 
   private def setUpdatedAt(
@@ -37,25 +37,25 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   ): Unit =
     run(
       sql"""UPDATE workflow_steps SET updated_at = $ts
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId""".update.run
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId""".update.run
     )
 
   private def storedInput(workflowId: WorkflowId, key: WorkflowInstanceKey): String =
     run(
       sql"""SELECT input FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[String].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[String].unique
     )
 
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def parentCols(workflowId: WorkflowId, key: WorkflowInstanceKey): (Option[String], Option[String], Option[String]) =
     run(
       sql"""SELECT parent_workflow_id, parent_instance_key, parent_scope FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String], Option[String])
         ].unique
     )
@@ -63,13 +63,13 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   private def countCursor(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM signal_cursor
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
     )
 
   private def counterWf(

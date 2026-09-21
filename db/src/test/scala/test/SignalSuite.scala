@@ -18,7 +18,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
   ): Vector[(Long, String, String, String, Instant)] =
     run(
       sql"""SELECT sequence_id, event_kind, event_key, payload, created_at
-            FROM workflow_events WHERE workflow_id = $workflowId AND key = $key AND scope = ''
+            FROM workflow_events WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
             ORDER BY sequence_id""".query[(Long, String, String, String, Instant)].to[Vector]
     )
 
@@ -84,7 +84,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""UPDATE workflow_instances
             SET lease_owner = 'worker', fencing_token = fencing_token + 1, lease_expires_at = $leaseExpiry
-            WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run
     )
 
     val signal = Signal[String]("greet")
@@ -97,7 +97,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "sig-wakeup") { in => in }
     rt.createWorkflowInstance(wf, "k", "in")
     run(
-      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, key, scope, step_id, step_version, leaf_idx, signal_key)
+      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, scope, step_id, step_version, subscriber_key, signal_key)
             VALUES (${wf.id}, 'k', '', 'step', 1, 0, 'greet')""".update.run
     )
 
@@ -105,7 +105,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(signal.send(WorkflowInstanceId(wf.id, "k"), "x")(using rt), SignalSendResult.Success)
 
     val wake = run(
-      sql"""SELECT scheduled_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".query[
+      sql"""SELECT scheduled_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".query[
           Instant
         ].option
     )
@@ -121,7 +121,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     signal.send(WorkflowInstanceId(wf.id, "k"), "x")(using rt)
 
     val wake = run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".query[Int].option
+      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".query[Int].option
     )
     assertEquals(wake, None)
   }

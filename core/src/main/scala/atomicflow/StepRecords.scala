@@ -15,11 +15,11 @@ final case class StoredStep(
 )
 
 /** One durable `TimerFired` event matching a pending timer subscription of an
-  * awaiting site, keyed by the subscription id.
+  * awaiting site, keyed by the timer id.
   */
 final case class AwaitTimerCandidate(
     sequenceId: Long,
-    subscriptionId: java.util.UUID,
+    timerId: java.util.UUID,
     createdAt: java.time.Instant
 )
 
@@ -55,27 +55,27 @@ final case class WaitSite(
     expiresAt: Option[Instant]
 )
 
-/** One durable interest of a wait-site: how its subscription is registered in
-  * the corresponding table. `leafIdx` is the interest's position within the
-  * site (0 for single-interest awaits, the awaitable's index for races).
+/** One subscriber of a wait-site: how its subscription is registered in the
+  * corresponding table. `subscriberKey` names the subscriber within the site
+  * (`""` for single-subscriber awaits, the member's user-chosen key for races).
   */
-enum WaitInterest {
-  case Signal(leafIdx: Int, signalKey: SignalKey)
-  case Timer(leafIdx: Int, deadline: Instant)
+enum Subscriber {
+  case Signal(subscriberKey: String, signalKey: SignalKey)
+  case Timer(subscriberKey: String, deadline: Instant)
   case Completion(
-      leafIdx: Int,
+      subscriberKey: String,
       completedWorkflowId: WorkflowId,
-      completedKey: WorkflowInstanceKey,
+      completedWorkflowInstanceKey: WorkflowInstanceKey,
       completedScope: String
   )
 }
 
-/** One durable fact currently available to one interest of a wait-site,
-  * selected by global `sequenceId` across all interests so the earliest
+/** One durable fact currently available to one subscriber of a wait-site,
+  * selected by global `sequenceId` across all subscribers so the earliest
   * satisfying event wins regardless of kind or workflow tree.
   */
-final case class WaitCandidate(
-    leafIdx: Int,
+final case class SubscriberMatch(
+    subscriberKey: String,
     sequenceId: Long,
     payload: String,
     createdAt: Instant

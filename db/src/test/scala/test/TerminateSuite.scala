@@ -19,7 +19,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(Option[String], Option[String])] =
     run(
       sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String])
         ].option
     )
@@ -27,7 +27,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
   private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
     run(
       sql"""SELECT event_kind, event_key, payload FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND event_kind = 'WorkflowCompleted'""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'WorkflowCompleted'""".query[
           (String, String, String)
         ].option
     )
@@ -35,19 +35,19 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
   private def cancelRequestedAt(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
       sql"""SELECT cancel_requested_at FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Option[Instant]].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Option[Instant]].unique
     )
 
   private def leaseExpiry(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
       sql"""SELECT lease_expires_at FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Option[Instant]].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Option[Instant]].option
     ).flatten
 
   private def instanceRow(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Option[String], Option[String], Long)] =
     run(
       sql"""SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String], Long)
         ].option
     )
@@ -55,43 +55,43 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
   private def leaseOwner(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
       sql"""SELECT lease_owner FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Option[String]].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Option[String]].option
     ).flatten
 
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def countSignalSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def countTimerSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def countCompletionSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_completion_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
     )
 
   private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
     )
 
   private def stepStateKind(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String): Option[String] =
     run(
       sql"""SELECT state_kind FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId AND step_version = 1""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId AND step_version = 1""".query[
           String
         ].option
     )
@@ -300,7 +300,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "a").id
     run(
       sql"""UPDATE workflow_instances SET lease_owner = 'some-worker', lease_expires_at = now() + interval '1 hour'
-            WHERE workflow_id = $wfId AND key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = $wfId AND workflow_instance_key = 'k' AND scope = ''""".update.run
     )
     val before = instanceRow(wf.id, "k").get._3
 
