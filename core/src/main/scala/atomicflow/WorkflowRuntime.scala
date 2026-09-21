@@ -60,46 +60,36 @@ trait WorkflowRuntime {
     */
   def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep]
 
-  /** Replace (or create) the `started` row for the step, fenced. */
-  def writeStepStarted(
+  /** Replace (or create) the step row, fenced: `state` is `Started` (an
+    * unresolved row, its `payload` empty or carrying retry bookkeeping), or the
+    * terminal `Succeeded`/`Failed`. The site's retry timer subscription is
+    * retired in the same transaction, so a resolved or superseded retry can
+    * never be re-fired.
+    */
+  def writeStepState(
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
       stepKind: String,
-      inputFingerprints: String
-  ): Unit
-
-  /** Replace (or create) the `succeeded` row for the step, fenced. */
-  def writeStepSucceeded(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
+      state: StoredStep.State,
       inputFingerprints: String,
       payload: String,
       expiresAt: Option[Instant]
   ): Unit
 
-  /** Replace (or create) the `failed` row for the step, fenced. */
-  def writeStepFailed(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Delete the step row, fenced. */
+  /** Delete the step row and its retry timer subscription atomically, fenced.
+    * Used both to invalidate an ongoing retry "as if the step never executed"
+    * and to discard an expired or drifted cached result.
+    */
   def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
 
   /** Retire an await-site atomically, fenced: delete the site's `succeeded`/
     * `started` step row and all of its subscriptions in the three subscription
     * tables, in one transaction. Used by drift/expiry re-evaluation so no stale
     * registration (in particular a fired timer of the previous incarnation) can
-    * satisfy the re-evaluated site. Unlike [[deleteStep]], this retires the
-    * subscriptions too.
+    * satisfy the re-evaluated site. Unlike [[deleteStep]], which removes only
+    * the step row and its retry timer subscription, this retires every
+    * subscription of the site (signal, timer, and update).
     */
   def retireAwaitSite(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
 
@@ -126,34 +116,11 @@ trait WorkflowRuntime {
     * transaction (the same "two paths, one primitive" as user timer awaits): for
     * each retry subscription with `deadline <= now`, row-lock it, re-check that
     * no `TimerFired` event exists yet, and append one. The subscription row
-    * survives firing; only resolution retires it.
+    * survives firing; only resolution retires it. Returns whether a `TimerFired`
+    * event now exists for the site, distinguishing a due retry (resume the body)
+    * from one still waiting (suspend).
     */
-  def fireDueStepRetries(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
-
-  /** Read the durable `TimerFired` events matching this step-site's pending retry
-    * timer subscription (plain durable read; no lock or fence).
-    */
-  def readStepRetryCandidates(run: CurrentExecution, stepId: StepId, stepVersion: Long): Vector[AwaitTimerCandidate]
-
-  /** Resolve a retrying step to a terminal state, fenced: persist the
-    * `stateKind` (`succeeded` or `failed`) step row and delete the retry timer
-    * subscription, in one transaction.
-    */
-  def resolveStepRetry(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      stateKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Delete the step row and its retry timer subscription atomically, fenced.
-    * Used to invalidate an ongoing retry "as if the step never executed".
-    */
-  def deleteStepRetry(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+  def fireStepRetryIfDue(run: CurrentExecution, stepId: StepId, stepVersion: Long): Boolean
 
   /** Read the durable `Signal` events of `signalKey` that are visible to this
     * instance (after its shared exact-key cursor), in sequence order. A plain

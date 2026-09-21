@@ -3,16 +3,34 @@ package atomicflow
 import java.time.Instant
 
 /** The durable facts of one workflow_steps row, as read without any lease or
-  * fence. `stateKind` is one of `started`, `succeeded`, `failed`; `statePayload`
+  * fence. `state` is one of `Started`, `Succeeded`, `Failed`; `statePayload`
   * is the raw, encoded outcome; `inputFingerprints` is the deterministic
   * encoding of the step's named inputs.
   */
 final case class StoredStep(
-    stateKind: String,
+    state: StoredStep.State,
     statePayload: String,
     inputFingerprints: String,
     expiresAt: Option[Instant]
 )
+
+object StoredStep {
+
+  /** The `state_kind` of a `workflow_steps` row; stored as `toString`.
+    */
+  enum State {
+    case Started, Succeeded, Failed
+  }
+
+  object State {
+
+    /** Parses the stored DB value. Only the three written values are valid. */
+    def fromString(s: String): State =
+      values
+        .find(_.toString == s)
+        .getOrElse(throw new IllegalArgumentException(s"Unknown step state_kind '$s'"))
+  }
+}
 
 /** One durable `TimerFired` event matching a pending timer subscription of an
   * awaiting site, keyed by the timer id.

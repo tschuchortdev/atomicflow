@@ -212,8 +212,9 @@ object Workflow {
 
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime calls this automatically at every checkpoint; call it explicitly
-    * inside long-running Step bodies, between checkpoints.
+    * runtime does not renew the lease on its own; call this explicitly inside
+    * long-running Step bodies, and ensure `leaseDuration` exceeds the longest
+    * gap between calls.
     *
     * Not a cancellation checkpoint, and available only inside an executing
     * workflow (the `(using WorkflowContext)` requirement makes external or
