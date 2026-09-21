@@ -173,7 +173,7 @@ lease_expires_at (nullable timestamp)
     AND (lease_owner IS NULL OR lease_expires_at <= :now)
   ```
   Zero rows updated means a live owner or a terminal instance; the acquirer backs off.
-- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread; the lease is renewed on the workflow's own thread. The runtime invokes the heartbeat at every checkpoint (Step invocation, await evaluation, suspension), and long-running Step bodies call it explicitly through the public API below. `leaseDuration` must therefore exceed the longest gap between heartbeat opportunities. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread and the runtime does not renew the lease on its own; renewal happens only when the workflow's own thread calls `Workflow.heartbeat()`. `leaseDuration` must therefore exceed the longest gap between such calls. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
 
 **`Workflow.heartbeat()` — public lease renewal**
 
@@ -181,8 +181,8 @@ lease_expires_at (nullable timestamp)
 object Workflow {
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime calls this automatically at every checkpoint; call it explicitly
-    * inside long-running Step bodies, between checkpoints.
+    * runtime does not renew the lease on its own; call this explicitly inside
+    * long-running Step bodies.
     *
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
@@ -201,7 +201,7 @@ object Workflow {
   ```
   Zero rows updated → the runtime raises `LeaseLostException` and aborts the run without durable effect, identical to any other fenced-write loss.
 - **Not a cancellation checkpoint.** Heartbeat never delivers cancellation; delivery remains bound to checkpoints about to perform new work.
-- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; automatic and explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
+- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
 - Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
 - **Release.** A run releases the lease when it ends (suspension, terminal state, abort). Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
@@ -699,6 +699,6 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 - `awaitResult` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `awaitResult`. `LISTEN/NOTIFY` is an optional latency optimization.
 - Retention / auto-deletion of completed instances. The job runner's sweep mechanism is the designated hook (see "Job runner and scheduling").
 - **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token bump (see "Job runner and scheduling").
-- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime invokes it automatically at every checkpoint; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
+- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime does not renew the lease automatically; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
 - **Scheduler tuning** — Priority/fairness classes beyond `perWorkflowBatchShare` and per-workflow caps, and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
 - **`fork` / `forkFromFailure`** — `forkWorkflow` is specified in `continue-as-new-fork-reset.md`; its one open point there is the causal boundary for parallel-branch step prefixes. `forkFromFailure` is not yet specified.

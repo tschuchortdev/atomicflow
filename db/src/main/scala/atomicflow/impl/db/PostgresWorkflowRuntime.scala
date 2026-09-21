@@ -1724,7 +1724,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           (String, String, String, Option[java.time.Instant])
         ].option
     }.map { case (kind, payload, fingerprints, expiresAt) =>
-      StoredStep(kind, payload, fingerprints, expiresAt)
+      StoredStep(StoredStep.State.fromString(kind), payload, fingerprints, expiresAt)
     }
 
   /** Escapes `%`, `_`, and the escape character itself so the caller's prefix is
@@ -1903,47 +1903,32 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep] =
     readStepRow(run.workflowId, run.instanceKey, run.instanceScope, stepId.key, stepId.scope, stepVersion)
 
-  override def writeStepStarted(
+  override def writeStepState(
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
       stepKind: String,
-      inputFingerprints: String
-  ): Unit =
-    fenced(run) {
-      writeStepStartedIO(run, stepId, stepVersion, stepKind, inputFingerprints, "", None)
-    }
-
-  override def writeStepSucceeded(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
+      state: StoredStep.State,
       inputFingerprints: String,
       payload: String,
       expiresAt: Option[Instant]
   ): Unit =
     fenced(run) {
-      writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-    }
-
-  override def writeStepFailed(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit =
-    fenced(run) {
-      writeStepFailedIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+      for {
+        _ <- upsertStepStateIO(
+          run, stepId, stepVersion, stepKind, state, inputFingerprints, payload, expiresAt
+        )
+        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
+      } yield ()
     }
 
   override def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
     fenced(run) {
-      sql"""DELETE FROM workflow_steps
-            WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+      for {
+        _ <- sql"""DELETE FROM workflow_steps
+                   WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
+        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
+      } yield ()
     }
 
   override def retireAwaitSite(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
@@ -1967,22 +1952,30 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Unit =
     fenced(run) {
       for {
-        _ <- writeStepStartedIO(run, stepId, stepVersion, stepKind, inputFingerprints, retryPayload, expiresAt)
+        _ <- upsertStepStateIO(
+          run,
+          stepId,
+          stepVersion,
+          stepKind,
+          StoredStep.State.Started,
+          inputFingerprints,
+          retryPayload,
+          expiresAt
+        )
         _ <- insertRetrySubscriptionIO(run, stepId, stepVersion, deadline)
       } yield ()
     }
 
-  override def fireDueStepRetries(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
+  override def fireStepRetryIfDue(run: CurrentExecution, stepId: StepId, stepVersion: Long): Boolean =
     fenced(run) {
       val now = theClock.instant()
       for {
-        due <- sql"""SELECT timer_id FROM workflow_timer_subscriptions
-                     WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                       AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey
-                       AND deadline <= $now
-                     ORDER BY deadline, timer_id
-                     FOR UPDATE""".query[java.util.UUID].to[Vector]
-        _ <- due.traverse_ { subId =>
+        subs <- sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
+                      WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
+                        AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey
+                      ORDER BY deadline, timer_id
+                      FOR UPDATE""".query[(java.util.UUID, Instant)].to[Vector]
+        _ <- subs.collect { case (subId, deadline) if !deadline.isAfter(now) => subId }.traverse_ { subId =>
           for {
             exists <- sql"""SELECT 1 FROM workflow_events
                             WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
@@ -1991,62 +1984,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
                  else ().pure[ConnectionIO]
           } yield ()
         }
-      } yield ()
-    }
-
-  override def readStepRetryCandidates(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long
-  ): Vector[AwaitTimerCandidate] =
-    runTransaction {
-      for {
-        subIds <- sql"""SELECT timer_id FROM workflow_timer_subscriptions
-                        WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                          AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey""".query[
-            java.util.UUID
-          ].to[List]
-        events <- if (subIds.isEmpty) Vector.empty[AwaitTimerCandidate].pure[ConnectionIO]
-                  else {
-                    val idStrings = subIds.map(_.toString)
-                    fr"""SELECT sequence_id, event_key, created_at FROM workflow_events
-                          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                            AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
-                          ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-                      .map(_.map { case (seq, ek, createdAt) =>
-                        AwaitTimerCandidate(seq, java.util.UUID.fromString(ek), createdAt)
-                      })
-                  }
-      } yield events
-    }
-
-  override def resolveStepRetry(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      stateKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit =
-    fenced(run) {
-      for {
-        _ <- if (stateKind == "succeeded")
-          writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-        else
-          writeStepFailedIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
-        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
-      } yield ()
-    }
-
-  override def deleteStepRetry(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
-    fenced(run) {
-      for {
-        _ <- sql"""DELETE FROM workflow_steps
-                   WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
-        _ <- deleteTimerSubscriptionsIO(run, stepId, stepVersion)
-      } yield ()
+        fired <- if (subs.isEmpty) false.pure[ConnectionIO]
+                 else {
+                   val idStrings = subs.map(_._1.toString)
+                   fr"""SELECT 1 FROM workflow_events
+                         WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
+                           AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
+                         LIMIT 1""".query[Int].option.map(_.isDefined)
+                 }
+      } yield fired
     }
 
   override def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[SubscriberMatch] =
@@ -2088,7 +2034,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
       for {
         updated <- handleUpdateRecordIO(run, updateKey, candidate, encodedResponse)
         won = updated == 1
-        _ <- if (won) writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, encodedOutput, expiresAt)
+        _ <- if (won) upsertStepStateIO(
+               run,
+               stepId,
+               stepVersion,
+               stepKind,
+               StoredStep.State.Succeeded,
+               inputFingerprints,
+               encodedOutput,
+               expiresAt
+             )
              else ().pure[ConnectionIO]
         _ <- if (won) deleteUpdateSubscriptionsIO(run, stepId, stepVersion) else ().pure[ConnectionIO]
       } yield won
@@ -2113,7 +2068,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
             for {
               updated <- handleUpdateRecordIO(run, updateKey, d.candidate, d.encodedResponse)
               won = updated == 1
-              _ <- if (won) writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, d.encodedOutput, expiresAt)
+              _ <- if (won) upsertStepStateIO(
+                     run,
+                     stepId,
+                     stepVersion,
+                     stepKind,
+                     StoredStep.State.Succeeded,
+                     inputFingerprints,
+                     d.encodedOutput,
+                     expiresAt
+                   )
                    else ().pure[ConnectionIO]
               _ <- if (won) deleteUpdateSubscriptionsIO(run, stepId, stepVersion) else ().pure[ConnectionIO]
             } yield if (won) Some(d) else None
@@ -2150,8 +2114,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
         result <- resolution match {
           case Some(r) =>
             for {
-              _ <- writeStepSucceededIO(run, site.stepId, site.stepVersion, site.stepKind,
-                    site.inputFingerprints, r.payload, site.expiresAt)
+_ <- upsertStepStateIO(
+                   run,
+                   site.stepId,
+                   site.stepVersion,
+                   site.stepKind,
+                   StoredStep.State.Succeeded,
+                   site.inputFingerprints,
+                   r.payload,
+                   site.expiresAt
+                 )
               _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorIO(run, k, seq) }
               _ <- deleteSiteSubscriptionsIO(run, site.stepId, site.stepVersion)
             } yield Some(r.payload)
@@ -2173,7 +2145,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Unit =
     fenced(run) {
       for {
-        _ <- writeStepSucceededIO(run, stepId, stepVersion, stepKind, inputFingerprints, payload, expiresAt)
+        _ <- upsertStepStateIO(
+          run,
+          stepId,
+          stepVersion,
+          stepKind,
+          StoredStep.State.Succeeded,
+          inputFingerprints,
+          payload,
+          expiresAt
+        )
         _ <- deleteBranchSubscriptionsIO(run, loserScopePaths)
       } yield ()
     }
@@ -2263,56 +2244,22 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private val RetrySubscriberKey: String = "__retry__"
 
-  private def writeStepStartedIO(
+  private def upsertStepStateIO(
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
       stepKind: String,
+      state: StoredStep.State,
       inputFingerprints: String,
       payload: String,
       expiresAt: Option[java.time.Instant]
   ): ConnectionIO[Unit] = {
     val now = theClock.instant()
+    val kind = state.toString
     sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'started', $payload, $inputFingerprints, $expiresAt, $now, $now)
+          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, $kind, $payload, $inputFingerprints, $expiresAt, $now, $now)
           ON CONFLICT (workflow_id, workflow_instance_key, scope, step_id, step_version, step_scope_path) DO UPDATE
-          SET state_kind = 'started', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-      _ => ()
-    )
-  }
-
-  private def writeStepSucceededIO(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[java.time.Instant]
-  ): ConnectionIO[Unit] = {
-    val now = theClock.instant()
-    sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'succeeded', $payload, $inputFingerprints, $expiresAt, $now, $now)
-          ON CONFLICT (workflow_id, workflow_instance_key, scope, step_id, step_version, step_scope_path) DO UPDATE
-          SET state_kind = 'succeeded', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-      _ => ()
-    )
-  }
-
-  private def writeStepFailedIO(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      payload: String,
-      expiresAt: Option[java.time.Instant]
-  ): ConnectionIO[Unit] = {
-    val now = theClock.instant()
-    sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, 'failed', $payload, $inputFingerprints, $expiresAt, $now, $now)
-          ON CONFLICT (workflow_id, workflow_instance_key, scope, step_id, step_version, step_scope_path) DO UPDATE
-          SET state_kind = 'failed', state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+          SET state_kind = $kind, state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
       _ => ()
     )
   }
