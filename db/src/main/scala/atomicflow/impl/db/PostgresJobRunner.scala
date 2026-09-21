@@ -105,7 +105,7 @@ final class PostgresJobRunner private[atomicflow] (
 
   private final case class ClaimRow(
       workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
+      instanceKey: WorkflowInstanceKey,
       scope: String,
       createdAt: java.time.Instant,
       scheduledAt: java.time.Instant,
@@ -132,21 +132,21 @@ final class PostgresJobRunner private[atomicflow] (
     val query =
       fr"""
         WITH ranked AS (
-          SELECT w.workflow_id, w.key, w.scope, w.created_at, w.scheduled_at, w.attempts,
-                 ROW_NUMBER() OVER (PARTITION BY w.workflow_id ORDER BY w.scheduled_at, w.key) AS share
+          SELECT w.workflow_id, w.workflow_instance_key, w.scope, w.created_at, w.scheduled_at, w.attempts,
+                 ROW_NUMBER() OVER (PARTITION BY w.workflow_id ORDER BY w.scheduled_at, w.workflow_instance_key) AS share
           FROM workflow_wakeups w
           JOIN workflow_instances i
-            ON i.workflow_id = w.workflow_id AND i.key = w.key AND i.scope = w.scope
+            ON i.workflow_id = w.workflow_id AND i.workflow_instance_key = w.workflow_instance_key AND i.scope = w.scope
           WHERE w.scheduled_at <= $now
             AND i.terminal_state IS NULL
             AND w.workflow_id = ANY($ids)
         )
-        SELECT r.workflow_id, r.key, r.scope, r.created_at, r.scheduled_at, r.attempts
+        SELECT r.workflow_id, r.workflow_instance_key, r.scope, r.created_at, r.scheduled_at, r.attempts
         FROM ranked r
         JOIN workflow_wakeups w
-          ON w.workflow_id = r.workflow_id AND w.key = r.key AND w.scope = r.scope
+          ON w.workflow_id = r.workflow_id AND w.workflow_instance_key = r.workflow_instance_key AND w.scope = r.scope
         WHERE r.share <= ${settings.perWorkflowBatchShare}
-        ORDER BY r.scheduled_at, r.workflow_id, r.key
+        ORDER BY r.scheduled_at, r.workflow_id, r.workflow_instance_key
         LIMIT ${settings.wakeupBatchSize}
         FOR UPDATE OF w SKIP LOCKED
       """
@@ -156,13 +156,13 @@ final class PostgresJobRunner private[atomicflow] (
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
           if (atCapacity(row.workflowId)) deferRowIO(row, now).as(acc)
           else
-            runtime.tryAcquireOnceIO(row.workflowId, row.key, row.scope, runnerWorker, settings.leaseDuration).flatMap {
+            runtime.tryAcquireOnceIO(row.workflowId, row.instanceKey, row.scope, runnerWorker, settings.leaseDuration).flatMap {
               case Some(token) =>
                 sql"""DELETE FROM workflow_wakeups
-                      WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
+                      WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND scope = ${row.scope}
                         AND scheduled_at = ${row.scheduledAt}""".update.run.map { _ =>
                   acquirePermit(row.workflowId)
-                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.key, row.scope), runnerWorker, token, row.attempts, row.createdAt)
+                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorker, token, row.attempts, row.createdAt)
                 }
               case None => acc.pure[ConnectionIO]
             }
@@ -180,7 +180,7 @@ final class PostgresJobRunner private[atomicflow] (
     val deferred = now.plus(java.time.Duration.ofNanos(settings.capacityRetryDelay.toNanos))
     sql"""UPDATE workflow_wakeups
           SET scheduled_at = $deferred
-          WHERE workflow_id = ${row.workflowId} AND key = ${row.key} AND scope = ${row.scope}
+          WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND scope = ${row.scope}
             AND scheduled_at = ${row.scheduledAt}""".update.run.map(_ => ())
   }
 
@@ -195,9 +195,9 @@ final class PostgresJobRunner private[atomicflow] (
     val now = runtime.clock.instant()
     val scheduled = now.plus(java.time.Duration.ofNanos(backoffDelay(attempts).toNanos))
     runtime.runTransaction {
-      sql"""INSERT INTO workflow_wakeups (workflow_id, key, scope, created_at, scheduled_at, attempts)
+      sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, scope, created_at, scheduled_at, attempts)
             VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduled, ${attempts + 1})
-            ON CONFLICT (workflow_id, key, scope) DO UPDATE
+            ON CONFLICT (workflow_id, workflow_instance_key, scope) DO UPDATE
             SET created_at = workflow_wakeups.created_at,
                 scheduled_at = GREATEST(workflow_wakeups.scheduled_at, EXCLUDED.scheduled_at),
                 attempts = workflow_wakeups.attempts + 1""".update.run
@@ -279,15 +279,15 @@ final class PostgresJobRunner private[atomicflow] (
   }
 
   private final case class TimerSweepRow(
-      subscriptionId: java.util.UUID,
+      timerId: java.util.UUID,
       workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
+      instanceKey: WorkflowInstanceKey,
       scope: String
   )
 
   private final case class InstanceRow(
       workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
+      instanceKey: WorkflowInstanceKey,
       scope: String
   )
 
@@ -304,16 +304,16 @@ final class PostgresJobRunner private[atomicflow] (
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
       (fr"""
-        SELECT s.subscription_id, s.workflow_id, s.key, s.scope
+        SELECT s.timer_id, s.workflow_id, s.workflow_instance_key, s.scope
         FROM workflow_timer_subscriptions s
         JOIN workflow_instances i
-          ON i.workflow_id = s.workflow_id AND i.key = s.key AND i.scope = s.scope
+          ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
         WHERE s.deadline <= $now
           AND i.terminal_state IS NULL
           AND NOT EXISTS (
             SELECT 1 FROM workflow_events e
-            WHERE e.workflow_id = s.workflow_id AND e.key = s.key AND e.scope = s.scope
-              AND e.event_kind = 'TimerFired' AND e.event_key = s.subscription_id::text
+            WHERE e.workflow_id = s.workflow_id AND e.workflow_instance_key = s.workflow_instance_key AND e.scope = s.scope
+              AND e.event_kind = 'TimerFired' AND e.event_key = s.timer_id::text
           )
         ORDER BY s.deadline
         LIMIT ${settings.timerBatchSize}
@@ -322,7 +322,7 @@ final class PostgresJobRunner private[atomicflow] (
     }
     var fired = 0
     rows.foreach { row =>
-      if (runtime.runTransaction(runtime.fireTimerSubscriptionIO(row.subscriptionId, row.workflowId, row.key, row.scope)))
+      if (runtime.runTransaction(runtime.fireTimerSubscriptionIO(row.timerId, row.workflowId, row.instanceKey, row.scope)))
         fired += 1
     }
     if (fired > 0) log.debug(s"Timer sweep fired $fired due timers")
@@ -338,14 +338,14 @@ final class PostgresJobRunner private[atomicflow] (
     val now = runtime.clock.instant()
     val cutoff = now.minus(java.time.Duration.ofNanos(settings.cancelTimeout.toNanos))
     val rows = runtime.runTransaction {
-      sql"""SELECT workflow_id, key, scope FROM workflow_instances
+      sql"""SELECT workflow_id, workflow_instance_key, scope FROM workflow_instances
             WHERE cancel_requested_at IS NOT NULL AND terminal_state IS NULL
               AND cancel_requested_at <= $cutoff
             LIMIT 128""".query[InstanceRow].to[Vector]
     }
     var escalated = 0
     rows.foreach { row =>
-      if (runtime.escalateTerminated(WorkflowInstanceId(row.workflowId, row.key, row.scope)))
+      if (runtime.escalateTerminated(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
         escalated += 1
     }
     if (escalated > 0) log.info(s"Escalation sweep escalated $escalated cancellations to TERMINATED")
@@ -361,13 +361,13 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
-      sql"""SELECT workflow_id, key, scope FROM workflow_instances
+      sql"""SELECT workflow_id, workflow_instance_key, scope FROM workflow_instances
             WHERE lease_owner IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
             LIMIT 128""".query[InstanceRow].to[Vector]
     }
     var recovered = 0
     rows.foreach { row =>
-      if (runtime.recoverLease(WorkflowInstanceId(row.workflowId, row.key, row.scope)))
+      if (runtime.recoverLease(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
         recovered += 1
     }
     if (recovered > 0) log.info(s"Lease recovery sweep recovered $recovered expired leases")

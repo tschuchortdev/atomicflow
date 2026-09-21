@@ -21,7 +21,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
   ): Vector[(String, Option[String], Option[Instant])] =
     run(
       sql"""SELECT idempotency_key, result, handled_at FROM workflow_updates
-            WHERE workflow_id = $workflowId AND key = $key AND scope = $scope AND update_key = $updateKey
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope AND update_key = $updateKey
             ORDER BY created_at""".query[(String, Option[String], Option[Instant])].to[Vector]
     )
 
@@ -186,7 +186,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""UPDATE workflow_instances
             SET lease_owner = 'someone-else', lease_expires_at = now() + interval '300 milliseconds'
-            WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run
     )
 
     val res = update.send(wf, id, "hello", idempotencyKey = "lease-idem")(using rt)

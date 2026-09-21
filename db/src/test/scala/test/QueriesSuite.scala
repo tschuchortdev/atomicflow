@@ -67,7 +67,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(w, "alpha-1", "a")
     rt.createWorkflowInstance(w, "alpha-2", "b")
     rt.createWorkflowInstance(w, "beta-1", "c")
-    run(sql"""INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation)
+    run(sql"""INSERT INTO workflow_instances (workflow_id, workflow_instance_key, scope, input, workflow_version_at_creation)
              VALUES (${w.id}, 'alpha-3', 'child', 'x', 1)""".update.run)
 
     val res = rt.getWorkflowInstancesByPrefix(w.id, "alpha")
@@ -95,7 +95,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(w, "waiting-1", "a")
     rt.createWorkflowInstance(w, "waiting-2", "b")
     rt.createAndRun(w, "done", "c")
-    run(sql"""INSERT INTO workflow_instances (workflow_id, key, scope, input, workflow_version_at_creation, times_executed)
+    run(sql"""INSERT INTO workflow_instances (workflow_id, workflow_instance_key, scope, input, workflow_version_at_creation, times_executed)
              VALUES (${w.id}, 'started', '', 'x', 1, 1)""".update.run)
 
     val waiting = rt.getUnfinishedWorkflowInstances(w.id)
@@ -121,9 +121,9 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createAndRun(w, "x-1", "a")
     rt.createWorkflowInstance(w, "x-2", "b")
     rt.createWorkflowInstance(w, "y-1", "c")
-    run(sql"""INSERT INTO workflow_steps (workflow_id, key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints)
+    run(sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints)
              VALUES (${w.id}, 'x-2', '', 's1', 1, 'k', 'started', '', '')""".update.run)
-    run(sql"""INSERT INTO signal_cursor (workflow_id, key, scope, signal_key, sequence_id)
+    run(sql"""INSERT INTO signal_cursor (workflow_id, workflow_instance_key, scope, signal_key, sequence_id)
              VALUES (${w.id}, 'x-2', '', 'sig', 1)""".update.run)
 
     val deleted = rt.deleteWorkflowInstancesByPrefix(w.id, "x-")
@@ -134,7 +134,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
       1
     )
     assertEquals(
-      run(sql"SELECT count(*) FROM workflow_instances WHERE workflow_id = ${w.id} AND key = 'y-1'".query[Int].unique),
+      run(sql"SELECT count(*) FROM workflow_instances WHERE workflow_id = ${w.id} AND workflow_instance_key = 'y-1'".query[Int].unique),
       1
     )
     assertEquals(run(sql"SELECT count(*) FROM workflow_steps WHERE workflow_id = ${w.id}".query[Int].unique), 0)
@@ -169,7 +169,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(w, "k", "a")
     run(sql"""UPDATE workflow_instances SET terminal_state = 'cancelled',
              terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Cancelled)}
-             WHERE workflow_id = ${w.id} AND key = 'k' AND scope = ''""".update.run)
+             WHERE workflow_id = ${w.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run)
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
     assertEquals(rt.awaitResult(h, 5.seconds), WorkflowRunResult.WorkflowCancelled)
   }
@@ -222,7 +222,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(w, "k", "a")
     given WorkflowRuntime = rt
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
-    run(sql"""DELETE FROM workflow_instances WHERE workflow_id = ${w.id} AND key = 'k' AND scope = ''""".update.run)
+    run(sql"""DELETE FROM workflow_instances WHERE workflow_id = ${w.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run)
     intercept[WorkflowNotFoundException] {
       rt.awaitResult(h, 5.seconds)
     }

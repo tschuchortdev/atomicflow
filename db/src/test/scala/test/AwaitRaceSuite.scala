@@ -31,60 +31,60 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-  private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, Int, String)] =
+  private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, String)] =
     run(
-      sql"""SELECT step_id, step_version, leaf_idx, signal_key FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
-            ORDER BY step_id, leaf_idx""".query[(String, Long, Int, String)].to[Vector]
+      sql"""SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
+            ORDER BY step_id, subscriber_key""".query[(String, Long, String, String)].to[Vector]
     )
 
-  private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, Int, java.util.UUID, Instant)] =
+  private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, java.util.UUID, Instant)] =
     run(
-      sql"""SELECT step_id, step_version, leaf_idx, subscription_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
-            ORDER BY step_id, leaf_idx""".query[(String, Long, Int, java.util.UUID, Instant)].to[Vector]
+      sql"""SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_timer_subscriptions
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
+            ORDER BY step_id, subscriber_key""".query[(String, Long, String, java.util.UUID, Instant)].to[Vector]
     )
 
   private def completionSubscriptions(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey
-  ): Vector[(String, Long, Int, String, String, String)] =
+  ): Vector[(String, Long, String, String, String, String)] =
     run(
-      sql"""SELECT step_id, step_version, leaf_idx, completed_workflow_id, completed_key, completed_scope
+      sql"""SELECT step_id, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_scope
             FROM workflow_completion_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
-            ORDER BY step_id, leaf_idx""".query[(String, Long, Int, String, String, String)].to[Vector]
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
+            ORDER BY step_id, subscriber_key""".query[(String, Long, String, String, String, String)].to[Vector]
     )
 
   private def cursor(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey): Option[Long] =
     run(
       sql"""SELECT sequence_id FROM signal_cursor
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND signal_key = $signalKey""".query[Long].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND signal_key = $signalKey""".query[Long].option
     )
 
   private def seqOf(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey, payload: String): Long =
     run(
       sql"""SELECT sequence_id FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
               AND event_kind = 'Signal' AND event_key = $signalKey AND payload = $payload""".query[Long].unique
     )
 
   private def timerFiredOrder(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
     run(
       sql"""SELECT event_key FROM workflow_events
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''
               AND event_kind = 'TimerFired' ORDER BY sequence_id""".query[String].to[Vector]
     )
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
-      sql"""SELECT EXISTS(SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND key = $key AND scope = '')""".query[Boolean].unique
+      sql"""SELECT EXISTS(SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '')""".query[Boolean].unique
     )
 
   private def stepRow(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String): Option[(String, String, String)] =
     run(
       sql"""SELECT step_kind, state_kind, state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId AND step_version = 0""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId AND step_version = 0""".query[
           (String, String, String)
         ].option
     )
@@ -95,14 +95,14 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     given Clock = clock
     val sig = Signal[String]("s")
     val wf = Workflow[String, String](id = "race-suspend") { in =>
-      Step.awaitRace[String]("race")(Awaitable.SignalEvent(sig), Awaitable.Timer(1.minute).map(_ => "timeout"))
+      Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
       "done"
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("race", 0L, 0, "s")))
-    assertEquals(timerSubscriptions(wf.id, "k").map { case (s, v, l, _, _) => (s, v, l) }, Vector(("race", 0L, 1)))
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("race", 0L, "signal", "s")))
+    assertEquals(timerSubscriptions(wf.id, "k").map { case (s, v, l, _, _) => (s, v, l) }, Vector(("race", 0L, "timeout")))
     assertEquals(completionSubscriptions(wf.id, "k"), Vector.empty)
     assertEquals(cursor(wf.id, "k", "s"), None)
     assertEquals(timerFiredOrder(wf.id, "k"), Vector.empty)
@@ -115,7 +115,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-signal-wins") { in =>
-      last = Step.awaitRace[String]("race")(Awaitable.SignalEvent(sig), Awaitable.Timer(1.minute).map(_ => "timeout"))
+      last = Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
       TestControlFlow.suspend()
       last
     }
@@ -141,7 +141,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-timer-wins") { in =>
-      last = Step.awaitRace[String]("race")(Awaitable.SignalEvent(sig), Awaitable.Timer(1.minute).map(_ => "timeout"))
+      last = Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
       TestControlFlow.suspend()
       last
     }
@@ -165,8 +165,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     var last = ""
     val wf = Workflow[String, String](id = "race-timers") { in =>
       last = Step.awaitRace[String]("race")(
-        Awaitable.Timer(5.minutes).map(_ => "t5"),
-        Awaitable.Timer(1.minute).map(_ => "t1")
+        "t5" -> Awaitable.Timer(5.minutes).map(_ => "t5"),
+        "t1" -> Awaitable.Timer(1.minute).map(_ => "t1")
       )
       TestControlFlow.suspend()
       last
@@ -174,8 +174,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    val (_, _, _, subT5, _) = timerSubscriptions(wf.id, "k")(0)
-    val (_, _, _, subT1, _) = timerSubscriptions(wf.id, "k")(1)
+    val (_, _, _, subT1, _) = timerSubscriptions(wf.id, "k")(0)
+    val (_, _, _, subT5, _) = timerSubscriptions(wf.id, "k")(1)
 
     clock.advanceBy(6.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
@@ -189,20 +189,20 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val sigA = Signal[String]("a")
     val sigB = Signal[String]("b")
     val wf = Workflow[String, String](id = "race-two-sig") { in =>
-      val r = Step.awaitRace[String]("race")(Awaitable.SignalEvent(sigA), Awaitable.SignalEvent(sigB))
+      val r = Step.awaitRace[String]("race")("a" -> Awaitable.SignalEvent(sigA), "b" -> Awaitable.SignalEvent(sigB))
       val b = Step.await[String]("after", Awaitable.SignalEvent(sigB))
       s"$r|$b"
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("race", 0L, 0, "a"), ("race", 0L, 1, "b")))
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("race", 0L, "a", "a"), ("race", 0L, "b", "b")))
 
     sigA.send(id, "xa")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(cursor(wf.id, "k", "a").get, seqOf(wf.id, "k", "a", "xa"))
     assertEquals(cursor(wf.id, "k", "b"), None, "the losing signal key's cursor must not advance")
-    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("after", 0L, 0, "b")), "the race's own leaves are retired")
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector(("after", 0L, "", "b")), "the race's own leaves are retired")
 
     sigB.send(id, "yb")(using rt)
     val ybSeq = seqOf(wf.id, "k", "b", "yb")
@@ -217,7 +217,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-cached") { in =>
-      last = Step.awaitRace[String]("race")(Awaitable.SignalEvent(sig), Awaitable.Timer(1.minute).map(_ => "timeout"))
+      last = Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
       TestControlFlow.suspend()
       last
     }
@@ -244,8 +244,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     var last = ""
     val wf = Workflow[String, String](id = "race-invalidate") { in =>
       last = Step.awaitRace[String]("race", invalidateOn = Seq("ctx" -> ctx))(
-        Awaitable.SignalEvent(sig),
-        Awaitable.Timer(1.minute).map(_ => "timeout")
+        "signal" -> Awaitable.SignalEvent(sig),
+        "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout")
       )
       TestControlFlow.suspend()
       last
@@ -262,8 +262,13 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(
       signalSubscriptions(wf.id, "k").map { case (s, v, l, k) => (s, v, l, k) },
-      Vector(("race", 0L, 0, "s")),
+      Vector(("race", 0L, "signal", "s")),
       "the invalidated race re-registers its subscriptions"
+    )
+    assertEquals(
+      timerSubscriptions(wf.id, "k").map(_._3),
+      Vector("timeout"),
+      "the invalidated race re-registers its timer member"
     )
 
     sig.send(id, "e2")(using rt)
@@ -278,8 +283,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val sig = Signal[String]("s")
     val wf = Workflow[String, String](id = "race-het") { in =>
       val v = Step.awaitRace[RaceOutcome]("race")(
-        Awaitable.Timer(1.minute).map(_ => RaceOutcomeTimeout),
-        Awaitable.SignalEvent(sig).map(v => RaceOutcomeGot(v))
+        "timeout" -> Awaitable.Timer(1.minute).map(_ => RaceOutcomeTimeout),
+        "signal" -> Awaitable.SignalEvent(sig).map(v => RaceOutcomeGot(v))
       )
       v match {
         case RaceOutcomeTimeout    => "timeout"
@@ -309,7 +314,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val aId = rt.createWorkflowInstance(aWf, "a", "in").id
 
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(completionSubscriptions(aWf.id, "a"), Vector(("wait-b", 0L, 0, "B", "b", "")))
+    assertEquals(completionSubscriptions(aWf.id, "a"), Vector(("wait-b", 0L, "", "B", "b", "")))
 
     assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HELLO"))
     assert(wakeupExists(aWf.id, "a"), "A's wakeup is upserted when B's terminal transition commits")
@@ -350,11 +355,11 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     var last = ""
     val aWf = Workflow[String, String](id = "Amap") { in =>
       last = Step.awaitRace[String]("race")(
-        bHandle.completion.map {
+        "completion" -> bHandle.completion.map {
           case WorkflowCompletionResult.Completed(v) => v
           case _                                     => "?"
         },
-        Awaitable.Timer(1.minute).map(_ => "timeout")
+        "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout")
       )
       TestControlFlow.suspend()
       last
@@ -383,11 +388,11 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     var last = ""
     val aWf = Workflow[String, String](id = "Amap2") { in =>
       last = Step.awaitRace[String]("race")(
-        bHandle.completion.map {
+        "completion" -> bHandle.completion.map {
           case WorkflowCompletionResult.Completed(v) => v
           case _                                     => "?"
         },
-        Awaitable.Timer(1.minute).map(_ => "timeout")
+        "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout")
       )
       TestControlFlow.suspend()
       last
@@ -410,8 +415,8 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     var last: WorkflowCompletionResult[String] = WorkflowCompletionResult.Cancelled
     val aWf = Workflow[String, String](id = "Amix") { in =>
       last = Step.awaitRace[WorkflowCompletionResult[String]]("race")(
-        bHandle.completion,
-        Awaitable.SignalEvent(sig).map(v => WorkflowCompletionResult.Completed(v))
+        "completion" -> bHandle.completion,
+        "signal" -> Awaitable.SignalEvent(sig).map(v => WorkflowCompletionResult.Completed(v))
       )
       TestControlFlow.suspend()
       "done"
@@ -424,5 +429,35 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     sig.send(aId, "sx")(using rt)
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
     assertEquals(last, WorkflowCompletionResult.Completed("HI"), "the earlier completion event beats the later signal")
+  }
+
+  test("awaitRace rejects empty, duplicate, and reserved-prefixed member keys") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    given Clock = clock
+    val rt = newRuntime(clock)
+    def runBody(id: String, members: Seq[(String, Awaitable[String])]): Unit = {
+      val wf = Workflow[String, String](id = id) { in =>
+        Step.awaitRace[String]("race")(members*)
+        "done"
+      }
+      val instance = rt.createWorkflowInstance(wf, "k", "in").id
+      rt.runWorkflowInstance(wf, instance)
+    }
+    val sig = Signal[String]("s")
+
+    val empty = intercept[StepFailed] {
+      runBody("race-invalid-empty", Seq("" -> Awaitable.SignalEvent(sig)))
+    }
+    assert(empty.getMessage.contains("non-empty"), empty.getMessage)
+
+    val duplicate = intercept[StepFailed] {
+      runBody("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(1.minute).map(_ => "timeout")))
+    }
+    assert(duplicate.getMessage.contains("unique"), duplicate.getMessage)
+
+    val reserved = intercept[StepFailed] {
+      runBody("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(1.minute).map(_ => "timeout")))
+    }
+    assert(reserved.getMessage.contains("reserved"), reserved.getMessage)
   }
 }

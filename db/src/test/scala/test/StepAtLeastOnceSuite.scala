@@ -31,7 +31,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(String, String, Option[Instant])] =
     run(
       sql"""SELECT state_kind, state_payload, expires_at FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId AND step_version = $stepVersion""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId AND step_version = $stepVersion""".query[
           (String, String, Option[Instant])
         ].option
     )
@@ -42,7 +42,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(Option[String], Option[String], Long)] =
     run(
       sql"""SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String], Long)
         ].option
     )
@@ -86,7 +86,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       Step.atLeastOnce[String]("step") {
         observed = run(
           sql"""SELECT state_kind FROM workflow_steps
-                WHERE workflow_id = 'started-before' AND key = 'k' AND scope = '' AND step_id = 'step' AND step_version = 1""".query[
+                WHERE workflow_id = 'started-before' AND workflow_instance_key = 'k' AND scope = '' AND step_id = 'step' AND step_version = 1""".query[
               String
             ].option
         )
@@ -258,7 +258,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       Step.atLeastOnce[String]("step") {
         run(
           sql"""UPDATE workflow_instances SET fencing_token = fencing_token + 1
-                WHERE workflow_id = 'fenced' AND key = 'k' AND scope = ''""".update.run
+                WHERE workflow_id = 'fenced' AND workflow_instance_key = 'k' AND scope = ''""".update.run
         )
         "result"
       }

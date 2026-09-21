@@ -17,13 +17,13 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
   private def cursor(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey): Option[Long] =
     run(
       sql"""SELECT sequence_id FROM signal_cursor
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND signal_key = $signalKey""".query[Long].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND signal_key = $signalKey""".query[Long].option
     )
 
-  private def subscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, Int, String)] =
+  private def subscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, String)] =
     run(
-      sql"""SELECT step_id, step_version, leaf_idx, signal_key FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[(String, Long, Int, String)].to[Vector]
+      sql"""SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[(String, Long, String, String)].to[Vector]
     )
 
   private def stepRow(
@@ -33,7 +33,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(String, String, String)] =
     run(
       sql"""SELECT step_kind, state_kind, state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId AND step_version = 0""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId AND step_version = 0""".query[
           (String, String, String)
         ].option
     )
@@ -51,7 +51,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.WorkflowSuspended)
 
     val subs = subscriptions(wf.id, "k")
-    assertEquals(subs, Vector(("wait-greet", 0L, 0, "greet")))
+    assertEquals(subs, Vector(("wait-greet", 0L, "", "greet")))
     assertEquals(cursor(wf.id, "k", "greet"), None)
   }
 
@@ -116,7 +116,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     val c = cursor(wf.id, "k", "s").get
     val acceptSeq = run(
-      sql"""SELECT sequence_id FROM workflow_events WHERE workflow_id = ${wf.id} AND key = 'k' AND scope = ''
+      sql"""SELECT sequence_id FROM workflow_events WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''
             AND event_kind = 'Signal' AND event_key = 's' AND payload = 'accept'""".query[Long].unique
     )
     assertEquals(c, acceptSeq)

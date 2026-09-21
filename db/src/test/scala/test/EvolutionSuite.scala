@@ -28,7 +28,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[String] =
     run(
       sql"""SELECT state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND scope = '' AND step_id = $stepId AND step_version = $stepVersion""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId AND step_version = $stepVersion""".query[
           String
         ].option
     )

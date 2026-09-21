@@ -20,13 +20,13 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
   ): Option[(String, String, String)] =
     run(
       sql"""SELECT step_kind, state_kind, state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND key = $key AND step_id = 'race'""".query[(String, String, String)].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND step_id = 'race'""".query[(String, String, String)].option
     )
 
-  private def signalSubscriptionKeys(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, String)] =
+  private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, String)] =
     run(
       sql"""SELECT step_scope_path, signal_key FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND key = $key
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key
             ORDER BY step_scope_path, signal_key""".query[(String, String)].to[Vector]
     )
 
@@ -63,7 +63,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     assertEquals(
-      signalSubscriptionKeys(wf.id, "k"),
+      signalSubscriptions(wf.id, "k"),
       Vector(("race/branch0", "s1"), ("race/branch1", "s2")),
       "each branch's await subscription remains registered while the workflow is suspended"
     )
@@ -85,7 +85,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(kind, "FirstToRunWithoutSuspension")
     assertEquals(state, "succeeded")
     assert(payload.startsWith("0\n"), s"winner index 0 recorded, got payload: $payload")
-    assertEquals(signalSubscriptionKeys(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
   }
 
   test("durable first-wins: after a winner is recorded, replay returns it even if another branch would now unblock first") {
@@ -128,14 +128,14 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
     assert(payload.startsWith("0\n"), s"winner index 0 recorded exactly once, got payload: $payload")
     assertEquals(
-      signalSubscriptionKeys(wf.id, "k"),
+      signalSubscriptions(wf.id, "k"),
       Vector.empty,
       "the winning branch's own await subscription (branch0) is cleaned up when it resolves via the pending await"
     )
     assertEquals(
       run(
         sql"""SELECT count(*) FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'race'""".query[Int].unique
+              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'race'""".query[Int].unique
       ),
       1,
       "the winner row is written once"
@@ -176,14 +176,14 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
     assert(payload.startsWith("2\n"), s"branch index 2 (the completing branch) wins, got payload: $payload")
     assertEquals(
-      signalSubscriptionKeys(wf.id, "k"),
+      signalSubscriptions(wf.id, "k"),
       Vector.empty,
       "both losing branches' subscriptions for the same key are cleaned up"
     )
     assertEquals(
       run(
         sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
+              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
       ),
       Vector(("fast", "race/branch2", "succeeded")),
       "the winner branch's own step row survives cleanup"
@@ -247,7 +247,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "both constructs suspend on the first run")
     assertEquals(
-      signalSubscriptionKeys(wf.id, "k").map(_._1).distinct.size,
+      signalSubscriptions(wf.id, "k").map(_._1).distinct.size,
       4,
       "each of the two constructs' branches registers a distinct (construct-qualified) subscription path"
     )
@@ -276,7 +276,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val paths = run(
       sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND key = 'k' ORDER BY step_scope_path""".query[String].to[Vector]
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_path""".query[String].to[Vector]
     )
     assert(paths.contains("outer/race/branch0"), s"the winner branch's step must persist under the enclosing scope, got: $paths")
     assert(!paths.contains("race/branch0"), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")

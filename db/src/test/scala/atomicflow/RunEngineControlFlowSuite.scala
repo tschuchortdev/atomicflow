@@ -22,7 +22,7 @@ class RunEngineControlFlowSuite extends PostgresWorkflowRuntimeSuite {
   private def instanceRow(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Option[String], Option[String], Int, Option[Instant], Option[String], Option[Instant])] =
     run(
       sql"""SELECT terminal_state, terminal_outcome, times_executed, last_run_at, lease_owner, lease_expires_at
-            FROM workflow_instances WHERE workflow_id = $workflowId AND key = $key AND scope = ''""".query[
+            FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
           (Option[String], Option[String], Int, Option[Instant], Option[String], Option[Instant])
         ].option
     )

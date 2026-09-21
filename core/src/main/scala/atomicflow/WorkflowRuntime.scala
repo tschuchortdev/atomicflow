@@ -94,12 +94,22 @@ trait WorkflowRuntime {
   /** Delete the step row, fenced. */
   def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
 
+  /** Retire an await-site atomically, fenced: delete the site's `succeeded`/
+    * `started` step row and all of its subscriptions in the three subscription
+    * tables, in one transaction. Used by drift/expiry re-evaluation so no stale
+    * registration (in particular a fired timer of the previous incarnation) can
+    * satisfy the re-evaluated site. Unlike [[deleteStep]], this retires the
+    * subscriptions too.
+    */
+  def retireAwaitSite(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+
   /** Durably suspend an at-least-once step for a retry, fenced, in one
     * transaction: persist (or refresh) the `started` step row carrying the
     * runtime-owned retry bookkeeping in `retryPayload` and its `expiresAt`, and
-    * register the retry's timer subscription (deadline = `now + delay`) under a
-    * reserved subscription identity that cannot collide with user awaits of the
-    * same site. The step body is NOT executed until the subscription is due.
+    * register the retry's timer subscription (deadline = `now + delay`) under
+    * the reserved `"__retry__"` subscriber key, which cannot collide with user
+    * awaits of the same site. The step body is NOT executed until the
+    * subscription is due.
     */
   def suspendStepRetry(
       run: CurrentExecution,
@@ -148,10 +158,10 @@ trait WorkflowRuntime {
   /** Read the durable `Signal` events of `signalKey` that are visible to this
     * instance (after its shared exact-key cursor), in sequence order. A plain
     * read of durable facts; no lease or fence is involved and the cursor is not
-    * advanced. Serves `Step.peekSignal`, so `leafIdx` is always `0` on the
+    * advanced. Serves `Step.peekSignal`, so `subscriberKey` is always `""` on the
     * returned candidates.
     */
-  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[WaitCandidate]
+  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[SubscriberMatch]
 
   /** Read the unhandled `Update` records of `updateKey` addressed directly to
     * this instance, oldest first, without handling any of them. A plain durable
@@ -204,7 +214,7 @@ trait WorkflowRuntime {
 
   /** Retire an invalidated/expired timer await atomically, fenced: discard the
     * site's `succeeded` step row, delete its old timer subscriptions, and
-    * register a fresh subscription (new id, `deadline`) — all in one
+    * register a fresh subscription (new timer id, `deadline`) — all in one
     * transaction, so no crash window can leave the old incarnation live. The
     * fresh deadline is recomputed (`now + delay`), so its old `TimerFired`
     * event is structurally inert.
@@ -214,21 +224,21 @@ trait WorkflowRuntime {
   /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
     * own transaction, fire the site's own due timer subscriptions
     * (`deadline <= now`), row-locked in deadline order
-    * (`ORDER BY deadline, subscription_id`), appending a `TimerFired` event per
+    * (`ORDER BY deadline, timer_id`), appending a `TimerFired` event per
     * due subscription that has none yet under the global append protocol (no
     * wakeup upsert); this commits immediately, so a fired event persists even if
     * the evaluation that follows rolls back (a re-fire on a later evaluation is
     * an idempotent event-exists no-op). Then, in a second transaction, register
-    * every interest idempotently (`ON CONFLICT DO NOTHING`), preserving an
-    * existing timer subscription's id and stored deadline; read all interests'
-    * candidates and apply `decide` to the candidates merged across interests and
-    * sorted by global `sequenceId`. `decide` runs inside this second transaction
-    * while the instance row lock is held, so it must be fast and pure (no I/O,
-    * no blocking). If `decide` returns `Some(resolution)`, persist the
-    * `succeeded` step row (`site.stepKind`), advance the winning signal key's
-    * cursor when the resolution requests it, and delete the site's rows in all
-    * three subscription tables — all atomically with the registration and
-    * candidate read (this registration + read + resolution atomicity is what
+    * every subscriber idempotently (`ON CONFLICT DO NOTHING`), preserving an
+    * existing timer subscription's timer id and stored deadline; read all
+    * subscribers' candidates and apply `decide` to the candidates merged across
+    * subscribers and sorted by global `sequenceId`. `decide` runs inside this
+    * second transaction while the instance row lock is held, so it must be fast
+    * and pure (no I/O, no blocking). If `decide` returns `Some(resolution)`,
+    * persist the `succeeded` step row (`site.stepKind`), advance the winning
+    * signal key's cursor when the resolution requests it, and delete the site's
+    * rows in all three subscription tables — all atomically with the registration
+    * and candidate read (this registration + read + resolution atomicity is what
     * makes the await lost-wakeup-free). If it returns `None`, the registrations
     * commit and no cursor moves (the await durably suspends). Returns the
     * persisted payload when resolved, `None` when suspended. A `decide`
@@ -238,8 +248,8 @@ trait WorkflowRuntime {
   def evaluateWait(
       run: CurrentExecution,
       site: WaitSite,
-      interests: Vector[WaitInterest]
-  )(decide: Vector[WaitCandidate] => Option[WaitResolution]): Option[String]
+      subscribers: Vector[Subscriber]
+  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[String]
 
   /** Resolve a `Step.firstToRunWithoutSuspension` construct atomically, fenced:
     * persist the `succeeded` step row (`stepKind`) recording the winner, and in
