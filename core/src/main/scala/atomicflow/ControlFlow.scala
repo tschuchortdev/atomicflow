@@ -10,7 +10,7 @@ import scala.util.control.ControlThrowable
   * Extends [[ControlThrowable]], so both [[scala.util.control.NonFatal]] and
   * [[WorkflowNonFatal]] exclude them.
   */
-sealed trait WorkflowControlException extends ControlThrowable
+sealed trait WorkflowControlFlowException extends ControlThrowable
 
 /** Thrown when an await cannot be satisfied and the instance durably suspends.
   * The pending subscriptions are committed by the await evaluation before this
@@ -20,7 +20,7 @@ sealed trait WorkflowControlException extends ControlThrowable
   */
 final class WorkflowSuspendedException private[atomicflow] (
     val causes: Seq[WorkflowSuspendedException] = Nil
-) extends WorkflowControlException {
+) extends WorkflowControlFlowException {
   override def toString: String = "WorkflowSuspendedException"
 }
 
@@ -31,7 +31,7 @@ final class WorkflowSuspendedException private[atomicflow] (
   * commits the transition; the type system ties the two by convention, so a
   * mismatch fails the run (acceptable).
   */
-final class ContinueAsNewException private[atomicflow] (val encoded: String) extends WorkflowControlException {
+final class ContinueAsNewException private[atomicflow] (val encoded: String) extends WorkflowControlFlowException {
   override def toString: String = "ContinueAsNewException"
 }
 
@@ -43,7 +43,7 @@ final class ContinueAsNewException private[atomicflow] (val encoded: String) ext
   * previous looping's nested rows and subscriptions, closing its children), and
   * re-enters the body locally in the same run.
   */
-final class RegionRestartException private[atomicflow] (val serializedState: String) extends WorkflowControlException {
+final class RegionRestartException private[atomicflow] (val serializedState: String) extends WorkflowControlFlowException {
   override def toString: String = "RegionRestartException"
 }
 
@@ -51,7 +51,7 @@ final class RegionRestartException private[atomicflow] (val serializedState: Str
   * result. Carries the in-memory result `R` (not persisted at the region level);
   * the region's loop catches it and returns the value as the function's result.
   */
-final class RegionBreakException[R] private[atomicflow] (val result: R) extends WorkflowControlException {
+final class RegionBreakException[R] private[atomicflow] (val result: R) extends WorkflowControlFlowException {
   override def toString: String = "RegionBreakException"
 }
 

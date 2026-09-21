@@ -214,20 +214,19 @@ object Step {
     * bookkeeping plus an ordinary timer subscription) and resumes after the
     * deadline.
     */
-  private def runStep[A: Cacheable](
-      guarantee: Guarantee,
-      key: String,
-      stepVersion: Long,
-      ensureUnchanged: Seq[StepInput[?]],
-      invalidateOn: Seq[StepInput[?]],
-      invalidateAfter: Duration,
-      retry: Step.RetryPolicy
+  private def runStep[A: Cacheable as valueCodec](
+     guarantee: Guarantee,
+     stepKey: String,
+     stepVersion: Long,
+     ensureUnchanged: Seq[StepInput[?]],
+     invalidateOn: Seq[StepInput[?]],
+     invalidateAfter: Duration,
+     retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
-    val stepId = StepId(key, ctx.currentScope)
+    val stepId = StepId(stepKey, ctx.currentScope)
     val stepKind = guarantee.toString
-    val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = rt.clock.instant()
     val expiresAt = expiryOf(invalidateAfter, now)
@@ -245,7 +244,7 @@ object Step {
           case _: Throwable =>
             Left(
               new StepSerializationFailed(
-                s"Step '$key' failure could not be encoded with the configured throwable codec: ${t.getClass.getName}: ${t.getMessage}"
+                s"Step '$stepKey' failure could not be encoded with the configured throwable codec: ${t.getClass.getName}: ${t.getMessage}"
               )
             )
         }
@@ -253,7 +252,7 @@ object Step {
         case Right(serialized) =>
           val decoded =
             try throwableCodec.read(serialized)
-            catch { case _: Throwable => new StepSerializationFailed(s"Step '$key' failure could not be decoded") }
+            catch { case _: Throwable => new StepSerializationFailed(s"Step '$stepKey' failure could not be decoded") }
           (serialized, decoded)
         case Left(ssf) =>
           val persisted =
@@ -292,7 +291,7 @@ object Step {
       }
       while (true) {
         try {
-          val (serialized, decoded) = serializeAndDecode(valueCodec, key)(body)
+          val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(body)
           rt.writeStepState(
             run, stepId, stepVersion, stepKind, StoredStep.State.Succeeded, fingerprints, serialized, expiresAt
           )
@@ -339,7 +338,7 @@ object Step {
     val rawExisting = rt.lookupStep(run, stepId, stepVersion)
     val replayable =
       rawExisting.filterNot(row =>
-        isExpired(row, now) || hasDrifted(key, row, ensureUnchanged, invalidateOn)
+        isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)
       )
     if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStep(run, stepId, stepVersion)
 
@@ -349,9 +348,9 @@ object Step {
       case Some(row) =>
         row.state match {
           case StoredStep.State.Succeeded =>
-            Some(decodeStored(valueCodec, key)(row.statePayload))
+            Some(decodeStored(valueCodec, stepKey)(row.statePayload))
           case StoredStep.State.Failed =>
-            throw decodeStoredFailure(throwableCodec, key)(row.statePayload)
+            throw decodeStoredFailure(throwableCodec, stepKey)(row.statePayload)
           case StoredStep.State.Started if guarantee == Guarantee.AtMostOnce =>
             None
           case StoredStep.State.Started if row.statePayload.startsWith(RetryBookkeeping.payloadPrefix) =>
@@ -444,21 +443,21 @@ object Step {
     * event, compared by global `sequenceId` so signals, timers, and workflow
     * completions compete fairly regardless of kind or workflow tree.
     *
-    * Each member is a `key -> awaitable` pair: the key is the member's
+    * Each branch is a `key -> awaitable` pair: the key is the branch's
     * subscriber key, a stable identity that names the awaitable within this race
     * independently of its position. Keys must be non-empty, unique within the
     * race, and must not start with `"__"` (reserved for engine-internal
-    * subscribers). Reordering the members never changes their subscription
+    * subscribers). Reordering the branchs never changes their subscription
     * identity.
     *
-    * Creates one subscription per member in the corresponding table. Each signal
-    * member retains the shared exact-key cursor for its own key; only the winning
+    * Creates one subscription per branch in the corresponding table. Each signal
+    * branch retains the shared exact-key cursor for its own key; only the winning
     * signal key's cursor advances. A satisfied race persists a `succeeded` step
-    * row (result = the winning member's value) and retires every member's
+    * row (result = the winning branch's value) and retires every branch's
     * subscription atomically. If no candidate is satisfiable the workflow durably
-    * suspends with every member's subscription registered and no cursor movement.
+    * suspends with every branch's subscription registered and no cursor movement.
     *
-    * Due timer members of the race are materialized at evaluation in deadline
+    * Due timer branchs of the race are materialized at evaluation in deadline
     * order, so the earliest due timer wins deterministically among timers.
     *
     * Drift policies apply exactly as for [[await]]: `ensureUnchanged` values must
@@ -474,34 +473,34 @@ object Step {
     *   named inputs that invalidate the cached race result when they change
     * @param ensureUnchanged
     *   named inputs that must be invariant between runs
-    * @param members
-    *   the `key -> awaitable` members to race, all of result type `A`
+    * @param branches
+    *   the `key -> awaitable` branches to race, all of result type `A`
     */
   def awaitRace[A: Cacheable](
       stepKey: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-  )(members: (String, Awaitable[A])*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
-    validateRaceMembers(stepKey, members)
-    awaitRace0(stepKey, members.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
+  )(branches: (String, Awaitable[A])*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
+    validateRaceBranches(stepKey, branches)
+    awaitRace0(stepKey, branches.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
   }
 
-  /** Validates user-supplied race member keys. The `""` key is reserved for
+  /** Validates user-supplied race branch keys. The `""` key is reserved for
     * single-subscriber sites (plain awaits), and the `"__"` prefix for
     * engine-internal subscribers (such as step retries).
     */
-  private def validateRaceMembers(stepKey: String, members: Seq[(String, Awaitable[?])]): Unit = {
-    members.foreach { case (memberKey, _) =>
-      require(memberKey.nonEmpty, s"awaitRace('$stepKey') member keys must be non-empty")
+  private def validateRaceBranches(stepKey: String, branches: Seq[(String, Awaitable[?])]): Unit = {
+    branches.foreach { case (branchKey, _) =>
+      require(branchKey.nonEmpty, s"awaitRace('$stepKey') branch keys must be non-empty")
       require(
-        !memberKey.startsWith("__"),
-        s"awaitRace('$stepKey') member key '$memberKey' uses the reserved '__' prefix"
+        !branchKey.startsWith("__"),
+        s"awaitRace('$stepKey') branch key '$branchKey' uses the reserved '__' prefix"
       )
     }
-    val duplicateKeys = members.groupBy(_._1).collect { case (k, ms) if ms.size > 1 => k }.toVector.sorted
+    val duplicateKeys = branches.groupBy(_._1).collect { case (k, ms) if ms.size > 1 => k }.toVector.sorted
     require(
       duplicateKeys.isEmpty,
-      s"awaitRace('$stepKey') member keys must be unique; duplicated: ${duplicateKeys.mkString(", ")}"
+      s"awaitRace('$stepKey') branch keys must be unique; duplicated: ${duplicateKeys.mkString(", ")}"
     )
   }
 
@@ -662,7 +661,7 @@ object Step {
       } else {
         val completed = outcomes.zipWithIndex.collect { case (Right(r), i) => (i, r) }
         val (winnerIdx, winnerResult) = completed.head
-        val (serialized, decoded) = serializeAndDecode(valueCodec, stepId)(winnerResult)
+        val (serialized, decoded) = encodeAndDecode(valueCodec, stepId)(winnerResult)
         val loserPathsToClean = outcomes.zipWithIndex.collect {
           case (Left(_), i) if i != winnerIdx => branchPath(baseScope, i)
         }
@@ -683,7 +682,7 @@ object Step {
     val rawExisting = rt.lookupStep(run, stepIdv, 0L)
     val replayable =
       rawExisting.filterNot(row =>
-        isExpired(row, now) || hasDrifted(stepId, row, ensureUnchanged, invalidateOn)
+        isExpired(row, now) || haveInputsChanged(stepId, row, ensureUnchanged, invalidateOn)
       )
     if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStep(run, stepIdv, 0L)
 
@@ -730,7 +729,7 @@ object Step {
         if (rawExisting.exists(isExpired(_, now))) onExpired()
         else evaluate()
       case Some(row) =>
-        if (hasDrifted(stepKey, row, ensureUnchanged, invalidateOn)) onDrift()
+        if (haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)) onDrift()
         else
           row.state match {
             case StoredStep.State.Succeeded => decode(row.statePayload)
@@ -922,13 +921,13 @@ object Step {
     * stale registrations can never satisfy the new incarnation.
     */
   private def awaitRace0[A: Cacheable](
-      stepKey: String,
-      members: Seq[(String, Awaitable[A])],
-      invalidateOn: Seq[StepInput[?]],
-      ensureUnchanged: Seq[StepInput[?]],
-      invalidateAfter: Duration
+                                        stepKey: String,
+                                        branches: Seq[(String, Awaitable[A])],
+                                        invalidateOn: Seq[StepInput[?]],
+                                        ensureUnchanged: Seq[StepInput[?]],
+                                        invalidateAfter: Duration
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
-    require(members.nonEmpty, s"awaitRace('$stepKey') requires at least one member")
+    require(branches.nonEmpty, s"awaitRace('$stepKey') requires at least one branch")
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
@@ -938,7 +937,7 @@ object Step {
     val expiresAt = expiryOf(invalidateAfter, now)
 
     val subscribers: Vector[(Subscriber, SubscriberMatcher[A])] =
-      members.map { case (memberKey, a) => buildSubscriber(a, memberKey, valueCodec, now) }.toVector
+      branches.map { case (branchKey, a) => buildSubscriber(a, branchKey, valueCodec, now) }.toVector
 
     def decode(payload: String): A =
       try valueCodec.read(payload)
@@ -1003,19 +1002,19 @@ object Step {
   }
 
   private def buildSubscriber[A](
-      a: Awaitable[A],
-      memberKey: String,
-      valueCodec: Cacheable[A],
-      now: java.time.Instant
+                                  a: Awaitable[A],
+                                  branchKey: String,
+                                  valueCodec: Cacheable[A],
+                                  now: java.time.Instant
   ): (Subscriber, SubscriberMatcher[A]) = {
     val (base, toA) = flattenAwaitable(a)
     base match {
       case Awaitable.SignalEvent(signal, filter, lookBack) =>
-        val subscriber = Subscriber.Signal(memberKey, signal.key)
+        val subscriber = Subscriber.Signal(branchKey, signal.key)
         val signalCodec = signal.cacheable
         val matcher = new SubscriberMatcher[A] {
           override def pick(candidates: Vector[SubscriberMatch]): Option[(Long, String, Option[SignalKey])] = {
-            val matching = candidates.filter(_.subscriberKey == memberKey).find { c =>
+            val matching = candidates.filter(_.subscriberKey == branchKey).find { c =>
               val withinLookBack = lookBack match {
                 case d: FiniteDuration =>
                   !c.createdAt.isBefore(now.minus(java.time.Duration.ofNanos(d.toNanos)))
@@ -1028,7 +1027,7 @@ object Step {
                 try valueCodec.write(toA(signalCodec.read(c.payload)))
                 catch {
                   case _: Throwable =>
-                    throw new StepSerializationFailed(s"Subscriber '$memberKey' result could not be encoded")
+                    throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
                 }
               (c.sequenceId, serialized, Some(signal.key))
             }
@@ -1036,15 +1035,15 @@ object Step {
         }
         (subscriber, matcher)
       case Awaitable.Timer(deadline) =>
-        val subscriber = Subscriber.Timer(memberKey, deadline)
+        val subscriber = Subscriber.Timer(branchKey, deadline)
         val matcher = new SubscriberMatcher[A] {
           override def pick(candidates: Vector[SubscriberMatch]): Option[(Long, String, Option[SignalKey])] =
-            candidates.find(_.subscriberKey == memberKey).map { c =>
+            candidates.find(_.subscriberKey == branchKey).map { c =>
               val serialized =
                 try valueCodec.write(toA(()))
                 catch {
                   case _: Throwable =>
-                    throw new StepSerializationFailed(s"Subscriber '$memberKey' result could not be encoded")
+                    throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
                 }
               (c.sequenceId, serialized, None)
             }
@@ -1052,25 +1051,25 @@ object Step {
         (subscriber, matcher)
       case wc @ Awaitable.WorkflowCompletion(_) =>
         val subscriber = Subscriber.Completion(
-          memberKey,
+          branchKey,
           wc.workflowInstanceId.workflowId,
           wc.workflowInstanceId.workflowInstanceKey,
           wc.workflowInstanceId.scope
         )
         val matcher = new SubscriberMatcher[A] {
           override def pick(candidates: Vector[SubscriberMatch]): Option[(Long, String, Option[SignalKey])] =
-            candidates.find(_.subscriberKey == memberKey).map { c =>
+            candidates.find(_.subscriberKey == branchKey).map { c =>
               val decoded =
                 try wc.completionCacheable.read(c.payload)
                 catch {
                   case _: Throwable =>
-                    throw new StepSerializationFailed(s"Subscriber '$memberKey' completion could not be decoded")
+                    throw new StepSerializationFailed(s"Subscriber '$branchKey' completion could not be decoded")
                 }
               val serialized =
                 try valueCodec.write(toA(decoded))
                 catch {
                   case _: Throwable =>
-                    throw new StepSerializationFailed(s"Subscriber '$memberKey' result could not be encoded")
+                    throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
                 }
               (c.sequenceId, serialized, None)
             }
@@ -1087,7 +1086,7 @@ object Step {
     */
   private def isNonCacheable(t: Throwable): Boolean = t match {
     case _: VirtualMachineError | _: ThreadDeath | _: LinkageError => true
-    case _: WorkflowControlException                                => true
+    case _: WorkflowControlFlowException                                => true
     case _: LeaseLostException                                      => true
     case _: WorkflowCancelledException                              => true
     case _                                                          => false
@@ -1121,7 +1120,7 @@ object Step {
     * serialization boundary before being observed (commit-before-observation), so
     * a body's result is always a decoded copy of what was persisted.
     */
-  private def serializeAndDecode[A](codec: Cacheable[A], key: String)(value: A): (String, A) = {
+  private def encodeAndDecode[A](codec: Cacheable[A], key: String)(value: A): (String, A) = {
     val serialized = encodeStored(codec, key)(value)
     (serialized, decodeStored(codec, key)(serialized))
   }
@@ -1143,7 +1142,7 @@ object Step {
     * differs from what the stored row recorded. Shared by steps, first-to-run
     * constructs, and cached awaits.
     */
-  private def hasDrifted(
+  private def haveInputsChanged(
       key: String,
       row: StoredStep,
       ensureUnchanged: Seq[StepInput[?]],
