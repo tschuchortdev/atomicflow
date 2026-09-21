@@ -420,7 +420,7 @@ object Workflow {
   private sealed trait BranchOutcome[+R]
   private final case class BranchResult[R](value: R) extends BranchOutcome[R]
   private final case class BranchSuspended(suspension: WorkflowSuspendedException) extends BranchOutcome[Nothing]
-  private final case class BranchControlFlow(c: WorkflowControlException) extends BranchOutcome[Nothing]
+  private final case class BranchControlFlow(c: WorkflowControlFlowException) extends BranchOutcome[Nothing]
   private final case class BranchFailed(t: Throwable) extends BranchOutcome[Nothing]
 
   /** Runs several branches concurrently (via Ox `par`), waiting for ALL of
@@ -458,7 +458,7 @@ object Workflow {
     try BranchResult(branch(using ctx))
     catch {
       case e: WorkflowSuspendedException => BranchSuspended(e)
-      case e: WorkflowControlException   => BranchControlFlow(e)
+      case e: WorkflowControlFlowException   => BranchControlFlow(e)
       case e if NonFatal(e)              => BranchFailed(e)
     }
 
