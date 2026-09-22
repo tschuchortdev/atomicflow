@@ -125,8 +125,8 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
     assertEquals(compCounter.get(), 2, "both compensation steps executed inside the region despite cancellation")
-    assertEquals(stepStateKind(wf.id, "k", "comp1"), Some("succeeded"), "comp1's succeeded row persisted")
-    assertEquals(stepStateKind(wf.id, "k", "comp2"), Some("succeeded"), "comp2's succeeded row persisted")
+    assertEquals(stepStateKind(wf.id, "k", "comp1"), Some("Succeeded"), "comp1's succeeded row persisted")
+    assertEquals(stepStateKind(wf.id, "k", "comp2"), Some("Succeeded"), "comp2's succeeded row persisted")
     assertEquals(terminalRow(wf.id, "k").get._1, Some("cancelled"))
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)

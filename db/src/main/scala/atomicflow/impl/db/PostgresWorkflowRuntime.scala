@@ -2186,7 +2186,7 @@ _ <- upsertStepStateIO(
         _ <- deleteRegionNestedSubscriptionsIO(run, base)
         _ <- applyRegionClosePoliciesIO(run.workflowId, run.instanceKey, run.instanceScope, run.generation, base)
         _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_scope_path, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'started', ${regionPayload(restartCount, serializedState)}, '', NULL, $now, $now)
+              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${regionPayload(restartCount, serializedState)}, '', NULL, $now, $now)
               ON CONFLICT (workflow_id, workflow_instance_key, scope, step_id, step_version, step_scope_path)
               DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
       } yield ()

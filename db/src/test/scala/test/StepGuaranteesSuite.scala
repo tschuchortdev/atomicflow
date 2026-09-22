@@ -54,7 +54,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(observed, Some("value"))
 
     run(
-      sql"""UPDATE workflow_steps SET state_kind = 'started', state_payload = ''
+      sql"""UPDATE workflow_steps SET state_kind = 'Started', state_payload = ''
             WHERE workflow_id = 'mo-crash' AND workflow_instance_key = 'k' AND scope = '' AND step_id = 'step' AND step_version = 0""".update.run
     )
 
@@ -202,7 +202,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
           (String, Long, String)
         ].option
     )
-    assertEquals(row, Some(("AtMostOnce", 0L, "succeeded")))
+    assertEquals(row, Some(("AtMostOnce", 0L, "Succeeded")))
   }
 
   test("atMostOnce: no named inputs — instance id is the sole cache key") {
