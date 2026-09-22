@@ -481,26 +481,27 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, Awaitable[A])*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
-    validateRaceBranches(stepKey, branches)
+    validateBranchKeys(stepKey, branches.map(_._1))
     awaitRace0(stepKey, branches.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
   }
 
-  /** Validates user-supplied race branch keys. The `""` key is reserved for
+  /** Validates user-supplied race branch keys (an [[awaitRace]] member key or a
+    * [[firstToRunWithoutSuspension]] branch key). The `""` key is reserved for
     * single-subscriber sites (plain awaits), and the `"__"` prefix for
     * engine-internal subscribers (such as step retries).
     */
-  private def validateRaceBranches(stepKey: String, branches: Seq[(String, Awaitable[?])]): Unit = {
-    branches.foreach { case (branchKey, _) =>
-      require(branchKey.nonEmpty, s"awaitRace('$stepKey') branch keys must be non-empty")
+  private def validateBranchKeys(stepKey: String, branchKeys: Seq[String]): Unit = {
+    branchKeys.foreach { branchKey =>
+      require(branchKey.nonEmpty, s"'$stepKey' branch keys must be non-empty")
       require(
         !branchKey.startsWith("__"),
-        s"awaitRace('$stepKey') branch key '$branchKey' uses the reserved '__' prefix"
+        s"'$stepKey' branch key '$branchKey' uses the reserved '__' prefix"
       )
     }
-    val duplicateKeys = branches.groupBy(_._1).collect { case (k, ms) if ms.size > 1 => k }.toVector.sorted
+    val duplicateKeys = branchKeys.groupBy(identity).collect { case (k, ms) if ms.size > 1 => k }.toVector.sorted
     require(
       duplicateKeys.isEmpty,
-      s"awaitRace('$stepKey') branch keys must be unique; duplicated: ${duplicateKeys.mkString(", ")}"
+      s"'$stepKey' branch keys must be unique; duplicated: ${duplicateKeys.mkString(", ")}"
     )
   }
 
@@ -559,10 +560,21 @@ object Step {
     *
     * Unlike `Workflow.parallel`, this construct is EDGE-triggered, so it persists
     * its own step row (`FirstToRunWithoutSuspension`) recording the winning
-    * branch's index and result. On replay the first-ever-completed branch's
-    * result is returned even if later reruns would unblock a different branch
-    * first: once a winner is recorded it is never recomputed, and no branch runs
-    * again.
+    * branch's result. On replay the first-ever-completed branch's result is
+    * returned even if later reruns would unblock a different branch first: once
+    * a winner is recorded it is never recomputed, and no branch runs again. The
+    * winning branch's identity is transaction-local (used to select the result)
+    * and is not retained — the row persists only the public returned value,
+    * exactly like a cached await.
+    *
+    * Each branch's pending subscriptions — including those of nested subscopes —
+    * are deleted BEFORE the winner's row is written. The ordering is deliberate:
+    * the winner row is the durable first-wins marker, so a crash in between
+    * leaves no marker and the construct's next run re-evaluates from scratch and
+    * re-deletes; a committed winner row never coexists with branch
+    * subscriptions. A crash before the winner row is committed re-runs the
+    * branches (see the WARNING below): the recomputed winner may differ from the
+    * discarded run's outcome.
     *
     * WARNING — dangerous pitfalls: racing arbitrary code against an await depends
     * on WHEN the code is run, and code that runs as a branch may be re-executed
@@ -574,16 +586,17 @@ object Step {
     * Even when every branch suspends, the construct only behaves as expected when
     * the workflow is re-run for each incoming event individually. If the workflow
     * is re-run for multiple events at once (for example because of a long queue
-     * in the job runner), several branches may become unblocked in the same run
-     * and the code cannot tell which event came first: the winner is whichever the
-     * implementation observes first, NOT a spec-guaranteed order (though the
-     * recorded winner is durable first-wins). When several branches complete in
-     * the same run, the lowest-index completed branch is the deterministic
-     * tie-break winner.
+      * in the job runner), several branches may become unblocked in the same run
+      * and the code cannot tell which event came first: the winner is whichever the
+      * implementation observes first, NOT a spec-guaranteed order (though the
+      * recorded winner is durable first-wins). When several branches complete in
+      * the same run, the earliest declared completed branch is the deterministic
+      * tie-break winner.
     *
-    * Each branch runs in its own branch-scoped identity, so two branches awaiting
-    * the same key register distinct subscriptions and a losing branch's cleanup
-    * cannot delete the winner's (or another branch's) rows.
+    * Each branch runs in its own branch-scoped identity (the branch's key, a
+    * stable name like an [[awaitRace]] member key), so two branches awaiting
+    * the same key register distinct subscriptions and cleanup cannot delete the
+    * winner's (or another branch's) rows.
     *
     * Drift policies apply exactly as for ordinary steps: `ensureUnchanged` values
     * must be invariant between runs, and `invalidateOn` changes discard the
@@ -595,34 +608,32 @@ object Step {
     *   named inputs that invalidate the cached result when they change
     * @param ensureUnchanged
     *   named inputs that must be invariant between runs
-    * @param branches
-    *   the branches to race; the first to complete normally wins
+* @param branches
+    *   the `key -> branch` pairs to race; keys are non-empty, unique within the
+    *   race, and must not start with `"__"` (reserved for engine-internal
+    *   subscribers); the first branch to complete normally wins. Each branch
+    *   body is wrapped in a `() => WorkflowContext ?=> R` lambda
+    *   (`"key" -> { () => ... }`) so it stays lazy: constructing the lambda has
+    *   no side effects and the body runs only when the construct applies it with
+    *   the branch's own context. A bare `("key", { ... })` context function
+    *   would be typed eagerly and evaluated at the call site.
     */
-  @experimental
-  def firstToRunWithoutSuspension[R: Cacheable](
-      stepId: String,
-      invalidateOn: Seq[StepInput[?]],
-      ensureUnchanged: Seq[StepInput[?]]
-  )(branches: Seq[WorkflowContext ?=> R])(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
-    firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
-
-  /** Vararg form of [[firstToRunWithoutSuspension]]. */
-  @targetName("firstToRunWithoutSuspensionVararg")
   @experimental
   def firstToRunWithoutSuspension[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-  )(branches: (WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
+  )(branches: (String, () => WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
     firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
 
   private def firstToRun0[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]],
-      branches: Vector[WorkflowContext ?=> R]
+      branches: Vector[(String, () => WorkflowContext ?=> R)]
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R = {
     require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepId') requires at least one branch")
+    validateBranchKeys(stepId, branches.map(_._1))
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
     val stepIdv = StepId(stepId, ctx.currentScope)
@@ -630,17 +641,11 @@ object Step {
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = rt.clock.instant()
 
-    def decodeWinner(payload: String): R = {
-      val nl = payload.indexOf('\n')
-      if (nl < 0) throw new StepSerializationFailed(s"Step '$stepId' stored a malformed first-to-run result")
-      decodeStored(valueCodec, stepId)(payload.substring(nl + 1))
-    }
+    def branchSegment(key: String): String =
+      ScopePath.escapeScopeSegment(stepId) + "/" + ScopePath.escapeScopeSegment(key)
 
-    def branchSegment(i: Int): String =
-      ScopePath.escapeScopeSegment(stepId) + "/" + ScopePath.escapeScopeSegment("branch" + i)
-
-    def branchPath(base: String, i: Int): String = {
-      val seg = branchSegment(i)
+    def branchPath(base: String, key: String): String = {
+      val seg = branchSegment(key)
       if (base.isEmpty) seg else base + "/" + seg
     }
 
@@ -648,32 +653,27 @@ object Step {
       throwIfCancelled
       val baseScope = ctx.currentScope
       val baseScopePath = ctx.scopePath
+      val branchPaths = branches.map((key, _) => branchPath(baseScope, key))
+      val branchCtxs = branches.map((key, _) => ctx.copy(scopePath = baseScopePath :+ branchSegment(key)))
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
-            val branchCtx = ctx.copy(scopePath = baseScopePath :+ branchSegment(i))
-            try Right(branches(i)(using branchCtx))
+            try Right(branches(i)._2()(using branchCtxs(i)))
             catch { case e: WorkflowSuspendedException => Left(e) }
         })
       val suspensions = outcomes.collect { case Left(s) => s }
       if (suspensions.size == outcomes.size) {
         throw new WorkflowSuspendedException(suspensions)
       } else {
-        val completed = outcomes.zipWithIndex.collect { case (Right(r), i) => (i, r) }
-        val (winnerIdx, winnerResult) = completed.head
+        val winnerResult = outcomes.collect { case Right(r) => r }.head
         val (serialized, decoded) = encodeAndDecode(valueCodec, stepId)(winnerResult)
-        val loserPathsToClean = outcomes.zipWithIndex.collect {
-          case (Left(_), i) if i != winnerIdx => branchPath(baseScope, i)
-        }
-        rt.resolveFirstToRun(
-          run,
-          stepIdv,
-          0L,
-          "FirstToRunWithoutSuspension",
-          fingerprints,
-          loserPathsToClean,
-          s"$winnerIdx\n$serialized",
-          None
+        // Delete-first: retire every branch's subscriptions (including nested
+        // subscopes) before persisting the winner. The winner row is the durable
+        // first-wins marker, so a crash in between leaves no marker and the next
+        // run re-evaluates from scratch and re-deletes.
+        rt.deleteSubscriptionsUnderScopePaths(run, branchPaths)
+        rt.writeStepState(
+          run, stepIdv, 0L, "FirstToRunWithoutSuspension", StoredStep.State.Succeeded, fingerprints, serialized, None
         )
         decoded
       }
@@ -687,7 +687,7 @@ object Step {
     if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStep(run, stepIdv, 0L)
 
     replayable match {
-      case Some(row) if row.state == StoredStep.State.Succeeded => decodeWinner(row.statePayload)
+      case Some(row) if row.state == StoredStep.State.Succeeded => decodeStored(valueCodec, stepId)(row.statePayload)
       case _                                                    => evaluate()
     }
   }

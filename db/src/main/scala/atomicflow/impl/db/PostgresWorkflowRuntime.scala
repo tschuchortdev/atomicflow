@@ -2133,31 +2133,8 @@ _ <- upsertStepStateIO(
     }
   }
 
-  override def resolveFirstToRun(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      loserScopePaths: Seq[String],
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit =
-    fenced(run) {
-      for {
-        _ <- upsertStepStateIO(
-          run,
-          stepId,
-          stepVersion,
-          stepKind,
-          StoredStep.State.Succeeded,
-          inputFingerprints,
-          payload,
-          expiresAt
-        )
-        _ <- deleteBranchSubscriptionsIO(run, loserScopePaths)
-      } yield ()
-    }
+  override def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[String]): Unit =
+    fenced(run)(deleteSubscriptionsUnderScopePathsIO(run, scopePaths))
 
   override def readRegionState(
       run: CurrentExecution,
@@ -2409,18 +2386,27 @@ _ <- upsertStepStateIO(
                    AND step_id = ${stepId.key} AND step_scope_path = ${stepId.scope} AND step_version = $stepVersion""".update.run
     } yield ()
 
-  private def deleteBranchSubscriptionsIO(run: CurrentExecution, loserScopePaths: Seq[String]): ConnectionIO[Unit] =
-    loserScopePaths.traverse_ { path =>
+  /** Deletes the subscription rows whose `step_scope_path` equals one of
+    * `scopePaths` or lies beneath one (any `path/...` descendant), across all
+    * four subscription tables. The LIKE pattern escapes `%`, `_` and `\` so the
+    * caller's paths are matched literally.
+    */
+  private def deleteSubscriptionsUnderScopePathsIO(run: CurrentExecution, scopePaths: Seq[String]): ConnectionIO[Unit] =
+    scopePaths.traverse_ { path =>
+      val escaped = likeEscaped(path)
       for {
         _ <- sql"""DELETE FROM workflow_signal_subscriptions
                    WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                     AND step_scope_path = $path""".update.run
+                     AND (step_scope_path = $path OR step_scope_path LIKE ${escaped + "/%"} ESCAPE '\')""".update.run
         _ <- sql"""DELETE FROM workflow_timer_subscriptions
                    WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                     AND step_scope_path = $path""".update.run
+                     AND (step_scope_path = $path OR step_scope_path LIKE ${escaped + "/%"} ESCAPE '\')""".update.run
         _ <- sql"""DELETE FROM workflow_completion_subscriptions
                    WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
-                     AND step_scope_path = $path""".update.run
+                     AND (step_scope_path = $path OR step_scope_path LIKE ${escaped + "/%"} ESCAPE '\')""".update.run
+        _ <- sql"""DELETE FROM workflow_update_subscriptions
+                   WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND scope = ${run.instanceScope}
+                     AND (step_scope_path = $path OR step_scope_path LIKE ${escaped + "/%"} ESCAPE '\')""".update.run
       } yield ()
     }
 

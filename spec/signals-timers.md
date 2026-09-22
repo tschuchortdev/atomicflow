@@ -550,7 +550,11 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded
   by the partial unique index on `(workflowInstanceId, eventKey) WHERE
   eventKind = 'TimerFired'`. The subscription row survives firing and is
-  deleted only when its await resolves. Workflow completion appends one
+  deleted only when its await resolves. A first-to-run construct additionally
+  retires every branch's subscriptions — including nested subscopes, via
+  `deleteSubscriptionsUnderScopePaths` — BEFORE the winner's step row is
+  written, so a committed winner row never coexists with branch subscriptions.
+  Workflow completion appends one
   `WorkflowCompleted` event in the same transaction as the guarded terminal
   instance transition, whether or not a subscriber already exists.
 - A child await uses a recursive ancestor query over `workflow_instances` to
