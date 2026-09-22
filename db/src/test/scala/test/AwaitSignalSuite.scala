@@ -71,7 +71,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(subscriptions(wf.id, "k"), Vector.empty)
     val (kind, state, payload) = stepRow(wf.id, "k", "wait").get
     assertEquals(kind, "Await")
-    assertEquals(state, "succeeded")
+    assertEquals(state, "Succeeded")
     assertEquals(payload, "hello")
   }
 
@@ -97,7 +97,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1, "the step before the await must be cached on resume")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("final"))
-    assertEquals(stepRow(wf.id, "k", "wait").get._2, "succeeded")
+    assertEquals(stepRow(wf.id, "k", "wait").get._2, "Succeeded")
   }
 
   test("a filter-rejected event is skipped permanently: the cursor jumps to the accepted event") {
@@ -162,7 +162,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     signal.send(id, "fresh")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val (kind, state, payload) = stepRow(wf.id, "k", "a").get
-    assertEquals((kind, state, payload), ("Await", "succeeded", "fresh"))
+    assertEquals((kind, state, payload), ("Await", "Succeeded", "fresh"))
   }
 
   test("peekSignal returns visible events after the cursor without advancing it") {

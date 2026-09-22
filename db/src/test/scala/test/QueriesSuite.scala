@@ -122,7 +122,7 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(w, "x-2", "b")
     rt.createWorkflowInstance(w, "y-1", "c")
     run(sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints)
-             VALUES (${w.id}, 'x-2', '', 's1', 1, 'k', 'started', '', '')""".update.run)
+             VALUES (${w.id}, 'x-2', '', 's1', 1, 'k', 'Started', '', '')""".update.run)
     run(sql"""INSERT INTO signal_cursor (workflow_id, workflow_instance_key, scope, signal_key, sequence_id)
              VALUES (${w.id}, 'x-2', '', 'sig', 1)""".update.run)
 

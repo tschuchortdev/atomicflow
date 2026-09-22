@@ -54,7 +54,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.Result("ok"))
     assertEquals(counter.get(), 3)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Succeeded"))
   }
 
   test("durable retry: a long delay suspends with retry bookkeeping and a timer subscription; re-run after the deadline re-executes and completes") {
@@ -73,7 +73,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("started"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Started"))
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
     assertEquals(subs.head._2, Instant.parse("2026-01-02T01:00:00Z"))
@@ -81,7 +81,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(2.hours)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("recovered"))
     assertEquals(counter.get(), 2)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Succeeded"))
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the retry subscription is retired on success")
   }
 
@@ -168,7 +168,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     clock.advanceBy(2.hours)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 2, "the retry re-executes once before exhaustion")
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("failed"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Failed"))
     assert(caught.get.contains("boom-a"))
 
     rt.runWorkflowInstance(wf, id)
@@ -201,7 +201,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("failed"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Failed"))
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "no retry subscription for a non-retriable failure")
   }
 

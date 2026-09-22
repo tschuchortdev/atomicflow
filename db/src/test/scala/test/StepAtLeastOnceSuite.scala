@@ -73,7 +73,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.Result("value-a"))
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Succeeded"))
 
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("value-a"))
     assertEquals(counter.get(), 1)
@@ -95,7 +95,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     }
 
     rt.createAndRun(wf, "k", "a")
-    assertEquals(observed, Some("started"))
+    assertEquals(observed, Some("Started"))
   }
 
   test("success returns the decoded value; identity is not preserved (commit-before-observation)") {
@@ -139,7 +139,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.createAndRun(wf, "k", "x")
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("failed"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Failed"))
     val firstMessage = caught.get
     assert(firstMessage.contains("boom-x"))
 
@@ -159,7 +159,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.WorkflowSuspended)
     val row = stepRow(wf.id, "k", "step", 1)
-    assert(row.exists(_._1 == "started"), s"step should remain Started, got $row")
+    assert(row.exists(_._1 == "Started"), s"step should remain Started, got $row")
   }
 
   test("bumping the version creates new retryable work (body re-executes)") {
@@ -177,13 +177,13 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.createAndRun(wf, "k", "a")
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Succeeded"))
     assert(stepRow(wf.id, "k", "step", 2).isEmpty)
 
     stepVersion = 2
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     assertEquals(counter.get(), 2)
-    assertEquals(stepRow(wf.id, "k", "step", 2).map(_._1), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 2).map(_._1), Some("Succeeded"))
   }
 
   test("getExecutionState reports NeverStarted") {
@@ -411,7 +411,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     }
 
     rt.createAndRun(wf, "k", "a")
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("started"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Started"))
 
     date = "2024-02-01"
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
@@ -439,7 +439,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     rt.createAndRun(wf, "k", "a")
     assertEquals(counter.get(), 1)
     assert(caught.get.contains("could not be encoded"), s"unexpected: $caught")
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("failed"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Failed"))
 
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     assertEquals(counter.get(), 1, "replay must not re-execute the failed step body")

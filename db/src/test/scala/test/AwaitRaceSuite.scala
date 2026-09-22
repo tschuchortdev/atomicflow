@@ -226,7 +226,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     sig.send(id, "x")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(last, "x")
-    assertEquals(stepRow(wf.id, "k", "race").map(_._2), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "race").map(_._2), Some("Succeeded"))
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
@@ -295,7 +295,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
 
     sig.send(id, "hello")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("got:hello"))
-    assertEquals(stepRow(wf.id, "k", "race").map(_._2), Some("succeeded"))
+    assertEquals(stepRow(wf.id, "k", "race").map(_._2), Some("Succeeded"))
   }
 
   test("completion await: A suspends on B's completion; B completing wakes A; re-run resolves Completed(value)") {
@@ -370,7 +370,7 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HELLO"))
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
     assertEquals(last, "HELLO", "the mapped completion result wins when it completes first")
-    assertEquals(stepRow(aWf.id, "a", "race").map(_._2), Some("succeeded"))
+    assertEquals(stepRow(aWf.id, "a", "race").map(_._2), Some("Succeeded"))
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)

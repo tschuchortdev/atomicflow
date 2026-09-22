@@ -83,7 +83,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("42"))
     val Some((kind, state, payload)) = winnerRow(wf.id, "k"): @unchecked
     assertEquals(kind, "FirstToRunWithoutSuspension")
-    assertEquals(state, "succeeded")
+    assertEquals(state, "Succeeded")
     assert(payload.startsWith("0\n"), s"winner index 0 recorded, got payload: $payload")
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
   }
@@ -185,7 +185,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
         sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
               WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
       ),
-      Vector(("fast", "race/branch2", "succeeded")),
+      Vector(("fast", "race/branch2", "Succeeded")),
       "the winner branch's own step row survives cleanup"
     )
   }
