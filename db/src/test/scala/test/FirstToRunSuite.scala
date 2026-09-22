@@ -37,8 +37,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-all-suspend") { in =>
       val caught = Workflow.runToSuspension {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
-          { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
+          "a" -> { () => Step.await[String]("a1", Awaitable.SignalEvent(s1)); 1 },
+          "b" -> { () => Step.await[String]("b1", Awaitable.SignalEvent(s2)); 2 }
         )
       }
       caught.left.toOption.map(_.causes.size).getOrElse(-1).toString
@@ -54,8 +54,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s2 = Signal[String]("s2")
     val wf = Workflow[String, String](id = "ftr-all-suspend-durable") { in =>
       Step.firstToRunWithoutSuspension[Int]("race")(
-        { Step.await[String]("a", Awaitable.SignalEvent(s1)); 1 },
-        { Step.await[String]("b", Awaitable.SignalEvent(s2)); 2 }
+        "a" -> { () => Step.await[String]("a1", Awaitable.SignalEvent(s1)); 1 },
+        "b" -> { () => Step.await[String]("b1", Awaitable.SignalEvent(s2)); 2 }
       )
       "unreachable"
     }
@@ -64,7 +64,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
-      Vector(("race/branch0", "s1"), ("race/branch1", "s2")),
+      Vector(("race/a", "s1"), ("race/b", "s2")),
       "each branch's await subscription remains registered while the workflow is suspended"
     )
   }
@@ -74,8 +74,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s2 = Signal[String]("s2")
     val wf = Workflow[String, String](id = "ftr-winner") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        { Step.atLeastOnce[Int]("fast") { 42 } },
-        { Step.await[String]("wait", Awaitable.SignalEvent(s2)); 99 }
+        "fast" -> { () => Step.atLeastOnce[Int]("fast") { 42 } },
+        "wait" -> { () => Step.await[String]("wait", Awaitable.SignalEvent(s2)); 99 }
       )
       result.toString
     }
@@ -84,7 +84,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val Some((kind, state, payload)) = winnerRow(wf.id, "k"): @unchecked
     assertEquals(kind, "FirstToRunWithoutSuspension")
     assertEquals(state, "Succeeded")
-    assert(payload.startsWith("0\n"), s"winner index 0 recorded, got payload: $payload")
+    assertEquals(payload, "42", "the winner row persists only the winning branch's result")
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
   }
 
@@ -94,8 +94,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-durable") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        { counter.incrementAndGet(); Step.atLeastOnce[Int]("fast") { 1 } },
-        { Step.await[String]("wait", Awaitable.SignalEvent(sig)); counter.incrementAndGet(); 2 }
+        "fast" -> { () => counter.incrementAndGet(); Step.atLeastOnce[Int]("fast") { 1 } },
+        "wait" -> { () => Step.await[String]("wait", Awaitable.SignalEvent(sig)); counter.incrementAndGet(); 2 }
       )
       result.toString
     }
@@ -115,8 +115,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-retry") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        { Step.await[String]("a", Awaitable.SignalEvent(s1)); counter.incrementAndGet(); 1 },
-        { Step.await[String]("b", Awaitable.SignalEvent(s2)); counter.incrementAndGet(); 2 }
+        "a" -> { () => Step.await[String]("a1", Awaitable.SignalEvent(s1)); counter.incrementAndGet(); 1 },
+        "b" -> { () => Step.await[String]("b1", Awaitable.SignalEvent(s2)); counter.incrementAndGet(); 2 }
       )
       result.toString
     }
@@ -124,13 +124,13 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     s1.send(id, "x")(using rt)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"), "the unblocked branch (index 0) wins")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"), "the signaled branch (a) wins")
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
-    assert(payload.startsWith("0\n"), s"winner index 0 recorded exactly once, got payload: $payload")
+    assertEquals(payload, "1", "the winner row is written once with only the result")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
       Vector.empty,
-      "the winning branch's own await subscription (branch0) is cleaned up when it resolves via the pending await"
+      "the winning branch's own await subscription (a) is cleaned up when it resolves via the pending await"
     )
     assertEquals(
       run(
@@ -147,8 +147,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-failure") { in =>
       try {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          { Step.atLeastOnce[Int]("ok") { 1 } },
-          { throw new RuntimeException("boom"); 2 }
+          "ok" -> { () => Step.atLeastOnce[Int]("ok") { 1 } },
+          "boom" -> { () => throw new RuntimeException("boom"); 2 }
         )
         "no-failure"
       } catch {
@@ -165,16 +165,16 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val s = Signal[String]("shared")
     val wf = Workflow[String, String](id = "ftr-loser-cleanup") { in =>
       val result = Step.firstToRunWithoutSuspension[Int]("race")(
-        { Step.await[String]("l1", Awaitable.SignalEvent(s)); 1 },
-        { Step.await[String]("l2", Awaitable.SignalEvent(s)); 2 },
-        { Step.atLeastOnce[Int]("fast") { 3 } }
+        "l1" -> { () => Step.await[String]("l1", Awaitable.SignalEvent(s)); 1 },
+        "l2" -> { () => Step.await[String]("l2", Awaitable.SignalEvent(s)); 2 },
+        "fast" -> { () => Step.atLeastOnce[Int]("fast") { 3 } }
       )
       result.toString
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("3"))
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
-    assert(payload.startsWith("2\n"), s"branch index 2 (the completing branch) wins, got payload: $payload")
+    assertEquals(payload, "3", "the completing branch (fast) wins")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
       Vector.empty,
@@ -185,7 +185,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
         sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
               WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
       ),
-      Vector(("fast", "race/branch2", "Succeeded")),
+      Vector(("fast", "race/fast", "Succeeded")),
       "the winner branch's own step row survives cleanup"
     )
   }
@@ -196,7 +196,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ftr-invalidate") { in =>
       Step.firstToRunWithoutSuspension[Int]("race", invalidateOn = Seq(StepInput("v", holder.get())))(
-        { counter.incrementAndGet(); holder.get() * 10 }
+        "only" -> { () => counter.incrementAndGet(); holder.get() * 10 }
       )
       TestControlFlow.suspend()
       "unreachable"
@@ -225,6 +225,25 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("empty"))
   }
 
+  test("firstToRunWithoutSuspension rejects empty, duplicate, and reserved-prefixed branch keys") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "ftr-invalid-keys") { in =>
+      def attempt(branches: (String, () => WorkflowContext ?=> Int)*): String =
+        try {
+          Step.firstToRunWithoutSuspension[Int]("race")(branches*)
+          "valid"
+        } catch {
+          case _: IllegalArgumentException => "invalid"
+        }
+val empty = attempt("" -> { () => 1 })
+      val duplicate = attempt("dup" -> { () => 1 }, "dup" -> { () => 2 })
+      val reserved = attempt("__retry__" -> { () => 1 })
+      s"$empty-$duplicate-$reserved"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("invalid-invalid-invalid"))
+  }
+
   test("sibling constructs in parallel branches sharing a scope keep each other's branch subscriptions (no over-deletion)") {
     val rt = newRuntime
     val sA = Signal[String]("sA")
@@ -234,12 +253,12 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-sibling") { in =>
       val results = Workflow.parallel[Int](
         Step.firstToRunWithoutSuspension[Int]("raceA")(
-          { Step.await[String]("a0", Awaitable.SignalEvent(sA)); 1 },
-          { Step.await[String]("a1", Awaitable.SignalEvent(sB)); 2 }
+          "a0" -> { () => Step.await[String]("a0", Awaitable.SignalEvent(sA)); 1 },
+          "a1" -> { () => Step.await[String]("a1", Awaitable.SignalEvent(sB)); 2 }
         ),
         Step.firstToRunWithoutSuspension[Int]("raceB")(
-          { Step.await[String]("b0", Awaitable.SignalEvent(sC)); 10 },
-          { Step.await[String]("b1", Awaitable.SignalEvent(sD)); 20 }
+          "b0" -> { () => Step.await[String]("b0", Awaitable.SignalEvent(sC)); 10 },
+          "b1" -> { () => Step.await[String]("b1", Awaitable.SignalEvent(sD)); 20 }
         )
       )
       results.mkString(",")
@@ -266,8 +285,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-scoped") { in =>
       Workflow.scoped("outer") {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          Step.atLeastOnce[Int]("step") { 1 },
-          Step.atLeastOnce[Int]("step2") { 2 }
+          "one" -> { () => Step.atLeastOnce[Int]("step") { 1 } },
+          "two" -> { () => Step.atLeastOnce[Int]("step2") { 2 } }
         )
       }
       "done"
@@ -278,9 +297,41 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
       sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
             WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_path""".query[String].to[Vector]
     )
-    assert(paths.contains("outer/race/branch0"), s"the winner branch's step must persist under the enclosing scope, got: $paths")
-    assert(!paths.contains("race/branch0"), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
-    assert(paths.contains("outer/race/branch1"), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
+    assert(paths.contains("outer/race/one"), s"the winner branch's step must persist under the enclosing scope, got: $paths")
+    assert(!paths.contains("race/one"), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
+    assert(paths.contains("outer/race/two"), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
+  }
+
+  test("loser cleanup deletes subscriptions of nested subscopes, not just the branch's immediate scope") {
+    val rt = newRuntime
+    val sWinner = Signal[String]("winner")
+    val sDeep = Signal[String]("deep")
+    val wf = Workflow[String, String](id = "ftr-nested-cleanup") { in =>
+      val result = Step.firstToRunWithoutSuspension[Int]("race")(
+        "winner" -> { () => Step.await[String]("w", Awaitable.SignalEvent(sWinner)); 1 },
+        "loser" -> { () =>
+          Workflow.scoped("inner") {
+            Step.await[String]("deep", Awaitable.SignalEvent(sDeep))
+          }
+          2
+        }
+      )
+      result.toString
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(
+      signalSubscriptions(wf.id, "k"),
+      Vector(("race/loser/inner", "deep"), ("race/winner", "winner")),
+      "the nested await registers under race/loser/inner while the construct is suspended"
+    )
+    sWinner.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))
+    assertEquals(
+      signalSubscriptions(wf.id, "k"),
+      Vector.empty,
+      "resolution cleans up the loser's nested-subscope subscription via the subtree delete"
+    )
   }
 
   test("firstToRun branches inherit an enclosing uncancellable depth") {
@@ -290,8 +341,8 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-uncancellable-outer") { in =>
       Workflow.uncancellable {
         Step.firstToRunWithoutSuspension[Int]("race")(
-          { Step.await[String]("a", Awaitable.SignalEvent(sA)); 1 },
-          { Step.await[String]("b", Awaitable.SignalEvent(sB)); 2 }
+          "a" -> { () => Step.await[String]("a1", Awaitable.SignalEvent(sA)); 1 },
+          "b" -> { () => Step.await[String]("b1", Awaitable.SignalEvent(sB)); 2 }
         )
       }
       "done"
@@ -315,7 +366,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "ftr-ensure") { in =>
       try {
         Step.firstToRunWithoutSuspension[Int]("race", ensureUnchanged = Seq(StepInput("v", holder.get())))(
-          { counter.incrementAndGet(); holder.get() * 10 }
+          "only" -> { () => counter.incrementAndGet(); holder.get() * 10 }
         )
       } catch {
         case _: StepInputConflictException => conflict = true

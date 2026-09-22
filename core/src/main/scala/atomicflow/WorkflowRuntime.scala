@@ -218,23 +218,18 @@ trait WorkflowRuntime {
       subscribers: Vector[Subscriber]
   )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[String]
 
-  /** Resolve a `Step.firstToRunWithoutSuspension` construct atomically, fenced:
-    * persist the `succeeded` step row (`stepKind`) recording the winner, and in
-    * the same transaction best-effort delete the pending subscriptions of every
-    * losing branch (identified by their branch scope paths), so a losing await
-    * cannot wake the workflow later. The winner's own subscriptions were already
-    * retired when its branch completed, so only the losers' rows are touched.
+  /** Delete every subscription row whose `step_scope_path` is one of `scopePaths`
+    * or lies beneath one (any `path/...` descendant), across all four
+    * subscription tables (signal, timer, completion, update), fenced. Used by
+    * `Step.firstToRunWithoutSuspension` to retire every branch's pending
+    * subscriptions — including nested subscopes — before the winner's step row
+    * is written. The ordering is deliberate: the winner row is the durable
+    * first-wins marker, so deleting first means a crash in between leaves no
+    * marker, and the construct's next run re-evaluates from scratch and
+    * re-deletes; a committed winner row therefore never coexists with branch
+    * subscriptions.
     */
-  def resolveFirstToRun(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      loserScopePaths: Seq[String],
-      payload: String,
-      expiresAt: Option[Instant]
-  ): Unit
+  def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[String]): Unit
 
   /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
     * located at `regionId` under `parentScopePath`: its encoded state and its
