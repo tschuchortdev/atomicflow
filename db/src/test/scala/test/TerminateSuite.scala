@@ -5,7 +5,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
 
@@ -189,7 +189,6 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
   test("heartbeat continues inside an uncancellable region") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     var before: Option[Instant] = None
     var after: Option[Instant] = None
     val sig = Signal[String]("approve")

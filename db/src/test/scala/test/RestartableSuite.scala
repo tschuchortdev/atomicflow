@@ -5,7 +5,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.duration.*
@@ -126,7 +126,6 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
   test("reusing a step/timer ID in a successor looping creates fresh work: the timer fires again each looping") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String]("rl-timer") { in =>
       Workflow.loop[Int, String]("R", 0) { (state, loop) =>
         Step.await[Unit]("poll-interval", Awaitable.Timer(1.minute))

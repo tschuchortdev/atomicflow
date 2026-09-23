@@ -103,10 +103,12 @@ enum Awaitable[R : Cacheable as resultCacheable] {
   like a Step result. `WorkflowInstance.completion` returns one directly; see
   `core-types.md`. A bare `WorkflowInstanceId` carries no output type — upgrade
   it to a typed handle from the workflow definition to await a completion.
-- `Timer.apply`'s contextual `clk` resolves to the runtime's `clock` parameter
-  during execution (see `running-workflows.md`, "Settings and backends"), so
-  workflow code computes deadlines from the application's time source and tests
-  substitute a virtual clock that they advance between runs.
+- `Timer.apply(delay)` resolves its clock through the `WorkflowContext` of the
+  calling workflow body (`ctx.runtime.clock`), so workflow code computes
+  deadlines from the executing runtime's single time source — an ambient
+  `given Clock` is neither needed nor possible — and tests substitute a virtual
+  clock on the runtime, advancing it between runs. Building a timer outside a
+  workflow body uses the absolute `Timer(deadline: Instant)` case directly.
 
 Convenience accessors:
 ```scala

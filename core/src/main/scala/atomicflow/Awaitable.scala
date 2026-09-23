@@ -1,7 +1,7 @@
 package atomicflow
 
 import scala.concurrent.duration.{Duration, FiniteDuration}
-import java.time.{Clock, Instant}
+import java.time.Instant
 
 /** A durable description of something a workflow can wait on. The result type
   * `R` is what the successful await yields; it is invariant because the cases
@@ -55,8 +55,15 @@ enum Awaitable[R] {
 
 object Awaitable {
   object Timer {
-    /** A timer `delay` from the supplied clock's current instant. */
-    def apply(delay: FiniteDuration)(using clk: Clock): Timer =
-      Timer(clk.instant().plusMillis(delay.toMillis))
+
+    /** A timer `delay` from the runtime clock's current instant: resolves the
+      * clock through the [[WorkflowContext]] of the calling workflow body, so
+      * deadlines are always computed from the executing runtime's single time
+      * source — never from an ambient clock of the enclosing scope. Construct
+      * the absolute [[Timer]] case directly when building an awaitable outside
+      * a workflow body.
+      */
+    def apply(delay: FiniteDuration)(using ctx: WorkflowContext): Timer =
+      Timer(ctx.runtime.clock.instant().plusNanos(delay.toNanos))
   }
 }

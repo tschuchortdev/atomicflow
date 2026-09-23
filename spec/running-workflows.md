@@ -160,7 +160,8 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 Ownership of an instance's execution is a **lease on the instance row, not a row lock and not an in-process mutex** (see `child-signal-inheritance.md`). Three columns on `workflow_instances`:
 
 ```text
-lease_owner (nullable)   -- worker identity, e.g. "processUuid:workerId"
+lease_owner (nullable)   -- worker identity, opaque; any stable unique string
+                         -- (caller-thread runs and each runner name themselves)
 fencing_token (bigint)   -- stale-writer fence, incremented on every lease acquisition
 lease_expires_at (nullable timestamp)
 ```
@@ -301,12 +302,13 @@ case class JobRunnerSettings(
   leaseDuration: FiniteDuration,        // must exceed the longest gap between Workflow.heartbeat calls
   leaseAcquireTimeout: FiniteDuration,  // wait bound for external run on a leased instance
   cancelTimeout: FiniteDuration,
+  workerId: Option[String] = None,    // lease_owner identity for this runner's claims; None → generated unique id
 )
 ```
 
 - PostgreSQL is the reference implementation: the database is the queue, the lease, and the coordination point. `LISTEN/NOTIFY` can reduce claim latency; **polling remains the correctness contract** (NOTIFY is lossy).
 - The in-memory backend implements the same behavior with a concurrent queue, a timer scheduler, and CAS-based leases; coalescing, exclusivity, and fencing semantics are identical, nothing is durable.
-- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it contextually, so `Awaitable.Timer` computes deadlines from it (see `signals-timers.md`). Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
+- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it through the workflow context — `Awaitable.Timer.apply` resolves `ctx.runtime.clock`, so deadlines are always computed from the executing runtime's clock and an ambient `given Clock` is neither needed nor possible. Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
 - `JobRunnerSettings.forTests` bundles test-friendly defaults: tiny `pollInterval`/`timerSweepInterval`, one worker thread for deterministic child ordering. Only used when a test explicitly starts a runner (see "Testing").
 
 ### Why this design
