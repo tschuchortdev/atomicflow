@@ -49,11 +49,16 @@ final class Signal[A](
 
 
 // Runtime contexts: materialized only during execution; compose stable ids, not Meta wrappers.
-trait WorkflowContext {
-  def instanceId: WorkflowInstanceId
-  def versionAtCreation: Long
-  def runtime: WorkflowRuntime
-}
+final class WorkflowContext(
+  val instanceId: WorkflowInstanceId,
+  val versionAtCreation: Long,
+  val runtime: WorkflowRuntime
+)(
+  // The runtime's opaque per-run execution handle: created by the runtime,
+  // identity-stable for the run, contents runtime-owned. Dependent second
+  // parameter list so the type can be prefixed by runtime.
+  val currentExecution: runtime.CurrentExecution
+)
 
 trait StepContext[Out] {
   def stepId: StepId

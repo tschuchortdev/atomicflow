@@ -17,23 +17,23 @@ Awaits thus reuse the entire step machinery (explicit ids, persisted results, ma
 
 ### Why timer awaits need a subscription — and why the scheduler must not delete it
 
-Every pending timer await owns one row in `workflow_timer_subscriptions` (site, subscription ID, absolute deadline). It is not a wakeup hint; it is load-bearing in three ways:
+Every pending timer await owns one row in `workflow_timer_subscriptions` (site, timer id, absolute deadline). It is not a wakeup hint; it matters in three ways:
 
 1. **It is the durable deadline record.** The deadline is computed once (`now + delay`, runtime clock) and stored absolutely; every replay of the await-site reads it from the row. Recomputing it from code would push timeouts forward — with a test clock advanced between runs, the recomputed deadline would land in the future again and the await would suspend forever instead of resolving.
 2. **It is the scheduling source.** The timer sweep's only input is this row's stored deadline; without the row, due timers of unattended instances would never produce a wakeup and no runner would ever come.
-3. **It is the firing identity.** `TimerFired` events are keyed by the subscription ID, which is minted at registration and reused on replay. The ID versions the *registration incarnation*: `invalidateOn` invalidation re-registers the site with a recomputed deadline and a fresh ID, so the old incarnation's `TimerFired` event is structurally inert — it can never satisfy the new evaluation ("recomputes later → as if never executed"). The partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` — exactly one event per subscription — is the exactly-once guarantee for concurrent firing.
+3. **It is the firing identity.** `TimerFired` events are keyed by the timer id, which is assigned at registration and reused on replay. The ID versions the *registration incarnation*: `invalidateOn` invalidation re-registers the site with a recomputed deadline and a fresh timer id, so the old incarnation's `TimerFired` event is structurally inert — it can never satisfy the new evaluation ("recomputes later → as if never executed"). The partial unique index on `(workflowInstanceId, eventKey) WHERE eventKind = 'TimerFired'` — exactly one event per subscription — is the exactly-once guarantee for concurrent firing.
 
-**The scheduler must not delete the subscription when it fires.** Firing appends the `TimerFired` event; deleting the row would (a) make the existing event unmatchable, because evaluation correlates events to the site via the row's subscription ID, and (b) destroy the stored deadline, forcing the replay recomputation of point 1. Both break the resume that the fired event was supposed to enable. The row survives firing and is retired **only when its await resolves** — atomically with the step row and cursor moves — or by terminal cleanup. Until then, the "no existing event" re-check under the subscription row lock keeps repeated sweeps idempotent no-ops. Deletion is therefore exclusively the await's retirement decision, never the scheduler's.
+**The scheduler must not delete the subscription when it fires.** Firing appends the `TimerFired` event; deleting the row would (a) make the existing event unmatchable, because evaluation correlates events to the site via the row's timer id, and (b) destroy the stored deadline, forcing the replay recomputation of point 1. Both break the resume that the fired event was supposed to enable. The row survives firing and is retired **only when its await resolves** — atomically with the step row and cursor moves — or by terminal cleanup. Until then, the "no existing event" re-check under the subscription row lock keeps repeated sweeps idempotent no-ops. Deletion is therefore exclusively the await's retirement decision, never the scheduler's.
 
 ### Timer firing: two paths, one primitive
 
-A due timer becomes a durable fact — a `TimerFired` event keyed by its subscription ID — through two paths that share one primitive: **lock the subscription row, re-check that no event exists yet, append `TimerFired` (global append mutex), commit.** The subscription row survives firing; it is retired only when its await resolves.
+A due timer becomes a durable fact — a `TimerFired` event keyed by its timer id — through two paths that share one primitive: **lock the subscription row, re-check that no event exists yet, append `TimerFired` (global append mutex), commit.** The subscription row survives firing; it is retired only when its await resolves.
 
 **Path 1 — the scheduler (sweep).** Runs as a driver-loop step of the JobRunner (see `running-workflows.md`, "Job runner and scheduling") every `timerSweepInterval`:
 
 ```text
 every timerSweepInterval:
-  rows = SELECT subscriptionId, workflowInstanceId FROM workflow_timer_subscriptions s
+  rows = SELECT timerId, workflowInstanceId FROM workflow_timer_subscriptions s
          WHERE s.deadline <= now()                          -- runtime clock
            AND NOT EXISTS (matching TimerFired event)       -- idempotent across passes
            AND instance non-terminal
@@ -103,10 +103,12 @@ enum Awaitable[R : Cacheable as resultCacheable] {
   like a Step result. `WorkflowInstance.completion` returns one directly; see
   `core-types.md`. A bare `WorkflowInstanceId` carries no output type — upgrade
   it to a typed handle from the workflow definition to await a completion.
-- `Timer.apply`'s contextual `clk` resolves to the runtime's `clock` parameter
-  during execution (see `running-workflows.md`, "Settings and backends"), so
-  workflow code computes deadlines from the application's time source and tests
-  substitute a virtual clock that they advance between runs.
+- `Timer.apply(delay)` resolves its clock through the `WorkflowContext` of the
+  calling workflow body (`ctx.runtime.clock`), so workflow code computes
+  deadlines from the executing runtime's single time source — an ambient
+  `given Clock` is neither needed nor possible — and tests substitute a virtual
+  clock on the runtime, advancing it between runs. Building a timer outside a
+  workflow body uses the absolute `Timer(deadline: Instant)` case directly.
 
 Convenience accessors:
 ```scala
@@ -272,18 +274,23 @@ object Step {
         stepKey: String,
         invalidateOn: Seq[StepInput[?]] = Seq.empty,
         ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-    )(awaits: Awaitable[A]*): A = ???
+    )(members: (String, Awaitable[A])*): A = ???
 }
 ```
 
-`awaitRace` creates one subscription for each awaitable in the database.
+`awaitRace` creates one subscription for each member in the database. Each member
+is a `key -> awaitable` pair; the key is that member's **subscriber key**, a
+stable identity within the race that is independent of the member's position.
+Keys must be non-empty, unique within the race, and must not start with `"__"`
+(reserved for engine-internal subscribers). The empty key `""` is reserved for
+single-subscriber sites: plain `Step.await` and update awaits.
 
-- Each signal leaf retains the cursor for its own exact key; `awaitRace` does
+- Each signal member retains the cursor for its own exact key; `awaitRace` does
   not introduce a cursor shared between keys.
 - All candidates are compared by global `sequenceId`, so the earliest
   satisfying signal, timer, or completion event wins even when the events
   belong to unrelated workflow trees.
-- Due timer leaves of the race are materialized at evaluation time (step 3 of
+- Due timer members of the race are materialized at evaluation time (step 3 of
   the core model) before comparison; appending them in deadline order makes the
   earliest due timer win deterministically among timers. In runner mode the
   sweep has usually already fired them (≈ deadline + sweep latency); in manual
@@ -443,7 +450,7 @@ When an upstream step is invalidated (TTL expired, `invalidateOn` dependency cha
 Step.awaitRace(
   "approval-race",
   invalidateOn = Seq("context" -> someContextValue)
-)(Awaitable.SignalEvent(approval), Awaitable.Timer(deadline))
+)("approval" -> Awaitable.SignalEvent(approval), "deadline" -> Awaitable.Timer(deadline))
 ```
 
 If `someContextValue` changes, the await's cached Step result is discarded; on the next replay it re-evaluates from scratch.
@@ -452,7 +459,7 @@ If `someContextValue` changes, the await's cached Step result is discarded; on t
 
 A timer whose expression (duration/deadline) is keyed on an invalidated upstream value recomputes from scratch:
 - If a timer already fired and then its deadline recomputes to a *later* moment, the timer is treated as if it had **never executed** — the workflow suspends again waiting for the new deadline.
-- Re-evaluation registers a **fresh timer subscription** (new subscription ID), so the previous incarnation's `TimerFired` event — keyed by the old ID — is structurally inert and can never satisfy the new deadline (see "Why timer awaits need a subscription").
+- Re-evaluation registers a **fresh timer subscription** (new timer id), so the previous incarnation's `TimerFired` event — keyed by the old timer id — is structurally inert and can never satisfy the new deadline (see "Why timer awaits need a subscription").
 
 ### Signal invalidation
 
@@ -482,13 +489,13 @@ signal_cursor (
   workflowInstanceId, signalKey, sequenceId
 )
 workflow_signal_subscriptions (
-  workflowInstanceId, stepId, leafIdx, signalKey
+  workflowInstanceId, stepId, subscriberKey, signalKey
 )
 workflow_timer_subscriptions (
-  workflowInstanceId, stepId, leafIdx, subscriptionId, deadline
+  workflowInstanceId, stepId, subscriberKey, timerId, deadline
 )
 workflow_completion_subscriptions (
-  workflowInstanceId, stepId, leafIdx, completedWorkflowInstanceId
+  workflowInstanceId, stepId, subscriberKey, completedWorkflowInstanceId
 )
 workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)
 ```
@@ -498,7 +505,7 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
 | Event kind | `workflowInstanceId` | `eventKey` | `payload` |
 |---|---|---|---|
 | `Signal` | The addressed instance | Exact signal key | Serialized signal value |
-| `TimerFired` | The instance owning the timer | Timer subscription ID | Encoded `Unit` |
+| `TimerFired` | The instance owning the timer | Timer id | Encoded `Unit` |
 | `WorkflowCompleted` | The completed instance | Empty string | Serialized `WorkflowCompletionResult` — one event per terminal transition; see `running-workflows.md` |
 
 - `workflow_events.sequenceId` is the global durable event order. It is backed
@@ -541,11 +548,15 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
   not retained.
 - The three subscription tables contain only pending awaits and are never event
   rows. A timer subscription holds its absolute deadline and its subscription
-  ID (minted at registration, reused on replay); firing — by the scheduler or
+  ID (assigned at registration, reused on replay); firing — by the scheduler or
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded
   by the partial unique index on `(workflowInstanceId, eventKey) WHERE
   eventKind = 'TimerFired'`. The subscription row survives firing and is
-  deleted only when its await resolves. Workflow completion appends one
+  deleted only when its await resolves. A first-to-run construct additionally
+  retires every branch's subscriptions — including nested subscopes, via
+  `deleteSubscriptionsUnderScopePaths` — BEFORE the winner's step row is
+  written, so a committed winner row never coexists with branch subscriptions.
+  Workflow completion appends one
   `WorkflowCompleted` event in the same transaction as the guarded terminal
   instance transition, whether or not a subscriber already exists.
 - A child await uses a recursive ancestor query over `workflow_instances` to
@@ -592,7 +603,7 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
 - Explicit await ids for stability under evolution and invalidation-driven rerouting.
 - Invalidation by explicit dependency only; no cascade. Means the user controls what changes trigger downstream re-work.
 - **Evaluation is self-sufficient; the scheduler is only latency.** An await resolves from durable state alone — the run even materializes its own due timers. Sweeps and wakeups never affect correctness, only how promptly unattended instances are noticed; this is what lets tests drive a workflow with `run` alone. The timer *subscription* is the deliberate exception to "latency-only": it is durable semantic state — deadline record and firing identity (see "Why timer awaits need a subscription").
-- **Timer subscriptions are durable registrations, not hints.** They carry the stored absolute deadline (replays must not recompute), schedule unattended instances, and version the registration incarnation via the subscription ID — which is why the scheduler fires without deleting and only the await's resolution retires the row (see "Why timer awaits need a subscription").
+- **Timer subscriptions are durable registrations, not hints.** They carry the stored absolute deadline (replays must not recompute), schedule unattended instances, and version the registration incarnation via the timer id — which is why the scheduler fires without deleting and only the await's resolution retires the row (see "Why timer awaits need a subscription").
 - **Why no Temporal-style always-on handlers**: Without mutable fields or a live object in scope, signal handlers can only affect execution via the value returned from an await. Since workflows re-run after every suspension, checking signals at the workflow start (or other strategic points) is often sufficient for patterns like cancellation — users decide where to check, cooperatively, rather than relying on handlers living ambient in the background. This trades Temporal-like ambient ergonomics for simpler, explicit semantics.
 
 ## Open questions and TODOs

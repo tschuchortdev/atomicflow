@@ -1,9 +1,6 @@
 package atomicflow
 
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
-import cats.Contravariant
-import cats.syntax.all.*
-import io.circe.Codec
 
 import java.util
 import java.util.Base64
@@ -20,11 +17,10 @@ trait Fingerprintable[-A] {
 object Fingerprintable {
   inline def apply[A](using f: Fingerprintable[A]): Fingerprintable[A] = f
 
-  given Contravariant[Fingerprintable] = new {
-    override def contramap[A, B](fa: Fingerprintable[A])(f: B => A): Fingerprintable[B] = new Fingerprintable[B] {
-      override def fingerprintRep(value: B, fp: Fingerprinter): fp.Rep =
-        fa.fingerprintRep(f(value), fp)
-    }
+  /** Contravariant map without requiring a cats dependency. */
+  def contramap[A, B](fa: Fingerprintable[A])(f: B => A): Fingerprintable[B] = new Fingerprintable[B] {
+    override def fingerprintRep(value: B, fp: Fingerprinter): fp.Rep =
+      fa.fingerprintRep(f(value), fp)
   }
 
   case class Fingerprint(bytes: IArray[Byte]) {
@@ -42,9 +38,7 @@ object Fingerprintable {
 
   object Fingerprint {
     def fromString(string: String): Fingerprint =
-      Fingerprint(Base64.getDecoder.decode(string).asInstanceOf[IArray[Byte]])
-
-    given Codec[Fingerprint] = Codec.implied[String].imap(fromString)(_.toString)
+      Fingerprint(Base64.getDecoder().decode(string).asInstanceOf[IArray[Byte]])
   }
 
   trait Fingerprinter {

@@ -67,15 +67,31 @@ enum WorkflowRunResult[+A]:
 
 Workflow execution runs on two kinds of threads: **caller threads**, which execute the blocking `run`/`createAndRun` API, and **runner threads**, which belong to a started **JobRunner**. The JobRunner is a **driver loop** plus an **executor**: each cycle it invokes the runtime's sweep operations — fire due timers, escalate overlong cancellations, recover expired leases — on their cadences, and claims due wakeups to execute instances. The sweep operations are *definition-agnostic operations of the runtime* (like `sendSignal`), not sub-components of the runner: any runner services every workflow in the shared tables, including other applications'. The executor is the only part that knows workflow code — it resolves definitions from the runner's registry.
 
-**The runner and its runtime are one implementation family.** The driver loop executes backend-internal operations — wakeup claiming, conditional lease acquisition, fenced writes, the timer-firing primitive, the sweeps — that are deliberately absent from the public `WorkflowRuntime` trait. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
+**The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal — are public methods on the `WorkflowRuntime` trait, each taking an opaque per-run handle: the runtime's `CurrentExecution` type member, created at run start and carried by `WorkflowContext.currentExecution`. (Cancellation delivery is not a runtime operation: Step's checkpoints read the durable flag through `isCancellationRequested` and throw.) What remains deliberately absent from the public trait are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
 
 Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.**
 
 ```scala
 trait WorkflowRuntime {
-  /** Creates and starts this process's job runner. Implemented per backend:
-    * the runner executes backend-internal operations and is bound to this
-    * runtime — runners and runtimes cannot be mixed and matched. */
+  /** The opaque per-run execution handle: created by the runtime at run
+    * start, identity-stable for the run, contents runtime-owned. Carried by
+    * `WorkflowContext.currentExecution` and passed back to every engine
+    * operation. */
+  type CurrentExecution
+
+  /** Durable engine operations — Step rows, awaits, timers, regions, lease
+    * renewal — each taking the run's handle. `isCancellationRequested` is a
+    * plain durable read keyed by instance, consulted by Step's cancellation
+    * checkpoints. (Three representative members; the full surface is much
+    * larger.) */
+  def renewLease(run: CurrentExecution): Unit
+  def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
+
+  /** Creates and starts a job runner. Implemented per backend:
+    * the runner executes the runner-internal operations (wakeup claiming,
+    * lease acquisition, the sweeps) and is bound to this runtime — runners
+    * and runtimes cannot be mixed and matched. Any number of runners may be
+    * started on the same runtime, each with its own settings and registry. */
   def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
@@ -96,7 +112,7 @@ val runner = runtime.startJobRunner(
 runner.stop(gracePeriod = 30.seconds)   // stop claiming, drain in-flight runs
 ```
 
-- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: calling `startJobRunner` while this runtime's runner is still active throws (two driver loops in one process double every sweep — a guard, not a correctness need; multi-process cooperation is unaffected); `stop` is idempotent; after `stop`, the factory may be called again. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
+- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: any number of runners may be started on the same runtime, each with its own settings and registry; an extra runner costs redundant sweep and claim work but is never incorrect (the database's claim-atomic leases and idempotent sweeps arbitrate, exactly as they already do across processes); `stop` is idempotent and independent per runner. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
 - The runner holds the definition registry because it is the only component that ever resolves code from an id (below).
 - **Production always runs a runner; tests drive manually.** The runner is the default way workflows progress, and regular applications always start one. Tests of user workflows deliberately do not: they drive execution deterministically on caller threads via `run`/`createAndRun` (see "Testing"). Signals never need background machinery at all — senders append events and upsert wakeups on their own caller threads.
 - **No sweep is public API.** Timer firing, cancellation escalation, and lease recovery are internal steps of the runner's driver loop. Await evaluation is self-sufficient (see "Run semantics"), so no on-demand sweep operation exists: escalation and recovery are never needed by caller threads (an external `run` acquires an expired lease directly through the conditional update), and timer awaits fire their own due timers.
@@ -144,7 +160,8 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 Ownership of an instance's execution is a **lease on the instance row, not a row lock and not an in-process mutex** (see `child-signal-inheritance.md`). Three columns on `workflow_instances`:
 
 ```text
-lease_owner (nullable)   -- worker identity, e.g. "processUuid:workerId"
+lease_owner (nullable)   -- worker identity, opaque; any stable unique string
+                         -- (caller-thread runs and each runner name themselves)
 fencing_token (bigint)   -- stale-writer fence, incremented on every lease acquisition
 lease_expires_at (nullable timestamp)
 ```
@@ -158,7 +175,7 @@ lease_expires_at (nullable timestamp)
     AND (lease_owner IS NULL OR lease_expires_at <= :now)
   ```
   Zero rows updated means a live owner or a terminal instance; the acquirer backs off.
-- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread; the lease is renewed on the workflow's own thread. The runtime invokes the heartbeat at every checkpoint (Step invocation, await evaluation, suspension), and long-running Step bodies call it explicitly through the public API below. `leaseDuration` must therefore exceed the longest gap between heartbeat opportunities. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread and the runtime does not renew the lease on its own; renewal happens only when the workflow's own thread calls `Workflow.heartbeat()`. `leaseDuration` must therefore exceed the longest gap between such calls. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
 
 **`Workflow.heartbeat()` — public lease renewal**
 
@@ -166,8 +183,8 @@ lease_expires_at (nullable timestamp)
 object Workflow {
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime calls this automatically at every checkpoint; call it explicitly
-    * inside long-running Step bodies, between checkpoints.
+    * runtime does not renew the lease on its own; call this explicitly inside
+    * long-running Step bodies.
     *
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
@@ -186,7 +203,7 @@ object Workflow {
   ```
   Zero rows updated → the runtime raises `LeaseLostException` and aborts the run without durable effect, identical to any other fenced-write loss.
 - **Not a cancellation checkpoint.** Heartbeat never delivers cancellation; delivery remains bound to checkpoints about to perform new work.
-- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; automatic and explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
+- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
 - Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
 - **Release.** A run releases the lease when it ends (suspension, terminal state, abort). Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
@@ -285,12 +302,13 @@ case class JobRunnerSettings(
   leaseDuration: FiniteDuration,        // must exceed the longest gap between Workflow.heartbeat calls
   leaseAcquireTimeout: FiniteDuration,  // wait bound for external run on a leased instance
   cancelTimeout: FiniteDuration,
+  workerId: Option[String] = None,    // lease_owner identity for this runner's claims; None → generated unique id
 )
 ```
 
 - PostgreSQL is the reference implementation: the database is the queue, the lease, and the coordination point. `LISTEN/NOTIFY` can reduce claim latency; **polling remains the correctness contract** (NOTIFY is lossy).
 - The in-memory backend implements the same behavior with a concurrent queue, a timer scheduler, and CAS-based leases; coalescing, exclusivity, and fencing semantics are identical, nothing is durable.
-- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it contextually, so `Awaitable.Timer` computes deadlines from it (see `signals-timers.md`). Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
+- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it through the workflow context — `Awaitable.Timer.apply` resolves `ctx.runtime.clock`, so deadlines are always computed from the executing runtime's clock and an ambient `given Clock` is neither needed nor possible. Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
 - `JobRunnerSettings.forTests` bundles test-friendly defaults: tiny `pollInterval`/`timerSweepInterval`, one worker thread for deterministic child ordering. Only used when a test explicitly starts a runner (see "Testing").
 
 ### Why this design
@@ -302,7 +320,7 @@ case class JobRunnerSettings(
 - **Evaluation is self-sufficient; the scheduler is only latency.** Every await a run reaches resolves from durable state alone — including its own due timers, which the evaluation materializes itself. Sweeps and wakeups never affect correctness, only how quickly an unattended instance is noticed; the timer *subscription* is the deliberate exception — durable semantic state, not scheduling (`signals-timers.md`). That is what lets tests drive a workflow with `run` alone and what keeps production progress independent of any single mechanism.
 - **Sweeps are runtime operations, not sub-components.** Timer firing, cancellation escalation, and lease recovery are definition-agnostic operations of the runtime, driven on a cadence by the runner's loop. None is public API — await evaluation's self-sufficiency removes the need for on-demand firing, and escalation/recovery are never needed by caller threads. There is deliberately no way to manage sweeps as a separate component: a gateway needs no background machinery, and production always needs everything together.
 - **The sweep pre-fires timers for race predictability** — why, and how firing stays exactly-once, is specified in `signals-timers.md` ("Timer firing: two paths, one primitive"); this document only states the scheduling consequence above: manual mode progresses timers without any sweep.
-- **Runner and runtime are one implementation family.** The runner executes backend-internal operations (claiming, lease acquisition, sweeps, timer firing) that the public `WorkflowRuntime` trait deliberately omits; a generic runner parameterized by the public trait could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
+- **Runner and runtime are one implementation family.** The durable engine operations are public `WorkflowRuntime` methods, each taking the run's opaque `CurrentExecution` handle; what the public trait deliberately omits are the runner-internal operations (wakeup claiming, lease acquisition, the sweeps), so a generic runner parameterized by the public trait alone could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
 - **Registration on the runner, permissive call sites.** The executor is the only consumer that starts from an id alone, so the id→definition registry is passed to `startJobRunner`, lives on the runner object, and is validated once at start. Direct API calls keep working with any in-hand definition object; a workflow known to no runner anywhere surfaces through wakeup-age alerting instead of failing anywhere.
 
 ## Testing
@@ -684,6 +702,6 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 - `awaitResult` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `awaitResult`. `LISTEN/NOTIFY` is an optional latency optimization.
 - Retention / auto-deletion of completed instances. The job runner's sweep mechanism is the designated hook (see "Job runner and scheduling").
 - **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token bump (see "Job runner and scheduling").
-- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime invokes it automatically at every checkpoint; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
+- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime does not renew the lease automatically; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
 - **Scheduler tuning** — Priority/fairness classes beyond `perWorkflowBatchShare` and per-workflow caps, and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
 - **`fork` / `forkFromFailure`** — `forkWorkflow` is specified in `continue-as-new-fork-reset.md`; its one open point there is the causal boundary for parallel-branch step prefixes. `forkFromFailure` is not yet specified.
