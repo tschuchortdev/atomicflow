@@ -6,7 +6,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
 
@@ -42,7 +42,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("inline retry: short delays sleep in-process and the step completes in one run") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 1.hour)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "inline") { in =>
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(3, 20.millis)) {
@@ -60,7 +59,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("durable retry: a long delay suspends with retry bookkeeping and a timer subscription; re-run after the deadline re-executes and completes") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "durable") { in =>
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(2, 1.hour)) {
@@ -88,7 +86,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("a retry not yet due suspends again without re-executing the body") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "notdue") { in =>
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(2, 1.hour)) {
@@ -110,7 +107,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("two consecutive durable retries each mint a fresh subscription; a re-run before the second delay stays suspended") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "two-retries") { in =>
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(3, 1.hour)) {
@@ -143,7 +139,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
 
   test("durable retry: after maxRetries are exhausted the failure is persisted and replayed without re-executing") {    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     var caught: Option[String] = None
     val wf = Workflow[String, String](id = "exhaust") { in =>
@@ -179,7 +174,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("a non-retriable failure persists immediately with no retry subscription") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "nonretriable") { in =>
       try {
@@ -231,7 +225,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("crash during a retry body leaves the scheduled subscription untouched; re-running re-enters after the deadline with exactly one subscription") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "crashretry") { in =>
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(5, 1.hour)) {
@@ -261,7 +254,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("invalidateAfter expires an ongoing durable retry; re-run executes fresh as if never begun") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "ttlretry") { in =>
       Step.atLeastOnce[String]("step", invalidateAfter = 30.seconds, retry = Step.RetryPolicy.fixedDelay(2, 1.hour)) {
@@ -288,7 +280,6 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
   test("getExecutionState reports Started while a durable retry is suspended") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     var observed: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "retrystate") { in =>
       observed = Step.getExecutionState[String]("step", stepVersion = 1)

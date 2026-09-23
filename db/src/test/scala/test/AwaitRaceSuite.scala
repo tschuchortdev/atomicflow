@@ -6,7 +6,6 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.Clock
 import java.time.Instant
 import scala.concurrent.duration.*
 
@@ -92,7 +91,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("all-unsatisfiable race suspends with every leaf's subscription registered and no cursor movement") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     val wf = Workflow[String, String](id = "race-suspend") { in =>
       Step.awaitRace[String]("race")("signal" -> Awaitable.SignalEvent(sig), "timeout" -> Awaitable.Timer(1.minute).map(_ => "timeout"))
@@ -111,7 +109,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("signal sent first wins the race over an also-due timer; only the signal cursor advances") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-signal-wins") { in =>
@@ -137,7 +134,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("a timer that resolves before a later signal keeps the cached timer outcome") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-timer-wins") { in =>
@@ -161,7 +157,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("due timers of a race are materialized in deadline order; the earliest due timer wins") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     var last = ""
     val wf = Workflow[String, String](id = "race-timers") { in =>
       last = Step.awaitRace[String]("race")(
@@ -213,7 +208,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("a resolved race is cached: re-runs do not re-evaluate or re-register subscriptions") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     var last = ""
     val wf = Workflow[String, String](id = "race-cached") { in =>
@@ -238,7 +232,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("invalidateOn change discards the cached race and re-evaluates from scratch, re-registering subscriptions") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     var ctx = "A"
     var last = ""
@@ -279,7 +272,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("heterogeneous leaves unify onto one result type via map") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("s")
     val wf = Workflow[String, String](id = "race-het") { in =>
       val v = Step.awaitRace[RaceOutcome]("race")(
@@ -347,7 +339,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("a mapped completion leaf raced against a timer resolves with the completion when it completes first") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val bWf = Workflow[String, String](id = "Bmap") { in => in.toUpperCase }
     val bId = rt.createWorkflowInstance(bWf, "bm", "hello").id
     val bHandle = rt.getWorkflowInstance(bWf, bId)
@@ -380,7 +371,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("a mapped completion leaf raced against a timer resolves with the timer when it fires first") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val bWf = Workflow[String, String](id = "Bmap2") { in => in.toUpperCase }
     val bId = rt.createWorkflowInstance(bWf, "bm2", "hello").id
     val bHandle = rt.getWorkflowInstance(bWf, bId)
@@ -433,7 +423,6 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
 
   test("awaitRace rejects empty, duplicate, and reserved-prefixed member keys") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    given Clock = clock
     val rt = newRuntime(clock)
     def runBody(id: String, members: Seq[(String, Awaitable[String])]): Unit = {
       val wf = Workflow[String, String](id = id) { in =>
@@ -451,12 +440,12 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assert(empty.getMessage.contains("non-empty"), empty.getMessage)
 
     val duplicate = intercept[StepFailed] {
-      runBody("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(1.minute).map(_ => "timeout")))
+      runBody("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     }
     assert(duplicate.getMessage.contains("unique"), duplicate.getMessage)
 
     val reserved = intercept[StepFailed] {
-      runBody("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(1.minute).map(_ => "timeout")))
+      runBody("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     }
     assert(reserved.getMessage.contains("reserved"), reserved.getMessage)
   }

@@ -38,9 +38,12 @@ object PostgresWorkflowRuntime {
   * tables.
   *
   * The execution lease is a conditional update on the instance row, fenced by a
-  * monotonic `fencing_token`. The worker identity is `"processUuid:threadId"`
-  * where `processUuid` is generated once per runtime instance; any
-  * stable-per-process string is acceptable.
+  * monotonic `fencing_token`. Worker identity is an opaque string recorded in
+  * `lease_owner`: caller-thread runs use `"processUuid:threadId"` (with
+  * `processUuid` generated once per runtime instance), and each job runner names
+  * itself through its `JobRunnerSettings`. Nothing interprets the strings —
+  * leases compare `lease_owner`/`fencing_token` pairs — so any stable unique
+  * value is acceptable.
   */
 class PostgresWorkflowRuntime private[atomicflow] (
     ds: DataSource,
@@ -73,8 +76,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   private def workerId: String = s"$processUuid:${Thread.currentThread().getId}"
-
-  private[atomicflow] def workerIdFor(role: String): String = s"$processUuid:$role"
 
   private[atomicflow] def leaseExpiry(now: java.time.Instant, duration: FiniteDuration): java.time.Instant =
     now.plus(java.time.Duration.ofNanos(duration.toNanos))
@@ -1069,7 +1070,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   }
               }
             } finally {
-              releaseLease(workflowId, key, scope, worker, token)
+              releaseLeaseIfStillOwned(instanceId, worker, token)
             }
         }
     }
@@ -1118,33 +1119,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
     acquired
   }
 
-  /** Optimization: release the lease if still ours. Correctness relies on expiry
-    * plus fencing, not on this.
+  /** Clears the lease if it is still owned by this exact incarnation — the run
+    * or claim holding `worker`/`token`. "Owned" means the row still records
+    * that worker at that fencing token: if the lease expired and another
+    * executor took over (bumping the token), this releases nothing and cannot
+    * clobber the new owner's lease. Optimization only — correctness relies on
+    * expiry plus fencing, not on this release. The run path calls it in a
+    * `finally` so a fault-injected abort that never reached the run's own
+    * release cannot leak a lease.
     */
-  private def releaseLease(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: String,
+  private[atomicflow] def releaseLeaseIfStillOwned(
+      instanceId: WorkflowInstanceId,
       worker: String,
       token: Long
   ): Unit =
     runTransaction {
       sql"""UPDATE workflow_instances
             SET lease_owner = NULL, lease_expires_at = NULL
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope
+            WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey} AND scope = ${instanceId.scope}
               AND lease_owner = $worker AND fencing_token = $token""".update.run
     }
-
-  /** Runner-side lease release: clears the lease if it is still held by `worker`
-    * at `token`. The runner calls this in a `finally` so a fault-injected abort
-    * that never reached the run's own release cannot leak a lease.
-    */
-  private[atomicflow] def releaseLeaseIfOurs(
-      instanceId: WorkflowInstanceId,
-      worker: String,
-      token: Long
-  ): Unit =
-    releaseLease(instanceId.workflowId, instanceId.workflowInstanceKey, instanceId.scope, worker, token)
 
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
     * append and the deletion of this instance's directly addressed `Signal`
@@ -2610,8 +2604,9 @@ _ <- upsertStepStateIO(
       """.query[Option[String]].unique
     }
 
-  /** Whether the instance's lease is still held by `worker` at `token`. */
-  private[atomicflow] def leaseStillOurs(
+  /** Whether the instance's lease is still owned by `worker` at `token` — i.e.
+    * this exact lease incarnation still holds it. */
+  private[atomicflow] def isLeaseStillOwned(
       instanceId: WorkflowInstanceId,
       worker: String,
       token: Long

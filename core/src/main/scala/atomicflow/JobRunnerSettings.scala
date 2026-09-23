@@ -35,6 +35,11 @@ import scala.concurrent.duration.*
   *   how long a cancellation may run before escalation to TERMINATED
   * @param throwableCacheable
   *   codec used to encode runner-driven terminal failure outcomes
+  * @param workerId
+  *   worker identity recorded under `workflow_instances.lease_owner` for this
+  *   runner's claims and leases; any stable string, and each concurrently
+  *   running runner should have its own so lease holders stay attributable.
+  *   `None` (the default) means the runner generates a unique id
   */
 final case class JobRunnerSettings(
     workerThreads: Int = 8,
@@ -50,7 +55,8 @@ final case class JobRunnerSettings(
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
     cancelTimeout: FiniteDuration = 5.minutes,
-    throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
+    throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer,
+    workerId: Option[String] = None
 )
 
 object JobRunnerSettings {

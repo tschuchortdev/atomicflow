@@ -35,7 +35,6 @@ class DocumentProcessingAtomicflow(
   import DocumentProcessingAtomicflow.*
   import DocumentProcessingAtomicflow.given
 
-  private given Clock = clock
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 

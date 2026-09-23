@@ -5,7 +5,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
 
@@ -46,7 +46,6 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   test("cancel before first start finalizes CANCELLED immediately and the body never runs") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "created-cancel") { in =>
       counter.incrementAndGet()
@@ -91,7 +90,6 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   test("cancel while suspended delivers at the frontier await; the cached step is not re-executed; boundary returns WorkflowCancelled") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val counter = new AtomicInteger(0)
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "suspended-cancel") { in =>
@@ -157,7 +155,6 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   test("a workflow that completes despite the pending cancel is COMPLETED (first-terminal-event rule)") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "complete-anyway") { in =>
       Step.atLeastOnce[String]("A") { "a" }
@@ -182,7 +179,6 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
   test("cancel_requested_at is set once and never reset") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "set-once") { in =>
       Step.await[String]("wait", Awaitable.SignalEvent(sig))

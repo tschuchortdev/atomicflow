@@ -6,7 +6,6 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.Clock
 import java.time.Instant
 import scala.concurrent.duration.*
 
@@ -41,7 +40,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("a timer not yet due suspends and records an absolute-deadline subscription with no event") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-notdue") { in =>
       Step.await[Unit]("t", Awaitable.Timer(5.minutes))
       "done"
@@ -58,7 +56,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("advancing past the deadline then re-running fires the timer inline and completes") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-resolve") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
       "done"
@@ -81,7 +78,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("the deadline is stored once and never recomputed across re-runs") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-deadline") { in =>
       Step.await[Unit]("t", Awaitable.Timer(5.minutes))
       "done"
@@ -104,7 +100,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("exactly-once: firing never duplicates across repeated runs of a suspended flow") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-once") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
       TestControlFlow.suspend()
@@ -127,7 +122,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("the subscription persists while suspended and is deleted only when the await resolves") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-lifecycle") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
       TestControlFlow.suspend()
@@ -147,7 +141,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("manual mode resolves a timer purely via run evaluation, with no sweep or runner") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-manual") { in =>
       Step.await[Unit]("t", Awaitable.Timer(10.seconds))
       "done"
@@ -162,7 +155,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("invalidateOn re-registers a fresh subscription; the old TimerFired is inert") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     var ctx = "A"
     val wf = Workflow[String, String](id = "timer-invalidate") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute), invalidateOn = Seq("ctx" -> ctx))
@@ -193,7 +185,6 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
   test("invalidateAfter expiry re-registers a fresh subscription with a recomputed deadline; the old TimerFired is inert") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "timer-ttl") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute), invalidateAfter = 10.seconds)
       TestControlFlow.suspend()

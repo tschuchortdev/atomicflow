@@ -38,7 +38,12 @@ final class PostgresJobRunner private[atomicflow] (
     }
   }
 
-  private val runnerWorker = runtime.workerIdFor("jobrunner")
+  /** The worker identity recorded under `lease_owner` for this runner's claims
+    * and leases: user-configurable via `JobRunnerSettings.workerId`, otherwise
+    * a generated unique id — two runners of the same runtime never share one.
+    */
+  private val runnerWorker: String =
+    settings.workerId.getOrElse(s"jobrunner-${java.util.UUID.randomUUID()}")
 
   private val stopped = new AtomicBoolean(false)
 
@@ -228,7 +233,7 @@ final class PostgresJobRunner private[atomicflow] (
       case e: Throwable =>
         classifyFailure(c, e)
     } finally {
-      runtime.releaseLeaseIfOurs(c.instanceId, c.worker, c.token)
+      runtime.releaseLeaseIfStillOwned(c.instanceId, c.worker, c.token)
       releasePermit(c.instanceId.workflowId)
     }
   }
@@ -245,7 +250,7 @@ final class PostgresJobRunner private[atomicflow] (
       case Some(_) =>
         log.debug(s"Workflow instance ${c.instanceId} reached a terminal state; adopting its outcome")
       case None =>
-        if (runtime.leaseStillOurs(c.instanceId, c.worker, c.token)) {
+        if (runtime.isLeaseStillOwned(c.instanceId, c.worker, c.token)) {
           log.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
           requeueTransient(c.instanceId, c.attempts, c.createdAt)
         } else
@@ -267,7 +272,7 @@ final class PostgresJobRunner private[atomicflow] (
       } catch {
         case e: Throwable =>
           log.warn(s"Executor rejected the dispatch of ${c.instanceId}; requeueing", e)
-          runtime.releaseLeaseIfOurs(c.instanceId, c.worker, c.token)
+          runtime.releaseLeaseIfStillOwned(c.instanceId, c.worker, c.token)
           releasePermit(c.instanceId.workflowId)
           requeueTransient(c.instanceId, c.attempts, c.createdAt)
           latch.countDown()

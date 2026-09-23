@@ -6,7 +6,7 @@ import atomicflow.Cacheable.Simple.given
 import doobie.implicits.*
 import doobie.postgres.implicits.*
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.duration.*
 
@@ -151,7 +151,6 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
   test("getExecutionState matrix: NeverStarted, at-least-once Started mid-retry, Failed on exhaustion") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     var observed: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "evo-retry-matrix") { in =>
       observed = Step.getExecutionState[String]("quote", stepVersion = 1)
@@ -174,7 +173,6 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
   test("getExecutionState reports Failed once the retry budget is exhausted (durable failure)") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
-    given Clock = clock
     var observed: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "evo-retry-failed") { in =>
       try {

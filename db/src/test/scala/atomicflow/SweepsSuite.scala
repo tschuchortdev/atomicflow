@@ -6,7 +6,7 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 import test.PostgresWorkflowRuntimeSuite
 
-import java.time.{Clock, Instant}
+import java.time.Instant
 import scala.concurrent.duration.*
 
 /** Background sweeps: timer firing (Path 1), cancellation escalation, and lease
@@ -92,7 +92,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("timer sweep fires a due timer of an unattended instance and upserts a wakeup") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "ts-fire") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
       s"done-$in"
@@ -117,7 +116,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("timer sweep leaves NOT-due subscriptions untouched") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "ts-notdue") { in =>
       Step.await[Unit]("t", Awaitable.Timer(5.minutes))
       "done"
@@ -136,7 +134,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("timer sweep is idempotent across passes: one event total") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "ts-idem") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
       "done"
@@ -157,7 +154,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("timer sweep fires within a batch in deadline order") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "ts-order") { in =>
       Step.await[Unit]("t", Awaitable.Timer(in.toInt.minutes))
       "done"
@@ -184,7 +180,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("escalation sweep turns an overdue cancellation into TERMINATED") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "escalate") { in =>
       Step.await[String]("w", Awaitable.SignalEvent(sig))
@@ -212,7 +207,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("escalation sweep ignores cancellations that have not yet exceeded cancelTimeout") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "escalate-pending") { in =>
       Step.await[String]("w", Awaitable.SignalEvent(sig))
@@ -234,7 +228,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("escalation sweep ignores terminal instances and is idempotent") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val wf = Workflow[String, String](id = "escalate-terminal") { in => s"out-$in" }
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
@@ -257,7 +250,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("escalation sweep is idempotent: running it again does not re-terminate") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "escalate-idem") { in =>
       Step.await[String]("w", Awaitable.SignalEvent(sig))
@@ -287,7 +279,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("recovery sweep clears an expired lease, upserts a wakeup, and does not bump the fencing token") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "recover") { in =>
       Step.await[String]("w", Awaitable.SignalEvent(sig))
@@ -351,7 +342,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
 
   test("cadence wiring: an unattended suspended-on-timer instance completes autonomously") {
     val rt = newRuntime
-    given Clock = Clock.systemUTC()
     val wf = Workflow[String, String](id = "cadence") { in =>
       Step.await[Unit]("t", Awaitable.Timer(100.millis))
       "done"
@@ -366,7 +356,6 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   test("sweeps are definition-agnostic: they service a workflow outside the runner's registry") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    given Clock = clock
     val registered = Workflow[String, String](id = "registered") { in => s"out-$in" }
     val unknown = Workflow[String, String](id = "unknown") { in =>
       Step.await[Unit]("t", Awaitable.Timer(1.minute))
