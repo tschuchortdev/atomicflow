@@ -87,10 +87,11 @@ trait WorkflowRuntime {
   def renewLease(run: CurrentExecution): Unit
   def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
-  /** Creates and starts this process's job runner. Implemented per backend:
+  /** Creates and starts a job runner. Implemented per backend:
     * the runner executes the runner-internal operations (wakeup claiming,
     * lease acquisition, the sweeps) and is bound to this runtime — runners
-    * and runtimes cannot be mixed and matched. */
+    * and runtimes cannot be mixed and matched. Any number of runners may be
+    * started on the same runtime, each with its own settings and registry. */
   def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
@@ -111,7 +112,7 @@ val runner = runtime.startJobRunner(
 runner.stop(gracePeriod = 30.seconds)   // stop claiming, drain in-flight runs
 ```
 
-- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: calling `startJobRunner` while this runtime's runner is still active throws (two driver loops in one process double every sweep — a guard, not a correctness need; multi-process cooperation is unaffected); `stop` is idempotent; after `stop`, the factory may be called again. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
+- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: any number of runners may be started on the same runtime, each with its own settings and registry; an extra runner costs redundant sweep and claim work but is never incorrect (the database's claim-atomic leases and idempotent sweeps arbitrate, exactly as they already do across processes); `stop` is idempotent and independent per runner. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
 - The runner holds the definition registry because it is the only component that ever resolves code from an id (below).
 - **Production always runs a runner; tests drive manually.** The runner is the default way workflows progress, and regular applications always start one. Tests of user workflows deliberately do not: they drive execution deterministically on caller threads via `run`/`createAndRun` (see "Testing"). Signals never need background machinery at all — senders append events and upsert wakeups on their own caller threads.
 - **No sweep is public API.** Timer firing, cancellation escalation, and lease recovery are internal steps of the runner's driver loop. Await evaluation is self-sufficient (see "Run semantics"), so no on-demand sweep operation exists: escalation and recovery are never needed by caller threads (an external `run` acquires an expired lease directly through the conditional update), and timer awaits fire their own due timers.

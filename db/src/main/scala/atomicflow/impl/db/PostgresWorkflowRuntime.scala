@@ -2622,24 +2622,11 @@ _ <- upsertStepStateIO(
               AND lease_owner = $worker AND fencing_token = $token""".query[Int].option
     }.isDefined
 
-  private val runnerGuard = new Object
-  @volatile private var activeRunner: PostgresJobRunner = null
-
-  private[atomicflow] def isRunnerActive: Boolean = {
-    val r = activeRunner
-    r != null && r.isActive
-  }
-
-  private[atomicflow] def clearActiveRunner(runner: PostgresJobRunner): Unit =
-    runnerGuard.synchronized {
-      if (activeRunner eq runner) activeRunner = null
-    }
-
   override def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
   ): JobRunner =
-    createRunner(definitions, settings, startLoop = true)
+    new PostgresJobRunner(this, definitions, settings, startLoop = true)
 
   /** Package-private test hook: like [[startJobRunner]] but builds a runner whose
     * background driver loop is NOT started, so a test can drive claim cycles
@@ -2649,20 +2636,5 @@ _ <- upsertStepStateIO(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings
   ): PostgresJobRunner =
-    createRunner(definitions, settings, startLoop = false)
-
-  private def createRunner(
-      definitions: Seq[Workflow[?, ?]],
-      settings: JobRunnerSettings,
-      startLoop: Boolean
-  ): PostgresJobRunner =
-    runnerGuard.synchronized {
-      if (isRunnerActive)
-        throw new IllegalStateException(
-          "This runtime already has an active job runner; stop it before starting another"
-        )
-      val runner = new PostgresJobRunner(this, definitions, settings, startLoop)
-      activeRunner = runner
-      runner
-    }
+    new PostgresJobRunner(this, definitions, settings, startLoop = false)
 }

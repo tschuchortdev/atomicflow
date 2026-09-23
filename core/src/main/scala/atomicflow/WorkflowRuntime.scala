@@ -537,18 +537,21 @@ trait WorkflowRuntime {
       instance: WorkflowInstance[In, Out]
   ): WorkflowInstance.Info
 
-  /** Creates and starts this process's job runner over the given definition
-    * registry. Implemented per backend: the runner executes backend-internal
-    * operations (wakeup claiming, conditional lease acquisition, sweeps) and is
-    * bound to this runtime — runners and runtimes cannot be mixed and matched.
+  /** Creates and starts a job runner over the given definition registry.
+    * Implemented per backend: the runner executes backend-internal operations
+    * (wakeup claiming, conditional lease acquisition, sweeps) and is bound to
+    * this runtime — runners and runtimes cannot be mixed and matched.
     *
     * The registry maps each `workflowId` to its one current definition; it is
     * validated once (duplicate ids throw) and immutable for the runner's
     * lifetime. The runner claims only wakeups of workflows in the registry, so
     * several applications with different code can share the same tables.
     *
-    * Calling this while this runtime's runner is still active throws
-    * [[IllegalStateException]]; after `stop` it may be called again.
+    * Any number of runners may be started on the same runtime — in this process
+    * or another — each with its own settings and registry. They cooperate through
+    * storage alone (claim-atomic leases and idempotent sweeps), so duplicate
+    * runners cost redundant work but are never incorrect. Each runner stops
+    * independently via [[JobRunner.stop]].
     */
   def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
