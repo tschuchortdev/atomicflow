@@ -184,17 +184,27 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("double start throws while a runner is active; stop is idempotent; restart works after stop") {
+  test("multiple runners may run concurrently and stop independently; stop is idempotent") {
     val rt = newRuntime
-    val wf = simpleWf("lc")
-    val r1 = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
-    intercept[IllegalStateException] {
-      rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
+    val wfA = simpleWf("multiA")
+    val wfB = simpleWf("multiB")
+    val r1 = rt.startJobRunner(Seq(wfA), JobRunnerSettings.forTests)
+    val r2 = rt.startJobRunner(Seq(wfB), JobRunnerSettings.forTests)
+    try {
+      val a = wfA.createAndSchedule("k", "a")(using rt)
+      val b = wfB.createAndSchedule("k", "b")(using rt)
+      assertEquals(a.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-a"))
+      assertEquals(b.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-b"))
+    } finally {
+      r1.stop(1.second)
+      r1.stop(1.second)
+      r2.stop(1.second)
     }
-    r1.stop(1.second)
-    r1.stop(1.second)
-    val r2 = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
-    r2.stop(1.second)
+    val r3 = rt.startJobRunner(Seq(wfA), JobRunnerSettings.forTests)
+    try {
+      val c = wfA.createAndSchedule("k2", "c")(using rt)
+      assertEquals(c.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-c"))
+    } finally r3.stop(1.second)
   }
 
   test("stop(gracePeriod) waits for the in-flight run, stops claiming, and is idempotent") {

@@ -7,10 +7,11 @@ import scala.concurrent.duration.FiniteDuration
   * tables and executes the corresponding instances on its worker pool, driving
   * unattended workflows to completion.
   *
-  * A runner is created already started and cooperates with every other process's
-  * runner through storage alone. Lifecycle: calling `startJobRunner` again on the
-  * same runtime while this runner is active throws; [[stop]] is idempotent; after
-  * `stop` the factory may be called again.
+  * A runner is created already started and cooperates with every other runner —
+  * in this process or another — through storage alone. Lifecycle: any number of
+  * runners may be started on the same runtime, each with its own settings and
+  * registry, and each stops independently; [[stop]] is idempotent and after
+  * `stop` the runner is inert while others keep running.
   */
 trait JobRunner {
 

@@ -95,8 +95,6 @@ final class PostgresJobRunner private[atomicflow] (
 
   private val pool: Executor = settings.executor.getOrElse(ownedPool.get)
 
-  private[atomicflow] def isActive: Boolean = !stopped.get
-
   private def jittered(d: FiniteDuration): Long = {
     val base = d.toNanos
     val jitter = ((base * 0.2) * (math.random * 2 - 1)).toLong
@@ -451,7 +449,6 @@ final class PostgresJobRunner private[atomicflow] (
 
   override def stop(gracePeriod: FiniteDuration): Unit = {
     if (!stopped.getAndSet(true)) {
-      runtime.clearActiveRunner(this)
       val deadline = System.nanoTime() + gracePeriod.toNanos
       loopThread.interrupt()
       try {
