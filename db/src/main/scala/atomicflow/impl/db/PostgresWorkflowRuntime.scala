@@ -75,6 +75,45 @@ class PostgresWorkflowRuntime private[atomicflow] (
     fa.transact(xa).unsafeRunSync()(using cats.effect.unsafe.IORuntime.global)
   }
 
+  /** Whether `t`'s cause chain contains a `java.sql.SQLException` whose
+    * SQLSTATE is 40P01 (deadlock). Deadlocks are transient: both wakeup passes
+    * are idempotent, so the caller may simply retry the whole pass.
+    */
+  private def isDeadlock(t: Throwable): Boolean = {
+    @annotation.tailrec
+    def loop(c: Throwable): Boolean =
+      c match {
+        case null                                   => false
+        case e: java.sql.SQLException if e.getSQLState == "40P01" => true
+        case other                                  => loop(other.getCause)
+      }
+    loop(t)
+  }
+
+  /** Bounded retry around a deadlockable pass. The two full-scan passes
+    * (`dispatchNewEvents`, `scanAllSubscriptions`) upsert wakeups for many
+    * instances in one transaction while a concurrent terminal transition /
+    * child-close upserts wakeups for other instances; the opposite lock orders
+    * over `workflow_instances` (FK KEY SHARE) and `workflow_wakeups` can raise
+    * SQLSTATE 40P01. Both passes are idempotent, so a bounded retry with a short
+    * backoff lets one side make progress and the retried pass succeed.
+    */
+  private def withDeadlockRetry[A](fa: => A, attempts: Int = 5, backoffMillis: Long = 50L): A = {
+    var attempt = 0
+    var last: Throwable = null
+    while (attempt < attempts) {
+      try {
+        return fa
+      } catch {
+        case t: Throwable if isDeadlock(t) =>
+          last = t
+          attempt += 1
+          if (attempt < attempts) Thread.sleep(backoffMillis)
+      }
+    }
+    throw last
+  }
+
   private def workerId: String = s"$processUuid:${Thread.currentThread().getId}"
 
   private[atomicflow] def leaseExpiry(now: java.time.Instant, duration: FiniteDuration): java.time.Instant =
@@ -542,9 +581,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** The guarded `CANCELLED` terminal transition for an instance that has no
     * execution lease (finalized from a cancel request before first start): the
-    * guarded status update plus the `WorkflowCompleted(Cancelled)` event and the
-    * completion-subscriber wakeups, in one transaction. The `Cancelled` outcome
-    * carries no user code, so it is encoded directly with the runtime's framing.
+    * guarded status update plus the `WorkflowCompleted(Cancelled)` event, in one
+    * transaction. Completion wakeups are produced asynchronously by the job
+    * runner. The `Cancelled` outcome carries no user code, so it is encoded
+    * directly with the runtime's framing.
     */
   private def finalizeCancelledWithoutLease(
       workflowId: WorkflowId,
@@ -561,7 +601,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
         for {
           _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
           _ <- appendCompletedEvent(workflowId, key, scope, payload)
-          _ <- wakeCompletionSubscribers(workflowId, key, scope)
           _ <- terminalCleanupIO(workflowId, key, scope)
           _ <- applyParentClosePoliciesIO(workflowId, key, scope)
         } yield ()
@@ -794,10 +833,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * [[terminate]] and the cancellation-escalation sweep. Row-locks the
     * instance; a missing or already-terminal instance is a no-op (returns
     * `false`); otherwise the guarded status update plus the
-    * `WorkflowCompleted(Terminated)` event, completion-subscriber wakeups,
-    * lease revocation (fencing-token bump and clearing owner/expiry), and
-    * terminal cleanup commit in one transaction. Idempotent: a concurrent
-    * winner makes a later caller a no-op.
+    * `WorkflowCompleted(Terminated)` event, lease revocation (fencing-token
+    * bump and clearing owner/expiry), and terminal cleanup commit in one
+    * transaction. Completion wakeups are produced asynchronously by the job
+    * runner. Idempotent: a concurrent winner makes a later caller a no-op.
     */
   private[atomicflow] def escalateTerminated(instanceId: WorkflowInstanceId): Boolean = {
     val workflowId = instanceId.workflowId
@@ -825,7 +864,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 for {
                   _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
                   _ <- appendCompletedEvent(workflowId, key, scope, payload)
-                  _ <- wakeCompletionSubscribers(workflowId, key, scope)
                   _ <- terminalCleanupIO(workflowId, key, scope)
                   _ <- applyParentClosePoliciesIO(workflowId, key, scope)
                 } yield ()
@@ -892,6 +930,134 @@ class PostgresWorkflowRuntime private[atomicflow] (
         _ <- if (updated == 1) upsertWakeupIO(workflowId, key, scope, now)
              else ().pure[ConnectionIO]
       } yield updated == 1
+    }
+  }
+
+  /** Best-effort watermark dispatch. Processes events appended after the stored
+    * watermark and upserts the wakeups they imply. At most one dispatcher works
+    * at a time: it locks the single watermark row with FOR UPDATE SKIP LOCKED and
+    * a concurrent caller returns immediately. TimerFired events are skipped here
+    * because the timer sweep already wakes their owning instance. Returns the
+    * number of events processed.
+    */
+  private[atomicflow] def dispatchNewEvents(batchSize: Int): Int =
+    withDeadlockRetry {
+      runTransaction {
+        sql"SELECT dispatched_through FROM workflow_event_dispatch WHERE id = 1 FOR UPDATE SKIP LOCKED"
+          .query[Long]
+          .option
+          .flatMap {
+            case None => 0.pure[ConnectionIO]
+            case Some(through) =>
+              sql"""SELECT sequence_id, event_kind, workflow_id, workflow_instance_key, scope, event_key
+                    FROM workflow_events WHERE sequence_id > $through
+                    ORDER BY sequence_id LIMIT $batchSize""".query[
+                  (Long, String, WorkflowId, WorkflowInstanceKey, String, String)
+                ].to[Vector].flatMap { events =>
+                  events.traverse_ { case (_, kind, wf, k, s, ek) =>
+                    kind match {
+                      case "Signal" =>
+                        wakeMatchingSubscribers(wf, k, s, ek) *> wakeInheritingDescendantsIO(wf, k, s, ek)
+                      case "WorkflowCompleted" =>
+                        wakeCompletionSubscribers(wf, k, s)
+                      case _ => ().pure[ConnectionIO]
+                    }
+                  } *> events.lastOption.traverse_ { case (seq, _, _, _, _, _) =>
+                    sql"UPDATE workflow_event_dispatch SET dispatched_through = $seq WHERE id = 1".update.run
+                  }.map(_ => events.size)
+                }
+          }
+      }
+    }
+
+  /** Full liveness scan. Wakes every non-terminal instance holding a pending
+    * signal or completion subscription that has a visible, unconsumed candidate.
+    * This is the correctness guarantee behind the asynchronous wakeup jobs; the
+    * watermark dispatcher is only a latency optimization. Returns the number of
+    * wakeups inserted. Timer and update subscriptions are excluded (the timer
+    * sweep and the instance-row lock cover them).
+    */
+  private[atomicflow] def scanAllSubscriptions(): Int = {
+    val now = theClock.instant()
+    withDeadlockRetry {
+      runTransaction {
+        for {
+          direct <- sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, scope, created_at, scheduled_at, attempts)
+              SELECT s.workflow_id, s.workflow_instance_key, s.scope, $now, $now, 0
+              FROM workflow_signal_subscriptions s
+              JOIN workflow_instances i
+                ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+              WHERE i.terminal_state IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM workflow_events e
+                  WHERE e.event_kind = 'Signal' AND e.event_key = s.signal_key
+                    AND e.workflow_id = s.workflow_id AND e.workflow_instance_key = s.workflow_instance_key AND e.scope = s.scope
+                    AND e.sequence_id > COALESCE((
+                      SELECT c.sequence_id FROM signal_cursor c
+                      WHERE c.workflow_id = s.workflow_id AND c.workflow_instance_key = s.workflow_instance_key
+                        AND c.scope = s.scope AND c.signal_key = s.signal_key), 0)
+                )
+              ON CONFLICT (workflow_id, workflow_instance_key, scope) DO NOTHING""".update.run
+          inherited <- sql"""WITH RECURSIVE ancestry AS (
+                SELECT s.workflow_id AS sub_wf, s.workflow_instance_key AS sub_key, s.scope AS sub_scope, s.signal_key AS signal_key,
+                       i.workflow_id AS node_wf, i.workflow_instance_key AS node_key, i.scope AS node_scope,
+                       i.inherit_signals AS node_policy,
+                       i.parent_workflow_id AS parent_wf, i.parent_instance_key AS parent_key, i.parent_scope AS parent_scope,
+                       i.inherited_events_start_sequence_id AS start_seq, i.inherit_past_events AS past, 0 AS depth
+                FROM workflow_signal_subscriptions s
+                JOIN workflow_instances i
+                  ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+                WHERE i.terminal_state IS NULL
+                  AND i.parent_workflow_id IS NOT NULL
+                UNION ALL
+                SELECT a.sub_wf, a.sub_key, a.sub_scope, a.signal_key,
+                       p.workflow_id, p.workflow_instance_key, p.scope,
+                       p.inherit_signals, p.parent_workflow_id, p.parent_instance_key, p.parent_scope,
+                       a.start_seq, a.past, a.depth + 1
+                FROM ancestry a
+                JOIN workflow_instances p
+                  ON p.workflow_id = a.parent_wf AND p.workflow_instance_key = a.parent_key AND p.scope = a.parent_scope
+                WHERE a.parent_wf IS NOT NULL
+                  AND a.depth < 64
+                  AND ( a.node_policy = 'all'
+                        OR ( a.node_policy LIKE 'some:%'
+                             AND EXISTS (
+                               SELECT 1 FROM jsonb_array_elements_text(substring(a.node_policy from 6)::jsonb) AS t(pfx)
+                               WHERE left(a.signal_key, length(pfx)) = pfx
+                             ) ) )
+              )
+              INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, scope, created_at, scheduled_at, attempts)
+              SELECT DISTINCT a.sub_wf, a.sub_key, a.sub_scope, $now, $now, 0
+              FROM ancestry a
+              WHERE a.depth > 0
+                AND EXISTS (
+                  SELECT 1 FROM workflow_events e
+                  WHERE e.event_kind = 'Signal' AND e.event_key = a.signal_key
+                    AND e.workflow_id = a.node_wf AND e.workflow_instance_key = a.node_key AND e.scope = a.node_scope
+                    AND e.sequence_id > COALESCE((
+                      SELECT c.sequence_id FROM signal_cursor c
+                      WHERE c.workflow_id = a.sub_wf AND c.workflow_instance_key = a.sub_key
+                        AND c.scope = a.sub_scope AND c.signal_key = a.signal_key), 0)
+                    AND (a.past OR a.start_seq IS NULL OR e.sequence_id > a.start_seq)
+                )
+              ON CONFLICT (workflow_id, workflow_instance_key, scope) DO NOTHING""".update.run
+          completion <- sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, scope, created_at, scheduled_at, attempts)
+              SELECT s.workflow_id, s.workflow_instance_key, s.scope, $now, $now, 0
+              FROM workflow_completion_subscriptions s
+              JOIN workflow_instances i
+                ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+              WHERE i.terminal_state IS NULL
+                AND EXISTS (
+                  SELECT 1 FROM workflow_events e
+                  WHERE e.event_kind = 'WorkflowCompleted'
+                    AND e.event_key = ''
+                    AND e.workflow_id = s.completed_workflow_id
+                    AND e.workflow_instance_key = s.completed_workflow_instance_key
+                    AND e.scope = s.completed_scope
+                )
+              ON CONFLICT (workflow_id, workflow_instance_key, scope) DO NOTHING""".update.run
+        } yield direct + inherited + completion
+      }
     }
   }
 
@@ -1143,11 +1309,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
     * append and the deletion of this instance's directly addressed `Signal`
     * events: the guarded `terminal_state`/`terminal_outcome` update, the event
-    * append, the subscriber wakeups, and the `Signal` deletion commit together in
-    * one transaction. Wins only if the instance is not already terminal and the
-    * lease is still ours. `TimerFired` and `WorkflowCompleted` events are
-    * retained (subscribers and replays need them); consumers of the deleted
-    * `Signal` events already hold cached Step results.
+    * append, and the `Signal` deletion commit together in one transaction.
+    * Completion wakeups are produced asynchronously by the job runner. Wins only
+    * if the instance is not already terminal and the lease is still ours.
+    * `TimerFired` and `WorkflowCompleted` events are retained (subscribers and
+    * replays need them); consumers of the deleted `Signal` events already hold
+    * cached Step results.
     *
     * Returns rows updated (1 if this writer won the transition, 0 if another
     * writer already made it terminal).
@@ -1171,7 +1338,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
           for {
             _ <- deleteDirectSignalEventsIO(workflowId, key, scope)
             _ <- appendCompletedEvent(workflowId, key, scope, payload)
-            _ <- wakeCompletionSubscribers(workflowId, key, scope)
             _ <- terminalCleanupIO(workflowId, key, scope)
             _ <- applyParentClosePoliciesIO(workflowId, key, scope)
           } yield ()
@@ -1241,10 +1407,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     workflow.onUnconsumedSignals(unconsumed)
   }
 
-  /** Upserts the wakeup of every instance holding a pending completion
-    * subscription on the instance that just completed, `ON CONFLICT DO NOTHING`
-    * with `scheduled_at = now`. Rides in the same transaction as the guarded
-    * terminal update and the `WorkflowCompleted` append.
+  /** Upserts the wakeup of every non-terminal instance holding a pending
+    * completion subscription on the instance that just completed, `ON CONFLICT
+    * DO NOTHING` with `scheduled_at = now`. Called by the best-effort watermark
+    * dispatcher when it processes a committed `WorkflowCompleted` event; the
+    * full subscription scan covers the same case independently.
     */
   private def wakeCompletionSubscribers(
       workflowId: WorkflowId,
@@ -1253,8 +1420,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Unit] = {
     val now = theClock.instant()
     for {
-      subscribers <- sql"""SELECT workflow_id, workflow_instance_key, scope FROM workflow_completion_subscriptions
-            WHERE completed_workflow_id = $workflowId AND completed_workflow_instance_key = $key AND completed_scope = $scope""".query[
+      subscribers <- sql"""SELECT s.workflow_id, s.workflow_instance_key, s.scope
+            FROM workflow_completion_subscriptions s
+            JOIN workflow_instances i
+              ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+            WHERE s.completed_workflow_id = $workflowId AND s.completed_workflow_instance_key = $key AND s.completed_scope = $scope
+              AND i.terminal_state IS NULL""".query[
           (WorkflowId, WorkflowInstanceKey, String)
         ].to[Vector]
       _ <- subscribers.traverse_ { case (subWf, subKey, subScope) =>
@@ -1317,8 +1488,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * transaction: row-lock the instance (`SELECT ... FOR UPDATE`), return
     * [[WorkflowNotFoundException]] if absent or [[SignalSendResult.InstanceAlreadyCompleted]]
     * if it has stopped accepting signals, else append the event (payload from the
-    * signal's [[Cacheable]]) and upsert a wakeup when a matching pending
-    * subscription exists. Does not acquire the execution lease.
+    * signal's [[Cacheable]]). The sender only appends; wakeups are produced
+    * asynchronously by the job runner. Does not acquire the execution lease.
     */
   override def sendSignal[A: Cacheable](
       workflowInstanceId: WorkflowInstanceId,
@@ -1342,17 +1513,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
           case Some(true) =>
             for {
               _ <- appendEvent(workflowId, instanceKey, scope, "Signal", key, payload)
-              _ <- wakeMatchingSubscribers(workflowId, instanceKey, scope, key)
-              _ <- wakeInheritingDescendantsIO(workflowId, instanceKey, scope, key)
             } yield SignalSendResult.Success
         }
       } yield result
     }
   }
 
-  /** Upserts the instance's wakeup row when a pending subscription for the exact
-    * signal key exists. The sender never evaluates payload filters; only
-    * key-matching subscriptions matter.
+  /** Upserts the addressed instance's own wakeup row when it holds a pending
+    * subscription for the exact signal key and is still non-terminal. Called by
+    * the best-effort watermark dispatcher; the sender no longer upserts wakeups,
+    * and no payload filter is evaluated (only key-matching subscriptions matter).
     */
   private def wakeMatchingSubscribers(
       workflowId: WorkflowId,
@@ -1362,8 +1532,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Unit] = {
     val now = theClock.instant()
     for {
-      has <- sql"""SELECT 1 FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope AND signal_key = $signalKey
+      has <- sql"""SELECT 1
+            FROM workflow_signal_subscriptions s
+            JOIN workflow_instances i
+              ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+            WHERE s.workflow_id = $workflowId AND s.workflow_instance_key = $key AND s.scope = $scope AND s.signal_key = $signalKey
+              AND i.terminal_state IS NULL
             LIMIT 1""".query[Int].option
       _ <- if (has.isDefined)
         sql"""
@@ -1375,13 +1549,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
     } yield ()
   }
 
-  /** Upserts a wakeup for every currently eligible descendant of the addressed
-    * instance that is suspended on `signalKey`, so a single committed send is
-    * atomically readable by all descendants that inherit it. A descendant is
-    * eligible when every parent-child edge on the path from the sender down
-    * currently permits the key (evaluated here at send time; the awaiting
+  /** Upserts a wakeup for every currently eligible, non-terminal descendant of
+    * the addressed instance that is suspended on `signalKey`, so one committed
+    * send reaches all descendants that inherit it. A descendant is eligible when
+    * every parent-child edge on the path from the addressed instance down
+    * currently permits the key (evaluated at dispatch time; the awaiting
     * descendant re-checks eligibility when it runs). Waking a superset is
     * harmless because the run-time candidate query applies the policy again.
+    * Called by the best-effort watermark dispatcher; the full subscription scan
+    * covers the same case independently.
     */
   private def wakeInheritingDescendantsIO(
       wf: WorkflowId,
@@ -1401,8 +1577,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
         ].to[Vector]
     def wakeIfSubscribed(w: WorkflowId, kk: WorkflowInstanceKey, ss: String): ConnectionIO[Unit] =
       for {
-        has <- sql"""SELECT 1 FROM workflow_signal_subscriptions
-                     WHERE workflow_id = $w AND workflow_instance_key = $kk AND scope = $ss AND signal_key = $signalKey
+        has <- sql"""SELECT 1
+                     FROM workflow_signal_subscriptions s
+                     JOIN workflow_instances i
+                       ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.scope = s.scope
+                     WHERE s.workflow_id = $w AND s.workflow_instance_key = $kk AND s.scope = $ss AND s.signal_key = $signalKey
+                       AND i.terminal_state IS NULL
                      LIMIT 1""".query[Int].option
         _ <- if (has.isDefined)
           sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, scope, created_at, scheduled_at, attempts)
@@ -2103,25 +2283,36 @@ class PostgresWorkflowRuntime private[atomicflow] (
     fenced(run) {
       for {
         _ <- subscribers.traverse_(registerInterestIO(run, site, _))
-        candidates <- subscribers.traverse(readInterestCandidatesIO(run, site, _)).map(_.flatten)
-        resolution = decide(candidates.sortBy(_.sequenceId))
+        perSubscriber <- subscribers.traverse(sub => readInterestCandidatesIO(run, site, sub).map(sub -> _))
+        candidates = perSubscriber.flatMap(_._2).sortBy(_.sequenceId)
+        resolution = decide(candidates)
         result <- resolution match {
           case Some(r) =>
             for {
-_ <- upsertStepStateIO(
-                   run,
-                   site.stepId,
-                   site.stepVersion,
-                   site.stepKind,
-                   StoredStep.State.Succeeded,
-                   site.inputFingerprints,
-                   r.payload,
-                   site.expiresAt
-                 )
+              _ <- upsertStepStateIO(
+                     run,
+                     site.stepId,
+                     site.stepVersion,
+                     site.stepKind,
+                     StoredStep.State.Succeeded,
+                     site.inputFingerprints,
+                     r.payload,
+                     site.expiresAt
+                   )
               _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorIO(run, k, seq) }
               _ <- deleteSiteSubscriptionsIO(run, site.stepId, site.stepVersion)
             } yield Some(r.payload)
-          case None => Option.empty[String].pure[ConnectionIO]
+          case None =>
+            val advances: Map[SignalKey, Long] =
+              perSubscriber.foldLeft(Map.empty[SignalKey, Long]) {
+                case (acc, (Subscriber.Signal(_, k), cs)) if cs.nonEmpty =>
+                  val mx = cs.iterator.map(_.sequenceId).max
+                  acc.updated(k, acc.get(k).fold(mx)(math.max(_, mx)))
+                case (acc, _) => acc
+              }
+            advances.toVector
+              .traverse_ { case (k, seq) => advanceCursorIO(run, k, seq) }
+              .as(None)
         }
       } yield result
     }
@@ -2413,7 +2604,7 @@ _ <- upsertStepStateIO(
     sql"""INSERT INTO signal_cursor (workflow_id, workflow_instance_key, scope, signal_key, sequence_id)
           VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $signalKey, $sequenceId)
           ON CONFLICT (workflow_id, workflow_instance_key, scope, signal_key) DO UPDATE
-          SET sequence_id = EXCLUDED.sequence_id""".update.run.map(_ => ())
+          SET sequence_id = GREATEST(signal_cursor.sequence_id, EXCLUDED.sequence_id)""".update.run.map(_ => ())
 
   /** Walks the active-parent chain from this instance upward and returns the
     * (workflow_id, workflow_instance_key, scope) identities of the ancestor sources whose

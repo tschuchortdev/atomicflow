@@ -380,10 +380,23 @@ final class PostgresJobRunner private[atomicflow] (
   private var lastTimerSweep: Long = 0L
   private var lastEscalationSweep: Long = 0L
   private var lastRecoverySweep: Long = 0L
+  private var lastFullScan: Long = 0L
 
-  /** Runs each sweep when its cadence has elapsed: the timer sweep on
-    * `timerSweepInterval`, escalation and recovery on `sweepInterval`. First
-    * cycle runs all three.
+  /** Two asynchronous wakeup jobs back the liveness guarantee:
+    *
+    * Writers (signal sends and terminal transitions) only append events, so
+    * their transactions stay short and cannot deadlock against subscribers. A
+    * best-effort watermark dispatcher (`dispatchNewEvents`) replays events after
+    * a stored watermark and upserts the wakeups they imply, giving low-latency
+    * wakeups for the common case where the subscription already exists when the
+    * event is appended. A periodic full subscription scan
+    * (`scanAllSubscriptions`) re-examines every pending signal/completion
+    * subscription and wakes every non-terminal instance with a visible,
+    * unconsumed candidate — the correctness guarantee for the rare race where a
+    * subscription and an event commit concurrently, the dispatcher misses the
+    * subscription and advances its watermark past the event, so the next scan
+    * must re-check all subscriptions. The full scan cadence is
+    * `fullSubscriptionScanInterval` (default 1 minute).
     */
   private def runSweepsDue(): Unit = {
     val now = System.nanoTime()
@@ -398,6 +411,11 @@ final class PostgresJobRunner private[atomicflow] (
     if (now - lastRecoverySweep >= settings.sweepInterval.toNanos) {
       lastRecoverySweep = now
       runRecoverySweep()
+    }
+    runtime.dispatchNewEvents(settings.eventDispatchBatchSize)
+    if (now - lastFullScan >= settings.fullSubscriptionScanInterval.toNanos) {
+      lastFullScan = now
+      runtime.scanAllSubscriptions()
     }
   }
 

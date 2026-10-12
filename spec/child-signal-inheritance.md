@@ -57,6 +57,12 @@ workerWorkflow.startAsChild(
 - Sending atomically appends one event. That fact is immediately readable by
   the addressed workflow and all currently eligible descendants, so there is no
   partially copied child delivery.
+- The sender walks no descendants and creates no descendant wakeups: descendant
+  wakeups are produced asynchronously by the runner's watermark dispatcher and
+  full subscription scan using the same read-time policy. Waking a superset is
+  therefore harmless — the run re-applies the current policy when it gathers
+  candidates, so a descendant woken by an over-broad or stale policy simply finds
+  nothing and re-suspends.
 - Atomic visibility is based on current read-time policy; it does not freeze a
   recipient list at send time.
 - The global order does not force strict consumption across signal keys.

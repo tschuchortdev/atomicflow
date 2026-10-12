@@ -92,7 +92,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(signalEvents(wf.id, "k").size, 1)
   }
 
-  test("send upserts a wakeup row when a matching subscription exists") {
+  test("send appends only; a matching subscription is not woken synchronously by the sender") {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "sig-wakeup") { in => in }
     rt.createWorkflowInstance(wf, "k", "in")
@@ -109,7 +109,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
           Instant
         ].option
     )
-    assert(wake.isDefined)
+    assertEquals(wake, None, "the sender only appends the event; wakeups are produced asynchronously by the job runner")
   }
 
   test("send does not create a wakeup without a matching subscription") {

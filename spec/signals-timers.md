@@ -7,11 +7,11 @@ Guideline for waiting on external events and timers.
 A step's result is computed by *user code* and cached. An **await's** result is computed by the *runtime* (from persisted events) and cached in the same `workflow_steps` table. When replay reaches an await-site, evaluation proceeds in this exact order:
 
 1. a completed Step row already exists → return its recorded result. This prevents an await from re-suspending on every re-run.
-2. no completed row → **gather candidates from durable facts**: visible signal events after the shared exact-key cursor (the filter is evaluated in code), `TimerFired` events matching the site's current timer subscriptions, and `WorkflowCompleted` events of the awaited instances.
+2. no completed row → **gather candidates from durable facts**: visible signal events after the shared exact-key cursor (the filter is evaluated in code; a suspending evaluation advances that cursor past every event it examined and rejected, so rejected events are not re-gathered — see "Await-signal searches" below), `TimerFired` events matching the site's current timer subscriptions, and `WorkflowCompleted` events of the awaited instances.
 3. **fire the site's own due timers**: for each timer subscription with `deadline <= now` and no existing event, append its `TimerFired` event (subscription row lock + global append mutex) — it becomes a candidate like any other event.
-4. if any candidate satisfies the condition → **resolve atomically**: persist the result, advance signal cursors, delete the site's subscriptions; otherwise **suspend**: register/refresh pending subscriptions and throw `WorkflowSuspendedException` — caught at the outer workflow boundary, which returns `WorkflowSuspended` from `run` (see `running-workflows.md`).
+4. if any candidate satisfies the condition → **resolve atomically**: persist the result, advance signal cursors, delete the site's subscriptions; otherwise **suspend**: advance the shared exact-key cursor past every examined-and-rejected event, register/refresh pending subscriptions and throw `WorkflowSuspendedException` — caught at the outer workflow boundary, which returns `WorkflowSuspended` from `run` (see `running-workflows.md`).
 
-**Evaluation is self-sufficient**: it depends only on durable state — events, cached Step rows, and the await's own timer subscriptions with their stored deadlines — never on the scheduler having run. Wakeups and the timer sweep exist purely so *unattended* instances get noticed promptly; a run advances whether or not any scheduling happened (see `running-workflows.md`, "Run semantics"). The distinction matters: signal and completion subscriptions are pure wakeup hints (their facts live independently in the event log), while a **timer subscription is semantic state** — the durable deadline and firing identity (see below). A site's first evaluation has no subscriptions yet — registration happens in the suspension transaction — which is harmless: a timer's deadline is computed at registration (`now + delay`), so it can never already be due at first evaluation, while signals and completions are found at step 2 regardless.
+**Evaluation is self-sufficient**: it depends only on durable state — events, cached Step rows, and the await's own timer subscriptions with their stored deadlines — never on the scheduler having run. Wakeups and the timer sweep exist purely so *unattended* instances get noticed promptly; a run advances whether or not any scheduling happened (see `running-workflows.md`, "Run semantics"). Signal and completion wakeups are materialized asynchronously by the job runner's watermark dispatch and full subscription scan — the full scan is the liveness guarantee and the dispatcher is only latency (see `running-workflows.md`, "Sources of wakeups"). The distinction matters: signal and completion subscriptions are pure wakeup hints (their facts live independently in the event log), while a **timer subscription is semantic state** — the durable deadline and firing identity (see below). A site's first evaluation has no subscriptions yet — registration happens in the suspension transaction — which is harmless: a timer's deadline is computed at registration (`now + delay`), so it can never already be due at first evaluation, while signals and completions are found at step 2 regardless.
 
 Awaits thus reuse the entire step machinery (explicit ids, persisted results, manual intervention via reset) instead of inventing a parallel mechanism.
 
@@ -206,14 +206,17 @@ trait WorkflowRuntime {
 ```
 
 - `sendSignal` does not acquire the workflow execution lease, so a
-  busy or long-running workflow never blocks senders. They append only signal
-  data and schedule work; they do not modify Step results or other
-  execution records owned by the running workflow.
+  busy or long-running workflow never blocks senders. They only append signal
+  data; they do not modify Step results or other
+  execution records owned by the running workflow, and they schedule no work
+  themselves.
 - Sending a Signal event briefly acquires a row lock on the addressed workflow
   instance and checks `is_accepting_signals` to prevent appending an event when
   that instance is completed or completing. It then acquires the global event
-  allocator mutex (pg_advisory_lock in postgres), obtains the next `sequenceId` (`SEQUENCE CACHE 1` in postgres), appends the event, schedules
-  relevant wakeups, and commits.
+  allocator mutex (pg_advisory_lock in postgres), obtains the next `sequenceId` (`SEQUENCE CACHE 1` in postgres), appends the one immutable event, and commits.
+  The sender creates no wakeups: signal and completion wakeups are produced
+  asynchronously by the job runner's watermark dispatch and full subscription
+  scan (see `running-workflows.md`, "Sources of wakeups").
 - One committed append is immediately readable by the addressed workflow and
   every child currently allowed to inherit it. This is atomic for all children
   because the immutable fact is stored once; there is no per-child delivery or
@@ -249,9 +252,11 @@ object Step {
   workflow instance's shared cursor and suspends if none satisfies the filter.
   - Child workflows also search events addressed to allowed ancestors using the
     current inheritance configuration; see `child-signal-inheritance.md`.
-   - When suspending, it registers subscriptions/wakeups for the currently
-     visible sources. The filter is evaluated in workflow code, so any new event
-     for the key wakes the workflow for reevaluation.
+   - When suspending, it registers subscriptions for the currently visible
+     sources; wakeups are produced asynchronously by the job runner (see
+     `running-workflows.md`, "Sources of wakeups"). The filter is evaluated in
+     workflow code, so any new event for the key wakes the workflow for
+     reevaluation.
    - If an event matches, advancing the shared cursor and persisting the
      successful await Step row happen atomically before its value is returned.
   - If a matching event is found, moving the cursor to that event also skips
@@ -259,10 +264,13 @@ object Step {
     clearly state that an await with a filter may skip past unprocessed events:
     when it returns a matching event, all earlier rejected events become
     permanently unavailable to later awaits of the same key in this workflow.**
-  - If no event satisfies the filter, the await leaves the cursor unchanged,
-   including after examining rejected events. This allows accumulated events,
-   including events made visible by a later inheritance-policy change, to
-    satisfy it on a future run.
+  - If no event satisfies the filter, the suspending await advances the shared
+    exact-key cursor to the maximum `sequenceId` it examined, so every event it
+    examined and rejected is treated as consumed for scheduling: those events
+    are not re-examined on reruns and do not repeatedly cause wakeups. Because
+    awaits on the same instance and key share the cursor, a rejection discards
+    those events for all of them; a later change to the filter will not
+    reconsider them (see "Signal invalidation").
 
 ## Racing signals/timers
 
@@ -463,9 +471,9 @@ A timer whose expression (duration/deadline) is keyed on an invalidated upstream
 
 ### Signal invalidation
 
-- Events consumed by an await, and earlier events skipped when its filter found
-  that result, remain behind the workflow instance's shared cursor for that
-  exact signal key.
+- Events consumed by an await, earlier events skipped when its filter found that
+  result, and events examined-and-rejected by a suspension all remain behind the
+  workflow instance's shared cursor for that exact signal key.
 - Discarding an await's cached Step result does not rewind that cursor. The invalidated
   await resumes after it and may consume an event that arrived before the
   invalidation but has not yet been examined.
@@ -498,6 +506,7 @@ workflow_completion_subscriptions (
   workflowInstanceId, stepId, subscriberKey, completedWorkflowInstanceId
 )
 workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)
+workflow_event_dispatch (id, dispatched_through)
 ```
 
 `workflow_events` has one non-null envelope shape for every event kind:
@@ -520,9 +529,9 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
 - The mutex is a deliberate global append bottleneck required by the strict
   cross-workflow `awaitRace` guarantee. It queues writers instead of causing
   unique-key collisions and retry storms. Keep its critical section to the
-  sequence allocation, event insertion, precomputed wakeup writes, and commit;
-  never serialize payloads, run user code, or make network calls while holding
-  it. Monitor lock wait time, append latency, and connection-pool pressure, and
+  sequence allocation, event insertion, any wakeup writes the appender performs
+  (timer firing), and commit; never serialize payloads, run user code, or make
+  network calls while holding it. Monitor lock wait time, append latency, and connection-pool pressure, and
   benchmark expected event throughput.
 - PostgreSQL uses a dedicated sequence and a well-known advisory-lock key:
   ```sql
@@ -569,12 +578,34 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
   inheritance relationship and `inheritedEventsStartSequenceId`.
 - Cursor advancement and successful `workflow_steps` persistence happen in one
   atomic transaction. Signal events themselves have no acknowledged state.
-- Wake-on-relevant-events: an incoming event checks the appropriate pending
-  subscription table and upserts a coalesced `workflow_wakeups` row. The sender
-  does not evaluate payload filters or alter cached Step results.
-- No lost wakeups: on suspension, register source-specific subscriptions and
-  recheck `workflow_events` from the shared exact-key cursor before committing;
-  on append, insert the event then check and schedule interested workflows.
+- Wakeups are produced asynchronously, not by writers. Signal sends and terminal
+  transitions only append events (short transactions, no deadlock against
+  subscribers); two definition-agnostic job-runner passes materialize the
+  coalesced `workflow_wakeups` rows. The best-effort watermark dispatcher
+  (`JobRunnerSettings.eventDispatchBatchSize`, default 1000; every driver cycle)
+  locks the single-row `workflow_event_dispatch` table with `FOR UPDATE SKIP
+  LOCKED`, reads events with `sequence_id > dispatched_through` in order, upserts
+  the wakeups each implies (`Signal` → direct subscriber + eligible descendants;
+  `WorkflowCompleted` → completion subscribers; `TimerFired` skipped), and
+  advances the watermark to the last processed event in the same transaction. At
+  most one dispatcher works at a time; concurrent callers return immediately. The
+  full subscription scan (`JobRunnerSettings.fullSubscriptionScanInterval`,
+  default 1 minute) wakes every non-terminal instance holding a pending signal or
+  completion subscription with a visible, unconsumed candidate. No payload filter
+  is evaluated by the sender, and it does not alter cached Step results.
+- No lost wakeups: the periodic full subscription scan is the liveness guarantee
+  — it wakes every non-terminal instance holding a pending signal or completion
+  subscription whose candidate is visible and unconsumed (a direct signal event
+  after the shared cursor; an inherited event from an eligible ancestor after the
+  cursor and, unless `inheritPastEvents`, after
+  `inherited_events_start_sequence_id`; or the awaited instance's
+  `WorkflowCompleted` event). The watermark dispatcher is only latency: it can
+  miss a subscription that commits concurrently with an event and then advance
+  its watermark past that event, so correctness cannot rest on the writer; only
+  the independent, periodic re-scan of subscriptions guarantees no lost wakeup.
+  This is why writers only append: the dispatcher gives low-latency wakeups when
+  the subscription already committed before the event, and the scan covers the
+  concurrent case.
 - The wakeup row is removed only when a worker has obtained the workflow lease
   and accepted responsibility for that wakeup. A delivery that races with that
   removal upserts a replacement row, so an event cannot be missed while an
@@ -602,19 +633,22 @@ workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attemp
   remains a separate derived runtime operation.
 - Explicit await ids for stability under evolution and invalidation-driven rerouting.
 - Invalidation by explicit dependency only; no cascade. Means the user controls what changes trigger downstream re-work.
-- **Evaluation is self-sufficient; the scheduler is only latency.** An await resolves from durable state alone — the run even materializes its own due timers. Sweeps and wakeups never affect correctness, only how promptly unattended instances are noticed; this is what lets tests drive a workflow with `run` alone. The timer *subscription* is the deliberate exception to "latency-only": it is durable semantic state — deadline record and firing identity (see "Why timer awaits need a subscription").
+- **Evaluation is self-sufficient; the scheduler is only latency.** An await resolves from durable state alone — the run even materializes its own due timers. Sweeps and wakeups never affect correctness, only how promptly unattended instances are noticed; this is what lets tests drive a workflow with `run` alone. Signal and completion wakeups are materialized by the runner's two wakeup passes — the periodic full subscription scan is the liveness guarantee, the best-effort watermark dispatch only latency (see "Persistence model"). The timer *subscription* is the deliberate exception to "latency-only": it is durable semantic state — deadline record and firing identity (see "Why timer awaits need a subscription").
 - **Timer subscriptions are durable registrations, not hints.** They carry the stored absolute deadline (replays must not recompute), schedule unattended instances, and version the registration incarnation via the timer id — which is why the scheduler fires without deleting and only the await's resolution retires the row (see "Why timer awaits need a subscription").
 - **Why no Temporal-style always-on handlers**: Without mutable fields or a live object in scope, signal handlers can only affect execution via the value returned from an await. Since workflows re-run after every suspension, checking signals at the workflow start (or other strategic points) is often sufficient for patterns like cancellation — users decide where to check, cooperatively, rather than relying on handlers living ambient in the background. This trades Temporal-like ambient ergonomics for simpler, explicit semantics.
 
 ## Open questions and TODOs
 
-1. **Unsatisfied await performance** — **TODO**: An unsatisfied await does not
-advance its shared exact-key cursor, so it may repeat the same empty lookup on
-every workflow rerun. Inspect the PostgreSQL query plan and benchmark whether
-the exact-key, ancestor-source, relationship-boundary, and cursor indexes make
-this negligible or whether an additional non-semantic scan hint is needed. A
-large set of same-key events rejected by a user-code filter is the worst case,
-because every rerun may reload and evaluate the same payloads.
+1. **Unsatisfied await performance** — **TODO**: A suspending await now advances
+   its shared exact-key cursor past every event it examined and rejected, so it no
+   longer repeats the same lookup of rejected events on every rerun. What remains
+   uncertain is the cost of the periodic full subscription scan (it re-examines
+   every pending signal/completion subscription each
+   `fullSubscriptionScanInterval`) and the inherited-lookup cost of the
+   ancestor-source query for child awaits. Inspect the PostgreSQL query plans and
+   benchmark whether the exact-key, ancestor-source, relationship-boundary, and
+   cursor indexes make these negligible or whether an additional non-semantic scan
+   hint is needed.
 
 2. **Signal checkpoints and cross-key cursors** — **TODO**: Design an API for
 accepting events only after a durable causal boundary. Cursors are currently

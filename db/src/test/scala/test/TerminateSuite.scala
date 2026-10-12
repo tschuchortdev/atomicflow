@@ -274,7 +274,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(countSignalSubs(wf.id, "k"), 1, "a pending signal subscription exists while suspended")
     sig.send(id, "v")(using rt)
     assertEquals(countSignalEvents(wf.id, "k"), 1, "a directly addressed Signal event exists while suspended")
-    assertEquals(countWakeups(wf.id, "k"), 1, "the signal send upserts a wakeup for the suspended instance")
+    assertEquals(countWakeups(wf.id, "k"), 0, "a signal send appends only; no wakeup is created synchronously")
 
     rt.terminate(id)
 
