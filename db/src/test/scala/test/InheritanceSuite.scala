@@ -271,9 +271,6 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
 
     signal.send(parentId, "x")(using rt)
 
-    assert(hasWakeup(childWf.id, "c1", c1.scope), "an eligible suspended child is woken by the parent send")
-    assert(hasWakeup(childWf.id, "c2", c2.scope), "an eligible suspended child is woken by the parent send")
-
     assertEquals(
       rt.runWorkflowInstance(childWf, c1),
       WorkflowRunResult.Result("done"),

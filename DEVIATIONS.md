@@ -398,7 +398,83 @@ implementation phase.
      timer id makes the previous incarnation's `TimerFired` structurally
      inert" guarantee locally evident and robust rather than resting on the
      fact that await resolution happens to retire subscriptions already.
-     Today's await rows exist only after resolution (a suspended await has no
-     cached row, so drift/expiry cannot fire mid-suspension), which makes the
-     retirement defensive rather than an observable fix.
+      Today's await rows exist only after resolution (a suspended await has no
+      cached row, so drift/expiry cannot fire mid-suspension), which makes the
+      retirement defensive rather than an observable fix.
+
+## Phase 13 (asynchronous signal/completion wakeups)
+
+81. **`V001__init.sql` edited in place** to add the single-row watermark table
+    `workflow_event_dispatch (id, dispatched_through)` (seeded at 0) and two
+    indexes: `workflow_completion_subscriptions_await` (the awaited-instance
+    columns) and `workflow_instances_parent` (the parent columns). Pre-release
+    schema, so no separate migration is introduced (same approach as entries 5
+    and 79). The spec's persistence-model table list gains
+    `workflow_event_dispatch`.
+
+82. **Signal and completion wakeups are now asynchronous, replacing
+    sender/terminal-side wakeups.** `sendSignal` no longer creates wakeups: after
+    row-locking the addressed instance and checking `is_accepting_signals`, it
+    appends the one immutable `Signal` event and commits — no direct-subscriber
+    or descendant walk happens on the sender. Likewise, the terminal transitions
+    (`terminalTransitionAndEvent` for completed/failed, `escalateTerminated`,
+    `finalizeCancelledWithoutLease`) no longer call `wakeCompletionSubscribers`;
+    they still append and keep the `WorkflowCompleted` event. Timer firing is
+    unchanged: the sweep appends `TimerFired` and upserts the owning instance's
+    wakeup in the same transaction. Two definition-agnostic job-runner passes
+    materialize signal/completion wakeups: a best-effort **watermark dispatch**
+    (`JobRunnerSettings.eventDispatchBatchSize`, default 1000; run every driver
+    cycle) that locks the watermark row with `FOR UPDATE SKIP LOCKED`, replays
+    events past the watermark in order, upserts each implied wakeup (`Signal` →
+    direct subscriber + eligible descendants; `WorkflowCompleted` → completion
+    subscribers; `TimerFired` skipped), and advances the watermark to the last
+    processed event in the same transaction (at most one dispatcher runs at a
+    time); and a periodic **full subscription scan**
+    (`JobRunnerSettings.fullSubscriptionScanInterval`, default 1 minute) that
+    wakes every non-terminal instance holding a pending signal/completion
+    subscription with a visible, unconsumed candidate. The scan is the liveness
+    guarantee; the dispatcher is only latency — it can miss a subscription that
+    commits concurrently with an event and then advance its watermark past it.
+    Rationale: writers only append, keeping their transactions short and
+    deadlock-free against subscribers. The corresponding spec edits were made in
+    the same change — `signals-timers.md` ("Basic Signal API", "Persistence
+    model", core model, "Await-signal searches", "Signal invalidation", "Open
+    questions", rationale summary), `running-workflows.md` ("Job runner and
+    scheduling", driver loop, "Sources of wakeups", settings, "Why this design"),
+    and `child-signal-inheritance.md` ("Events and ordering") — so no spec/impl
+    mismatch remains.
+
+83. **The shared exact-key signal cursor now advances on a filter-rejected
+    suspension** (`evaluateWait`). When an await suspends because the filter
+    rejected every examined event, it advances each exact-key cursor to the
+    maximum examined `sequenceId`; previously the cursor was left unchanged.
+    Rejected events are therefore treated as consumed for scheduling — not
+    re-examined on reruns and not repeatedly causing wakeups. Because awaits on
+    the same instance and key share the cursor, a rejection discards those events
+    for all of them, and a later filter change does not reconsider them
+    (consistent with the existing "skipped events are not reconsidered"
+    invalidation note). The spec's core-model suspend branch, "Await-signal
+    searches" bullets, "Signal invalidation", and the "Unsatisfied await
+    performance" TODO were edited in the same change.
+
+84. **The dispatch watermark seeds at 0, so the first dispatch replays the entire
+    event log.** Accepted pre-release: the log is small and each pass is bounded
+    by `eventDispatchBatchSize`. A production rollout would seed the watermark at
+    the current `MAX(sequence_id)`.
+
+85. **Known consequences/limits of the asynchronous-wakeup phase, found in
+    review.**
+    - The cursor-advance-on-rejection semantics (entry 83) mean two concurrent
+      await-sites on the same instance+signal-key with different filters can
+      consume an event for each other: one site's rejection advances the shared
+      cursor, so a `Workflow.parallel` branch awaiting the same key may then miss
+      it. This is the accepted consequence of the shared-cursor model and the
+      reason rejected events are not re-examined.
+    - Because `onUnconsumedSignals` reads after the cursor, filter-rejected
+      events no longer appear in that handler's input.
+    - The inherited full-scan ancestry recursion is capped at 64 edges; deeper
+      chains are handled by the run-time ancestor walk
+      (`inheritedSourceScopesIO`) but not by the scan.
+    - `V001__init.sql` was edited in place (pre-release); any already-migrated
+      database would fail Flyway checksum validation.
 

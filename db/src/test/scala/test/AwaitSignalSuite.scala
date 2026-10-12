@@ -125,7 +125,7 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("accept|next"))
   }
 
-  test("when all events are rejected the cursor stays unchanged and a later matching event can satisfy the await") {
+  test("a filter-rejected event advances the cursor so it is not re-examined; a later matching event still resolves") {
     val rt = newRuntime
     val signal = Signal[String]("s")
     val wf = Workflow[String, String](id = "await-reject") { in =>
@@ -138,7 +138,32 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     signal.send(id, "bad2")(using rt)
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(cursor(wf.id, "k", "s"), None)
+    val badSeq = run(
+      sql"""SELECT MAX(sequence_id) FROM workflow_events WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''
+            AND event_kind = 'Signal' AND event_key = 's' AND payload IN ('bad1', 'bad2')""".query[Option[Long]].unique
+    ).get
+    assertEquals(cursor(wf.id, "k", "s"), Some(badSeq))
+
+    signal.send(id, "good")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
+  }
+
+  test("consecutive runs with only rejected events do not re-raise and the cursor does not move backwards") {
+    val rt = newRuntime
+    val signal = Signal[String]("s")
+    val wf = Workflow[String, String](id = "await-reject-again") { in =>
+      Step.await[String]("a", Awaitable.SignalEvent(signal, filter = _ == "good"))
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+
+    signal.send(id, "bad1")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val c1 = cursor(wf.id, "k", "s")
+    assertEquals(c1.isDefined, true)
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(cursor(wf.id, "k", "s"), c1, "the cursor must not move backwards")
 
     signal.send(id, "good")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))

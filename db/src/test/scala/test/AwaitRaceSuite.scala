@@ -309,7 +309,10 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(completionSubscriptions(aWf.id, "a"), Vector(("wait-b", 0L, "", "B", "b", "")))
 
     assertEquals(rt.runWorkflowInstance(bWf, bId), WorkflowRunResult.Result("HELLO"))
-    assert(wakeupExists(aWf.id, "a"), "A's wakeup is upserted when B's terminal transition commits")
+    assert(
+      !wakeupExists(aWf.id, "a"),
+      "completion wakeups are produced asynchronously by the job runner, not by the terminal transition"
+    )
 
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.Result("got:HELLO"))
     assertEquals(completionSubscriptions(aWf.id, "a"), Vector.empty)

@@ -256,7 +256,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(countSignalSubs(wf.id, "k"), 1)
     sig.send(id, "go")(using rt)
-    assertEquals(countWakeups(wf.id, "k"), 1, "the signal send schedules a wakeup")
+    assertEquals(countWakeups(wf.id, "k"), 0, "a signal send appends only; no wakeup is created synchronously")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.ContinueAsNew)
 
