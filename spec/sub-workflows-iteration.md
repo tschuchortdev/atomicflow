@@ -225,22 +225,59 @@ success, failure, cancellation, or termination — or calls `continueAsNew`:
 
 Application rules:
 
-- Applied when the parent's guarded terminal transition commits (or during the
-  `continueAsNew` child-close transaction); the active parent pointer on each
-  child is cleared in the same transaction.
-- **Idempotent.** Recovery, replay, and concurrent workers may re-trigger
-  application. Applying the policy twice is a no-op: a `Cancel` delivery to an
-  already-terminal child is a no-op, and `Abandon` clears an already-cleared
-  pointer.
+- **Asynchronous delivery.** The parent's terminal transition
+  (success/failure/cancellation/termination) and its `continueAsNew` and
+  region-restart transitions never touch child rows. Each instead records a
+  `ChildClose` row in the **parent's own** `workflow_steps` (runtime
+  bookkeeping, `step_kind = 'ChildClose'`) whose target is the scope prefix of
+  the children to close: the empty prefix for a terminal parent (all attached
+  children), the parent's identity plus `key@generation` for `continueAsNew`
+  (exactly the closing generation), and that prefix plus the discarded region
+  interior for a region restart (exactly the discarded iteration). No closure
+  row is written when no attached child matches, so the childless common case
+  leaves no bookkeeping. Targeting by exact prefix is what prevents collisions
+  between old and new children across generations and region iterations: a
+  later generation's or iteration's child carries markers past the prefix and
+  never matches. This is why no transaction ever locks another instance's rows.
+- **Delivery** happens at two asynchronous points, and the active parent pointer
+  on each child is cleared then: (a) the **run-start self-check** — whenever a
+  child's own run starts, before its body executes, it applies its own pending
+  policy; (b) the periodic **child-close sweep** — the driver loop applies every
+  pending closure in bounded batches, one child per short transaction. Both
+  re-verify under the child's own row lock and are idempotent, so they cooperate
+  safely with each other and with recovery. The sweep deletes a `ChildClose` row
+  once no attached child matches it.
+- **A gone parent detaches.** A child whose parent instance row has been
+  hard-deleted is detached (pointer cleared) by the self-check or sweep; it is
+  never cancelled, matching the inheritance walk, which also stops at a missing
+  parent.
 - Per child state, `Cancel` follows the standard per-state cancel semantics
   (see `running-workflows.md`): a `CREATED` child is finalized `CANCELLED`
-  immediately without ever running; a `SUSPENDED` child gets
-  `cancel_requested_at` set and a resume scheduled in the same transaction; a
-  `RUNNING` child gets the flag set and delivers at its next checkpoint.
-- A cancelling parent never waits for the children it cancels. The parent is
-  terminal as soon as its own terminal transition commits; child cleanup is a
-  side obligation, and the global `cancelTimeout` escalation bounds any child
-  that never observes its cancellation.
+  without ever running; a `SUSPENDED` child gets `cancel_requested_at` set and a
+  wakeup scheduled; a `RUNNING` child gets the flag set and delivers at its next
+  checkpoint. `Abandon` clears the pointer only.
+- **Inherited-signal visibility cuts off at the closure event, not at
+  delivery.** The inheritance walk treats a parent as unusable — terminating the
+  walk exactly as a detached pointer does — when it is terminal or holds a
+  `ChildClose` row matching the child's scope. So even before the pointer is
+  cleared, no transitive ancestor event can leak through a closed parent; a
+  suspended child cannot consume a grandparent signal through a parent that has
+  continued as new or completed. Directly addressed `Signal` events of the
+  closing parent are deleted in its transition (before children are delivered);
+  with the walk cutoff, this ordering inversion is unobservable to children.
+- **A cancelling parent never waits for the children it cancels.** The parent is
+  terminal as soon as its own transition commits; child cleanup is a side
+  obligation. Observably, a child may run (and even complete) in the window
+  between the parent's closure and its delivery, and the global `cancelTimeout`
+  escalation is measured from delivery, bounding any child that never observes
+  its cancellation.
+- **`startChild` is fenced.** A stale run can never attach a child that escapes
+  a closure record. Under the parent's own row lock, the insert is refused
+  (lease lost) when the parent's generation differs from the run's, when the
+  parent is terminal, or when a pending `ChildClose` target already covers the
+  child's derived scope (a same-generation orphan attaching into a discarded
+  region interior). A legitimate new child never matches a pending target,
+  because targets name only discarded interiors and old generations.
 
 `Terminate` is intentionally absent from the policy enum. Force-stopping a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 
@@ -297,11 +334,14 @@ Application rules:
 - The database uniqueness key is `(workflowId, instanceKey, scope)`. Queries
   accept an optional scope whose default is the empty array `{}`; omitting it
   means exactly the top-level scope, never all matching scopes.
-- The scope has a maximum encoded length. Before appending the current local
-  `Workflow.scoped`/restartable path, the composed array is rejected with an
-  `IllegalArgumentException` when its joined `/`-form would exceed the limit;
-  local segments are not part of any truncation, ensuring that all children of
-  one parent instance and generation share the same scope prefix.
+- The scope has a maximum encoded length. When the composed array's joined
+  `/`-form would exceed the limit, derivation is **rejected** with an
+  `IllegalArgumentException` (nothing is truncated or hashed): the limit is
+  generous enough for deep legitimate nesting, and the Postgres btree index
+  entry that holds the `(workflowId, instanceKey, scope)` key would otherwise
+  fail at a slightly higher length. This replaces the former silent
+  prefix-preserving shortening, which existed only to keep string prefix
+  matching working and is obsolete now that scopes are structured arrays.
 - The readable slash-joined form (without escaping) is for debugging only.
   Callers must not construct or parse derived scopes or rely on their textual
   layout.
@@ -309,9 +349,10 @@ Application rules:
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
   `parentWorkflowInstanceId` on the storage record; it does not include the
-  generation and is cleared when the parent reaches a terminal state or
-  continues as new — in the same transaction that applies the
-  `ParentClosePolicy`. `WorkflowInstance.Info` exposes this as `parentId`.
+  generation. It is cleared when the parent's closure is delivered to the child
+  (run-start self-check or child-close sweep); it may therefore still be set for
+  a short asynchronous window after the parent reaches a terminal state or
+  continues as new. `WorkflowInstance.Info` exposes this as `parentId`.
 
 ## Recursion
 

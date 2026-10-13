@@ -98,6 +98,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
 
     gate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(rt.getChildWorkflowInstances(parentId), Vector.empty, "the active relationship is cleared at parent close")
   }
 
@@ -185,8 +186,10 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     gate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+
     val row = childRow(childWf.id, "worker-1", scope).get
-    assertEquals(row.terminalState, Some("cancelled"), "a CREATED child under Cancel is finalized CANCELLED immediately")
+    assertEquals(row.terminalState, Some("cancelled"), "a CREATED child under Cancel is finalized CANCELLED by delivery")
     assertEquals(row.timesExecuted, 0)
   }
 
@@ -213,6 +216,8 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
 
     parentGate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
+
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
     val row = childRow(childWf.id, "worker-1", scope).get
     assertEquals(row.terminalState, None, "a SUSPENDED child is not finalized immediately")
@@ -244,6 +249,8 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.terminate(parentId)
 
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+
     val row = childRow(childWf.id, "worker-1", scope).get
     assertEquals(row.terminalState, None, "a RUNNING child is not finalized immediately")
     assertEquals(row.cancelRequestedAt.isDefined, true, "cancel_requested_at is set on the running child")
@@ -268,6 +275,8 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     gate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+
     val row = childRow(childWf.id, "worker-1", scope).get
     assertEquals(row.terminalState, None, "an abandoned child is not cancelled")
     assertEquals(row.cancelRequestedAt, None)
@@ -290,9 +299,11 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
 
     val scope = Vector("orders", "order-42@0")
     rt.terminate(parentId)
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, Some("cancelled"))
 
     rt.terminate(parentId)
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, Some("cancelled"), "re-applying the policy is a no-op")
   }
 

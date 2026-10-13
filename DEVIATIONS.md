@@ -480,3 +480,37 @@ implementation phase.
     - `V001__init.sql` was edited in place (pre-release); any already-migrated
       database would fail Flyway checksum validation.
 
+
+86. **ParentClosePolicy is delivered asynchronously (was: applied synchronously
+    inside the parent's transition).** A parent's terminal, `continueAsNew`, and
+    region-restart transitions no longer lock or modify child rows; each records
+    a `ChildClose` row in the *parent's own* `workflow_steps` whose
+    `step_scope_within_instance` is the target prefix (empty = all attached
+    children; otherwise the parent identity + `key@generation` + discarded
+    interior). Delivery happens at the child's own run start (self-check) and by
+    a new driver-loop child-close sweep, one child per short transaction, so no
+    transaction ever locks rows of more than one instance. Consequences:
+    - The active parent pointer (`parentId`) can remain set for a short
+      asynchronous window after the parent closes, and a child may run — even
+      complete — before its cancellation is delivered; `cancelTimeout` now
+      measures from delivery.
+    - Inherited-signal visibility cuts off at the closure *event*, not at
+      delivery: the inheritance walk (run-time walk and full-scan ancestry CTE)
+      treats a terminal parent or a parent holding a matching `ChildClose` row
+      as detached, so no transitive ancestor event leaks in the window.
+    - `ChildClose` rows are runtime bookkeeping (`step_kind = 'ChildClose'`,
+      `state_kind = 'Pending'`) and are excluded from generic step handling:
+      `continueAsNew`'s generation erase, region-interior erases, fork copies,
+      and reset erases. A no-child closure writes no row (existence is checked
+      in the parent's transaction). The sweep deletes a row once no attached
+      child matches it.
+    - `startChild` is now fenced on the parent's generation *and* terminal
+      state: a stale orphan run cannot attach a child under an old generation or
+      under a terminal parent. It also takes the parent-row lock before the
+      global event-append lock (matching the terminal transitions' order), and
+      its replay path touches only the child's own row.
+    - A hard-deleted parent detaches its children (self-check/sweep); it never
+      cancels them.
+    - Spec updated in `sub-workflows-iteration.md` ("ParentClosePolicy", "Key
+      derivation"), `continue-as-new-fork-reset.md`, `restartable-regions-loops.md`,
+      and `running-workflows.md` ("Job runner and scheduling", wakeup sources).

@@ -201,3 +201,7 @@ CREATE INDEX workflow_completion_subscriptions_await
 
 CREATE INDEX workflow_instances_parent
   ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);
+
+CREATE INDEX workflow_steps_child_close
+  ON workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope)
+  WHERE step_kind = 'ChildClose';
