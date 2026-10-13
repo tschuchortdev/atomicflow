@@ -23,15 +23,23 @@ workflow body does not continue after the call.
 - The generation is exposed only through `WorkflowInstance.Info`. Users should
   not normally need to inspect or use it.
 - The transition is committed atomically by the runtime: current execution
-  records and directly addressed `Signal` events are removed, child
-  relationships are closed before those events are deleted, and the incremented
-  generation and new input are installed as one durable in-place state
-  transition. Current execution records include old await subscriptions and
-  wakeups. The unconsumed-signal handler runs before this transaction while
-  signal acceptance is closed.
-- Children of the old generation are handled according to their
+  records and directly addressed `Signal` events are removed, a `ChildClose`
+  record targeting exactly the closing generation's children is written in the
+  parent's own steps, and the incremented generation and new input are installed
+  as one durable in-place state transition. Current execution records include
+  old await subscriptions and wakeups (pending `ChildClose` records survive the
+  generation erase). The unconsumed-signal handler runs before this transaction
+  while signal acceptance is closed. The directly addressed `Signal` events are
+  deleted before children are delivered; this ordering is unobservable because
+  the inheritance walk treats a parent holding a matching `ChildClose` record as
+  detached (see `sub-workflows-iteration.md`, `ParentClosePolicy`).
+- Children of the old generation are handled asynchronously according to their
   `ParentClosePolicy`: `Cancel` requests cancellation and `Abandon` detaches
-  them. The continuation does not wait for cooperative child cancellation.
+  them, delivered at each child's next run start or by the periodic child-close
+  sweep. The continuation does not wait for cooperative child cancellation, and
+  the parent's transition touches no child rows. Children of the successor
+  generation carry a distinct scope (`key@generation+1`) and are never matched
+  by the old generation's closure target.
 - Signals receive the same completion-boundary treatment as normal completion.
   The `onUnconsumedSignals` handler runs before the transition. Once it
   finishes, directly addressed `Signal` events are deleted. State needed by the
@@ -55,8 +63,11 @@ workflow body does not continue after the call.
 ## Generations and child identity
 
 - The generation of a workflow is informational metadata (`WorkflowInstance.Info`), not part of its identity (`WorkflowInstanceId`), since there is only ever one active generation of a particular instance. For child workflows however, the parent's generation number must be part of their identity to prevent key collisions between children of the previous parent generation which are still running and newly started children of the successive parent generation. The complete child-scope derivation rules are specified in `sub-workflows-iteration.md`.
-- The parent reference is cleared when the parent completes or continues as
-  new, including when cancellation of a child is still in progress.
+- The parent reference is cleared when the parent's close is delivered to the
+  child — at the child's next run start or by the child-close sweep — after the
+  parent completes or continues as new; it may remain set for a short
+  asynchronous window, including while cancellation of the child is still in
+  progress.
 - Stopping of the current execution is achieved by a throwing a special exception. This exception must also be ignored by the `NonFatal`-like extractor that the library provides.
 
 ## Forking

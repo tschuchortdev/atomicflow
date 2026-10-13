@@ -174,6 +174,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.ContinueAsNew)
 
     val scope = Vector("can-parent4", "p@0")
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(childRow(childWf.id, "cancel-child", scope).get.terminalState, Some("cancelled"))
     val ab = childRow(childWf.id, "abandon-child", scope).get
     assertEquals(ab.terminalState, None, "an abandoned child is not cancelled")
@@ -206,6 +207,8 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
 
     parentGate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.ContinueAsNew)
+
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
     val row = childRow(childWf.id, "cancel-child", scope).get
     assertEquals(row.terminalState, None, "the continuation does not wait for cooperative child cancellation")

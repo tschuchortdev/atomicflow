@@ -385,9 +385,19 @@ final class PostgresJobRunner private[atomicflow] (
     recovered
   }
 
+  /** Child-close delivery: applies pending `ParentClosePolicy` closures
+    * recorded as `ChildClose` rows in parent instances' own steps, and detaches
+    * children whose parent rows are gone. Each child is closed in its own short
+    * transaction so no transaction ever locks another instance's rows.
+    * Idempotent. Returns the number of children closed.
+    */
+  private[atomicflow] def runChildCloseSweep(): Int =
+    runtime.closePendingChildClosures(128)
+
   private var lastTimerSweep: Long = 0L
   private var lastEscalationSweep: Long = 0L
   private var lastRecoverySweep: Long = 0L
+  private var lastChildCloseSweep: Long = 0L
   private var lastFullScan: Long = 0L
 
   /** Two asynchronous wakeup jobs back the liveness guarantee:
@@ -419,6 +429,10 @@ final class PostgresJobRunner private[atomicflow] (
     if (now - lastRecoverySweep >= settings.sweepInterval.toNanos) {
       lastRecoverySweep = now
       runRecoverySweep()
+    }
+    if (now - lastChildCloseSweep >= settings.sweepInterval.toNanos) {
+      lastChildCloseSweep = now
+      runChildCloseSweep()
     }
     runtime.dispatchNewEvents(settings.eventDispatchBatchSize)
     if (now - lastFullScan >= settings.fullSubscriptionScanInterval.toNanos) {

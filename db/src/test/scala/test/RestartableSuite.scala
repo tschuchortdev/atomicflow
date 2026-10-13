@@ -193,6 +193,8 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(wf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(wf, parentId), WorkflowRunResult.WorkflowSuspended, "the parent suspends after the region, before terminal close policies apply")
 
+    ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+
     val rows = childRows(childWf.id, "c")
     assertEquals(rows.size, 3, "one distinct child identity per looping")
     val cancelledScopes = rows.filter(_._2.contains("cancelled")).map(_._1)
