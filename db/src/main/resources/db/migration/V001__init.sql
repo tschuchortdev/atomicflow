@@ -1,7 +1,7 @@
 CREATE TABLE workflow_instances (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   input TEXT NOT NULL,
   workflow_version_at_creation BIGINT NOT NULL,
   generation BIGINT NOT NULL DEFAULT 0,
@@ -18,12 +18,12 @@ CREATE TABLE workflow_instances (
   is_accepting_signals BOOLEAN NOT NULL DEFAULT true,
   parent_workflow_id TEXT,
   parent_instance_key TEXT,
-  parent_scope TEXT,
+  parent_instance_scope TEXT[],
   parent_close_policy TEXT,
   inherit_signals TEXT,
   inherit_past_events BOOLEAN NOT NULL DEFAULT false,
   inherited_events_start_sequence_id BIGINT,
-  PRIMARY KEY (workflow_id, workflow_instance_key, scope)
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );
 
 CREATE TABLE workflow_events (
@@ -31,7 +31,7 @@ CREATE TABLE workflow_events (
   event_kind TEXT NOT NULL,
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   event_key TEXT NOT NULL,
   payload TEXT NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -40,18 +40,18 @@ CREATE TABLE workflow_events (
 CREATE SEQUENCE workflow_event_sequence AS BIGINT CACHE 1;
 
 CREATE UNIQUE INDEX workflow_events_timer_unique
-  ON workflow_events (workflow_id, workflow_instance_key, scope, event_key)
+  ON workflow_events (workflow_id, workflow_instance_key, workflow_instance_scope, event_key)
   WHERE event_kind = 'TimerFired';
 
 CREATE INDEX workflow_events_lookup
-  ON workflow_events (event_kind, event_key, workflow_id, workflow_instance_key, scope, sequence_id);
+  ON workflow_events (event_kind, event_key, workflow_id, workflow_instance_key, workflow_instance_scope, sequence_id);
 
 CREATE TABLE workflow_steps (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   step_id TEXT NOT NULL,
-  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_scope_within_instance TEXT[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   step_kind TEXT NOT NULL,
   state_kind TEXT NOT NULL,
@@ -60,38 +60,38 @@ CREATE TABLE workflow_steps (
   expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (workflow_id, workflow_instance_key, scope, step_id, step_version, step_scope_path),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance),
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
 CREATE TABLE signal_cursor (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   signal_key TEXT NOT NULL,
   sequence_id BIGINT NOT NULL,
-  PRIMARY KEY (workflow_id, workflow_instance_key, scope, signal_key),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, signal_key),
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
 CREATE TABLE workflow_signal_subscriptions (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   step_id TEXT NOT NULL,
-  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_scope_within_instance TEXT[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   subscriber_key TEXT NOT NULL,
   signal_key TEXT NOT NULL,
   PRIMARY KEY (
-    workflow_id, workflow_instance_key, scope, step_id, step_version, subscriber_key, signal_key, step_scope_path
+    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, signal_key, step_scope_within_instance
   ),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
@@ -99,16 +99,16 @@ CREATE TABLE workflow_timer_subscriptions (
   timer_id UUID PRIMARY KEY,
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   step_id TEXT NOT NULL,
-  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_scope_within_instance TEXT[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   subscriber_key TEXT NOT NULL,
   deadline TIMESTAMPTZ NOT NULL,
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE,
-  UNIQUE (workflow_id, workflow_instance_key, scope, step_id, step_version, subscriber_key, step_scope_path)
+  UNIQUE (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance)
 );
 
 CREATE INDEX workflow_timer_subscriptions_deadline
@@ -117,40 +117,40 @@ CREATE INDEX workflow_timer_subscriptions_deadline
 CREATE TABLE workflow_completion_subscriptions (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   step_id TEXT NOT NULL,
-  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_scope_within_instance TEXT[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   subscriber_key TEXT NOT NULL,
   completed_workflow_id TEXT NOT NULL,
   completed_workflow_instance_key TEXT NOT NULL,
-  completed_scope TEXT NOT NULL,
+  completed_workflow_instance_scope TEXT[] NOT NULL,
   PRIMARY KEY (
-    workflow_id, workflow_instance_key, scope, step_id, step_version, subscriber_key,
-    completed_workflow_id, completed_workflow_instance_key, completed_scope, step_scope_path
+    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key,
+    completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope, step_scope_within_instance
   ),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
 CREATE TABLE workflow_wakeups (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
   scheduled_at TIMESTAMPTZ NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
-  PRIMARY KEY (workflow_id, workflow_instance_key, scope),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope),
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
 CREATE TABLE workflow_updates (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   update_key TEXT NOT NULL,
   encoded_input TEXT NOT NULL,
   idempotency_key TEXT NOT NULL DEFAULT '',
@@ -158,34 +158,34 @@ CREATE TABLE workflow_updates (
   handled_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (workflow_id, workflow_instance_key, scope, update_key, idempotency_key, created_at),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, idempotency_key, created_at),
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
 CREATE UNIQUE INDEX workflow_updates_idempotency_unique
-  ON workflow_updates (workflow_id, workflow_instance_key, scope, update_key, idempotency_key)
+  ON workflow_updates (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, idempotency_key)
   WHERE idempotency_key <> '';
 
 CREATE INDEX workflow_updates_await
-  ON workflow_updates (workflow_id, workflow_instance_key, scope, update_key, created_at)
+  ON workflow_updates (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, created_at)
   WHERE handled_at IS NULL;
 
 CREATE TABLE workflow_update_subscriptions (
   workflow_id TEXT NOT NULL,
   workflow_instance_key TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  workflow_instance_scope TEXT[] NOT NULL,
   step_id TEXT NOT NULL,
-  step_scope_path TEXT NOT NULL DEFAULT '',
+  step_scope_within_instance TEXT[] NOT NULL DEFAULT '{}',
   step_version BIGINT NOT NULL,
   subscriber_key TEXT NOT NULL,
   update_key TEXT NOT NULL,
   PRIMARY KEY (
-    workflow_id, workflow_instance_key, scope, step_id, step_version, subscriber_key, update_key, step_scope_path
+    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, update_key, step_scope_within_instance
   ),
-  FOREIGN KEY (workflow_id, workflow_instance_key, scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, scope)
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
 
@@ -197,7 +197,7 @@ CREATE TABLE workflow_event_dispatch (
 INSERT INTO workflow_event_dispatch (id, dispatched_through) VALUES (1, 0);
 
 CREATE INDEX workflow_completion_subscriptions_await
-  ON workflow_completion_subscriptions (completed_workflow_id, completed_workflow_instance_key, completed_scope);
+  ON workflow_completion_subscriptions (completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope);
 
 CREATE INDEX workflow_instances_parent
-  ON workflow_instances (parent_workflow_id, parent_instance_key, parent_scope);
+  ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);

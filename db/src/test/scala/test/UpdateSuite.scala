@@ -16,12 +16,12 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
   private def updates(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: String,
+      scope: Vector[String],
       updateKey: String
   ): Vector[(String, Option[String], Option[Instant])] =
     run(
       sql"""SELECT idempotency_key, result, handled_at FROM workflow_updates
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope AND update_key = $updateKey
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope AND update_key = $updateKey
             ORDER BY created_at""".query[(String, Option[String], Option[Instant])].to[Vector]
     )
 
@@ -62,7 +62,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
 
     val res = update.send(wf, id, "x")(using rt)
     assertEquals(res, UpdateSendResult.Unhandled)
-    assertEquals(updates(wf.id, "k", "", "ask"), Vector.empty, "the unhandled record is deleted by default")
+    assertEquals(updates(wf.id, "k", Vector.empty, "ask"), Vector.empty, "the unhandled record is deleted by default")
   }
 
   test("completed instance returns InstanceAlreadyCompleted; missing instance throws WorkflowNotFoundException") {
@@ -95,7 +95,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
 
     val r3 = update.send(wf, id, "b", idempotencyKey = "kb")(using rt)
     assertEquals(r3, UpdateSendResult.Success("r2:b"))
-    val rows = updates(wf.id, "k", "", "ask")
+    val rows = updates(wf.id, "k", Vector.empty, "ask")
     assertEquals(rows.size, 2, "different idempotency keys produce independent records")
     assertEquals(rows.map(_._1), Vector("ka", "kb"))
     assertEquals(rows.map(_._2), Vector(Some("r1:a"), Some("r2:b")))
@@ -112,10 +112,10 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
     val idIdem = rt.createWorkflowInstance(wf, "k2", "in").id
 
     assertEquals(update.send(wf, idEmpty, "e", idempotencyKey = "")(using rt), UpdateSendResult.Success("resp:e"))
-    assertEquals(updates(wf.id, "k1", "", "ask"), Vector.empty, "handled empty-idem record is deleted")
+    assertEquals(updates(wf.id, "k1", Vector.empty, "ask"), Vector.empty, "handled empty-idem record is deleted")
 
     assertEquals(update.send(wf, idIdem, "n", idempotencyKey = "ka")(using rt), UpdateSendResult.Success("resp:n"))
-    val rows = updates(wf.id, "k2", "", "ask")
+    val rows = updates(wf.id, "k2", Vector.empty, "ask")
     assertEquals(rows.size, 1, "handled non-empty-idem record is kept")
     assertEquals(rows.head._1, "ka")
     assertEquals(rows.head._2, Some("resp:n"))
@@ -135,11 +135,11 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
 
     val r1 = update.send(wf, id, "hello", persistUnhandledUpdates = true)(using rt)
     assertEquals(r1, UpdateSendResult.Unhandled)
-    assertEquals(updates(wf.id, "k", "", "ask").size, 1, "the unhandled record is kept")
+    assertEquals(updates(wf.id, "k", Vector.empty, "ask").size, 1, "the unhandled record is kept")
 
     signal.send(id, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    val rows = updates(wf.id, "k", "", "ask")
+    val rows = updates(wf.id, "k", Vector.empty, "ask")
     assertEquals(rows.size, 1)
     assertEquals(rows.head._2, Some("resp:hello"), "the kept record is now handled with the response")
   }
@@ -160,7 +160,7 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val childScope = "orders/order-42@0"
+    val childScope = Vector("orders", "order-42@0")
     val childId = WorkflowInstanceId(childWf.id, "worker-1", childScope)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -186,12 +186,12 @@ class UpdateSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""UPDATE workflow_instances
             SET lease_owner = 'someone-else', lease_expires_at = now() + interval '300 milliseconds'
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
     )
 
     val res = update.send(wf, id, "hello", idempotencyKey = "lease-idem")(using rt)
     assertEquals(res, UpdateSendResult.Success("resp:hello"))
-    assertEquals(updates(wf.id, "k", "", "ask").size, 1, "no duplicate record after the lease wait")
+    assertEquals(updates(wf.id, "k", Vector.empty, "ask").size, 1, "no duplicate record after the lease wait")
   }
 
   test("the response computed by the run's transaction is what the sender receives") {

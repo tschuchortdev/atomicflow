@@ -2,7 +2,6 @@ package atomicflow
 
 import atomicflow.Cacheable.Simple.given
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.ScopePath
 
 import java.nio.charset.StandardCharsets
 import scala.annotation.experimental
@@ -642,12 +641,10 @@ object Step {
     val now = rt.clock.instant()
 
     def branchSegment(key: String): String =
-      ScopePath.escapeScopeSegment(stepId) + "/" + ScopePath.escapeScopeSegment(key)
+      s"$stepId/$key"
 
-    def branchPath(base: String, key: String): String = {
-      val seg = branchSegment(key)
-      if (base.isEmpty) seg else base + "/" + seg
-    }
+    def branchPath(base: Vector[String], key: String): Vector[String] =
+      base :+ branchSegment(key)
 
     def evaluate(): R = {
       throwIfCancelled

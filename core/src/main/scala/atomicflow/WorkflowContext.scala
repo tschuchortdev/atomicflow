@@ -37,8 +37,8 @@ final class WorkflowContext(
       * level. Transient per-run state carried immutably through derived
       * contexts; never persisted directly. The exact contents are an
       * implementation detail of the runtime and are not portable across runtime
-      * implementations — [[currentScope]] is the composed string the durable
-      * records key on.
+      * implementations — [[currentScope]] is the same raw segment array the
+      * durable records key on.
       */
     private[atomicflow] val scopePath: Vector[String] = Vector.empty,
     /** The depth of enclosing `Workflow.uncancellable` regions at this context's
@@ -49,11 +49,11 @@ final class WorkflowContext(
     private[atomicflow] val uncancellableDepth: Int = 0
 ) {
 
-  /** The current step scope path: [[scopePath]]'s segments joined by `/` (`""`
-    * at the top level). Step/Await IDs and derived child scopes key on this
-    * string.
+  /** The current step scope path: [[scopePath]] itself, the raw segment array
+    * (`Vector.empty` at the top level). Step/Await IDs and derived child scopes
+    * key on this array.
     */
-  private[atomicflow] def currentScope: String = scopePath.mkString("/")
+  private[atomicflow] def currentScope: Vector[String] = scopePath
   
   private[atomicflow] def copy(
       scopePath: Vector[String] = scopePath,

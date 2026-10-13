@@ -12,11 +12,11 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-  private def stepScopePaths(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
+  private def stepScopePaths(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[Vector[String]] =
     run(
-      sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
+      sql"""SELECT DISTINCT step_scope_within_instance FROM workflow_steps
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key
-            ORDER BY step_scope_path""".query[String].to[Vector]
+            ORDER BY step_scope_within_instance""".query[Vector[String]].to[Vector]
     )
 
   test("scoped runs the same step definition once per element with distinct rows") {
@@ -51,7 +51,7 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     }
     rt.createWorkflowInstance(wf, "k", "in")
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("done"))
-    assertEquals(stepScopePaths(wf.id, "k"), Vector("outer/inner"))
+    assertEquals(stepScopePaths(wf.id, "k"), Vector(Vector("outer", "inner")))
   }
 
   test("Fingerprintable overload: equal elements share the derived scope (cached); distinct elements do not") {
@@ -151,7 +151,7 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     }
     rt.createWorkflowInstance(wf, "k", "in")
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("a,b,c"))
-    assertEquals(stepScopePaths(wf.id, "k"), Vector("A", "B", "C"))
+    assertEquals(stepScopePaths(wf.id, "k"), Vector(Vector("A"), Vector("B"), Vector("C")))
   }
 
   test("plain sequential loops with scoped: foreach, map, and fold") {
@@ -169,7 +169,7 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("10,20,30|6"))
   }
 
-  test("injectivity: StepId('a/b','') and StepId('b','a') are distinct rows; step_id is the bare key and the path lives in step_scope_path") {
+  test("injectivity: StepId('a/b','') and StepId('b','a') are distinct rows; step_id is the bare key and the path lives in step_scope_within_instance") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "scope-injective") { in =>
@@ -181,11 +181,11 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("done"))
     assertEquals(counter.get(), 2, "the two distinct step identities execute independently")
     val rows = run(
-      sql"""SELECT step_id, step_scope_path FROM workflow_steps
+      sql"""SELECT step_id, step_scope_within_instance FROM workflow_steps
             WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
-            ORDER BY step_id, step_scope_path""".query[(String, String)].to[Vector]
+            ORDER BY step_id, step_scope_within_instance""".query[(String, Vector[String])].to[Vector]
     )
-    assertEquals(rows, Vector(("a/b", ""), ("b", "a")))
+    assertEquals(rows, Vector(("a/b", Vector.empty), ("b", Vector("a"))))
   }
 
   test("scoped requires a non-empty scope key") {
@@ -278,9 +278,9 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(shieldedCounter.get(), 1, "the shielded branch's body ran despite the pending cancel")
     assertEquals(exposedCounter.get(), 0, "the exposed branch's body never ran")
     val rows = run(
-      sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
+      sql"""SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
             WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
-            ORDER BY step_id, step_scope_path""".query[(String, String, String)].to[Vector]
+            ORDER BY step_id, step_scope_within_instance""".query[(String, Vector[String], String)].to[Vector]
     )
     assert(rows.exists { case (stepId, _, _) => stepId == "shielded" }, "the shielded step row exists (its checkpoint suppressed delivery)")
     assert(!rows.exists { case (stepId, _, _) => stepId == "exposed" }, "the exposed step row is absent (its body never ran)")
@@ -305,7 +305,7 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1, "the step body executes exactly once")
     assertEquals(
       stepScopePaths(wf.id, "k"),
-      Vector("outer"),
+      Vector(Vector("outer")),
       "the step row lands under the enclosing scope carried by the context, not the foreign thread's empty scope"
     )
   }

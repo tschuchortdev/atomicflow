@@ -2,64 +2,48 @@ package atomicflow.internal
 
 import atomicflow.{WorkflowId, WorkflowInstanceKey}
 
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
-/** Composition and normalization of derived workflow-instance scopes (see
+/** Composition of derived workflow-instance scopes (see
   * `spec/sub-workflows-iteration.md`, "Key derivation").
   *
-  * The scope is a flat string whose structural delimiters are `/` (segment
-  * boundary) and `@` (generation / restart-count marker, always numeric). Every
-  * user-supplied segment is backslash-escaped before joining, making the
-  * derivation injective.
+  * The scope is a segment array: each element is a raw (unescaped) segment, and
+  * structure comes from the array position rather than from delimiters, so no
+  * user-supplied content needs escaping. Parent markers are `key@generation`
+  * (a trailing numeric run) and region markers are `id@restartCount`, formats
+  * that stay injective without escaping because a segment boundary is
+  * structural, not textual.
   */
 private[atomicflow] object ScopePath {
 
-  /** The maximum encoded length of a scope portion before it is replaced by a
-    * marked stable hash.
+  /** The maximum composed scope length (in characters of its `/`-joined form)
+    * before derivation is rejected. Postgres btree index entries cap at roughly
+    * 2700 bytes; this guard turns the obscure database error into a clear one.
     */
-  val MaxEncodedLength: Int = 512
-
-  /** Escapes `\`, `/` and `@` so a segment cannot be confused with structural
-    * delimiters. The escaped `\` keeps the encoding unambiguous.
-    */
-  def escapeScopeSegment(s: String): String =
-    s.replace("\\", "\\\\").replace("/", "\\/").replace("@", "\\@")
-
-  /** Joins already-escaped segments with the `/` delimiter, outer-to-inner. */
-  def joinEscaped(escapedSegments: String*): String = escapedSegments.mkString("/")
+  val MaxDerivedScopeLength: Int = 1800
 
   /** Derives a child workflow instance's scope from its parent's identity and
     * the current run context: the parent's own instance scope, the parent
-    * workflow id and instance key (backslash-escaped), the parent's current run
-    * generation as an `@generation` marker, and the parent's enclosing
-    * `Workflow.scoped` path. The result is injective because every user-supplied
-    * segment is escaped (see `spec/sub-workflows-iteration.md`, "Key
-    * derivation").
+    * workflow id and instance key, the parent's current run generation as an
+    * `@generation` marker, and the parent's enclosing `Workflow.scoped` path.
+    * The result is injective by construction because array positions are
+    * structural (see `spec/sub-workflows-iteration.md`, "Key derivation").
+    *
+    * @throws IllegalArgumentException
+    *   when the composed scope exceeds [[MaxDerivedScopeLength]] (indicating
+    *   pathologically deep child nesting).
     */
   def deriveChildScope(
-      parentInstanceScope: String,
+      parentInstanceScope: Vector[String],
       parentWorkflowId: WorkflowId,
       parentKey: WorkflowInstanceKey,
       parentGeneration: Long,
-      enclosingScopePath: String
-  ): String = {
-    val segments = Vector.newBuilder[String]
-    if (parentInstanceScope.nonEmpty) segments += parentInstanceScope
-    segments += escapeScopeSegment(parentWorkflowId)
-    segments += escapeScopeSegment(parentKey) + "@" + parentGeneration
-    if (enclosingScopePath.nonEmpty) segments += enclosingScopePath
-    joinEscaped(segments.result()*)
+      enclosingScopePath: Vector[String]
+  ): Vector[String] = {
+    val result = parentInstanceScope ++ Vector(parentWorkflowId, s"$parentKey@$parentGeneration") ++ enclosingScopePath
+    if (result.mkString("/").length > MaxDerivedScopeLength)
+      throw new IllegalArgumentException(
+        s"Derived workflow scope exceeds $MaxDerivedScopeLength characters; " +
+          "the child nesting is too deep (see ScopePath.MaxDerivedScopeLength)"
+      )
+    result
   }
-
-  /** Replaces an overlong scope portion with a marked stable hash, so all children
-    * of one parent instance and generation begin with the same normalized prefix.
-    * Portions at or below [[MaxEncodedLength]] are returned unchanged.
-    */
-  def shortenIfTooLong(scopePortion: String): String =
-    if (scopePortion.length <= MaxEncodedLength) scopePortion
-    else {
-      val digest = MessageDigest.getInstance("SHA-256").digest(scopePortion.getBytes(StandardCharsets.UTF_8))
-      s"shortened[sha256:${digest.map(b => f"${b & 0xff}%02x").mkString}]"
-    }
 }

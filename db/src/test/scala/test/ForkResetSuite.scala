@@ -17,16 +17,16 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   private val t2 = t1.plusSeconds(10)
   private val t3 = t2.plusSeconds(10)
 
-  private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String = ""): Int =
+  private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String] = Vector.empty): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[Int].unique
     )
 
-  private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String = ""): Set[String] =
+  private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String] = Vector.empty): Set[String] =
     run(
       sql"""SELECT step_id FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[String].to[Set]
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[String].to[Set]
     )
 
   private def setUpdatedAt(
@@ -37,39 +37,39 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   ): Unit =
     run(
       sql"""UPDATE workflow_steps SET updated_at = $ts
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND step_id = $stepId""".update.run
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId""".update.run
     )
 
   private def storedInput(workflowId: WorkflowId, key: WorkflowInstanceKey): String =
     run(
       sql"""SELECT input FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[String].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[String].unique
     )
 
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
-  private def parentCols(workflowId: WorkflowId, key: WorkflowInstanceKey): (Option[String], Option[String], Option[String]) =
+  private def parentCols(workflowId: WorkflowId, key: WorkflowInstanceKey): (Option[String], Option[String], Option[Vector[String]]) =
     run(
-      sql"""SELECT parent_workflow_id, parent_instance_key, parent_scope FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[
-          (Option[String], Option[String], Option[String])
+      sql"""SELECT parent_workflow_id, parent_instance_key, parent_instance_scope FROM workflow_instances
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+          (Option[String], Option[String], Option[Vector[String]])
         ].unique
     )
 
   private def countCursor(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM signal_cursor
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'Signal'""".query[Int].unique
     )
 
   private def counterWf(
@@ -101,7 +101,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
 
     val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
     assertEquals(fork.id.workflowInstanceKey, "fork")
-    assertEquals(fork.id.scope, "")
+    assertEquals(fork.id.scope, Vector.empty)
     assertEquals(stepIds(wf.id, "fork"), Set("A"), "only the strictly-before step A is copied")
 
     assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.Result("done"))

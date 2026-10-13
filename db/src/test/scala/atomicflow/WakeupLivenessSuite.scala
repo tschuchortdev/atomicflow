@@ -18,24 +18,24 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-  private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String): Boolean =
+  private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Boolean =
     run(
       sql"""SELECT 1 FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
         Int].option
     ).isDefined
 
-  private def wakeupCount(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String): Int =
+  private def wakeupCount(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
         Int].unique
     )
 
-  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String): Unit =
+  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Unit =
     run(
       sql"""DELETE FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".update.run
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run
     )
 
   private def watermark(): Long =
@@ -57,7 +57,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
 
     signal.send(id, "hi")(using rt)
-    assert(!wakeupExists(wf.id, "k", ""),
+    assert(!wakeupExists(wf.id, "k", Vector.empty),
            "a send only appends the event; the sender must not wake subscribers synchronously")
 
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
@@ -82,8 +82,8 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.WorkflowSuspended)
     val childId = rt.getChildWorkflowInstances(parentId).head.id
     assertEquals(rt.runWorkflowInstance(child, childId), WorkflowRunResult.Result(2))
-    deleteWakeup(parent.id, "p", "")
-    assert(!wakeupExists(parent.id, "p", ""),
+    deleteWakeup(parent.id, "p", Vector.empty)
+    assert(!wakeupExists(parent.id, "p", Vector.empty),
            "the parent's wakeup is gone; its completion await is otherwise unobservable")
 
     val settings = JobRunnerSettings.forTests.copy(
@@ -98,11 +98,11 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
         maxEventSeq(),
         "cycle 1 advanced the dispatcher watermark past the completion event, so a second cycle cannot dispatch it again"
       )
-      deleteWakeup(parent.id, "p", "")
-      assert(!wakeupExists(parent.id, "p", ""),
+      deleteWakeup(parent.id, "p", Vector.empty)
+      assert(!wakeupExists(parent.id, "p", Vector.empty),
              "the dispatcher already passed the completion event; only the full scan can wake the parent now")
       runner.runDriverCycle()
-      assert(wakeupExists(parent.id, "p", ""), "the full scan must recreate the lost completion wakeup")
+      assert(wakeupExists(parent.id, "p", Vector.empty), "the full scan must recreate the lost completion wakeup")
       assertEquals(rt.runWorkflowInstance(parent, parentId), WorkflowRunResult.Result("child:2"))
     } finally runner.stop(1.second)
   }
@@ -235,8 +235,8 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     )
     try {
       runner.runDriverCycle()
-      assert(!wakeupExists(wf.id, "k", ""), "a subscription with no candidate event must not be woken")
-      assert(!wakeupExists(done.id, "k", ""), "a terminal instance must not be woken")
+      assert(!wakeupExists(wf.id, "k", Vector.empty), "a subscription with no candidate event must not be woken")
+      assert(!wakeupExists(done.id, "k", Vector.empty), "a terminal instance must not be woken")
     } finally runner.stop(1.second)
   }
 
@@ -246,17 +246,17 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-in"))
     run(
-      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, scope, step_id, step_scope_path, step_version, subscriber_key, signal_key)
-            VALUES (${wf.id}, 'k', '', 'w', '', 0, '', 'greet')""".update.run
+      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
+            VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'greet')""".update.run
     )
     run(
-      sql"""INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, scope, event_key, payload, created_at)
-            VALUES (nextval('workflow_event_sequence'), 'Signal', ${wf.id}, 'k', '', 'greet', 'hi', now())""".update.run
+      sql"""INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key, payload, created_at)
+            VALUES (nextval('workflow_event_sequence'), 'Signal', ${wf.id}, 'k', '{}', 'greet', 'hi', now())""".update.run
     )
 
     rt.dispatchNewEvents(1000)
     assert(
-      !wakeupExists(wf.id, "k", ""),
+      !wakeupExists(wf.id, "k", Vector.empty),
       "the dispatcher must not create a wakeup for a terminal instance"
     )
   }
@@ -324,7 +324,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     try {
       runner.runDriverCycle()
       runner.runDriverCycle()
-      assertEquals(wakeupCount(wf.id, "k", ""), 1, "repeated scans must not accumulate duplicate wakeups")
+      assertEquals(wakeupCount(wf.id, "k", Vector.empty), 1, "repeated scans must not accumulate duplicate wakeups")
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("got:hi"))
     } finally runner.stop(1.second)
   }

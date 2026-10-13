@@ -5,57 +5,92 @@ import munit.FunSuite
 
 class ScopePathSuite extends FunSuite:
 
-  test("escaping protects the structural delimiters") {
-    assertEquals(ScopePath.escapeScopeSegment("plain"), "plain")
-    assertEquals(ScopePath.escapeScopeSegment("""a\b"""), """a\\b""")
-    assertEquals(ScopePath.escapeScopeSegment("a/b"), """a\/b""")
-    assertEquals(ScopePath.escapeScopeSegment("a@b"), """a\@b""")
-    // the example from the spec: a crafted segment cannot fake a chain
-    assertEquals(ScopePath.escapeScopeSegment("x@0/B/y"), """x\@0\/B\/y""")
-  }
-
-  test("escaped segments cannot collide with genuine chains") {
-    // spec: `x@0/B/y` encodes to `x\@0\/B\/y`, which cannot collide with the
-    // genuine chain composed of segments "x@0", "B", "y@0"
-    val crafted = ScopePath.escapeScopeSegment("x@0/B/y")
-    val genuine = ScopePath.joinEscaped(
-      ScopePath.escapeScopeSegment("x@0"),
-      ScopePath.escapeScopeSegment("B"),
-      ScopePath.escapeScopeSegment("y@0")
+  test("deriveChildScope composes parent identity, generation marker, and enclosing path") {
+    assertEquals(
+      ScopePath.deriveChildScope(
+        parentInstanceScope = Vector.empty,
+        parentWorkflowId = "orders",
+        parentKey = "order-42",
+        parentGeneration = 3,
+        enclosingScopePath = Vector.empty
+      ),
+      Vector("orders", "order-42@3")
     )
+  }
+
+  test("deriveChildScope carries the parent instance scope before the parent identity") {
+    val nestedParentScope = Vector("orders", "order-42@3", "items", "poll@7")
+    assertEquals(
+      ScopePath.deriveChildScope(
+        parentInstanceScope = nestedParentScope,
+        parentWorkflowId = "worker",
+        parentKey = "worker-1",
+        parentGeneration = 0,
+        enclosingScopePath = Vector("chunk", "retry@2")
+      ),
+      Vector("orders", "order-42@3", "items", "poll@7", "worker", "worker-1@0", "chunk", "retry@2")
+    )
+  }
+
+  test("an empty parent scope contributes no segments") {
+    assertEquals(
+      ScopePath.deriveChildScope(
+        parentInstanceScope = Vector.empty,
+        parentWorkflowId = "orders",
+        parentKey = "order-42",
+        parentGeneration = 0,
+        enclosingScopePath = Vector.empty
+      ),
+      Vector("orders", "order-42@0")
+    )
+  }
+
+  test("marker formats are a trailing numeric run on the parent key and region id") {
+    // the parent marker is `key@generation`; the region marker is `id@count`,
+    // both raw segments with no escaping
+    assertEquals(ScopePath.deriveChildScope(Vector("a"), "wf", "worker-1", 7, Vector.empty).last, "worker-1@7")
+    // a key that itself ends in a marker-looking suffix stays a single segment
+    val tricky = ScopePath.deriveChildScope(Vector.empty, "wf", "poll@7", 2, Vector.empty)
+    assertEquals(tricky, Vector("wf", "poll@7@2"))
+  }
+
+  test("raw segments containing /, @, and \\ are preserved verbatim") {
+    // injectivity is now structural (array positions), so no escaping is applied
+    val crafted = Vector("x@0/B/y")
+    val genuine = Vector("x@0", "B", "y@0")
     assertNotEquals(crafted, genuine)
+    assertEquals(
+      ScopePath.deriveChildScope(
+        parentInstanceScope = Vector("a/b@c", """d\e"""),
+        parentWorkflowId = "x@0/B/y",
+        parentKey = "k\\p",
+        parentGeneration = 1,
+        enclosingScopePath = Vector("s/c/d")
+      ),
+      Vector("a/b@c", """d\e""", "x@0/B/y", "k\\p@1", "s/c/d")
+    )
   }
 
-  test("joinEscaped composes escaped segments with the / delimiter") {
-    assertEquals(ScopePath.joinEscaped("a", "b", "c"), "a/b/c")
-    assertEquals(ScopePath.joinEscaped("a"), "a")
-  }
+  test("the length guard rejects only overlong derived scopes at the boundary") {
+    // exactly at the limit composes fine: the joined scope is 1800 chars
+    val atLimit = ScopePath.deriveChildScope(
+      parentInstanceScope = Vector("a" * 1794),
+      parentWorkflowId = "w",
+      parentKey = "k",
+      parentGeneration = 0,
+      enclosingScopePath = Vector.empty
+    )
+    assertEquals(atLimit.mkString("/").length, ScopePath.MaxDerivedScopeLength)
 
-  test("count markers are appended after the escaped key") {
-    val escapedKey = ScopePath.escapeScopeSegment("worker-1")
-    assertEquals(escapedKey + "@0", "worker-1@0")
-    // a key containing a marker-looking suffix stays unambiguous
-    val tricky = ScopePath.escapeScopeSegment("poll@7")
-    assertEquals(tricky + "@2", """poll\@7@2""")
-  }
-
-  test("shortening replaces only overlong parent portions with a marked stable hash") {
-    val short = "a" * (ScopePath.MaxEncodedLength - 1)
-    assertEquals(ScopePath.shortenIfTooLong(short), short)
-
-    val long1 = "a" * (ScopePath.MaxEncodedLength + 10)
-    val long2 = "b" * (ScopePath.MaxEncodedLength + 10)
-    val shortened1 = ScopePath.shortenIfTooLong(long1)
-    // deterministic, marked, sha256-hex
-    assertEquals(shortened1, ScopePath.shortenIfTooLong(long1))
-    assert(clue(shortened1).startsWith("shortened[sha256:"), s"unexpected: $shortened1")
-    assert(clue(shortened1).endsWith("]"))
-    val hash = shortened1.stripPrefix("shortened[sha256:").stripSuffix("]")
-    assertEquals(hash.length, 64)
-    assert(hash.forall(c => c.isDigit || ('a' to 'f').contains(c)))
-    // different overlong scopes shorten differently
-    assertNotEquals(shortened1, ScopePath.shortenIfTooLong(long2))
-    // exactly at the limit is kept
-    val exact = "c" * ScopePath.MaxEncodedLength
-    assertEquals(ScopePath.shortenIfTooLong(exact), exact)
+    // one character over the limit throws with a clear message
+    val e = intercept[IllegalArgumentException] {
+      ScopePath.deriveChildScope(
+        parentInstanceScope = Vector("a" * 1795),
+        parentWorkflowId = "w",
+        parentKey = "k",
+        parentGeneration = 0,
+        enclosingScopePath = Vector.empty
+      )
+    }
+    assert(e.getMessage.contains("too deep"), s"unexpected message: ${e.getMessage}")
   }

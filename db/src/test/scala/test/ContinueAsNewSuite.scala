@@ -19,58 +19,58 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       cancelRequestedAt: Option[Instant],
       parentWf: Option[String],
       parentKey: Option[String],
-      parentScope: Option[String]
+      parentScope: Option[Vector[String]]
   )
 
-  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String): Option[ChildRow] =
+  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Option[ChildRow] =
     run(
-      sql"""SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_scope
+      sql"""SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_instance_scope
             FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[
-          (Option[String], Int, Option[Instant], Option[String], Option[String], Option[String])
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
+          (Option[String], Int, Option[Instant], Option[String], Option[String], Option[Vector[String]])
         ].option
     ).map { case (t, te, c, pw, pk, ps) => ChildRow(t, te, c, pw, pk, ps) }
 
   private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = '' AND event_kind = 'Signal'""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'Signal'""".query[Int].unique
     )
 
   private def countSignalSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def countTimerSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def countCompletionSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_completion_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
     )
 
   private def storedInput(workflowId: WorkflowId, key: WorkflowInstanceKey): String =
     run(
       sql"""SELECT input FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''""".query[String].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[String].unique
     )
 
   test("continueAsNew returns the ContinueAsNew outcome, increments generation, erases old-gen steps, and the next run starts fresh with the new input") {
@@ -108,7 +108,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
 
     val rows = run(
       sql"""SELECT COUNT(*) FROM workflow_instances
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".query[Int].unique
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".query[Int].unique
     )
     assertEquals(rows, 1, "there is exactly one instance row for the key")
   }
@@ -173,7 +173,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "start").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.ContinueAsNew)
 
-    val scope = "can-parent4/p@0"
+    val scope = Vector("can-parent4", "p@0")
     assertEquals(childRow(childWf.id, "cancel-child", scope).get.terminalState, Some("cancelled"))
     val ab = childRow(childWf.id, "abandon-child", scope).get
     assertEquals(ab.terminalState, None, "an abandoned child is not cancelled")
@@ -200,7 +200,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "first").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = "can-parent3/p@0"
+    val scope = Vector("can-parent3", "p@0")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "cancel-child", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -228,17 +228,17 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = "can-parent5/p@0"
+    val scope = Vector("can-parent5", "p@0")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "c", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.ContinueAsNew)
 
     val row = childRow(childWf.id, "c", scope).get
     assertEquals(row.parentWf, Some("can-parent5"), "the child stays attached to its parent")
     assertEquals(row.parentKey, Some("p"))
-    assertEquals(row.parentScope, Some(""))
+    assertEquals(row.parentScope, Some(Vector.empty))
     val inherit = run(
       sql"""SELECT inherit_signals, inherit_past_events FROM workflow_instances
-            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND scope = $scope""".query[(String, Boolean)].unique
+            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = $scope""".query[(String, Boolean)].unique
     )
     assertEquals(inherit._1, "all", "the inheritance configuration is unchanged")
     assertEquals(inherit._2, false)
@@ -282,7 +282,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""UPDATE workflow_instances
             SET lease_owner = 'owner', fencing_token = 5, lease_expires_at = ${clock.instant().plus(java.time.Duration.ofSeconds(30))}
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
     )
 
     val results = new Array[WorkflowRunResult[String]](1)
@@ -293,7 +293,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""UPDATE workflow_instances
             SET generation = generation + 1, input = ${Cacheable[String].write("new-input")}
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".update.run
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
     )
 
     clock.advance(31.seconds)
@@ -301,7 +301,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assert(!t.isAlive, "the waiting run must finish after the lease expires")
     assertEquals(results(0), WorkflowRunResult.Result("gen-input:new-input"))
     assertEquals(
-      run(sql"""SELECT generation FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND scope = ''""".query[Long].unique),
+      run(sql"""SELECT generation FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".query[Long].unique),
       1L,
       "the run observed the newest generation"
     )
