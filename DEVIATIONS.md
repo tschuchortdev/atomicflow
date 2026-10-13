@@ -167,15 +167,17 @@ implementation phase.
 
 ## Phase 6 (children, inheritance, parallelism)
 
-32. **`step_scope_path` is `NOT NULL DEFAULT ''` rather than nullable.** The
-    spec says step/await rows carry a "nullable scope-path column"; Postgres
-    primary-key columns cannot be NULL, and the column participates in the
-    natural keys of `workflow_steps` and all three subscription tables. The
-    empty string is the top-level sentinel.
-33. **Scope-path shortening (`shortened[sha256:...]`) is not implemented.**
-    The spec's derivation section describes truncating long scope paths; the
-    current implementation stores full escaped paths. Deferred as a
-    performance concern (no behavioral difference).
+32. **`step_scope_within_instance` is `NOT NULL DEFAULT '{}'` rather than
+    nullable.** The spec says step/await rows carry a "nullable scope-path
+    column"; Postgres primary-key columns cannot be NULL, and the column
+    participates in the natural keys of `workflow_steps` and all three
+    subscription tables. The empty array is the top-level sentinel.
+33. **Scope-path shortening is not implemented.** The spec once described
+    truncating long scope paths; the current implementation stores full
+    segment arrays and instead rejects an overlong derived scope with an
+    `IllegalArgumentException` at the 1800-character joined-length limit.
+    Deferred as a performance concern (no behavioral difference at sane
+    depths).
 34. **`firstToRunWithoutSuspension` defaults live on the vararg overload
     only** (Seq form delegates without defaults) — Scala 3 forbids default
     arguments on two overloaded apply methods (same class of limitation as

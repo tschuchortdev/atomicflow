@@ -10,14 +10,14 @@ type SignalKey = String
 
 /** The address of a workflow instance: definition id, user-chosen key, and scope.
   *
-  * `scope` is `""` for top-level instances; children started via `startAsChild`
-  * carry a derived, non-empty scope (see `spec/sub-workflows-iteration.md`).
-  * Creation APIs never accept a scope.
+  * `scope` is `Vector.empty` for top-level instances; children started via
+  * `startAsChild` carry a derived, non-empty scope (see
+  * `spec/sub-workflows-iteration.md`). Creation APIs never accept a scope.
   */
 final case class WorkflowInstanceId(
     workflowId: WorkflowId,
     workflowInstanceKey: WorkflowInstanceKey,
-    scope: String = ""
+    scope: Vector[String] = Vector.empty
 ) {
 
   /** Append a `Signal` event addressed to this instance. Forwarder for the
@@ -59,7 +59,7 @@ enum SignalSendResult {
 /** Identity of a step (or await-site) within a workflow instance. `scope` is the
   * enclosing `Workflow.scoped` path.
   */
-final case class StepId(key: String, scope: String = "")
+final case class StepId(key: String, scope: Vector[String] = Vector.empty)
 
 /** The only durable, user-visible lifecycle states of an instance. `None` means
   * not terminal yet; CREATED/RUNNING/SUSPENDED are transient bookkeeping, and

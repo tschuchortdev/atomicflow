@@ -254,36 +254,39 @@ Application rules:
   complete enclosing `Workflow.scoped` path. Restartable and loop scopes appear
   as `scopeId@restartCount`; ordinary scopes appear as their scope ID. Segments
   retain their outer-to-inner order.
-- **Escaping.** The scope is a flat string whose *structural* delimiters are
-  `/` (segment boundary) and `@` (generation / restart-count marker, which is
-  always numeric). Every user-supplied segment that flows into a scope —
-  workflow IDs, instance keys, `Workflow.scoped` keys, restartable / loop IDs —
-  is **backslash-escaped** before being joined, so no segment content can be
-  confused with a structural delimiter. A single runtime function performs the
-  escaping for both scope composition and any scope-based prefix query:
+- **Representation.** The scope is a structured **segment array** (a
+  `TEXT[]` in Postgres, `Vector[String]` in Scala), not a joined string. The
+  array positions — not any delimiter — are what separate segments, so **no
+  escaping or shortening is performed anywhere**. User-supplied segments
+  (workflow IDs, instance keys, `Workflow.scoped` keys, restartable / loop IDs,
+  `key@generation`, `id@restartCount` markers) are stored verbatim, including
+  any embedded `/`, `@`, or `\`. A single runtime function composes the array:
   ```scala
-  // escape `\`, `/`, `@`; the escaped `\` keeps the encoding unambiguous
-  def escapeScopeSegment(s: String): String =
-    s.replace("\\", "\\\\").replace("/", "\\/").replace("@", "\\@")
+  def deriveChildScope(parentInstanceScope, parentWorkflowId, parentKey,
+                       parentGeneration, enclosingScopePath): Vector[String] =
+    parentInstanceScope ++ Vector(parentWorkflowId, s"$parentKey@$parentGeneration") ++ enclosingScopePath
   ```
-  The `@count` marker is appended *after* the escaped key (e.g. `worker\-1@0`),
-  so the numeric count is never escaped. Escaping guarantees the derivation is
-  injective: a key crafted to look like a nested chain (say `x@0/B/y`) encodes
-  to `x\@0\/B\/y`, which cannot collide with a genuine chain `x@0/B/y@0`. This
-  is what makes the `(workflowId, instanceKey, scope)` uniqueness key safe even
-  though scope is derived from user-supplied keys.
+  The `@count` / `@generation` marker is appended to the segment text
+  (`worker-1@0`), so the numeric count is part of the segment, never a
+  separate field. Injectivity is structural: a key crafted to look like a
+  nested chain (say `x@0/B/y`) is a single array element `"x@0/B/y"`, which
+  can never collide with the genuine chain `["x@0", "B", "y@0"]`. This is what
+  makes the `(workflowId, instanceKey, scope)` uniqueness key safe even though
+  scope is derived from user-supplied keys.
 - **Prefix search.** Instance-key prefix operations
   (`getWorkflowInstancesByPrefix`, `deleteWorkflowInstancesByPrefix`) query the
-  raw `workflowInstanceKey` column and take an **unescaped** prefix — no
-  escaping is applied, because the escaped copy lives only inside the `scope`
-  column. Escaping matters only for a scope-based prefix query (e.g. all
-  children of a parent), and such a query must run its input segments through
-  `escapeScopeSegment` first so it matches the composed encoding.
+  raw `workflowInstanceKey` column with a literal prefix (escaped only for SQL
+  `LIKE`). Scope-scoped queries (e.g. all descendants of a parent) match a
+  segment-array **prefix** by comparing array slices: a child row's
+  `workflow_instance_scope` equals the parent's derived array on its first
+  `n` positions, where `n` is the parent's array length. Because segments are
+  verbatim, a prefix match on the array never over-matches a sibling or a
+  segment boundary.
 - Example:
   ```text
-  parent:      (orders, order-42, "")
-  child:       (worker, worker-1, "orders/order-42@3/items/poll@7")
-  grandchild:  (audit, audit-1, "orders/order-42@3/items/poll@7/worker/worker-1@0/chunk/retry@2")
+  parent:      (orders, order-42, {})
+  child:       (worker, worker-1, {orders, order-42@3, items, poll@7})
+  grandchild:  (audit, audit-1, {orders, order-42@3, items, poll@7, worker, worker-1@0, chunk, retry@2})
   ```
 - The parent workflow generation distinguishes children started before and
   after `continueAsNew`. Every enclosing restart count distinguishes children
@@ -292,18 +295,16 @@ Application rules:
 - Scope is part of immutable identity. If a child is abandoned, its active
   parent relationship is cleared but its derived scope does not change.
 - The database uniqueness key is `(workflowId, instanceKey, scope)`. Queries
-  accept an optional scope whose default is `""`; omitting it means exactly the
-  top-level scope, never all matching scopes.
+  accept an optional scope whose default is the empty array `{}`; omitting it
+  means exactly the top-level scope, never all matching scopes.
 - The scope has a maximum encoded length. Before appending the current local
-  `Workflow.scoped`/restartable path, an overlong parent portion is replaced by
-  a marked stable hash such as `shortened[sha256:...]`. Local scope segments are
-  not part of that shortening calculation, ensuring that all children of one
-  parent instance and generation begin with the same normalized scope prefix.
-  When such a child later becomes a parent, its former local path is ancestry
-  and may be included in a shortened parent portion.
-- The readable slash-and-`@` form (with backslash escapes for embedded `/`,
-  `@`, `\`) is for debugging only. Callers must not construct or parse derived
-  scopes or rely on their textual layout.
+  `Workflow.scoped`/restartable path, the composed array is rejected with an
+  `IllegalArgumentException` when its joined `/`-form would exceed the limit;
+  local segments are not part of any truncation, ensuring that all children of
+  one parent instance and generation share the same scope prefix.
+- The readable slash-joined form (without escaping) is for debugging only.
+  Callers must not construct or parse derived scopes or rely on their textual
+  layout.
 - The returned handle is the normal way to address a child. Users should not
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional

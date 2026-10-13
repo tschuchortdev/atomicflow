@@ -1,7 +1,6 @@
 package atomicflow
 
 import atomicflow.impl.Sha256Fingerprinter
-import atomicflow.internal.ScopePath
 
 import java.time.Instant
 import scala.annotation.targetName
@@ -307,7 +306,7 @@ object Workflow {
     }
 
   private def regionSegment(id: String, count: Long): String =
-    ScopePath.escapeScopeSegment(id) + "@" + count
+    s"$id@$count"
 
   /** The single shared implementation behind [[restartable]] and [[loop]]. The
     * body uses a [[RestartableScope]]: a normal return completes the region with
@@ -381,24 +380,21 @@ object Workflow {
   /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
     * with `scopeKey` (see `spec/sub-workflows-iteration.md`, "Primitives"), so
     * the same step definitions can execute independently per element. Scopes
-    * nest arbitrarily; the full prefix is the path of enclosing keys joined by
-    * `/`.
+    * nest arbitrarily; the full scope is the array of enclosing segment keys.
     */
   def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
-    withScope(ScopePath.escapeScopeSegment(scopeKey))(body)
+    withScope(scopeKey)(body)
 
   /** Like [[scoped]] but the scope key is derived deterministically from the
     * element's fingerprint, so equal elements share the same scope (reusing
     * cached Steps) and distinct elements get distinct scopes.
     */
   def scoped[A: Fingerprintable, R](elem: A)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
-    withScope(
-      ScopePath.escapeScopeSegment(Fingerprintable[A].fingerprint(elem, Sha256Fingerprinter).toString)
-    )(body)
+    withScope(Fingerprintable[A].fingerprint(elem, Sha256Fingerprinter).toString)(body)
 
-  private def withScope[R](escapedSegment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
-    require(escapedSegment.nonEmpty, "Workflow.scoped requires a non-empty scope")
-    body(using ctx.copy(scopePath = ctx.scopePath :+ escapedSegment))
+  private def withScope[R](segment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
+    require(segment.nonEmpty, "Workflow.scoped requires a non-empty scope")
+    body(using ctx.copy(scopePath = ctx.scopePath :+ segment))
   }
 
   /** Runs one by-name block, catches its suspension instead of propagating it,

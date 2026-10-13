@@ -14,14 +14,14 @@ class TypesSuite extends FunSuite:
     val id = WorkflowInstanceId("orders", "order-42")
     assertEquals(id.workflowId, "orders")
     assertEquals(id.workflowInstanceKey, "order-42")
-    assertEquals(id.scope, "")
+    assertEquals(id.scope, Vector.empty)
     assertEquals(WorkflowInstanceId("orders", "order-42"), WorkflowInstanceId("orders", "order-42"))
-    assertNotEquals(WorkflowInstanceId("orders", "order-42"), WorkflowInstanceId("orders", "order-42", "s"))
+    assertNotEquals(WorkflowInstanceId("orders", "order-42"), WorkflowInstanceId("orders", "order-42", Vector("s")))
   }
 
   test("StepId defaults to the empty scope") {
-    assertEquals(StepId("charge").scope, "")
-    assertEquals(StepId("charge"), StepId("charge", ""))
+    assertEquals(StepId("charge").scope, Vector.empty)
+    assertEquals(StepId("charge"), StepId("charge", Vector.empty))
   }
 
   test("WorkflowCompletionResult codec round-trips all four cases") {

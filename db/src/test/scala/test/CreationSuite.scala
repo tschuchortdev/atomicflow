@@ -16,14 +16,14 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
 
   private def inputOf(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
-      sql"SELECT input FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''"
+      sql"SELECT input FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'"
         .query[String]
         .option
     )
 
   private def wakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Instant, Instant, Int)] =
     run(
-      sql"SELECT created_at, scheduled_at, attempts FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = ''"
+      sql"SELECT created_at, scheduled_at, attempts FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'"
         .query[(Instant, Instant, Int)]
         .option
     )
@@ -36,12 +36,12 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(inputOf(wf.id, "key-1"), Some(Cacheable[String].write("hello")))
 
     val row = run(
-      sql"SELECT workflow_version_at_creation, scope, terminal_state FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'key-1' AND scope = ''"
-        .query[(Long, String, Option[String])]
+      sql"SELECT workflow_version_at_creation, workflow_instance_scope, terminal_state FROM workflow_instances WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'key-1' AND workflow_instance_scope = '{}'"
+        .query[(Long, Vector[String], Option[String])]
         .unique
     )
     assertEquals(row._1, wf.version)
-    assertEquals(row._2, "")
+    assertEquals(row._2, Vector.empty)
     assertEquals(row._3, None)
   }
 

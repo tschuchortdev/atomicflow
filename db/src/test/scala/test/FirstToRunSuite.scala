@@ -23,11 +23,11 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND step_id = 'race'""".query[(String, String, String)].option
     )
 
-  private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, String)] =
+  private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(Vector[String], String)] =
     run(
-      sql"""SELECT step_scope_path, signal_key FROM workflow_signal_subscriptions
+      sql"""SELECT step_scope_within_instance, signal_key FROM workflow_signal_subscriptions
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key
-            ORDER BY step_scope_path, signal_key""".query[(String, String)].to[Vector]
+            ORDER BY step_scope_within_instance, signal_key""".query[(Vector[String], String)].to[Vector]
     )
 
   test("all branches suspend -> combined suspension with one cause per branch, no winner row, all subscriptions remain") {
@@ -64,7 +64,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
-      Vector(("race/a", "s1"), ("race/b", "s2")),
+      Vector((Vector("race/a"), "s1"), (Vector("race/b"), "s2")),
       "each branch's await subscription remains registered while the workflow is suspended"
     )
   }
@@ -182,10 +182,10 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     )
     assertEquals(
       run(
-        sql"""SELECT step_id, step_scope_path, state_kind FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, String, String)].to[Vector]
+        sql"""SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
+              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, Vector[String], String)].to[Vector]
       ),
-      Vector(("fast", "race/fast", "Succeeded")),
+      Vector(("fast", Vector("race/fast"), "Succeeded")),
       "the winner branch's own step row survives cleanup"
     )
   }
@@ -294,12 +294,12 @@ val empty = attempt("" -> { () => 1 })
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val paths = run(
-      sql"""SELECT DISTINCT step_scope_path FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_path""".query[String].to[Vector]
+      sql"""SELECT DISTINCT step_scope_within_instance FROM workflow_steps
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_within_instance""".query[Vector[String]].to[Vector]
     )
-    assert(paths.contains("outer/race/one"), s"the winner branch's step must persist under the enclosing scope, got: $paths")
-    assert(!paths.contains("race/one"), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
-    assert(paths.contains("outer/race/two"), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
+    assert(paths.contains(Vector("outer", "race/one")), s"the winner branch's step must persist under the enclosing scope, got: $paths")
+    assert(!paths.contains(Vector("race/one")), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
+    assert(paths.contains(Vector("outer", "race/two")), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
   }
 
   test("loser cleanup deletes subscriptions of nested subscopes, not just the branch's immediate scope") {
@@ -322,7 +322,7 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(
       signalSubscriptions(wf.id, "k"),
-      Vector(("race/loser/inner", "deep"), ("race/winner", "winner")),
+      Vector((Vector("race/loser", "inner"), "deep"), (Vector("race/winner"), "winner")),
       "the nested await registers under race/loser/inner while the construct is suspended"
     )
     sWinner.send(id, "go")(using rt)

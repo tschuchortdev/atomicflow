@@ -84,7 +84,7 @@ enum Subscriber {
       subscriberKey: String,
       completedWorkflowId: WorkflowId,
       completedWorkflowInstanceKey: WorkflowInstanceKey,
-      completedScope: String
+      completedScope: Vector[String]
   )
 }
 

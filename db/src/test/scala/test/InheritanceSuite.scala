@@ -12,20 +12,20 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-  private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: String): Boolean =
+  private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope""".query[Int].option
+      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[Int].option
     ).isDefined
 
   private def cursorAt(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: String,
+      scope: Vector[String],
       signalKey: SignalKey
   ): Option[Long] =
     run(
       sql"""SELECT sequence_id FROM signal_cursor
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND scope = $scope AND signal_key = $signalKey""".query[Long].option
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope AND signal_key = $signalKey""".query[Long].option
     )
 
   private def childInfo(rt: PostgresWorkflowRuntime, parentId: WorkflowInstanceId, childKey: WorkflowInstanceKey): WorkflowInstance.Info =
