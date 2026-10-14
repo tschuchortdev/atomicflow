@@ -28,14 +28,6 @@ final class PostgresJobRunner private[atomicflow] (
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  /** Doobie array support for scope arrays (`TEXT[]`), matching the runtime:
-    * the plain `Array[String]` binding is `varchar[]`, which Postgres refuses
-    * to compare against the `TEXT[]` scope columns.
-    */
-  private val scopeTextArrayMeta: Meta[Array[String]] = Meta.Advanced.array[String]("text", "_text")
-  implicit private val scopeVectorPut: Put[Vector[String]] = scopeTextArrayMeta.put.contramap(_.toArray)
-  implicit private val scopeVectorGet: Get[Vector[String]] = scopeTextArrayMeta.get.map(_.toVector)
-
   private val registry: Map[WorkflowId, Workflow[?, ?]] = {
     val grouped = definitions.groupBy(_.id)
     grouped.collectFirst { case (id, ws) if ws.size > 1 => id } match {
