@@ -61,15 +61,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private val xa = Transactor.fromDataSource[IO](ds, ec)
 
   /** Doobie array support for the structured scope arrays: scopes are stored as
-    * raw `TEXT[]` segment arrays (see `spec/sub-workflows-iteration.md`, "Key
-    * derivation") and mapped to `Vector[String]` at the Scala boundary. The
-    * element/array types are pinned to `text`/`_text` so the bound parameter is
-    * `TEXT[]` and compares equal to the column (a plain `Array[String]` binds
-    * as `varchar[]`, which Postgres refuses to compare against `TEXT[]`).
+    * raw `VARCHAR[]` segment arrays (see `spec/sub-workflows-iteration.md`,
+    * "Key derivation") and mapped to `Vector[String]` at the Scala boundary via
+    * doobie's default `varchar[]` array binding.
     */
-  private val scopeTextArrayMeta: Meta[Array[String]] = Meta.Advanced.array[String]("text", "_text")
-  implicit val scopeVectorPut: Put[Vector[String]] = scopeTextArrayMeta.put.contramap(_.toArray)
-  implicit val scopeVectorGet: Get[Vector[String]] = scopeTextArrayMeta.get.map(_.toVector)
 
   private val processUuid: String = java.util.UUID.randomUUID().toString
 
@@ -2904,7 +2899,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 SELECT 1 FROM workflow_steps r
                 WHERE r.workflow_id = $f AND r.workflow_instance_key = $k AND r.workflow_instance_scope = $s
                   AND r.step_kind = 'ChildClose'
-                  AND ($ss::text[])[1:COALESCE(array_length(r.step_scope_within_instance,1),0)] = r.step_scope_within_instance)
+                  AND ($ss)[1:COALESCE(array_length(r.step_scope_within_instance,1),0)] = r.step_scope_within_instance)
             LIMIT 1""".query[Int].option.map(_.isDefined)
     def loop(
         node: (Option[String], Option[String], Option[String], Option[Vector[String]]),

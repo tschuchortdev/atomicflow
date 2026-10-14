@@ -5,7 +5,6 @@ import cats.effect.IO
 import doobie.ConnectionIO
 import doobie.Transactor
 import doobie.implicits.*
-import doobie.{Get, Meta, Put}
 import munit.FunSuite
 import org.flywaydb.core.Flyway
 import org.postgresql.ds.PGSimpleDataSource
@@ -51,14 +50,6 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 
   private lazy val xa: Transactor[IO] =
     Transactor.fromDataSource[IO](newDataSource, ExecutionContext.global)
-
-  /** Test-side doobie array support matching the runtime: scope arrays are
-    * `TEXT[]` and must bind as `_text` (a plain `Array[String]` binds as
-    * `varchar[]`, which Postgres refuses to compare against `TEXT[]`).
-    */
-  private val scopeTextArrayMeta: Meta[Array[String]] = Meta.Advanced.array[String]("text", "_text")
-  implicit val scopeVectorPut: Put[Vector[String]] = scopeTextArrayMeta.put.contramap(_.toArray)
-  implicit val scopeVectorGet: Get[Vector[String]] = scopeTextArrayMeta.get.map(_.toVector)
 
   /** Runs a doobie `ConnectionIO` program synchronously against the suite's DB. */
   protected def run[A](program: ConnectionIO[A]): A =
