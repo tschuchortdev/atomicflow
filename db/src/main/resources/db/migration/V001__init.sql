@@ -26,6 +26,18 @@ CREATE TABLE workflow_instances (
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );
 
+CREATE TABLE child_close_requests (
+  workflow_id VARCHAR NOT NULL,
+  workflow_instance_key VARCHAR NOT NULL,
+  workflow_instance_scope VARCHAR[] NOT NULL,
+  target_prefix VARCHAR[] NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, target_prefix),
+  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
+    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
+    ON DELETE CASCADE
+);
+
 CREATE TABLE workflow_events (
   sequence_id BIGINT PRIMARY KEY,
   event_kind VARCHAR NOT NULL,
@@ -201,7 +213,3 @@ CREATE INDEX workflow_completion_subscriptions_await
 
 CREATE INDEX workflow_instances_parent
   ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);
-
-CREATE INDEX workflow_steps_child_close
-  ON workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope)
-  WHERE step_kind = 'ChildClose';

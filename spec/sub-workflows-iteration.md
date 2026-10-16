@@ -216,7 +216,8 @@ carries the decoded `Throwable`, ready to rethrow for direct-style handling.
 ### `ParentClosePolicy`
 
 Controls what happens to a child when the parent reaches a terminal state —
-success, failure, cancellation, or termination — or calls `continueAsNew`:
+success, failure, cancellation, or termination — or calls `continueAsNew`,
+restarts an enclosing region, or is reset:
 
 | Policy | Behaviour |
 |---|---|
@@ -226,14 +227,16 @@ success, failure, cancellation, or termination — or calls `continueAsNew`:
 Application rules:
 
 - **Asynchronous delivery.** The parent's terminal transition
-  (success/failure/cancellation/termination) and its `continueAsNew` and
-  region-restart transitions never touch child rows. Each instead records a
-  `ChildClose` row in the **parent's own** `workflow_steps` (runtime
-  bookkeeping, `step_kind = 'ChildClose'`) whose target is the scope prefix of
-  the children to close: the empty prefix for a terminal parent (all attached
-  children), the parent's identity plus `key@generation` for `continueAsNew`
+  (success/failure/cancellation/termination), its `continueAsNew`, its
+  region-restart, and its reset never touch child rows. Each instead records a
+  row in the dedicated **`child_close_requests`** table keyed by the parent's
+  own identity plus a `target_prefix` (and `created_at`); the composite primary
+  key deduplicates identical targets, and the foreign key cascades when the
+  parent row is deleted. The target is the scope prefix of the children to
+  close: the empty prefix for a terminal parent (all attached children), the
+  parent's identity plus `key@generation` for `continueAsNew` and reset
   (exactly the closing generation), and that prefix plus the discarded region
-  interior for a region restart (exactly the discarded iteration). No closure
+  interior for a region restart (exactly the discarded iteration). No request
   row is written when no attached child matches, so the childless common case
   leaves no bookkeeping. Targeting by exact prefix is what prevents collisions
   between old and new children across generations and region iterations: a
@@ -245,8 +248,8 @@ Application rules:
   policy; (b) the periodic **child-close sweep** — the driver loop applies every
   pending closure in bounded batches, one child per short transaction. Both
   re-verify under the child's own row lock and are idempotent, so they cooperate
-  safely with each other and with recovery. The sweep deletes a `ChildClose` row
-  once no attached child matches it.
+  safely with each other and with recovery. The sweep deletes a
+  `child_close_requests` row once no attached child matches it.
 - **A gone parent detaches.** A child whose parent instance row has been
   hard-deleted is detached (pointer cleared) by the self-check or sweep; it is
   never cancelled, matching the inheritance walk, which also stops at a missing
@@ -259,12 +262,13 @@ Application rules:
 - **Inherited-signal visibility cuts off at the closure event, not at
   delivery.** The inheritance walk treats a parent as unusable — terminating the
   walk exactly as a detached pointer does — when it is terminal or holds a
-  `ChildClose` row matching the child's scope. So even before the pointer is
-  cleared, no transitive ancestor event can leak through a closed parent; a
-  suspended child cannot consume a grandparent signal through a parent that has
-  continued as new or completed. Directly addressed `Signal` events of the
-  closing parent are deleted in its transition (before children are delivered);
-  with the walk cutoff, this ordering inversion is unobservable to children.
+  `child_close_requests` row whose target covers the child's scope. So even
+  before the pointer is cleared, no transitive ancestor event can leak through a
+  closed parent; a suspended child cannot consume a grandparent signal through a
+  parent that has continued as new or completed. Directly addressed `Signal`
+  events of the closing parent are deleted in its transition (before children
+  are delivered); with the walk cutoff, this ordering inversion is unobservable
+  to children.
 - **A cancelling parent never waits for the children it cancels.** The parent is
   terminal as soon as its own transition commits; child cleanup is a side
   obligation. Observably, a child may run (and even complete) in the window
@@ -274,10 +278,10 @@ Application rules:
 - **`startChild` is fenced.** A stale run can never attach a child that escapes
   a closure record. Under the parent's own row lock, the insert is refused
   (lease lost) when the parent's generation differs from the run's, when the
-  parent is terminal, or when a pending `ChildClose` target already covers the
-  child's derived scope (a same-generation orphan attaching into a discarded
-  region interior). A legitimate new child never matches a pending target,
-  because targets name only discarded interiors and old generations.
+  parent is terminal, or when a pending `child_close_requests` target already
+  covers the child's derived scope (a same-generation orphan attaching into a
+  discarded region interior). A legitimate new child never matches a pending
+  target, because targets name only discarded interiors and old generations.
 
 `Terminate` is intentionally absent from the policy enum. Force-stopping a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 

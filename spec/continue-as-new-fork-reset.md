@@ -23,16 +23,18 @@ workflow body does not continue after the call.
 - The generation is exposed only through `WorkflowInstance.Info`. Users should
   not normally need to inspect or use it.
 - The transition is committed atomically by the runtime: current execution
-  records and directly addressed `Signal` events are removed, a `ChildClose`
-  record targeting exactly the closing generation's children is written in the
-  parent's own steps, and the incremented generation and new input are installed
-  as one durable in-place state transition. Current execution records include
-  old await subscriptions and wakeups (pending `ChildClose` records survive the
-  generation erase). The unconsumed-signal handler runs before this transaction
+  records and directly addressed `Signal` events are removed, a
+  `child_close_requests` row targeting exactly the closing generation's children
+  is written in the dedicated `child_close_requests` table (keyed by the
+  parent's identity plus the target prefix), and the incremented generation and
+  new input are installed as one durable in-place state transition. Current
+  execution records include old await subscriptions and wakeups; pending
+  `child_close_requests` rows live in their own table and survive the
+  generation erase. The unconsumed-signal handler runs before this transaction
   while signal acceptance is closed. The directly addressed `Signal` events are
   deleted before children are delivered; this ordering is unobservable because
-  the inheritance walk treats a parent holding a matching `ChildClose` record as
-  detached (see `sub-workflows-iteration.md`, `ParentClosePolicy`).
+  the inheritance walk treats a parent holding a matching `child_close_requests`
+  row as detached (see `sub-workflows-iteration.md`, `ParentClosePolicy`).
 - Children of the old generation are handled asynchronously according to their
   `ParentClosePolicy`: `Cancel` requests cancellation and `Abandon` detaches
   them, delivered at each child's next run start or by the periodic child-close
@@ -108,6 +110,16 @@ runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
 - History strictly before `restartFromStep` remains cached. The selected step
   and subsequent history are erased, and the workflow replays from the top.
 - Runtime determines which steps are "after" or "before" by looking at the timestamp where the step row was last updated.
+- **Reset closes all children of the old generation.** Like `continueAsNew`, the
+  reset transaction records a `child_close_requests` row targeting exactly the
+  pre-increment generation's children (`parent identity + key@generation`),
+  delivered asynchronously per `ParentClosePolicy` (see
+  `sub-workflows-iteration.md`). Children created before the reset boundary are
+  closed; body replay recreates what is needed. A `startAsChild` inside a cached
+  step strictly before the boundary is closed and **not** recreated (the cached
+  step replays without re-executing its body), and the successor generation's
+  children carry the incremented marker and are never matched by the old
+  generation's closure target.
 
 ## Why this design
 

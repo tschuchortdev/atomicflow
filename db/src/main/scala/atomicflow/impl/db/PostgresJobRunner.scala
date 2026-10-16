@@ -378,10 +378,10 @@ final class PostgresJobRunner private[atomicflow] (
   }
 
   /** Child-close delivery: applies pending `ParentClosePolicy` closures
-    * recorded as `ChildClose` rows in parent instances' own steps, and detaches
-    * children whose parent rows are gone. Each child is closed in its own short
-    * transaction so no transaction ever locks another instance's rows.
-    * Idempotent. Returns the number of children closed.
+    * recorded as rows in the dedicated `child_close_requests` table, and
+    * detaches children whose parent rows are gone. Each child is closed in its
+    * own short transaction so no transaction ever locks another instance's
+    * rows. Idempotent. Returns the number of children closed.
     */
   private[atomicflow] def runChildCloseSweep(): Int =
     runtime.closePendingChildClosures(128)
