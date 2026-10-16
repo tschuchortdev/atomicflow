@@ -71,7 +71,7 @@ Workflow execution runs on two kinds of threads: **caller threads**, which execu
 
 Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.** That is still true at the queue level; the only refinement is *who* materializes signal and completion wakeups — the driver loop's two wakeup jobs (best-effort watermark dispatch and the periodic full subscription scan) rather than the sender or the terminal transition.
 
-**Child close is the one background path that is not a wakeup.** A parent's terminal/`continueAsNew`/region-restart transition records a `ChildClose` row in its own steps (never a row on a child), and the child's close is delivered by the child-close sweep or by the child's own run-start self-check — so a cancelling parent's transaction never locks another instance's rows. See `sub-workflows-iteration.md`, `ParentClosePolicy`.
+**Child close is the one background path that is not a wakeup.** A parent's terminal/`continueAsNew`/region-restart/reset transition records a row in the dedicated `child_close_requests` table (never a row on a child), and the child's close is delivered by the child-close sweep or by the child's own run-start self-check — so a cancelling parent's transaction never locks another instance's rows. See `sub-workflows-iteration.md`, `ParentClosePolicy`.
 
 ```scala
 trait WorkflowRuntime {

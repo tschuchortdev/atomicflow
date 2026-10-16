@@ -59,6 +59,13 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
   def newRuntime: PostgresWorkflowRuntime =
     PostgresWorkflowRuntime(newDataSource)(using ExecutionContext.global)
 
+  /** A raw JDBC connection to the suite's container, for tests that need to
+    * manipulate row locks outside the runtime (e.g. hold a child's row with
+    * `FOR UPDATE`).
+    */
+  protected def rawConnection: java.sql.Connection =
+    newDataSource.getConnection
+
   /** A fresh runtime with an injected clock, backed by the suite's single container. */
   def newRuntime(clock: Clock): PostgresWorkflowRuntime =
     PostgresWorkflowRuntime(newDataSource, clock)(using ExecutionContext.global)

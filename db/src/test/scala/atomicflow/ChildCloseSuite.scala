@@ -9,11 +9,11 @@ import java.time.Instant
 import scala.concurrent.duration.*
 
 /** Asynchronous ParentClosePolicy application: a parent's terminal transition,
-  * `continueAsNew`, and region restart record a `ChildClose` row in the parent's
-  * own steps and never touch child rows; the close is delivered (a) at the
-  * child's own run start (the self-check) and (b) by the periodic child-close
-  * sweep. Lives in package `atomicflow` so it can drive the package-private
-  * sweep hook deterministically.
+  * `continueAsNew`, region restart, and reset record a request row in the
+  * dedicated `child_close_requests` table and never touch child rows; the close
+  * is delivered (a) at the child's own run start (the self-check) and (b) by
+  * the periodic child-close sweep. Lives in package `atomicflow` so it can
+  * drive the package-private sweep hook deterministically.
   */
 class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
@@ -40,7 +40,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     ).map { case (t, te, c, pw, pk, ps) => ChildRow(t, te, c, pw, pk, ps) }
 
   private def childCloseRowCount(): Int =
-    run(sql"""SELECT COUNT(*) FROM workflow_steps WHERE step_kind = 'ChildClose'""".query[Int].unique)
+    run(sql"""SELECT COUNT(*) FROM child_close_requests""".query[Int].unique)
 
   private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Boolean =
     run(
@@ -54,6 +54,12 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     try runner.runChildCloseSweep()
     finally runner.stop(1.second)
   }
+
+  private def setUpdatedAt(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String, ts: Instant): Unit =
+    run(
+      sql"""UPDATE workflow_steps SET updated_at = $ts
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId""".update.run
+    )
 
   test("terminal close of a suspended Cancel child is asynchronous and delivered by the sweep") {
     val parentGate = Signal[String]("pgate")
@@ -78,7 +84,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
     // The terminal transition recorded the closure and touched no child rows.
-    assertEquals(childCloseRowCount(), 1, "the parent's terminal transition records exactly one ChildClose row")
+    assertEquals(childCloseRowCount(), 1, "the parent's terminal transition records exactly one close request")
     val before = childRow("worker", "worker-1", scope).get
     assertEquals(before.parentWf, Some("orders"), "the child is still attached immediately after the parent completes")
     assertEquals(before.cancelRequestedAt.isEmpty, true, "the cancel flag is not set synchronously")
@@ -94,7 +100,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     sweep(childWf)
     assertEquals(childRow("worker", "worker-1", scope).get.cancelRequestedAt.get, cancelFlag,
                 "a repeated sweep is a no-op")
-    assertEquals(childCloseRowCount(), 0, "the sweep removes the exhausted ChildClose row")
+    assertEquals(childCloseRowCount(), 0, "the sweep removes the exhausted close request")
 
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
     assertEquals(childRow("worker", "worker-1", scope).get.terminalState, Some("cancelled"))
@@ -211,7 +217,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val child1 = WorkflowInstanceId("worker", "c", Vector("orders", "order-42@1"))
     assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
 
-    assertEquals(childCloseRowCount(), 1, "continueAsNew records one closure row for the old generation")
+    assertEquals(childCloseRowCount(), 1, "continueAsNew records one closure request for the old generation")
 
     sweep(childWf)
 
@@ -255,7 +261,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val child1 = WorkflowInstanceId("worker", "c", Vector("orders", "order-42@0", "processing@1"))
     assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
 
-    assertEquals(childCloseRowCount(), 1, "the restart records one closure row for the discarded interior")
+    assertEquals(childCloseRowCount(), 1, "the restart records one closure request for the discarded interior")
 
     sweep(childWf)
 
@@ -369,12 +375,12 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
     gate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
-    assertEquals(childCloseRowCount(), 1, "the terminal close over a terminal attached child records a row")
+    assertEquals(childCloseRowCount(), 1, "the terminal close over a terminal attached child records a request")
 
     sweep(childWf)
 
     assertEquals(childRow("worker", "w", scope).get.parentWf, None, "the terminal child's pointer is cleared by delivery")
-    assertEquals(childCloseRowCount(), 0, "the exhausted record is removed")
+    assertEquals(childCloseRowCount(), 0, "the exhausted request is removed")
   }
 
   test("startChild is fenced: a stale generation or a terminal parent is refused") {
@@ -419,5 +425,159 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val row = childRow("worker", "w", scope).get
     assertEquals(row.terminalState, Some("cancelled"))
     assertEquals(row.parentWf, None)
+  }
+
+  test("reset closes the children of the old generation; the successor's children are untouched") {
+    val parentGate = Signal[String]("pgate")
+    val childGate  = Signal[String]("cgate")
+    val childWf = Workflow[String, String]("worker") { in =>
+      Step.await[String]("cwait", Awaitable.SignalEvent(childGate))
+      "done"
+    }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      Step.atLeastOnce[String]("pre") { "x" }
+      childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
+      Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val child0 = WorkflowInstanceId("worker", "c", Vector("orders", "order-42@0"))
+    assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
+
+    // Reset from the executed `pre` step: the old generation's child must be closed.
+    rt.resetWorkflow[String, String](parentId, StepId("pre"))(using parentWf)
+    assertEquals(childCloseRowCount(), 1, "reset records one closure request for the old generation")
+
+    sweep(childWf)
+
+    val row0 = childRow("worker", "c", child0.scope).get
+    assertEquals(row0.cancelRequestedAt.isDefined, true, "the old generation's child is cancelled by reset")
+    assertEquals(row0.parentWf, None, "the old generation's child is detached by reset")
+
+    // The successor generation starts its own child under a distinct scope.
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val child1 = WorkflowInstanceId("worker", "c", Vector("orders", "order-42@1"))
+    assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.WorkflowSuspended)
+
+    sweep(childWf)
+
+    val row1 = childRow("worker", "c", child1.scope).get
+    assertEquals(row1.cancelRequestedAt, None, "the successor generation's child is untouched by reset's closure")
+    assertEquals(row1.parentWf, Some("orders"), "the successor generation's child remains attached")
+
+    childGate.send(child1, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(childWf, child1), WorkflowRunResult.Result("done"),
+                 "the successor generation's child still works")
+  }
+
+  test("reset closes a child whose startAsChild is cached before the boundary and does not recreate it") {
+    val parentGate = Signal[String]("pgate")
+    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      Step.atLeastOnce[String]("start-child") {
+        childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
+        "started"
+      }
+      Step.atLeastOnce[String]("post") { "y" }
+      Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val child0 = WorkflowInstanceId("worker", "c", Vector("orders", "order-42@0"))
+    assertEquals(childRow("worker", "c", child0.scope).get.timesExecuted, 0, "the child is CREATED and never ran")
+
+    // Backdate the start-child step so it is strictly before the `post` boundary;
+    // on replay the cached step's body (startAsChild) is never re-executed.
+    setUpdatedAt("orders", "order-42", "start-child", Instant.parse("2026-01-01T00:00:00Z"))
+
+    rt.resetWorkflow[String, String](parentId, StepId("post"))(using parentWf)
+
+    sweep(childWf)
+    assertEquals(childRow("worker", "c", child0.scope).get.terminalState, Some("cancelled"),
+                 "the cached-before-boundary child is finalized CANCELLED by reset's closure")
+
+    // The replay resumes at the await; startAsChild is not re-executed.
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val rows = run(
+      sql"""SELECT workflow_instance_scope FROM workflow_instances
+            WHERE workflow_id = 'worker' AND workflow_instance_key = 'c' ORDER BY workflow_instance_scope""".query[Vector[String]].to[Vector]
+    )
+    assertEquals(rows, Vector(Vector("orders", "order-42@0")),
+                 "the closed child is not recreated: exactly one instance row, the cancelled one")
+  }
+
+  test("a locked child row does not block the parent's terminal transition") {
+    val parentGate = Signal[String]("pgate")
+    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
+      Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val scope   = Vector("orders", "order-42@0")
+    val childId = WorkflowInstanceId("worker", "c", scope)
+
+    // Hold the child's row locked from a raw connection for the duration of the
+    // parent's terminal transition.
+    val conn = rawConnection
+    conn.setAutoCommit(false)
+    val st = conn.prepareStatement(
+      "SELECT workflow_id FROM workflow_instances WHERE workflow_id = ? AND workflow_instance_key = ? AND workflow_instance_scope = ? FOR UPDATE"
+    )
+    st.setString(1, "worker")
+    st.setString(2, "c")
+    st.setArray(3, conn.createArrayOf("varchar", scope.toArray))
+    st.executeQuery()
+
+    try {
+      parentGate.send(parentId, "go")(using rt)
+      assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"),
+                   "the parent's terminal transition completes promptly despite the child row being locked")
+      assertEquals(rt.getWorkflowInstance(parentWf, parentId).getInfo()(using rt).terminalState,
+                   Some(WorkflowTerminalState.Completed))
+    } finally {
+      st.close()
+      conn.rollback()
+      conn.close()
+    }
+
+    sweep(childWf)
+    assertEquals(childRow("worker", "c", scope).get.terminalState, Some("cancelled"),
+                 "after the lock is released, the sweep closes the child")
+  }
+
+  test("Info.parentId is cleared after delivery") {
+    val parentGate = Signal[String]("pgate")
+    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val parentWf = Workflow[String, String]("orders") { in =>
+      childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Abandon)
+      Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+
+    val scope       = Vector("orders", "order-42@0")
+    val childId     = WorkflowInstanceId("worker", "c", scope)
+    val childHandle = rt.getWorkflowInstance(childWf, childId)
+
+    parentGate.send(parentId, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
+
+    assertEquals(childHandle.getInfo()(using rt).parentId, Some(parentId),
+                 "before delivery the parent pointer is still visible (the asynchrony window)")
+
+    sweep(childWf)
+
+    assertEquals(childHandle.getInfo()(using rt).parentId, None,
+                 "after delivery the parent pointer is cleared")
   }
 }

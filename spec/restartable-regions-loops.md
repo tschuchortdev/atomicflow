@@ -121,11 +121,11 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
   result therefore does not make an event behind its signal cursor consumable
   again.
 - Children created in a discarded generation are closed asynchronously
-  according to their `ParentClosePolicy`: the restart records a `ChildClose`
-  target for exactly the discarded interior (`…/id@restartCount`), delivered at
-  each child's next run start or by the child-close sweep, and never matches the
-  successor generation's children. Successor generations use distinct child
-  identities.
+  according to their `ParentClosePolicy`: the restart records a
+  `child_close_requests` row targeting exactly the discarded interior
+  (`…/id@restartCount`), delivered at each child's next run start or by the
+  child-close sweep, and never matches the successor generation's children.
+  Successor generations use distinct child identities.
 - Restartable regions have the same problems as `continueAsNew`: While Step and Await IDs can be reused after deletion, child IDs cannot, since the child may continue to live independently for a short time (there ID may then collide with the newly started child with the same ID). Thus, restartable regions must also include the loop count in the child's `WorkflowInstanceId` derivation (in the `scope` field), just like `continueAsNew` does for the generation. Each enclosing region's key and `restartCount` therefore
   contributes to the child's `scope`. The complete scope derivation rules are defined in `sub-workflows-iteration.md`.
 

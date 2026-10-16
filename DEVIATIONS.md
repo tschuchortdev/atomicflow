@@ -482,28 +482,33 @@ implementation phase.
 
 
 86. **ParentClosePolicy is delivered asynchronously (was: applied synchronously
-    inside the parent's transition).** A parent's terminal, `continueAsNew`, and
-    region-restart transitions no longer lock or modify child rows; each records
-    a `ChildClose` row in the *parent's own* `workflow_steps` whose
-    `step_scope_within_instance` is the target prefix (empty = all attached
-    children; otherwise the parent identity + `key@generation` + discarded
-    interior). Delivery happens at the child's own run start (self-check) and by
-    a new driver-loop child-close sweep, one child per short transaction, so no
-    transaction ever locks rows of more than one instance. Consequences:
+    inside the parent's transition).** A parent's terminal, `continueAsNew`,
+    region-restart, and reset transitions no longer lock or modify child rows;
+    each records a row in the dedicated `child_close_requests` table (keyed by
+    the parent's own identity plus a `target_prefix` and `created_at`; the
+    composite primary key deduplicates identical targets, and the foreign key
+    cascades on parent deletion) whose `target_prefix` is the scope prefix of
+    the children to close (empty = all attached children; otherwise the parent
+    identity + `key@generation` + discarded interior). Delivery happens at the
+    child's own run start (self-check) and by a new driver-loop child-close
+    sweep, one child per short transaction, so no transaction ever locks rows of
+    more than one instance. Consequences:
     - The active parent pointer (`parentId`) can remain set for a short
       asynchronous window after the parent closes, and a child may run — even
       complete — before its cancellation is delivered; `cancelTimeout` now
       measures from delivery.
     - Inherited-signal visibility cuts off at the closure *event*, not at
       delivery: the inheritance walk (run-time walk and full-scan ancestry CTE)
-      treats a terminal parent or a parent holding a matching `ChildClose` row
-      as detached, so no transitive ancestor event leaks in the window.
-    - `ChildClose` rows are runtime bookkeeping (`step_kind = 'ChildClose'`,
-      `state_kind = 'Pending'`) and are excluded from generic step handling:
-      `continueAsNew`'s generation erase, region-interior erases, fork copies,
-      and reset erases. A no-child closure writes no row (existence is checked
-      in the parent's transaction). The sweep deletes a row once no attached
-      child matches it.
+      treats a terminal parent or a parent holding a matching
+      `child_close_requests` row as detached, so no transitive ancestor event
+      leaks in the window.
+    - The closure record is a row in the dedicated `child_close_requests`
+      table, never a `workflow_steps` row, so the four generic step-handling
+      exclusions that used to protect `step_kind = 'ChildClose'` rows
+      (`continueAsNew`'s generation erase, region-interior erases, fork copies,
+      and reset erases) are gone. A no-child closure writes no row (existence
+      is checked in the parent's transaction). The sweep deletes a row once no
+      attached child matches it.
     - `startChild` is now fenced on the parent's generation *and* terminal
       state: a stale orphan run cannot attach a child under an old generation or
       under a terminal parent. It also takes the parent-row lock before the
@@ -514,3 +519,20 @@ implementation phase.
     - Spec updated in `sub-workflows-iteration.md` ("ParentClosePolicy", "Key
       derivation"), `continue-as-new-fork-reset.md`, `restartable-regions-loops.md`,
       and `running-workflows.md` ("Job runner and scheduling", wakeup sources).
+
+87. **`resetWorkflow` now closes all children of the old generation (was:
+    children survived reset).** Previously reset only bumped the generation and
+    erased step history, leaving the old generation's children attached. Now
+    reset records a `child_close_requests` row targeting exactly the
+    pre-increment generation's children (the same target `continueAsNew`
+    uses), delivered asynchronously per `ParentClosePolicy`, so all children of
+    the old generation are closed — including children of old-generation steps
+    at or after the boundary, whose erased steps replay and recreate them — and
+    body replay recreates what
+    is needed. Rationale: a reset discards the old attempt wholesale, so leaving
+    its children running under stale parents would leak them; closing them makes
+    reset's effect on children match continueAsNew's. Consequences: a
+    `startAsChild` inside a cached step strictly before the boundary is closed
+    and **not** recreated (the cached step replays without re-executing its
+    body); the successor generation's children carry the incremented marker and
+    are never matched by the old generation's closure target.
