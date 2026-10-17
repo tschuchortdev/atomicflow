@@ -26,25 +26,6 @@ final case class WorkflowInstanceId(
   @throws[WorkflowNotFoundException]
   def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
     runtime.sendSignal(this, signal.key, value)(using signal.cacheable)
-
-  /** Send a synchronous [[Update]] addressed to this instance. Forwarder for the
-    * runtime's `sendUpdate`, resolving the update's own [[Cacheable]]s.
-    */
-  @throws[WorkflowNotFoundException]
-  def sendUpdate[I, R](
-      workflow: Workflow[?, ?],
-      update: Update[I, R],
-      input: I,
-      idempotencyKey: String = "",
-      persistUnhandledUpdates: Boolean = false
-  )(using
-      runtime: WorkflowRuntime,
-      cacheableThrowable: Cacheable[Throwable]
-  ): UpdateSendResult[R] =
-    runtime.sendUpdate(workflow, this, update.key, input, idempotencyKey, persistUnhandledUpdates)(
-      using update,
-      cacheableThrowable
-    )
 }
 
 /** The result of appending a signal event. `InstanceAlreadyCompleted` is a
@@ -83,8 +64,9 @@ enum ParentClosePolicy {
   * `spec/sub-workflows-iteration.md`, "Inherited signals"). Defaults to `none`;
   * `some(prefixes)` permits matching key prefixes; `all` permits every key.
   * Inheritance is transitive only when every parent-child edge permits the key.
-  * Synchronous `Update`s are never inherited because multiple descendant
-  * responses would be ambiguous.
+  * The unimplemented synchronous Update design is intentionally not inherited:
+  * a synchronous request cannot have one unambiguous response if several
+  * descendants handle it.
   */
 enum SignalInheritance {
   case none

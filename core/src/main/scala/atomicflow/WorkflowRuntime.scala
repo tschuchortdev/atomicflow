@@ -77,21 +77,28 @@ trait WorkflowRuntime {
       expiresAt: Option[Instant]
   ): Unit
 
-  /** Delete the step row and its retry timer subscription atomically, fenced.
-    * Used both to invalidate an ongoing retry "as if the step never executed"
-    * and to discard an expired or drifted cached result.
+  /** Discard a step or await site atomically, fenced, in one transaction:
+    * delete the site's `workflow_steps` row (whatever its state) AND every
+    * subscription row of the site in all three subscription tables (signal,
+    * timer, completion). This is a superset of a plain step deletion, which
+    * only needs to remove the retry timer subscription: an ordinary user Step's
+    * sole subscription is its reserved `"__retry__"` timer, and awaits carry no
+    * retry subscriptions of their own, so removing all three kinds is always
+    * safe.
+    *
+    * Used (a) to invalidate an ongoing retry "as if the step never executed",
+    * (b) to discard a drifted (`invalidateOn` change) or expired
+    * (`invalidateAfter` TTL) cached step/await result before re-evaluating, and
+    * (c) to recompute a timer await whose deadline expression drifted or
+    * expired. In the timer case the caller deletes first and then evaluates:
+    * the fresh evaluation registers a brand-new timer subscription (new timer
+    * id, `now + delay` deadline), so the previous incarnation's `TimerFired`
+    * event is structurally inert. This spans two transactions instead of one;
+    * a crash in between leaves nothing registered for the site, so the lease
+    * recovery sweep (or the caller's own next run) re-runs the instance, which
+    * re-registers the subscription.
     */
-  def deleteStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
-
-  /** Retire an await-site atomically, fenced: delete the site's `succeeded`/
-    * `started` step row and all of its subscriptions in the three subscription
-    * tables, in one transaction. Used by drift/expiry re-evaluation so no stale
-    * registration (in particular a fired timer of the previous incarnation) can
-    * satisfy the re-evaluated site. Unlike [[deleteStep]], which removes only
-    * the step row and its retry timer subscription, this retires every
-    * subscription of the site (signal, timer, and update).
-    */
-  def retireAwaitSite(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
+  def deleteStepOrAwait(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
 
   /** Durably suspend an at-least-once step for a retry, fenced, in one
     * transaction: persist (or refresh) the `started` step row carrying the
@@ -130,64 +137,6 @@ trait WorkflowRuntime {
     */
   def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[SubscriberMatch]
 
-  /** Read the unhandled `Update` records of `updateKey` addressed directly to
-    * this instance, oldest first, without handling any of them. A plain durable
-    * read; no lease, fence, or write. Updates are never inherited, so only this
-    * instance's own rows are consulted.
-    */
-  def readAwaitUpdateCandidates(run: CurrentExecution, updateKey: String): Vector[UpdateCandidate]
-
-  /** Resolve an update await atomically, fenced: mark the selected candidate's
-    * record handled by writing `encodedResponse` and `handled_at` FIRST, gated
-    * on the row still being unhandled; only when the update affected a row
-    * (this branch won the record) persist the `succeeded` step row (`stepKind`)
-    * carrying `encodedOutput` and delete the site's update subscriptions — all
-    * in one transaction. The written response is what the blocked sender reads
-    * as `UpdateSendResult.Success`. Returns `true` when this branch handled the
-    * record, `false` when a concurrent branch already did (the caller should
-    * re-evaluate the await rather than commit a losing step row).
-    */
-  def resolveAwaitUpdate(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      updateKey: String,
-      candidate: UpdateCandidate,
-      encodedResponse: String,
-      encodedOutput: String,
-      expiresAt: Option[Instant]
-  ): Boolean
-
-  /** Suspend an update await, fenced, in one transaction: register the pending
-    * update subscription (idempotent), then re-read the unhandled records and
-    * apply `decide`. If `decide` selects a candidate, resolve the await
-    * (succeeded step row + handled record + subscription deletion) and return
-    * the decision; otherwise return `None` (suspended, subscriptions remain).
-    * The re-read within the transaction closes the lost-wakeup gap between
-    * candidate gathering and the suspension commit, so two awaits cannot
-    * double-consume the same record.
-    */
-  def suspendAwaitUpdate(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      updateKey: String,
-      expiresAt: Option[Instant]
-  )(decide: Vector[UpdateCandidate] => Option[AwaitUpdateDecision]): Option[AwaitUpdateDecision]
-
-  /** Retire an invalidated/expired timer await atomically, fenced: discard the
-    * site's `succeeded` step row, delete its old timer subscriptions, and
-    * register a fresh subscription (new timer id, `deadline`) — all in one
-    * transaction, so no crash window can leave the old incarnation live. The
-    * fresh deadline is recomputed (`now + delay`), so its old `TimerFired`
-    * event is structurally inert.
-    */
-  def invalidateTimer(run: CurrentExecution, stepId: StepId, stepVersion: Long, deadline: Instant): Unit
-
   /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
     * own transaction, fire the site's own due timer subscriptions
     * (`deadline <= now`), row-locked in deadline order
@@ -220,8 +169,8 @@ trait WorkflowRuntime {
 
   /** Delete every subscription row whose `step_scope_within_instance` equals one
     * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
-    * as a prefix), across all four subscription tables (signal, timer,
-    * completion, update), fenced. Used by
+    * as a prefix), across all three subscription tables (signal, timer,
+    * completion), fenced. Used by
     * `Step.firstToRunWithoutSuspension` to retire every branch's pending
     * subscriptions — including nested subscopes — before the winner's step row
     * is written. The ordering is deliberate: the winner row is the durable
@@ -259,10 +208,11 @@ trait WorkflowRuntime {
   ): Unit
 
   /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
-    * briefly row-locks the instance and checks `is_accepting_signals`, then
-    * appends the event (with the signal's `Cacheable`) and upserts a wakeup for
-    * the instance when a matching pending subscription exists. Does not acquire
-    * the execution lease.
+    * briefly row-locks the instance and rejects the append with
+    * [[SignalSendResult.InstanceAlreadyCompleted]] when it has already reached a
+    * terminal state, otherwise appends the event (with the signal's
+    * `Cacheable`). The sender only appends; wakeups are produced asynchronously
+    * by the job runner. Does not acquire the execution lease.
     */
   @throws[WorkflowNotFoundException]
   def sendSignal[A: Cacheable](
@@ -270,31 +220,6 @@ trait WorkflowRuntime {
       key: SignalKey,
       value: A
   ): SignalSendResult
-
-  /** Send a synchronous [[Update]] addressed directly to `workflowInstanceId`
-    * and block for its outcome.
-    *
-    * Updates are addressed to exactly one instance and are never inherited. The
-    * sender needs the [[Workflow]] definition so that, when the instance is free,
-    * it can run the workflow on the sender's own thread to deliver the update.
-    *
-    * `idempotencyKey`: when non-empty, sending the same (instance, update key,
-    * idempotency key) twice reuses the first send's record and returns the same
-    * result instead of creating a second record.
-    *
-    * `persistUnhandledUpdates`: when `true`, a run that finishes without handling
-    * the update keeps its record so a later `awaitUpdate` can consume it; when
-    * `false` (default) the unhandled record is deleted after the run.
-    */
-  @throws[WorkflowNotFoundException]
-  def sendUpdate[I, R](
-      workflow: Workflow[?, ?],
-      workflowInstanceId: WorkflowInstanceId,
-      updateKey: String,
-      input: I,
-      idempotencyKey: String = "",
-      persistUnhandledUpdates: Boolean = false
-  )(using u: Update[I, R], cacheableThrowable: Cacheable[Throwable]): UpdateSendResult[R]
 
   /** Register an instance, idempotent for equal (serialized) input; throws
     * [[WorkflowInputConflictException]] if the input differs.

@@ -383,7 +383,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assert(!hasWakeup(childWf.id, "worker-1", scope), "a conflicting replay must not commit a wakeup side effect")
   }
 
-  test("signal inheritance some(prefixes) is stored as an unambiguous JSON array") {
+  test("signal inheritance some(prefixes) is stored as a native text array") {
     val rt = newRuntime
     val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
     val parentWf = Workflow[String, String]("orders") { in =>
@@ -394,9 +394,9 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
     val scope = Vector("orders", "order-42@0")
-    val stored = run(sql"""SELECT inherit_signals FROM workflow_instances
-                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".query[String].option).get
-    assertEquals(stored, "some:" + upickle.default.write(Seq("a/\nb", "c,d")))
-    assert(!stored.contains('\n'), "prefixes containing newlines are JSON-escaped, not stored with literal newlines")
+    val stored = run(sql"""SELECT inherited_signal_mode, inherited_signal_prefixes FROM workflow_instances
+                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".query[(String, Vector[String])].unique)
+    assertEquals(stored._1, "prefixes")
+    assertEquals(stored._2, Vector("a/\nb", "c,d"), "prefixes are stored verbatim as array elements, including newlines")
   }
 }

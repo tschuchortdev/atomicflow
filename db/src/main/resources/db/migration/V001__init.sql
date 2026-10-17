@@ -15,13 +15,13 @@ CREATE TABLE workflow_instances (
   lease_owner VARCHAR,
   fencing_token BIGINT NOT NULL DEFAULT 0,
   lease_expires_at TIMESTAMPTZ,
-  is_accepting_signals BOOLEAN NOT NULL DEFAULT true,
   parent_workflow_id VARCHAR,
   parent_instance_key VARCHAR,
   parent_instance_scope VARCHAR[],
   parent_close_policy VARCHAR,
-  inherit_signals VARCHAR,
-  inherit_past_events BOOLEAN NOT NULL DEFAULT false,
+  inherited_signal_mode VARCHAR NOT NULL DEFAULT 'none',
+  inherited_signal_prefixes VARCHAR[] NOT NULL DEFAULT '{}',
+  inherit_past_signals BOOLEAN NOT NULL DEFAULT false,
   inherited_events_start_sequence_id BIGINT,
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );
@@ -159,48 +159,6 @@ CREATE TABLE workflow_wakeups (
     ON DELETE CASCADE
 );
 
-CREATE TABLE workflow_updates (
-  workflow_id VARCHAR NOT NULL,
-  workflow_instance_key VARCHAR NOT NULL,
-  workflow_instance_scope VARCHAR[] NOT NULL,
-  update_key VARCHAR NOT NULL,
-  encoded_input VARCHAR NOT NULL,
-  idempotency_key VARCHAR NOT NULL DEFAULT '',
-  result VARCHAR,
-  handled_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, idempotency_key, created_at),
-  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
-    ON DELETE CASCADE
-);
-
-CREATE UNIQUE INDEX workflow_updates_idempotency_unique
-  ON workflow_updates (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, idempotency_key)
-  WHERE idempotency_key <> '';
-
-CREATE INDEX workflow_updates_await
-  ON workflow_updates (workflow_id, workflow_instance_key, workflow_instance_scope, update_key, created_at)
-  WHERE handled_at IS NULL;
-
-CREATE TABLE workflow_update_subscriptions (
-  workflow_id VARCHAR NOT NULL,
-  workflow_instance_key VARCHAR NOT NULL,
-  workflow_instance_scope VARCHAR[] NOT NULL,
-  step_id VARCHAR NOT NULL,
-  step_scope_within_instance VARCHAR[] NOT NULL DEFAULT '{}',
-  step_version BIGINT NOT NULL,
-  subscriber_key VARCHAR NOT NULL,
-  update_key VARCHAR NOT NULL,
-  PRIMARY KEY (
-    workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, update_key, step_scope_within_instance
-  ),
-  FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
-    REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
-    ON DELETE CASCADE
-);
-
 CREATE TABLE workflow_event_dispatch (
   id SMALLINT PRIMARY KEY CHECK (id = 1),
   dispatched_through BIGINT NOT NULL
@@ -210,6 +168,9 @@ INSERT INTO workflow_event_dispatch (id, dispatched_through) VALUES (1, 0);
 
 CREATE INDEX workflow_completion_subscriptions_await
   ON workflow_completion_subscriptions (completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope);
+
+CREATE INDEX workflow_signal_subscriptions_key
+  ON workflow_signal_subscriptions (signal_key);
 
 CREATE INDEX workflow_instances_parent
   ON workflow_instances (parent_workflow_id, parent_instance_key, parent_instance_scope);

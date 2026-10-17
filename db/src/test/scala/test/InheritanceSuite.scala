@@ -7,6 +7,7 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 
 import scala.concurrent.duration.*
+import scala.jdk.CollectionConverters.*
 
 class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
 
@@ -30,6 +31,37 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
 
   private def childInfo(rt: PostgresWorkflowRuntime, parentId: WorkflowInstanceId, childKey: WorkflowInstanceKey): WorkflowInstance.Info =
     rt.getChildWorkflowInstances(parentId).find(_.id.workflowInstanceKey == childKey).get
+
+  private def storedInheritance(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: Vector[String]
+  ): (String, Vector[String], Boolean) =
+    run(
+      sql"""SELECT inherited_signal_mode, inherited_signal_prefixes, inherit_past_signals FROM workflow_instances
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope"""
+        .query[(String, Vector[String], Boolean)].unique
+    )
+
+  /** Captures the runtime logger's WARN messages emitted while `body` runs. */
+  private def withCapturedWarnings[A](body: => A): (A, Vector[String]) = {
+    val logger = org.slf4j.LoggerFactory
+      .getLogger("atomicflow.impl.db.PostgresWorkflowRuntime")
+      .asInstanceOf[ch.qos.logback.classic.Logger]
+    val appender = new ch.qos.logback.core.read.ListAppender[ch.qos.logback.classic.spi.ILoggingEvent]
+    appender.start()
+    logger.addAppender(appender)
+    try {
+      val result = body
+      val warnings = appender.list.asScala.toVector
+        .filter(_.getLevel == ch.qos.logback.classic.Level.WARN)
+        .map(_.getFormattedMessage)
+      (result, warnings)
+    } finally {
+      logger.detachAppender(appender)
+      appender.stop()
+    }
+  }
 
   test("default none: an event on the parent is invisible to the child's await") {
     val rt = newRuntime
@@ -283,7 +315,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     )
   }
 
-  test("broadening: replaying startAsChild with a wider policy wakes a suspended awaiting child") {
+  test("fixed at creation: replaying startAsChild with a wider policy keeps the stored policy and warns") {
     val rt = newRuntime
     val signal = Signal[String]("order/approve")
     var inherit = SignalInheritance.none
@@ -308,22 +340,36 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       "under none the child does not see the parent event"
     )
 
+    run(sql"""DELETE FROM workflow_wakeups
+              WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${childId.scope}""".update.run)
+    assert(!hasWakeup(childWf.id, "worker-1", childId.scope), "the child's stale creation wakeup is cleared")
+
     inherit = SignalInheritance.all
+    val (_, warnings) = withCapturedWarnings {
+      rt.runWorkflowInstance(parentWf, parentId)
+    }
     assertEquals(
-      rt.runWorkflowInstance(parentWf, parentId),
-      WorkflowRunResult.WorkflowSuspended,
-      "replaying the parent re-runs startAsChild and broadens the child's policy"
+      storedInheritance(childWf.id, "worker-1", childId.scope)._1,
+      "none",
+      "the configuration fixed at creation is kept; the replay does not replace it"
     )
-    assert(hasWakeup(childWf.id, "worker-1", childId.scope), "broadening durably schedules a wakeup for the affected subtree")
+    assert(
+      warnings.exists(w => w.contains("different signal-inheritance configuration") && w.contains(childId.toString)),
+      s"a replay that specifies a different configuration logs a WARN; got: $warnings"
+    )
+    assert(
+      !hasWakeup(childWf.id, "worker-1", childId.scope),
+      "no subtree wakeup is scheduled for a policy change anymore"
+    )
 
     assertEquals(
       rt.runWorkflowInstance(childWf, childId),
-      WorkflowRunResult.Result("done"),
-      "after broadening the suspended child resumes and consumes the retained parent event"
+      WorkflowRunResult.WorkflowSuspended,
+      "the child stays under the stored none policy, so the retained parent event remains invisible"
     )
   }
 
-  test("narrowing hides unresolved inherited events") {
+  test("fixed at creation: replaying startAsChild with a narrower policy keeps the stored policy and warns") {
     val rt = newRuntime
     val signal = Signal[String]("order/approve")
     var inherit = SignalInheritance.all
@@ -342,17 +388,54 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
     inherit = SignalInheritance.some(Seq("other/"))
-    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val (_, warnings) = withCapturedWarnings {
+      rt.runWorkflowInstance(parentWf, parentId)
+    }
+    assertEquals(
+      storedInheritance(childWf.id, "worker-1", childId.scope)._1,
+      "all",
+      "the stored all policy is kept; the narrowing replay is ignored"
+    )
+    assert(
+      warnings.exists(w => w.contains("different signal-inheritance configuration")),
+      s"the narrowing replay logs a WARN; got: $warnings"
+    )
 
     signal.send(parentId, "x")(using rt)
     assertEquals(
       rt.runWorkflowInstance(childWf, childId),
-      WorkflowRunResult.WorkflowSuspended,
-      "narrowing hides the unresolved inherited event"
+      WorkflowRunResult.Result("done"),
+      "the child keeps the stored all policy, so the event remains inherited"
     )
   }
 
-  test("narrowing leaves cached results replayable") {
+  test("a replay with an unchanged configuration is a silent no-op") {
+    val rt = newRuntime
+    val signal = Signal[String]("order/approve")
+    val childWf = Workflow[String, String]("worker") { _ =>
+      Step.await[String]("wait", Awaitable.SignalEvent(signal))
+      "done"
+    }
+    val parentWf = Workflow[String, String]("orders") { _ =>
+      childWf.startAsChild("worker-1", "hi", inheritSignals = SignalInheritance.all)
+      Step.await[String]("pwait", Awaitable.SignalEvent(Signal[String]("pgate")))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "o1", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val childId = childInfo(rt, parentId, "worker-1").id
+
+    val (_, warnings) = withCapturedWarnings {
+      rt.runWorkflowInstance(parentWf, parentId)
+    }
+    assert(
+      !warnings.exists(_.contains("different signal-inheritance configuration")),
+      s"an unchanged configuration must not warn; got: $warnings"
+    )
+    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, "all")
+  }
+
+  test("a diverging replay does not disturb a child's cached result") {
     val rt = newRuntime
     val signal = Signal[String]("order/approve")
     var inherit = SignalInheritance.all
@@ -373,13 +456,15 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("got:x"))
 
     inherit = SignalInheritance.some(Seq("other/"))
-    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val (_, warnings) = withCapturedWarnings { rt.runWorkflowInstance(parentWf, parentId) }
+    assert(warnings.exists(_.contains("different signal-inheritance configuration")))
+    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, "all")
 
     signal.send(parentId, "y")(using rt)
     assertEquals(
       rt.runWorkflowInstance(childWf, childId),
       WorkflowRunResult.Result("got:x"),
-      "the cached step result replays unchanged even though the event is now hidden"
+      "the cached step result replays unchanged despite the divergent replay"
     )
   }
 

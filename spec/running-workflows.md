@@ -69,7 +69,7 @@ Workflow execution runs on two kinds of threads: **caller threads**, which execu
 
 **The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal — are public methods on the `WorkflowRuntime` trait, each taking an opaque per-run handle: the runtime's `CurrentExecution` type member, created at run start and carried by `WorkflowContext.currentExecution`. (Cancellation delivery is not a runtime operation: Step's checkpoints read the durable flag through `isCancellationRequested` and throw.) What remains deliberately absent from the public trait are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
 
-Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.** That is still true at the queue level; the only refinement is *who* materializes signal and completion wakeups — the driver loop's two wakeup jobs (best-effort watermark dispatch and the periodic full subscription scan) rather than the sender or the terminal transition.
+Every background path — signals, timers, child completions, cancellation, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.** That is still true at the queue level; the only refinement is *who* materializes signal and completion wakeups — the driver loop's two wakeup jobs (best-effort watermark dispatch and the periodic full subscription scan) rather than the sender or the terminal transition.
 
 **Child close is the one background path that is not a wakeup.** A parent's terminal/`continueAsNew`/region-restart/reset transition records a row in the dedicated `child_close_requests` table (never a row on a child), and the child's close is delivered by the child-close sweep or by the child's own run-start self-check — so a cancelling parent's transaction never locks another instance's rows. See `sub-workflows-iteration.md`, `ParentClosePolicy`.
 
@@ -145,7 +145,6 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 | Full subscription scan | (periodic liveness pass) a non-terminal instance holds a pending signal or completion subscription with a visible, unconsumed candidate |
 | Timer firing | the sweep appended a `TimerFired` event for a due, not-yet-fired timer subscription |
 | `cancel` | cancellation is requested while the instance has no live lease owner |
-| Inheritance broadening | the policy change may unblock awaits in the affected descendant subtree |
 | `createAndSchedule` / `startAsChild` | schedules the first execution of a new instance |
 | Lease recovery sweep | a non-terminal instance's lease expired while held (worker crash) |
 | Executor requeue | a claimed run failed with a transient infrastructure error (delayed `scheduledAt`, `attempts + 1`) |
@@ -317,7 +316,7 @@ case class JobRunnerSettings(
 
 ### Why this design
 
-- **One queue, instance-addressed only.** Signals, timers, completions, cancellation, inheritance changes, and crash recovery all reduce to coalesced wakeup rows, and every row means "this instance may have work" — the queue never carries meta-work like "check whether timers are due"; timer firing is time-driven and only its results enter the queue. The executor has a single claim path, and coalescing keeps queue cost O(1) per instance per burst.
+- **One queue, instance-addressed only.** Signals, timers, completions, cancellation, and crash recovery all reduce to coalesced wakeup rows, and every row means "this instance may have work" — the queue never carries meta-work like "check whether timers are due"; timer firing is time-driven and only its results enter the queue. The executor has a single claim path, and coalescing keeps queue cost O(1) per instance per burst.
 - **The database is the coordinator.** No leader election, no external broker, no distributed scheduler state. Multi-process cooperation is conditional row updates — exactly the guarantee the storage backends already provide. Horizontal scaling is "start another process with a runner". The registry-filtered claim even allows different applications with different code to share the same tables.
 - **Fencing instead of mutual exclusion.** Leases must survive process crashes, so exclusivity is eventually consistent. The `fencing_token` makes stale writers harmless instead of assuming they are gone, which is what makes crash recovery a bounded, self-healing event.
 - **Sweeps are the liveness mechanism.** Every kind of durable pending state — wakeup row, due timer, overlong cancellation, expired lease — is discovered by a bounded, idempotent, leaderless sweep on a fixed cadence. For signal and completion wakeups the periodic full subscription scan is that mechanism: a suspended instance always has a subscription, and the scan catches any subscription committed concurrently with an event, so correctness needs no lost-wakeup reasoning on the writer's side.
@@ -565,6 +564,10 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
   outcome), revoke the lease, and never schedule the instance again. No resume
   is scheduled and no `WorkflowCancelledException` is delivered — the body gets no
   chance to run.
+- Directly addressed `Signal` events are gathered and deleted in the same
+  transition. No workflow definition is available on this path, so the
+  `onUnconsumedSignals` listener cannot run; any gathered unconsumed signals are
+  logged at WARN level instead of being silently dropped.
 - If currently running: the orphan thread may continue briefly but can never
   commit — all lease-checked writes are rejected, and its next checkpoint
   re-check observes the stored terminal state and discards the execution.
@@ -640,11 +643,12 @@ The public operation is available only inside an executing workflow through the 
 ### Semantics
 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
-2. After the unconsumed-signal handler finishes, one atomic transaction closes
-   old child relationships before deleting directly addressed `Signal` events
-   addressed to this instance, erases the remaining current execution state
-   (including old subscriptions and wakeups but not cursors), increments the generation counter,
-   and persists `newInput`. Older generations are not retained separately.
+2. One atomic transaction erases the current execution state (including old
+   subscriptions and wakeups but not cursors), closes old child relationships,
+   gathers the directly addressed `Signal` events (per signal key, after
+   cursors) and then deletes them, increments the generation counter, and
+   persists `newInput`. The `onUnconsumedSignals` handler runs after this
+   transaction commits. Older generations are not retained separately.
 3. The new generation therefore starts with a **completely empty** set of Step
    rows, subscriptions, and directly addressed event rows. Exact-key signal
    cursors survive the transition.
@@ -658,10 +662,11 @@ The public operation is available only inside an executing workflow through the 
 
 ### Unconsumed signals at the reset boundary
 
-Before transition, the workflow's `onUnconsumedSignals` handler receives all
-currently visible signals after the old generation's exact-key cursors. After
-the handler finishes and old child relationships are closed, directly addressed
-`Signal` events are physically deleted. Cached child Step results remain
+Inside the transition transaction the currently visible signals after the old
+generation's exact-key cursors are gathered, and the directly addressed
+`Signal` events are physically deleted as part of that same transaction; the
+workflow's `onUnconsumedSignals` handler then receives the gathered map after
+commit. Cached child Step results remain
 replayable without their source event. Events belonging to other workflow
 instances are not owned by this transition and are not deleted. A continuing
 child remains attached to its own parent and can inherit retained parent events

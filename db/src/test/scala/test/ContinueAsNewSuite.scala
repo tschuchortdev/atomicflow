@@ -157,7 +157,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     sig.send(id, "u2")(using rt)
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.ContinueAsNew)
-    assert(handlerCalled, "onUnconsumedSignals must run before the transition")
+    assert(handlerCalled, "onUnconsumedSignals must run after the transition commits")
     assertEquals(handlerMap.get("S"), Some(Seq("u1", "u2")))
     assertEquals(countSignalEvents(wf.id, "k"), 0, "directly addressed Signal events are deleted")
   }
@@ -240,7 +240,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row.parentKey, Some("p"))
     assertEquals(row.parentScope, Some(Vector.empty))
     val inherit = run(
-      sql"""SELECT inherit_signals, inherit_past_events FROM workflow_instances
+      sql"""SELECT inherited_signal_mode, inherit_past_signals FROM workflow_instances
             WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = $scope""".query[(String, Boolean)].unique
     )
     assertEquals(inherit._1, "all", "the inheritance configuration is unchanged")

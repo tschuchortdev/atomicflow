@@ -41,27 +41,6 @@ final case class AwaitTimerCandidate(
     createdAt: java.time.Instant
 )
 
-/** One unhandled `Update` record visible to an awaiting site (a row in
-  * `workflow_updates` with `handled_at IS NULL`). The row is identified by
-  * `createdAt` plus `idempotencyKey`; `encodedInput` is the update's payload.
-  */
-final case class UpdateCandidate(
-    createdAt: java.time.Instant,
-    idempotencyKey: String,
-    encodedInput: String
-)
-
-/** The outcome of an `awaitUpdate` that satisfies a candidate: which record was
-  * handled, the encoded synchronous `response` to persist on the record (what
-  * the blocked sender reads), and the encoded `output` to persist on the step
-  * row (what the workflow body receives).
-  */
-final case class AwaitUpdateDecision(
-    candidate: UpdateCandidate,
-    encodedResponse: String,
-    encodedOutput: String
-)
-
 /** The durable wait-site a runtime-computed await resolves into: the identity,
   * kind, fingerprints, and TTL of the `workflow_steps` row its result lands in.
   */
