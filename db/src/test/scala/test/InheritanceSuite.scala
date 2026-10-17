@@ -36,11 +36,11 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: Vector[String]
-  ): (String, Vector[String], Boolean) =
+  ): (Vector[String], Boolean) =
     run(
-      sql"""SELECT inherited_signal_mode, inherited_signal_prefixes, inherit_past_signals FROM workflow_instances
+      sql"""SELECT inherited_signal_prefixes, inherit_past_signals FROM workflow_instances
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope"""
-        .query[(String, Vector[String], Boolean)].unique
+        .query[(Vector[String], Boolean)].unique
     )
 
   /** Captures the runtime logger's WARN messages emitted while `body` runs. */
@@ -350,7 +350,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     }
     assertEquals(
       storedInheritance(childWf.id, "worker-1", childId.scope)._1,
-      "none",
+      Vector.empty[String],
       "the configuration fixed at creation is kept; the replay does not replace it"
     )
     assert(
@@ -393,7 +393,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     }
     assertEquals(
       storedInheritance(childWf.id, "worker-1", childId.scope)._1,
-      "all",
+      Vector(""),
       "the stored all policy is kept; the narrowing replay is ignored"
     )
     assert(
@@ -432,7 +432,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       !warnings.exists(_.contains("different signal-inheritance configuration")),
       s"an unchanged configuration must not warn; got: $warnings"
     )
-    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, "all")
+    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, Vector(""))
   }
 
   test("a diverging replay does not disturb a child's cached result") {
@@ -458,7 +458,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
     inherit = SignalInheritance.some(Seq("other/"))
     val (_, warnings) = withCapturedWarnings { rt.runWorkflowInstance(parentWf, parentId) }
     assert(warnings.exists(_.contains("different signal-inheritance configuration")))
-    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, "all")
+    assertEquals(storedInheritance(childWf.id, "worker-1", childId.scope)._1, Vector(""))
 
     signal.send(parentId, "y")(using rt)
     assertEquals(

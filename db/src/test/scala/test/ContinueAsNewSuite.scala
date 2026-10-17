@@ -240,10 +240,10 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row.parentKey, Some("p"))
     assertEquals(row.parentScope, Some(Vector.empty))
     val inherit = run(
-      sql"""SELECT inherited_signal_mode, inherit_past_signals FROM workflow_instances
-            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = $scope""".query[(String, Boolean)].unique
+      sql"""SELECT inherited_signal_prefixes, inherit_past_signals FROM workflow_instances
+            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = $scope""".query[(Vector[String], Boolean)].unique
     )
-    assertEquals(inherit._1, "all", "the inheritance configuration is unchanged")
+    assertEquals(inherit._1, Vector(""), "the inheritance configuration is unchanged")
     assertEquals(inherit._2, false)
   }
 

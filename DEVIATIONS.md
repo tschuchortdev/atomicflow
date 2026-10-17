@@ -763,3 +763,18 @@ implementation phase.
       (inherited-signals bullets), and `running-workflows.md` ("Sources of
       wakeups" row removed and the two "inheritance changes" background-path
       mentions dropped).
+
+93. **`inherited_signal_mode` is merged into `inherited_signal_prefixes`.**
+    The mode token was derivable data: the permitted-prefix set is the complete
+    configuration, so the storage encoding collapses `SignalInheritance` to one
+    `VARCHAR[]` column — an empty array inherits nothing, the single
+    empty-string prefix (a prefix of every key) inherits everything, any other
+    array inherits keys starting with one of its elements. The shared
+    `inheritedSignalSources` query's edge rule shrinks to one uniform
+    `EXISTS (... unnest(prefixes) ... starts_with(key, prefix))` predicate (no
+    mode branch), the recursion carries one column fewer, and a `COMMENT ON
+    COLUMN` documents the encoding in the schema. `signalInheritanceColumns`
+    becomes `permittedSignalPrefixes`; the ignored-change warning and its
+    rendering decode the encoding (empty set → `none`, `[""]` → `all`).
+    Supersedes the storage-columns part of entry 92; the public
+    `SignalInheritance` API and all semantics are unchanged.
