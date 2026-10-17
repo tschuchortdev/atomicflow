@@ -20,7 +20,7 @@ CREATE TABLE workflow_instances (
   parent_instance_scope VARCHAR[],
   parent_close_policy VARCHAR,
   inherited_signal_prefixes VARCHAR[] NOT NULL DEFAULT '{}',
-  inherit_past_signals BOOLEAN NOT NULL DEFAULT false,
+  inherit_past_events BOOLEAN NOT NULL DEFAULT false,
   inherited_events_start_sequence_id BIGINT,
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );

@@ -61,7 +61,7 @@ object Cacheable {
   inline def derived[A](using m: Mirror.Of[A], ct: ClassTag[A]): Cacheable[A] =
     Json.derived[A](using m, ct)
 
-  /** Hand-rolled codecs for primitives and standard containers. Members of
+  /** Codecs for primitives and standard containers. Members of
     * composite types are encoded as `frame(memberId) + frame(memberPayload)`.
     */
   object Simple {
@@ -198,7 +198,7 @@ object Cacheable {
     }
   }
 
-  /** Application-global `Cacheable[Throwable]` choices (see `steps.md`). One of
+  /** Application-wide `Cacheable[Throwable]` choices. One of
     * these (or a custom codec) must be selected explicitly; neither is an
     * automatic given.
     */

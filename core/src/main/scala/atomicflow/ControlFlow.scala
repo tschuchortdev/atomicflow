@@ -5,7 +5,7 @@ import scala.util.control.ControlThrowable
 /** Marker for the library's internal control-flow exceptions (suspension,
   * continue-as-new, restartable-region restart). They are thrown by the runtime to
   * implement non-local control transfer and are always caught at the workflow
-  * boundary; they must never escape the workflow body.
+  * or region boundary. Workflow code must let them propagate to that boundary.
   *
   * Extends [[ControlThrowable]], so both [[scala.util.control.NonFatal]] and
   * [[WorkflowNonFatal]] exclude them.
@@ -14,9 +14,8 @@ sealed trait WorkflowControlFlowException extends ControlThrowable
 
 /** Thrown when an await cannot be satisfied and the instance durably suspends.
   * The pending subscriptions are committed by the await evaluation before this
-  * exception is thrown; it carries no payload. It is an internal control-flow
-  * exception: only the runtime's await evaluation throws it, and it must never
-  * escape the workflow body.
+  * exception is thrown. Parallel operations can collect branch suspensions in
+  * `causes`. Workflow code must let it propagate to the runtime.
   */
 final class WorkflowSuspendedException private[atomicflow] (
     val causes: Seq[WorkflowSuspendedException] = Nil
@@ -25,11 +24,11 @@ final class WorkflowSuspendedException private[atomicflow] (
 }
 
 /** Thrown by `Workflow.continueAsNew` to abort the current body and restart the
-  * instance with new input. Carries the [[encoded]] bytes of the next input,
-  * serialized with the caller's local `Cacheable` at the forwarder. The runtime
+  * instance with new input. Carries the [[encoded]] string for the next input,
+  * serialized with the caller's local `Cacheable`. The runtime
   * decodes them with the current workflow definition's input codec when it
-  * commits the transition; the type system ties the two by convention, so a
-  * mismatch fails the run (acceptable).
+  * commits the transition. The caller must supply the workflow's input type;
+  * an incompatible encoding fails the run.
   */
 final class ContinueAsNewException private[atomicflow] (val encoded: String) extends WorkflowControlFlowException {
   override def toString: String = "ContinueAsNewException"
@@ -40,7 +39,7 @@ final class ContinueAsNewException private[atomicflow] (val encoded: String) ext
   * of the next generation, encoded with the region's `Cacheable[S]` at the
   * forwarder. The runtime's region loop catches it, commits the restart
   * transition (replacing the region row's state and count, discarding the
-  * previous looping's nested rows and subscriptions, closing its children), and
+  * previous iteration's nested rows and subscriptions, closing its children), and
   * re-enters the body locally in the same run.
   */
 final class RegionRestartException private[atomicflow] (val serializedState: String) extends WorkflowControlFlowException {

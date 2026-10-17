@@ -2,8 +2,7 @@ package atomicflow.internal
 
 import atomicflow.{WorkflowId, WorkflowInstanceKey}
 
-/** Composition of derived workflow-instance scopes (see
-  * `spec/sub-workflows-iteration.md`, "Key derivation").
+/** Builds child workflow scopes from parent identities and enclosing step scopes.
   *
   * The scope is a segment array: each element is a raw (unescaped) segment, and
   * structure comes from the array position rather than from delimiters, so no
@@ -24,8 +23,7 @@ private[atomicflow] object ScopePath {
     * the current run context: the parent's own instance scope, the parent
     * workflow id and instance key, the parent's current run generation as an
     * `@generation` marker, and the parent's enclosing `Workflow.scoped` path.
-    * The result is injective by construction because array positions are
-    * structural (see `spec/sub-workflows-iteration.md`, "Key derivation").
+    * Separate array positions distinguish components even when keys contain delimiters.
     *
     * @throws IllegalArgumentException
     *   when the composed scope exceeds [[MaxDerivedScopeLength]] (indicating

@@ -8,19 +8,17 @@ import scala.annotation.experimental
 import scala.annotation.targetName
 import scala.concurrent.duration.*
 
-/** The public step API: durable, replayed operations with per-key cache-drift
-  * policies (see `spec/steps.md`).
+/** Durable operations with stored results and named-input cache policies.
   */
 object Step {
 
-  private enum Guarantee { case AtLeastOnce, AtMostOnce }
+  private enum ExecutionGuarantee { case AtLeastOnce, AtMostOnce }
 
-  /** A built-in retry policy for `Step.atLeastOnce` (see `spec/steps.md`,
-    * "Built-in retries"). A policy decides, from the exact failure thrown by the
+  /** A retry policy for `Step.atLeastOnce`. A policy decides, from the failure thrown by the
     * step body and the retry bookkeeping accumulated so far, whether to retry
     * and after what delay.
     *
-    * `RetryPolicy` is orthogonal to the at-least-once/at-most-once guarantee:
+    * Retry policy and crash recovery are separate:
     * the guarantee governs crash recovery (whether an unresolved `Started`
     * record re-executes), while a retry policy governs what happens when the
     * body *completes* with an exception.
@@ -89,11 +87,6 @@ object Step {
       * (whichever is hit first; `Long.MaxValue` and `Duration.Inf` disable the
       * respective bound). The delay for the `failedAttempts`-th retry is
       * `initialDelay * multiplier^failedAttempts`.
-      *
-      * This is exposed as one method whose named-parameter forms match both
-      * spec variants: `exponentialBackoff(initialDelay, maxCumulativeDelay, ...)`
-      * and `exponentialBackoff(maxRetries, initialDelay, ...)`. (Scala forbids
-      * two overloaded methods both carrying default arguments.)
       */
     def exponentialBackoff(
         initialDelay: FiniteDuration,
@@ -161,7 +154,7 @@ object Step {
       invalidateAfter: Duration = Duration.Inf,
       retry: Step.RetryPolicy = Step.RetryPolicy.never
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    runStep(Guarantee.AtLeastOnce, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
+    runStep(ExecutionGuarantee.AtLeastOnce, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
   /** An at-most-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record yields `None`
@@ -187,7 +180,7 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runStep(Guarantee.AtMostOnce, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
+    runStep(ExecutionGuarantee.AtMostOnce, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** The cancellation checkpoint for new work (a Step body about to execute, or
     * an await about to be evaluated): unless the `Workflow.uncancellable` depth
@@ -214,13 +207,13 @@ object Step {
     * deadline.
     */
   private def runStep[A: Cacheable as valueCodec](
-     guarantee: Guarantee,
-     stepKey: String,
-     stepVersion: Long,
-     ensureUnchanged: Seq[StepInput[?]],
-     invalidateOn: Seq[StepInput[?]],
-     invalidateAfter: Duration,
-     retry: Step.RetryPolicy
+      guarantee: ExecutionGuarantee,
+      stepKey: String,
+      stepVersion: Long,
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateOn: Seq[StepInput[?]],
+      invalidateAfter: Duration,
+      retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
@@ -273,7 +266,7 @@ object Step {
       * by-name `body`) per attempt; inline retries loop rather than recurse so an
       * unbounded policy with tiny delays cannot grow the stack.
       */
-    def runBody(resumed: Option[RetryBookkeeping]): A = {
+    def runBody(resumed: Option[RetryState]): A = {
       throwIfCancelled
       var bookkeeping = resumed.getOrElse {
         rt.writeStepState(
@@ -286,7 +279,7 @@ object Step {
           "",
           None
         )
-        RetryBookkeeping.initial
+        RetryState.initial
       }
       while (true) {
         try {
@@ -322,7 +315,7 @@ object Step {
                     stepVersion,
                     stepKind,
                     fingerprints,
-                    RetryBookkeeping.encode(bookkeeping),
+                    RetryState.encode(bookkeeping),
                     deadline,
                     expiresAt
                   )
@@ -350,11 +343,11 @@ object Step {
             Some(decodeStored(valueCodec, stepKey)(row.statePayload))
           case StoredStep.State.Failed =>
             throw decodeStoredFailure(throwableCodec, stepKey)(row.statePayload)
-          case StoredStep.State.Started if guarantee == Guarantee.AtMostOnce =>
+          case StoredStep.State.Started if guarantee == ExecutionGuarantee.AtMostOnce =>
             None
-          case StoredStep.State.Started if row.statePayload.startsWith(RetryBookkeeping.payloadPrefix) =>
+          case StoredStep.State.Started if row.statePayload.startsWith(RetryState.payloadPrefix) =>
             if (!rt.fireStepRetryIfDue(run, stepId, stepVersion)) throw new WorkflowSuspendedException
-            Some(runBody(Some(RetryBookkeeping.decode(row.statePayload))))
+            Some(runBody(Some(RetryState.decode(row.statePayload))))
           case StoredStep.State.Started =>
             Some(runBody(None))
         }
@@ -394,7 +387,7 @@ object Step {
     * persisted in `workflow_steps` and replayed from cache, so a re-run never
     * re-suspends on an already-resolved await.
     *
-    * If the await cannot be satisfied from durable facts it durably suspends the
+    * If no stored event satisfies the wait, it suspends the
     * workflow by throwing [[WorkflowSuspendedException]] (an internal
     * control-flow exception the runtime catches at the boundary). User code must
     * ignore or rethrow it.
@@ -431,7 +424,7 @@ object Step {
       case Awaitable.Mapped(_, _) =>
         throw new UnsupportedOperationException("awaiting a mapped awaitable is not yet supported")
       case _ =>
-        awaitRace0(stepKey, Seq(("", awaitable)), invalidateOn, ensureUnchanged, invalidateAfter)
+        evaluateAwaitRace(stepKey, Seq(("", awaitable)), invalidateOn, ensureUnchanged, invalidateAfter)
     }
 
   /** Race several awaitables and resolve with the earliest satisfying durable
@@ -442,17 +435,17 @@ object Step {
     * subscriber key, a stable identity that names the awaitable within this race
     * independently of its position. Keys must be non-empty, unique within the
     * race, and must not start with `"__"` (reserved for engine-internal
-    * subscribers). Reordering the branchs never changes their subscription
+    * subscribers). Reordering the branches never changes their subscription
     * identity.
     *
     * Creates one subscription per branch in the corresponding table. Each signal
     * branch retains the shared exact-key cursor for its own key; only the winning
     * signal key's cursor advances. A satisfied race persists a `succeeded` step
     * row (result = the winning branch's value) and retires every branch's
-    * subscription atomically. If no candidate is satisfiable the workflow durably
-    * suspends with every branch's subscription registered and no cursor movement.
+    * subscription atomically. If no candidate matches, the workflow suspends
+    * with all subscriptions registered and signal cursors advanced past rejected events.
     *
-    * Due timer branchs of the race are materialized at evaluation in deadline
+    * Due timer branches of the race are fired at evaluation in deadline
     * order, so the earliest due timer wins deterministically among timers.
     *
     * Drift policies apply exactly as for [[await]]: `ensureUnchanged` values must
@@ -477,7 +470,7 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, Awaitable[A])*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
     validateBranchKeys(stepKey, branches.map(_._1))
-    awaitRace0(stepKey, branches.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
+    evaluateAwaitRace(stepKey, branches.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
   }
 
   /** Validates user-supplied race branch keys (an [[awaitRace]] member key or a
@@ -500,71 +493,33 @@ object Step {
     )
   }
 
-  /** Read the currently visible events of `s` (those after the instance's shared
+  /** Read the currently visible events of `signal` (those after the instance's shared
     * exact-key cursor) without advancing the cursor. The returned values are the
     * decoded signal payloads.
     */
-  def peekSignal[A](s: Signal[A])(using ctx: WorkflowContext): Seq[A] =
-    ctx.runtime.readAwaitSignalCandidates(ctx.currentExecution, s.key).map { c =>
-      try s.cacheable.read(c.payload)
+  def peekSignal[A](signal: Signal[A])(using ctx: WorkflowContext): Seq[A] =
+    ctx.runtime.readAwaitSignalCandidates(ctx.currentExecution, signal.key).map { candidate =>
+      try signal.cacheable.read(candidate.payload)
       catch {
-        case _: Throwable => throw new StepSerializationFailed(s"Signal '${s.key}' payload could not be decoded")
+        case _: Throwable => throw new StepSerializationFailed(s"Signal '${signal.key}' payload could not be decoded")
       }
     }
 
-  /** Runs several branches concurrently (via Ox `par`) and returns the result of
-    * the first branch to complete normally, without suspending. If every branch
-    * suspends, one combined [[WorkflowSuspendedException]] carrying each
-    * branch's suspension in `causes` is thrown, exactly like `Workflow.parallel`.
-    * If at least one branch completes, the first completed branch wins: its
-    * result is returned and the other branches' suspensions are DISCARDED (their
-    * pending subscriptions are cleaned up best-effort). A non-suspension failure
-    * in any branch fails the construct (propagated after the branches settle,
-    * parallel-failure semantics) and records no winner.
+  /** Runs branches concurrently and waits for them to finish or suspend.
+    * Returns and stores the result of the first declared branch that completed
+    * normally. If all branches suspend, throws their combined suspension. A
+    * non-suspension failure propagates without storing a winner.
     *
-    * Unlike `Workflow.parallel`, this construct is EDGE-triggered, so it persists
-    * its own step row (`FirstToRunWithoutSuspension`) recording the winning
-    * branch's result. On replay the first-ever-completed branch's result is
-    * returned even if later reruns would unblock a different branch first: once
-    * a winner is recorded it is never recomputed, and no branch runs again. The
-    * winning branch's identity is transaction-local (used to select the result)
-    * and is not retained — the row persists only the public returned value,
-    * exactly like a cached await.
+    * Replay returns the stored result without running branches again, unless
+    * `invalidateOn` inputs change. `ensureUnchanged` inputs must remain equal.
+    * Each branch has its own step scope. All branch subscriptions, including
+    * nested scopes, are deleted before the winning result is stored. A crash
+    * before that write can rerun branches and select a different result.
     *
-    * Each branch's pending subscriptions — including those of nested subscopes —
-    * are deleted BEFORE the winner's row is written. The ordering is deliberate:
-    * the winner row is the durable first-wins marker, so a crash in between
-    * leaves no marker and the construct's next run re-evaluates from scratch and
-    * re-deletes; a committed winner row never coexists with branch
-    * subscriptions. A crash before the winner row is committed re-runs the
-    * branches (see the WARNING below): the recomputed winner may differ from the
-    * discarded run's outcome.
-    *
-    * WARNING — dangerous pitfalls: racing arbitrary code against an await depends
-    * on WHEN the code is run, and code that runs as a branch may be re-executed
-    * on replay. A `Thread.sleep` or other blocking call that completes inline
-    * will beat an await that merely suspends: the await throws
-    * [[WorkflowSuspendedException]] and is not unblocked until the whole workflow
-    * re-runs, while the blocking call finishes immediately on this run.
-    *
-    * Even when every branch suspends, the construct only behaves as expected when
-    * the workflow is re-run for each incoming event individually. If the workflow
-    * is re-run for multiple events at once (for example because of a long queue
-      * in the job runner), several branches may become unblocked in the same run
-      * and the code cannot tell which event came first: the winner is whichever the
-      * implementation observes first, NOT a spec-guaranteed order (though the
-      * recorded winner is durable first-wins). When several branches complete in
-      * the same run, the earliest declared completed branch is the deterministic
-      * tie-break winner.
-    *
-    * Each branch runs in its own branch-scoped identity (the branch's key, a
-    * stable name like an [[awaitRace]] member key), so two branches awaiting
-    * the same key register distinct subscriptions and cleanup cannot delete the
-    * winner's (or another branch's) rows.
-    *
-    * Drift policies apply exactly as for ordinary steps: `ensureUnchanged` values
-    * must be invariant between runs, and `invalidateOn` changes discard the
-    * cached winner and re-run from scratch.
+    * This operation does not select by event time. A blocking branch can finish
+    * while another branch suspends on a wait. When several branches complete
+    * during one run, declaration order selects the result. Use [[awaitRace]]
+    * when the earliest stored event must win.
     *
     * @param stepId
     *   the construct's stable identity within the workflow
@@ -572,7 +527,7 @@ object Step {
     *   named inputs that invalidate the cached result when they change
     * @param ensureUnchanged
     *   named inputs that must be invariant between runs
-* @param branches
+    * @param branches
     *   the `key -> branch` pairs to race; keys are non-empty, unique within the
     *   race, and must not start with `"__"` (reserved for engine-internal
     *   subscribers); the first branch to complete normally wins. Each branch
@@ -588,9 +543,9 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, () => WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
-    firstToRun0(stepId, invalidateOn, ensureUnchanged, branches.toVector)
+    evaluateFirstCompletedBranch(stepId, invalidateOn, ensureUnchanged, branches.toVector)
 
-  private def firstToRun0[R: Cacheable](
+  private def evaluateFirstCompletedBranch[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]],
@@ -600,7 +555,7 @@ object Step {
     validateBranchKeys(stepId, branches.map(_._1))
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
-    val stepIdv = StepId(stepId, ctx.currentScope)
+    val scopedStepId = StepId(stepId, ctx.currentScope)
     val valueCodec = summon[Cacheable[R]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = rt.clock.instant()
@@ -616,11 +571,11 @@ object Step {
       val baseScope = ctx.currentScope
       val baseScopePath = ctx.scopePath
       val branchPaths = branches.map((key, _) => branchPath(baseScope, key))
-      val branchCtxs = branches.map((key, _) => ctx.copy(scopePath = baseScopePath :+ branchSegment(key)))
+      val branchContexts = branches.map((key, _) => ctx.copy(scopePath = baseScopePath :+ branchSegment(key)))
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
-            try Right(branches(i)._2()(using branchCtxs(i)))
+            try Right(branches(i)._2()(using branchContexts(i)))
             catch { case e: WorkflowSuspendedException => Left(e) }
         })
       val suspensions = outcomes.collect { case Left(s) => s }
@@ -635,18 +590,18 @@ object Step {
         // run re-evaluates from scratch and re-deletes.
         rt.deleteSubscriptionsUnderScopePaths(run, branchPaths)
         rt.writeStepState(
-          run, stepIdv, 0L, "FirstToRunWithoutSuspension", StoredStep.State.Succeeded, fingerprints, serialized, None
+          run, scopedStepId, 0L, "FirstToRunWithoutSuspension", StoredStep.State.Succeeded, fingerprints, serialized, None
         )
         decoded
       }
     }
 
-    val rawExisting = rt.lookupStep(run, stepIdv, 0L)
+    val rawExisting = rt.lookupStep(run, scopedStepId, 0L)
     val replayable =
       rawExisting.filterNot(row =>
         isExpired(row, now) || haveInputsChanged(stepId, row, ensureUnchanged, invalidateOn)
       )
-    if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStepOrAwait(run, stepIdv, 0L)
+    if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStepOrAwait(run, scopedStepId, 0L)
 
     replayable match {
       case Some(row) if row.state == StoredStep.State.Succeeded => decodeStored(valueCodec, stepId)(row.statePayload)
@@ -704,14 +659,14 @@ object Step {
     * conflicts throw; an `invalidateOn` change or an expired row discards the
     * site (`deleteStepOrAwait`: its step row plus every subscription) and
     * re-evaluates from scratch, so no stale registration can satisfy the new
-    * incarnation.
+    * registration.
     */
-  private def awaitRace0[A: Cacheable](
-                                        stepKey: String,
-                                        branches: Seq[(String, Awaitable[A])],
-                                        invalidateOn: Seq[StepInput[?]],
-                                        ensureUnchanged: Seq[StepInput[?]],
-                                        invalidateAfter: Duration
+  private def evaluateAwaitRace[A: Cacheable](
+      stepKey: String,
+      branches: Seq[(String, Awaitable[A])],
+      invalidateOn: Seq[StepInput[?]],
+      ensureUnchanged: Seq[StepInput[?]],
+      invalidateAfter: Duration
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
     require(branches.nonEmpty, s"awaitRace('$stepKey') requires at least one branch")
     val rt: ctx.runtime.type = ctx.runtime
@@ -756,11 +711,11 @@ object Step {
     * (`SignalEvent`, `Timer`, or `WorkflowCompletion`) plus the composition of
     * its `map` transforms, which maps the raw value onto the awaited type `A`.
     */
-  private def flattenAwaitable[A](a: Awaitable[A]): (Awaitable[?], Any => A) = a match {
-    case Awaitable.Mapped(u, f) =>
-      val (base, g) = flattenAwaitable(u)
-      (base, g.andThen(f))
-    case base => (base, (x: Any) => x.asInstanceOf[A])
+  private def flattenAwaitable[A](awaitable: Awaitable[A]): (Awaitable[?], Any => A) = awaitable match {
+    case Awaitable.Mapped(underlying, transform) =>
+      val (base, mapUnderlying) = flattenAwaitable(underlying)
+      (base, mapUnderlying.andThen(transform))
+    case base => (base, (value: Any) => value.asInstanceOf[A])
   }
 
   /** Selects the earliest satisfying candidate across every subscriber by global
@@ -787,12 +742,12 @@ object Step {
   }
 
   private def buildSubscriber[A](
-                                  a: Awaitable[A],
-                                  branchKey: String,
-                                  valueCodec: Cacheable[A],
-                                  now: java.time.Instant
+      awaitable: Awaitable[A],
+      branchKey: String,
+      valueCodec: Cacheable[A],
+      now: java.time.Instant
   ): (Subscriber, SubscriberMatcher[A]) = {
-    val (base, toA) = flattenAwaitable(a)
+    val (base, mapResult) = flattenAwaitable(awaitable)
     base match {
       case Awaitable.SignalEvent(signal, filter, lookBack) =>
         val subscriber = Subscriber.Signal(branchKey, signal.key)
@@ -817,7 +772,7 @@ object Step {
             }
             matching.map { c =>
               val serialized =
-                try valueCodec.write(toA(signalCodec.read(c.payload)))
+                try valueCodec.write(mapResult(signalCodec.read(c.payload)))
                 catch {
                   case _: Throwable =>
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
@@ -833,7 +788,7 @@ object Step {
           override def pick(candidates: Vector[SubscriberMatch]): Option[(Long, String, Option[SignalKey])] =
             candidates.find(_.subscriberKey == branchKey).map { c =>
               val serialized =
-                try valueCodec.write(toA(()))
+                try valueCodec.write(mapResult(()))
                 catch {
                   case _: Throwable =>
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
@@ -859,7 +814,7 @@ object Step {
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' completion could not be decoded")
                 }
               val serialized =
-                try valueCodec.write(toA(decoded))
+                try valueCodec.write(mapResult(decoded))
                 catch {
                   case _: Throwable =>
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
@@ -887,8 +842,8 @@ object Step {
 
   /** Deterministic, order-insensitive encoding of the named inputs. Each line is
     * `<hex(name)>|<base64fingerprint>`; lines are sorted by name and joined with
-    * `\n`. Empty when there are no named inputs (the instance id is then the sole
-    * cache key).
+    * `\n`. Empty when there are no named inputs; step identity and version still
+    * select the stored record.
     */
   private def encodeFingerprints(inputs: Seq[StepInput[?]]): String =
     inputs
@@ -965,28 +920,28 @@ object Step {
     * `retry:<failedAttempts>:<cumulativeNanos>:<lastNanos>` (`-1` for no last
     * delay).
     */
-  private final case class RetryBookkeeping(
+  private final case class RetryState(
       failedAttempts: Int,
       cumulativeDelay: FiniteDuration,
       lastDelay: Option[FiniteDuration]
   ) {
-    def after(delay: FiniteDuration): RetryBookkeeping =
-      RetryBookkeeping(failedAttempts + 1, cumulativeDelay + delay, Some(delay))
+    def after(delay: FiniteDuration): RetryState =
+      RetryState(failedAttempts + 1, cumulativeDelay + delay, Some(delay))
   }
 
-  private object RetryBookkeeping {
+  private object RetryState {
     val payloadPrefix = "retry:"
-    val initial: RetryBookkeeping = RetryBookkeeping(0, 0.seconds, None)
+    val initial: RetryState = RetryState(0, 0.seconds, None)
 
-    def encode(b: RetryBookkeeping): String =
-      s"$payloadPrefix${b.failedAttempts}:${b.cumulativeDelay.toNanos}:${b.lastDelay.fold(-1L)(_.toNanos)}"
+    def encode(state: RetryState): String =
+      s"$payloadPrefix${state.failedAttempts}:${state.cumulativeDelay.toNanos}:${state.lastDelay.fold(-1L)(_.toNanos)}"
 
-    def decode(payload: String): RetryBookkeeping = {
+    def decode(payload: String): RetryState = {
       val parts = payload.split(":")
       val lastDelay =
         if (parts(3).toLong == -1L) None
         else Some(FiniteDuration(parts(3).toLong, NANOSECONDS))
-      RetryBookkeeping(parts(1).toInt, FiniteDuration(parts(2).toLong, NANOSECONDS), lastDelay)
+      RetryState(parts(1).toInt, FiniteDuration(parts(2).toLong, NANOSECONDS), lastDelay)
     }
   }
 

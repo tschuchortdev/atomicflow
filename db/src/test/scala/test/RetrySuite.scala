@@ -104,7 +104,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1, "the body must not re-execute before the retry deadline")
   }
 
-  test("two consecutive durable retries each mint a fresh subscription; a re-run before the second delay stays suspended") {
+  test("consecutive durable retries create distinct subscriptions; a run before the second deadline stays suspended") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
     val counter = new AtomicInteger(0)
@@ -126,7 +126,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 2, "the second attempt executes after the first deadline")
     val subs2 = timerSubscriptions(wf.id, "k")
     assertEquals(subs2.length, 1, "exactly one retry subscription")
-    assertNotEquals(subs2.head._1, sub1, "the second durable retry mints a fresh subscription id")
+    assertNotEquals(subs2.head._1, sub1, "the second durable retry creates a new subscription id")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 2, "before the second deadline the body must not re-execute")
@@ -274,7 +274,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 2, "after the TTL the body executes fresh (as if never begun)")
     val sub2 = timerSubscriptions(wf.id, "k")
     assertEquals(sub2.length, 1, "a fresh retry subscription is scheduled")
-    assertNotEquals(sub2.head._1, sub1.head._1, "the fresh retry mints a new subscription id")
+    assertNotEquals(sub2.head._1, sub1.head._1, "the new retry creates a new subscription id")
   }
 
   test("getExecutionState reports Started while a durable retry is suspended") {

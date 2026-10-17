@@ -8,12 +8,9 @@ import test.PostgresWorkflowRuntimeSuite
 
 import java.time.Instant
 
-/** Exercises the runtime's boundary handling of [[WorkflowSuspendedException]],
-  * the library's internal control-flow exception. Because its constructor is
-  * `private[atomicflow]` (user code must not fabricate suspensions — the durable
-  * subscriptions are committed by await evaluation before it is thrown), this
-  * suite lives in package `atomicflow` so it can construct the exception and
-  * verify the boundary-catch behavior the spec mandates.
+/** Verifies that the runtime catches suspension, releases the execution lease,
+  * and leaves the instance non-terminal. This package can access the internal
+  * exception constructor without registering a real wait.
   */
 class RunEngineControlFlowSuite extends PostgresWorkflowRuntimeSuite {
 

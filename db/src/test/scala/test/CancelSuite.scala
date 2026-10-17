@@ -87,7 +87,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(completedEvent(wf.id, "k").map(_._1), Some("WorkflowCompleted"))
   }
 
-  test("cancel while suspended delivers at the frontier await; the cached step is not re-executed; boundary returns WorkflowCancelled") {
+  test("cancellation is delivered at the pending await; the cached step replays and the run returns WorkflowCancelled") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val counter = new AtomicInteger(0)

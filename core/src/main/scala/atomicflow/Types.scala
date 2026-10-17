@@ -1,8 +1,6 @@
 package atomicflow
 
-/** Identity types of the workflow model (see `spec/core-types.md`). Ids only; no
-  * definition objects, codecs, or runtime services.
-  */
+/** String identifiers for workflow definitions, instances, and signals. */
 
 type WorkflowId = String
 type WorkflowInstanceKey = String
@@ -11,8 +9,8 @@ type SignalKey = String
 /** The address of a workflow instance: definition id, user-chosen key, and scope.
   *
   * `scope` is `Vector.empty` for top-level instances; children started via
-  * `startAsChild` carry a derived, non-empty scope (see
-  * `spec/sub-workflows-iteration.md`). Creation APIs never accept a scope.
+  * `startAsChild` carry a scope derived from the parent's identity, generation,
+  * and enclosing step scopes. Creation APIs never accept a scope.
   */
 final case class WorkflowInstanceId(
     workflowId: WorkflowId,
@@ -28,10 +26,7 @@ final case class WorkflowInstanceId(
     runtime.sendSignal(this, signal.key, value)(using signal.cacheable)
 }
 
-/** The result of appending a signal event. `InstanceAlreadyCompleted` is a
-  * first-class return instead of an exception because the caller must handle it
-  * (the addressed instance has stopped accepting signals).
-  */
+/** Whether a signal was stored or rejected because the instance is terminal. */
 enum SignalSendResult {
   case Success
   case InstanceAlreadyCompleted
@@ -51,8 +46,7 @@ enum WorkflowTerminalState {
 }
 
 /** What happens to a child workflow when its parent reaches a terminal state or
-  * calls `continueAsNew` (see `spec/sub-workflows-iteration.md`,
-  * "ParentClosePolicy"). `Cancel` delivers a cooperative cancellation;
+  * calls `continueAsNew`. `Cancel` delivers a cooperative cancellation;
   * `Abandon` detaches the child, which continues independently.
   */
 enum ParentClosePolicy {
@@ -60,21 +54,15 @@ enum ParentClosePolicy {
   case Abandon
 }
 
-/** Which signals addressed to a child's parent are visible to the child (see
-  * `spec/sub-workflows-iteration.md`, "Inherited signals"). Defaults to `none`;
+/** Which signals addressed to a child's parent are visible to the child. Defaults to `none`;
   * `some(prefixes)` permits matching key prefixes; `all` permits every key.
   * Inheritance is transitive only when every parent-child edge permits the key.
-  * The unimplemented synchronous Update design is intentionally not inherited:
-  * a synchronous request cannot have one unambiguous response if several
-  * descendants handle it.
   */
 enum SignalInheritance {
   case none
   case all
   /** Permit every key matching one of `prefixes`. The prefixes are a `Seq`, so a
     * multi-prefix selection is written `some(Seq("approval/", "order/cancelled"))`
-    * (the spec shows a varargs call shape, but enum case parameters cannot be
-    * varargs).
     */
   case some(prefixes: Seq[SignalKey])
 }

@@ -10,7 +10,7 @@ package atomicflow
   */
 class StepFailed(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
 
-/** Delivered by the runtime at frontier checkpoints while `cancel_requested_at` is
+/** Thrown before an uncached step or wait while `cancel_requested_at` is
   * set. A plain public [[RuntimeException]] so ordinary cleanup (`NonFatal`, broad
   * catches) can run; catching it is legitimate user behavior (compensation), not a
   * library control-flow violation.
@@ -71,8 +71,7 @@ object LeaseLostException {
   */
 class StepInputConflictException(message: String) extends RuntimeException(message)
 
-/** Thrown when a stored terminal outcome cannot be decoded with the configured
-  * codecs (mirrors `StepSerializationFailed` for step payloads). A deterministic
-  * runtime-owned failure surfaced instead of recursing into a broken codec.
+/** Thrown when a step, signal, or terminal outcome cannot be encoded or decoded
+  * with the configured codec.
   */
 class StepSerializationFailed(message: String) extends StepFailed(message)

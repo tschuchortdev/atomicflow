@@ -335,7 +335,7 @@ Application rules:
   ```
 - The parent workflow generation distinguishes children started before and
   after `continueAsNew`. Every enclosing restart count distinguishes children
-  started in different region loopings, including when an inner count starts
+  started in different region iterations, including when an inner count starts
   again after an outer region restarts.
 - Scope is part of immutable identity. If a child is abandoned, its active
   parent relationship is cleared but its derived scope does not change.
@@ -392,7 +392,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 - `Workflow.runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `Workflow.parallel` and the fan-in partial-collection pattern.
 - Single `startAsChild` method: parent controls timing positionally, not via a deferred-creation API. `create`/`run` separation is only needed for external callers who must register a workflow in the same transaction as other business data.
 - Deriving child scope from parent identity, workflow generation, and enclosing
-  scope incarnations avoids persisting a randomized start ID while preventing
+  scope generations avoids persisting a randomized start ID while preventing
   collisions with top-level instances and children from discarded generations.
 - Parent reference without generation: there is only one active generation for
   an instance ID, and the parent pointer represents active ownership rather

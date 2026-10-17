@@ -5,17 +5,14 @@ import scala.concurrent.duration.{Duration, FiniteDuration}
 import java.time.Clock
 import java.time.Instant
 
-/** The canonical home of all single-instance workflow operations. Implemented per
-  * backend (in-memory, Postgres, ...). Convenience methods are `final`, built
-  * from a small set of abstract primitives.
+/** Creates, runs, and stores workflow instances. Storage backends implement the
+  * abstract operations; final methods combine them into convenience operations.
   */
 @implicitNotFound("No WorkflowRuntime available. Add a using clause (using WorkflowRuntime).")
 trait WorkflowRuntime {
 
-  /** The single time source for timer due-ness, retry thresholds, sweep
-    * predicates, and all persisted `:now` parameters. The database server's
-    * clock is never consulted for logic. Exposed so apps and tests share one
-    * clock with workflow code.
+  /** Clock used for timer deadlines, retry delays, leases, and stored timestamps.
+    * Workflow code and background jobs use this clock rather than database time.
     */
   def clock: Clock
 
@@ -45,17 +42,13 @@ trait WorkflowRuntime {
   /** Renews the lock on the workflow instance. */
   def heartbeat(run: CurrentExecution): Unit
 
-  /** Whether cooperative cancellation has been durably requested for the
-    * instance: its `cancel_requested_at` flag is set. The flag is a level —
-    * [[cancel]] sets it once and it is never reset. A plain durable read; no
-    * lease or fence. Consulted at the new-work checkpoints (a Step body about
-    * to execute, or an await about to be evaluated) to deliver
-    * [[atomicflow.WorkflowCancelledException]]; cached replays never deliver,
-    * so they never read the flag.
+  /** Reads whether cancellation has been requested. [[cancel]] sets the stored
+    * flag once and never clears it. Steps and waits check it before new work;
+    * cached results replay without checking it. No execution lease is required.
     */
   def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
-  /** Read a step's durable facts (no lease/fence needed), or `None` if absent.
+  /** Read a stored step without checking lease ownership, or `None` if absent.
     * Reports the stored row even if it has expired.
     */
   def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep]
@@ -77,26 +70,14 @@ trait WorkflowRuntime {
       expiresAt: Option[Instant]
   ): Unit
 
-  /** Discard a step or await site atomically, fenced, in one transaction:
-    * delete the site's `workflow_steps` row (whatever its state) AND every
-    * subscription row of the site in all three subscription tables (signal,
-    * timer, completion). This is a superset of a plain step deletion, which
-    * only needs to remove the retry timer subscription: an ordinary user Step's
-    * sole subscription is its reserved `"__retry__"` timer, and awaits carry no
-    * retry subscriptions of their own, so removing all three kinds is always
-    * safe.
+  /** Delete a step record and all its signal, timer, and completion subscriptions
+    * in one transaction, checking execution ownership. Used when inputs change
+    * or cached results expire, including pending retries.
     *
-    * Used (a) to invalidate an ongoing retry "as if the step never executed",
-    * (b) to discard a drifted (`invalidateOn` change) or expired
-    * (`invalidateAfter` TTL) cached step/await result before re-evaluating, and
-    * (c) to recompute a timer await whose deadline expression drifted or
-    * expired. In the timer case the caller deletes first and then evaluates:
-    * the fresh evaluation registers a brand-new timer subscription (new timer
-    * id, `now + delay` deadline), so the previous incarnation's `TimerFired`
-    * event is structurally inert. This spans two transactions instead of one;
-    * a crash in between leaves nothing registered for the site, so the lease
-    * recovery sweep (or the caller's own next run) re-runs the instance, which
-    * re-registers the subscription.
+    * The caller evaluates the operation again after deletion. A new timer gets
+    * a new id, so old firing events cannot satisfy it. If the process crashes
+    * between deletion and evaluation, lease recovery or the next manual run
+    * evaluates the operation and registers its subscriptions again.
     */
   def deleteStepOrAwait(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
 
@@ -119,9 +100,8 @@ trait WorkflowRuntime {
       expiresAt: Option[Instant]
   ): Unit
 
-  /** Fire this step-site's own due retry timer subscriptions, fenced, in one
-    * transaction (the same "two paths, one primitive" as user timer awaits): for
-    * each retry subscription with `deadline <= now`, row-lock it, re-check that
+  /** Fire this step's due retry timers in one transaction after checking execution
+    * ownership. For each subscription with `deadline <= now`, lock it, check that
     * no `TimerFired` event exists yet, and append one. The subscription row
     * survives firing; only resolution retires it. Returns whether a `TimerFired`
     * event now exists for the site, distinguishing a due retry (resume the body)
@@ -129,9 +109,8 @@ trait WorkflowRuntime {
     */
   def fireStepRetryIfDue(run: CurrentExecution, stepId: StepId, stepVersion: Long): Boolean
 
-  /** Read the durable `Signal` events of `signalKey` that are visible to this
-    * instance (after its shared exact-key cursor), in sequence order. A plain
-    * read of durable facts; no lease or fence is involved and the cursor is not
+  /** Read stored signals visible to this instance for `signalKey`, after its
+    * cursor and in sequence order. No lease check is required and the cursor is not
     * advanced. Serves `Step.peekSignal`, so `subscriberKey` is always `""` on the
     * returned candidates.
     */
@@ -154,9 +133,8 @@ trait WorkflowRuntime {
     * persist the `succeeded` step row (`site.stepKind`), advance the winning
     * signal key's cursor when the resolution requests it, and delete the site's
     * rows in all three subscription tables — all atomically with the registration
-    * and candidate read (this registration + read + resolution atomicity is what
-    * makes the await lost-wakeup-free). If it returns `None`, the registrations
-    * commit and no cursor moves (the await durably suspends). Returns the
+    * and candidate read. If it returns `None`, commit the registrations and
+    * advance each signal cursor past its examined, rejected events. Returns the
     * persisted payload when resolved, `None` when suspended. A `decide`
     * exception rolls the evaluation transaction back entirely; the earlier fire
     * transaction already committed.
@@ -173,7 +151,7 @@ trait WorkflowRuntime {
     * completion), fenced. Used by
     * `Step.firstToRunWithoutSuspension` to retire every branch's pending
     * subscriptions — including nested subscopes — before the winner's step row
-    * is written. The ordering is deliberate: the winner row is the durable
+    * is written. The winner row is the stored
     * first-wins marker, so deleting first means a crash in between leaves no
     * marker, and the construct's next run re-evaluates from scratch and
     * re-deletes; a committed winner row therefore never coexists with branch
@@ -343,8 +321,8 @@ trait WorkflowRuntime {
     */
   def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
-  /** Read a step's durable facts without acquiring a lease or fence (a pure
-    * lookup of durable state, used by `Step.getExecutionState`).
+  /** Read a stored step without acquiring an execution lease.
+    * Used by `Step.getExecutionState`.
     */
   def readStep(
       instanceId: WorkflowInstanceId,
@@ -388,7 +366,7 @@ trait WorkflowRuntime {
     instance
   }
 
-  /** Atomically create-if-absent and run on the caller thread. */
+  /** Create the instance if absent, then run it on the caller thread. */
   final def createAndRun[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,

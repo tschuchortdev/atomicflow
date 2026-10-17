@@ -3,15 +3,8 @@ package atomicflow
 import scala.concurrent.duration.{Duration, FiniteDuration}
 import java.time.Instant
 
-/** A durable description of something a workflow can wait on. The result type
-  * `R` is what the successful await yields; it is invariant because the cases
-  * embed their value-producing witnesses (a `SignalEvent`, `Timer`, or
-  * `WorkflowCompletion`, possibly wrapped by `Mapped`), so `Awaitable[A]` and
-  * `Awaitable[B]` are never interchangeable.
-  *
-  * The enum deliberately carries no `Cacheable` context bound: the `Cacheable`
-  * needed to persist the awaited result is supplied at the `Step.await` call
-  * site (the result's type), not here.
+/** A signal, timer, or workflow completion to wait for, with result type `R`.
+  * `Step.await` and `Step.awaitRace` require a `Cacheable` for the result they store.
   */
 enum Awaitable[R] {
 
@@ -21,7 +14,7 @@ enum Awaitable[R] {
     * runtime clock).
     */
   case SignalEvent[A](
-      s: Signal[A],
+      signal: Signal[A],
       filter: A => Boolean = (_: A) => true,
       lookBack: Duration = Duration.Inf
   ) extends Awaitable[A]
@@ -44,8 +37,8 @@ enum Awaitable[R] {
   case Mapped[A, B](underlying: Awaitable[A], f: A => B) extends Awaitable[B]
 
   /** Transform the awaited result onto another type. No `Cacheable[B]` is needed
-    * here; the `Cacheable` for the mapped result is supplied at the `Step.await`
-    * call site.
+    * here; `Step.awaitRace` requires the mapped result's codec. Direct
+    * `Step.await` does not currently support mapped awaitables.
     */
   def map[B](f: R => B): Awaitable[B] = this match {
     case Mapped(u, g) => Mapped(u, g.andThen(f))

@@ -14,11 +14,10 @@ import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
 import java.time.Clock
 
-/** Shared munit harness for the Postgres backend.
+/** Shared database setup for PostgreSQL runtime tests.
   *
-  * Starts ONE PostgreSQL 16 container for the whole suite, applies the Flyway
-  * migrations once, and cleans all tables between tests (Flyway clean +
-  * migrate). `newRuntime` returns a fresh runtime backed by the same container.
+  * Starts one PostgreSQL 16 container per suite and recreates the schema between
+  * tests with Flyway clean and migrate. `newRuntime` uses the same container.
   */
 abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 

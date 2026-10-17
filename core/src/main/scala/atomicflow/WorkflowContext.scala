@@ -1,24 +1,24 @@
 package atomicflow
 
-/** The runtime context materialized only during workflow execution. It carries
+/** The context created for each workflow run. It carries
   * the instance identity, the version of the definition captured at creation, the
   * runtime services, and (via [[currentExecution]]) the runtime's per-run
   * execution handle.
   *
-  * A new context is materialized for every run and is not retained between runs.
+  * A new context is created for every run and is not retained between runs.
   * The context is immutable: the transient lexical state of the run — the
   * enclosing `Workflow.scoped` path ([[scopePath]]) and the `Workflow.uncancellable`
   * depth ([[uncancellableDepth]]) — lives on the context, and every region
   * function (`Workflow.scoped`, `Workflow.uncancellable`, `Workflow.restartable` /
   * `Workflow.loop`, `Workflow.parallel`, `Step.firstToRunWithoutSuspension`)
-  * passes a derived copy to its body (the `local` of a reader monad). The state
+  * passes a copy with updated scope or cancellation settings to its body. The state
   * therefore travels with the context value, not with the executing thread.
   */
 final class WorkflowContext(
     val instanceId: WorkflowInstanceId,
     /** The `Workflow.version` recorded when the instance was created. The current
       * body may branch on it internally to adapt to the definition version that
-      * created the instance (see `spec/workflow-evolution.md`).
+      * created the instance.
       */
     val versionAtCreation: Long,
     /** The runtime executing this run. Declared as a `val` so that

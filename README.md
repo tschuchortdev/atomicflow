@@ -1,217 +1,152 @@
-# **AtomicFlow - A Workflow Framework with Idempotent Steps and Atomic Replay**
+# AtomicFlow
 
-**AtomicFlow** is a workflow framework designed to help you manage and execute workflows in an atomic, idempotent, and repeatable manner. With the ability to handle side effects, deduplication, and easy retries, this framework ensures that business processes are executed reliably while maintaining consistency.
+AtomicFlow is a Scala 3 library for durable workflows. It stores step results,
+signals, timers, and execution state in PostgreSQL. After a crash or a suspended
+wait, the workflow body runs again and completed steps return their stored results.
 
----
+## Execution guarantees
 
-## Features
+- `Step.atLeastOnce` runs again after a crash if its result was not stored. Use
+  idempotent operations or pass an idempotency key to the external service.
+- `Step.atMostOnce` does not run again when an earlier attempt has no stored
+  outcome. It returns `None` in that case: the external operation may or may not
+  have completed.
+- Completed steps replay their stored success or failure. Named input hashes
+  and cache expiry control when results can be reused.
+- A workflow is not one database transaction. Completed external effects are
+  not rolled back when a later step fails.
 
-- **Atomic Workflows**: Your workflows are guaranteed to run atomically, meaning either all steps complete successfully, or none of them do.
-- **Idempotent Execution**: Steps are idempotent, so re-executing a step with the same inputs and context will not result in side effects being performed multiple times.
-- **Only-Once Effects**: Critical steps that have side effects (e.g., sending data to a customer) are protected by **only-once execution** to ensure they are only executed once, unless explicitly retried with a new idempotency ID.
-- **Step Caching**: Every step's output is cached, enabling you to skip already executed steps during retries, providing an efficient means to recover from failures.
-- **Replayable Workflows**: If a failure occurs, you can replay the workflow from the beginning, skipping already successfully completed steps.
-- **Time-limited Steps**: Some steps (e.g., certificate validation) are only valid for a certain period and must be re-evaluated after expiration via TTL-based cache expiry.
-- **Signals**: Workflows can stop and wait for external signals (e.g., user approval) or timers, then be automatically restarted when the condition is met.
-- **Subworkflows**: Run parallel subworkflows within a parent workflow, with scoped step idempotency.
+PostgreSQL is the implemented runtime. The in-memory runtime file contains
+disabled prototype code.
 
----
+## Dependencies
 
-## Out of scope
-- Introspection / Diagram generation
+The project uses Scala 3.7.3 and sbt. The `core` module contains the workflow API;
+the `db` module contains the PostgreSQL runtime and depends on `core`. The
+current development version is `0.1.0-SNAPSHOT`.
 
----
-
-## How it Works
-
-AtomicFlow focuses on **workflow steps** that can be executed safely and deterministically. Each step can be classified into two types:
-
-1. **Cached Steps** – These steps are computationally simple or have side effects that are safe to repeat. Their output is cached by input fingerprint, so re-executing with the same inputs returns the cached result.
-2. **Only-Once Steps** – These steps may trigger important, irreversible changes (e.g., sending data to an external service). AtomicFlow ensures these steps are executed **exactly once** using a combination of **idempotency IDs** and **input hashing**.
-
-The framework also supports **retrying workflows** when exceptions occur, ensuring **atomicity** even in case of transient errors.
-
----
-
-## Installation
-
-Add the following to your `build.sbt` (for Scala projects using sbt):
-
-```scala
-libraryDependencies += "de.lhns" %% "atomicflow-core" % "0.1.0-SNAPSHOT"
-
-// Optional: PostgreSQL-backed runtime
-libraryDependencies += "de.lhns" %% "atomicflow-db" % "0.1.0-SNAPSHOT"
-```
-
----
-
-## Example Usage
-
-### Creating a Workflow Runtime
-
-Before running any workflows, you need a `WorkflowRuntime`. AtomicFlow provides an in-memory runtime (for testing/development) and a PostgreSQL-backed runtime (for production).
+## Define and run a workflow
 
 ```scala
 import atomicflow.*
-import atomicflow.impl.memory.InMemoryWorkflowRuntime
-import atomicflow.Cacheable.MsgPack.given
-
-// Create an in-memory runtime
-given WorkflowRuntime = InMemoryWorkflowRuntime()
-given WorkflowRunSettings = WorkflowRunSettings()
-```
-
-### Defining a Workflow
-
-A workflow is defined using the `Workflow` builder, which takes a `WorkflowId`, a name, and a body function:
-
-```scala
-val myWorkflow = Workflow[String, Int](
-  WorkflowId("d9ab1884-6e83-48d7-82c4-cbc89fb32ffc"),
-  name = "enrich and send"
-) { (input: String) =>
-  // A cached step: output is cached by input fingerprint
-  val enriched = Step(StepId("d27142b9-e7db-4b8e-b341-6dd3009655c7"), version = 0, name = "enrich") {
-    Step.cache("input" -> input)
-    input.trim.toUpperCase
-  }
-
-  // An only-once step: executed exactly once per workflow instance
-  Step(StepId("f4a18269-83a8-4fcf-a62b-3cbb6216ddee"), version = 0, name = "send email") {
-    Step.onlyOnce("email" -> enriched)
-    println(s"Sending email to $enriched")
-  }
-
-  42
-}
-```
-
-### Executing the Workflow
-
-```scala
-val instanceId = "my-instance-1"
-val result = myWorkflow.createAndRun(instanceId, "alice@example.com")
-// result: Either[StoppedWorkflow[Int], Int] = Right(42)
-```
-
-### Retrying Workflows
-
-If an exception occurs during execution, you can retry the workflow. Steps that were previously completed (cached or only-once) will be skipped:
-
-```scala
-val instanceId = "my-instance-1"
-try
-  myWorkflow.createAndRun(instanceId, "alice@example.com")
-catch
-  case e: Exception =>
-    println(s"Workflow failed, retrying: ${e.getMessage}")
-    myWorkflow.run(instanceId)  // Retry — cached steps are skipped
-```
-
-### Using the PostgreSQL Runtime
-
-For production use, the `DbWorkflowRuntime` persists workflow state, step caches, signals, and schedules in PostgreSQL:
-
-```scala
-import atomicflow.impl.db.DbWorkflowRuntime
+import atomicflow.given
+import atomicflow.Cacheable.Simple.given
+import atomicflow.impl.db.PostgresWorkflowRuntime
 import org.postgresql.ds.PGSimpleDataSource
 import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.*
 
-val ds = new PGSimpleDataSource()
-ds.setUrl("jdbc:postgresql://localhost:5432/atomicflow")
-ds.setUser("postgres")
-ds.setPassword("postgres")
+val dataSource = new PGSimpleDataSource()
+dataSource.setUrl("jdbc:postgresql://localhost:5432/atomicflow")
+dataSource.setUser("postgres")
+dataSource.setPassword(sys.env("ATOMICFLOW_DB_PASSWORD"))
 
-given WorkflowRuntime = DbWorkflowRuntime(ds)(using ExecutionContext.global)
-```
+given ExecutionContext = ExecutionContext.global
+given WorkflowRuntime = PostgresWorkflowRuntime(dataSource)
+given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-The database schema is managed by Flyway migrations and is created automatically when the runtime is initialized.
-
----
-
-## Concepts and Terminology
-
-- **Workflow**: A definition with a unique `WorkflowId`, an input type `In`, and an output type `Out`. Workflows are parameterized by `Cacheable[In]` and `Cacheable[Out]` for serialization.
-- **Workflow Instance**: A specific run of a workflow, identified by a `(WorkflowId, WorkflowInstanceKey)` pair. The instance key is a user-provided string.
-- **Step**: A unit of work within a workflow, identified by a `StepId` (UUID) and a version number. Steps have access to a `StepContext` for caching and idempotency.
-- **Cached Step**: A step whose output is cached by input fingerprint. Re-running with the same inputs returns the cached result without re-executing the step body.
-- **Only-Once Step**: A step that is executed exactly once per workflow instance, regardless of input changes. Useful for irreversible side effects like sending emails or making payments.
-- **Step Idempotency ID**: A UUID assigned to each step execution, used as the cache key. For only-once steps, this ID can be overridden to force re-execution.
-- **Fingerprint**: A SHA-256 hash of a step's inputs, used to detect when a step's inputs have changed between runs.
-- **Signal**: A typed value that a workflow can wait for. Workflows can stop themselves and be restarted when a signal is set.
-- **StoppedWorkflow**: When a workflow stops to wait for a timer, signal, or another workflow, it returns `Left(StoppedWorkflow)`. The runtime schedules an automatic restart when the condition is met.
-
----
-
-## Advanced Features
-
-### Expiring Steps (TTL)
-
-Steps can have a time-to-live (TTL) after which their cached output expires and the step must be re-executed:
-
-```scala
-Step(StepId("..."), version = 0) {
-  Step.cacheFor(Some(30.minutes))("input" -> inputValue)
-  // This step's cache expires after 30 minutes
-  computeExpensiveResult(inputValue)
-}
-```
-
-### Signals
-
-Workflows can wait for external signals:
-
-```scala
-val approvalSignal = Signal[String](SignalId("..."), name = "approval")
-
-val workflow = Workflow[Unit, String](...) { _ =>
-  val approval = Workflow.stopAndAwaitSignal(approvalSignal)
-  // Workflow stops here if signal is not set, and resumes when it is
-  s"Approved by: $approval"
-}
-
-// Set the signal externally
-workflow.setSignal("instance-1", approvalSignal, "manager", 30.days)
-```
-
-### Subworkflows
-
-Run parallel subworkflows within a parent workflow:
-
-```scala
-val workflow = Workflow[Seq[String], Unit](...) { (items: Seq[String]) =>
-  Workflow.subworkflowForEach(items)(parallelism = 4)(
-    subworkflowKey = identity
-  ) { item =>
-    processItem(item)
+val normalizeAddress = Workflow[String, String](id = "normalize-address") { address =>
+  Step.atLeastOnce[String]("normalize", ensureUnchanged = Seq("address" -> address)) {
+    address.trim.toLowerCase(java.util.Locale.ROOT)
   }
 }
+
+val result = normalizeAddress.createAndRun("customer-123", " Alice@Example.com ")
+assert(result == WorkflowRunResult.Result("alice@example.com"))
 ```
 
-### Awaiting Other Workflows
+Runtime construction applies the Flyway migrations. Creating an instance is
+idempotent when its serialized input matches the existing input; different
+input raises `WorkflowInputConflictException`.
 
-A workflow can wait for another workflow instance to complete:
+Select a throwable codec explicitly. The diagnostic codec above stores the
+original exception's class name, message, and cause chain, then decodes it as
+`StepFailed`. Workflow failures are thrown to the caller; suspension,
+cancellation, termination, and continue-as-new are `WorkflowRunResult` cases.
+
+## Wait for a signal
 
 ```scala
-val result = Workflow.stopAndAwaitWorkflow[Int](otherWorkflow, "other-instance-id")
-// If the other workflow hasn't finished, this workflow stops and resumes later
+val approval = Signal[String]("approval")
+
+val approveOrder = Workflow[String, String](id = "approve-order") { orderId =>
+  val approver = Step.await("wait-for-approval", Awaitable.SignalEvent(approval))
+  s"Order $orderId approved by $approver"
+}
+
+val order = approveOrder.create("order-123", "123")
+assert(order.run() == WorkflowRunResult.WorkflowSuspended)
+assert(order.sendSignal(approval, "manager") == SignalSendResult.Success)
+assert(order.run() == WorkflowRunResult.Result("Order 123 approved by manager"))
 ```
 
----
+Each signal key has a cursor shared by all waits in an instance. A filtered
+wait advances past rejected events, so later waits cannot receive them.
+`Step.peekSignal` reads visible events without advancing the cursor.
 
-## Contributing
+Use `Awaitable.Timer(15.minutes)` inside a workflow to wait for a duration, or
+`Awaitable.Timer(deadline)` for an absolute `java.time.Instant`. `Step.awaitRace`
+selects the matching signal, timer, or workflow completion event with the lowest
+stored sequence number.
 
-We welcome contributions to **AtomicFlow**! If you have ideas for new features, improvements, or bug fixes, feel free to open an issue or submit a pull request.
+## Run workflows in the background
 
-1. Fork the repo.
-2. Create your feature branch (`git checkout -b feature-name`).
-3. Commit your changes (`git commit -am 'Add new feature'`).
-4. Push to the branch (`git push origin feature-name`).
-5. Open a pull request.
+```scala
+import scala.concurrent.duration.*
 
----
+val runner = WorkflowRuntime.startJobRunner(Seq(normalizeAddress, approveOrder))
+try {
+  val order = approveOrder.createAndSchedule("order-456", "456")
+  order.sendSignal(approval, "manager")
+  val result = order.awaitResult(30.seconds)
+} finally runner.stop(5.seconds)
+```
+
+The runner executes registered workflow definitions, fires due timers, finds
+signal and completion events, and recovers expired execution leases. Manual
+`run` calls can also resolve waits without a runner. `awaitResult` only polls
+for completion; it does not execute the workflow.
+
+## Other operations
+
+- **Input changes:** `ensureUnchanged` rejects changed named inputs;
+  `invalidateOn` discards the cached result when a named input changes;
+  `invalidateAfter` sets cache expiry.
+- **Retries:** `Step.RetryPolicy` retries failures in at-least-once steps.
+  Short delays block the executing thread; delays above the runtime's
+  `durableRetryThreshold` suspend until a stored timer fires. A stored terminal
+  failure is replayed, not retried by calling `run` again.
+- **Scopes and parallel work:** `Workflow.scoped` gives steps a nested
+  namespace. `Workflow.parallel` runs branches concurrently and waits for all
+  branches to finish or suspend.
+- **Child workflows:** `startAsChild` creates a separately scheduled instance.
+  The parent can await `child.completion`. Parent-close policy and signal
+  inheritance are fixed at child creation.
+- **Loops:** `Workflow.restartable` and `Workflow.loop` store loop state and
+  remove the previous iteration's nested execution records on restart.
+- **History reset:** `Workflow.continueAsNew` replaces input and execution
+  history in place. Runtime `forkWorkflow` and `resetWorkflow` operations restart
+  from a selected stored step.
+- **Cancellation:** `cancel` requests cancellation at the next uncached step or
+  wait. `Workflow.uncancellable` permits cleanup before stopping. `terminate`
+  stops further durable execution but cannot interrupt an external operation
+  already running on a JVM thread.
+
+## Build and test
+
+Use JDK 21 or later. Database and example tests require Docker for PostgreSQL
+Testcontainers.
+
+```sh
+sbt test
+```
+
+The `example` module contains equivalent document-processing workflows using
+AtomicFlow and workflows4s. API and storage details are in [`spec/`](spec/).
+Runtime design notes are in [`docs/design/`](docs/design/).
+[`DEVIATIONS.md`](DEVIATIONS.md) records implementation decisions and differences
+from the design. System comparisons are in [`docs/comparison/`](docs/comparison/).
 
 ## License
 
-This project uses the Apache 2.0 License. See the file called LICENSE.
+Apache License 2.0. See [`LICENSE`](LICENSE).
