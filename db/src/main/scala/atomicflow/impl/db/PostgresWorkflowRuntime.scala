@@ -314,33 +314,35 @@ class PostgresWorkflowRuntime private[atomicflow] (
     ()
   }
 
-  /** The storage columns for a [[SignalInheritance]] configuration: the
-    * `inherited_signal_mode` token (`none`/`all`/`prefixes`) and the
-    * `inherited_signal_prefixes` array (empty unless the mode is `prefixes`).
+  /** The storage form of a [[SignalInheritance]] configuration: the set of
+    * permitted prefixes in `inherited_signal_prefixes`. The set is the complete
+    * configuration — an empty set inherits nothing, the single empty-string
+    * prefix (a prefix of every key) inherits everything, any other set inherits
+    * keys starting with one of its elements.
     */
-  private def signalInheritanceColumns(si: SignalInheritance): (String, Vector[String]) = si match {
-    case SignalInheritance.none           => ("none", Vector.empty)
-    case SignalInheritance.all            => ("all", Vector.empty)
-    case SignalInheritance.some(prefixes) => ("prefixes", prefixes.toVector)
+  private def permittedSignalPrefixes(si: SignalInheritance): Vector[String] = si match {
+    case SignalInheritance.none           => Vector.empty
+    case SignalInheritance.all            => Vector("")
+    case SignalInheritance.some(prefixes) => prefixes.toVector
   }
 
   /** Renders a stored or replay-specified signal-inheritance configuration
-    * (mode token, prefix array, past-signals flag) as one human-readable line,
-    * used in the warning about ignored changes.
+    * (permitted-prefix set, past-signals flag) as one human-readable line,
+    * used in the warning about ignored changes. Decodes the storage encoding:
+    * an empty set is `none`, the single empty-string prefix is `all`.
     */
-  private def renderSignalInheritanceConfig(mode: String, prefixes: Vector[String], past: Boolean): String = {
-    val selector = mode match {
-      case "all"      => "all"
-      case "prefixes" => s"some(${prefixes.mkString(", ")})"
-      case _          => "none"
-    }
+  private def renderSignalInheritanceConfig(prefixes: Vector[String], past: Boolean): String = {
+    val selector =
+      if (prefixes.isEmpty) "none"
+      else if (prefixes.lengthIs == 1 && prefixes.head.isEmpty) "all"
+      else s"some(${prefixes.mkString(", ")})"
     s"inheritSignals=$selector, inheritPastSignals=$past"
   }
 
   /** A `startAsChild` replay never replaces a child's signal-inheritance
     * configuration: the policy is fixed at creation. When the replay specifies a
-    * different `(mode, prefixes, inherit_past_signals)` than the stored row, the
-    * stored configuration wins, the specified change is ignored, and a WARN
+    * different `(permitted prefixes, inherit_past_signals)` than the stored row,
+    * the stored configuration wins, the specified change is ignored, and a WARN
     * records the divergence. An equal configuration is a silent no-op, so a
     * replay writes nothing and schedules no wakeups (there is no policy-change
     * mechanism anymore).
@@ -350,21 +352,20 @@ class PostgresWorkflowRuntime private[atomicflow] (
       cwf: WorkflowId,
       ckey: WorkflowInstanceKey,
       cscope: Vector[String],
-      specifiedMode: String,
       specifiedPrefixes: Vector[String],
       specifiedPast: Boolean
   ): Unit = {
     val stored = runTransaction {
-      sql"""SELECT inherited_signal_mode, inherited_signal_prefixes, inherit_past_signals
+      sql"""SELECT inherited_signal_prefixes, inherit_past_signals
             FROM workflow_instances
             WHERE workflow_id = $cwf AND workflow_instance_key = $ckey AND workflow_instance_scope = $cscope"""
-        .query[(String, Vector[String], Boolean)].option
+        .query[(Vector[String], Boolean)].option
     }
-    stored.foreach { case (mode, prefixes, past) =>
-      if (mode != specifiedMode || prefixes.toSet != specifiedPrefixes.toSet || past != specifiedPast)
+    stored.foreach { case (prefixes, past) =>
+      if (prefixes.toSet != specifiedPrefixes.toSet || past != specifiedPast)
         log.warn(
           s"Replaying startAsChild for child $childInstanceId with a different signal-inheritance configuration " +
-            s"(stored: ${renderSignalInheritanceConfig(mode, prefixes, past)}; specified: ${renderSignalInheritanceConfig(specifiedMode, specifiedPrefixes, specifiedPast)}); " +
+            s"(stored: ${renderSignalInheritanceConfig(prefixes, past)}; specified: ${renderSignalInheritanceConfig(specifiedPrefixes, specifiedPast)}); " +
             "the configuration fixed at creation is kept."
         )
     }
@@ -376,15 +377,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * inheritance configuration. These are the instances whose awaits may be
     * satisfied by signals inherited from ancestors. Columns (positionally):
     * `sub_wf, sub_key, sub_scope, signal_key, node_wf, node_key, node_scope,
-    * node_mode, node_prefixes, parent_wf, parent_key, parent_scope, start_seq,
-    * past`. `signalKeyFilter` may narrow the subscriptions it reads (the
+    * node_prefixes, parent_wf, parent_key, parent_scope, start_seq, past`.
+    * `signalKeyFilter` may narrow the subscriptions it reads (the
     * dispatcher restricts to one signal key); it is appended to the WHERE clause
     * and may reference the `s` and `i` aliases.
     */
   private def signalSubscriberCandidates(signalKeyFilter: Fragment): Fragment =
     fr"""SELECT s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope, s.signal_key,
                 i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope,
-                i.inherited_signal_mode, i.inherited_signal_prefixes,
+                i.inherited_signal_prefixes,
                 i.parent_workflow_id, i.parent_instance_key, i.parent_instance_scope,
                 i.inherited_events_start_sequence_id, i.inherit_past_signals
          FROM workflow_signal_subscriptions s
@@ -400,7 +401,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def runningInstanceCandidate(run: CurrentExecution, signalKey: SignalKey): Fragment =
     fr"""SELECT i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope, $signalKey,
                 i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope,
-                i.inherited_signal_mode, i.inherited_signal_prefixes,
+                i.inherited_signal_prefixes,
                 i.parent_workflow_id, i.parent_instance_key, i.parent_instance_scope,
                 i.inherited_events_start_sequence_id, i.inherit_past_signals
          FROM workflow_instances i
@@ -413,8 +414,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * whose signals the subscriber may inherit:
     * `sub_wf, sub_key, sub_scope, signal_key, source_wf, source_key, source_scope,
     * past, start_seq`. An edge from a node to its parent is usable iff the
-    * node's own stored selector permits the key (`all`, or `prefixes` with a
-    * matching prefix); `none` never. The parent must be non-terminal and not
+    * node's stored permitted-prefix set contains a prefix of the key (the
+    * empty-string prefix permits every key, the empty set permits nothing). The
+    * parent must be non-terminal and not
     * covered by a pending `child_close_requests` target for the child's scope.
     * The subscriber's own `inherit_past_signals` and
     * `inherited_events_start_sequence_id` are carried unchanged (they belong to
@@ -424,14 +426,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def inheritedSignalSources(candidates: Fragment): Fragment =
     fr"""WITH RECURSIVE ancestry(
             sub_wf, sub_key, sub_scope, signal_key,
-            node_wf, node_key, node_scope, node_mode, node_prefixes,
+            node_wf, node_key, node_scope, node_prefixes,
             parent_wf, parent_key, parent_scope, start_seq, past, depth) AS (
           SELECT candidates.*, 0
           FROM (""" ++ candidates ++ fr""") candidates
           UNION ALL
           SELECT a.sub_wf, a.sub_key, a.sub_scope, a.signal_key,
                  p.workflow_id, p.workflow_instance_key, p.workflow_instance_scope,
-                 p.inherited_signal_mode, p.inherited_signal_prefixes,
+                 p.inherited_signal_prefixes,
                  p.parent_workflow_id, p.parent_instance_key, p.parent_instance_scope,
                  a.start_seq, a.past, a.depth + 1
           FROM ancestry a
@@ -443,11 +445,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
               SELECT 1 FROM child_close_requests r
               WHERE r.workflow_id = p.workflow_id AND r.workflow_instance_key = p.workflow_instance_key AND r.workflow_instance_scope = p.workflow_instance_scope
                 AND a.node_scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix)
-            AND ( a.node_mode = 'all'
-                  OR ( a.node_mode = 'prefixes'
-                       AND EXISTS (
-                         SELECT 1 FROM unnest(a.node_prefixes) AS p(pfx)
-                         WHERE starts_with(a.signal_key, pfx)) ) )
+            AND EXISTS (
+              SELECT 1 FROM unnest(a.node_prefixes) AS p(pfx)
+              WHERE starts_with(a.signal_key, pfx))
         )
         SELECT sub_wf, sub_key, sub_scope, signal_key,
                node_wf AS source_wf, node_key AS source_key, node_scope AS source_scope,
@@ -521,7 +521,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       case ParentClosePolicy.Cancel  => "cancel"
       case ParentClosePolicy.Abandon => "abandon"
     }
-    val (inheritMode, inheritPrefixes) = signalInheritanceColumns(inheritSignals)
+    val inheritPrefixes = permittedSignalPrefixes(inheritSignals)
 
     val existing = runTransaction {
       for {
@@ -563,10 +563,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
               inserted <- sql"""
                 INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation, generation,
                   parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy,
-                  inherited_signal_mode, inherited_signal_prefixes, inherit_past_signals, inherited_events_start_sequence_id)
+                  inherited_signal_prefixes, inherit_past_signals, inherited_events_start_sequence_id)
                 VALUES ($childWorkflowId, $childKey, $derivedScope, $serializedInput, ${workflow.version}, 0,
                   ${parentId.workflowId}, ${parentId.workflowInstanceKey}, ${parentId.scope}, $policyStr,
-                  $inheritMode, $inheritPrefixes, $inheritPastEvents, $maxSeq)
+                  $inheritPrefixes, $inheritPastEvents, $maxSeq)
                 ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
               """.update.run
               _ <- if (inserted == 1)
@@ -586,7 +586,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         throw WorkflowInputConflictException(childInstanceId)
       case (0, Some(_)) =>
         warnOnIgnoredSignalInheritanceChange(
-          childInstanceId, childWorkflowId, childKey, derivedScope, inheritMode, inheritPrefixes, inheritPastEvents
+          childInstanceId, childWorkflowId, childKey, derivedScope, inheritPrefixes, inheritPastEvents
         )
         WorkflowInstance(workflow, childInstanceId)
       case _ =>

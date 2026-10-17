@@ -19,12 +19,14 @@ CREATE TABLE workflow_instances (
   parent_instance_key VARCHAR,
   parent_instance_scope VARCHAR[],
   parent_close_policy VARCHAR,
-  inherited_signal_mode VARCHAR NOT NULL DEFAULT 'none',
   inherited_signal_prefixes VARCHAR[] NOT NULL DEFAULT '{}',
   inherit_past_signals BOOLEAN NOT NULL DEFAULT false,
   inherited_events_start_sequence_id BIGINT,
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );
+
+COMMENT ON COLUMN workflow_instances.inherited_signal_prefixes IS
+  'Which signal keys this instance inherits from its parent, as a set of permitted prefixes: an empty array inherits nothing; a single empty-string element inherits every key; any other array inherits a key when it starts with one of the listed prefixes.';
 
 CREATE TABLE child_close_requests (
   workflow_id VARCHAR NOT NULL,

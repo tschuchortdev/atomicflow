@@ -394,9 +394,8 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
     val scope = Vector("orders", "order-42@0")
-    val stored = run(sql"""SELECT inherited_signal_mode, inherited_signal_prefixes FROM workflow_instances
-                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".query[(String, Vector[String])].unique)
-    assertEquals(stored._1, "prefixes")
-    assertEquals(stored._2, Vector("a/\nb", "c,d"), "prefixes are stored verbatim as array elements, including newlines")
+    val stored = run(sql"""SELECT inherited_signal_prefixes FROM workflow_instances
+                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".query[Vector[String]].unique)
+    assertEquals(stored, Vector("a/\nb", "c,d"), "prefixes are stored verbatim as array elements, including newlines")
   }
 }

@@ -112,10 +112,12 @@ workerWorkflow.startAsChild(
   bounded by the parent chain (no depth cap), and every subscriber's
   `inherit_past_signals` flag and `inherited_events_start_sequence_id` are
   carried up the recursion unchanged.
-- Inheritance configuration is stored descriptively on `workflow_instances`:
-  `inherited_signal_mode` (`none`/`all`/`prefixes`), `inherited_signal_prefixes`
-  (`VARCHAR[]`, meaningful only when the mode is `prefixes`),
-  `inherit_past_signals`, and `inherited_events_start_sequence_id`.
+- Inheritance configuration is stored on `workflow_instances` as one column,
+  `inherited_signal_prefixes` (`VARCHAR[]`): the set of permitted prefixes.
+  An empty array inherits nothing; a single empty-string element (a prefix of
+  every key) inherits every key; any other array inherits a key when it starts
+  with one of the listed prefixes. Alongside it: `inherit_past_signals` and
+  `inherited_events_start_sequence_id`.
 - The execution lease must not be a row lock held while user code runs.
 
 ## Why this design
