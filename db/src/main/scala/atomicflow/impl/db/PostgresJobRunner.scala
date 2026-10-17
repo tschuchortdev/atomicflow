@@ -348,8 +348,10 @@ final class PostgresJobRunner private[atomicflow] (
     }
     var escalated = 0
     rows.foreach { row =>
-      if (runtime.escalateTerminated(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
-        escalated += 1
+      val id = WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)
+      val (terminated, unconsumed) = runtime.escalateTerminated(id)
+      runtime.logDroppedUnconsumedSignals(id, unconsumed)
+      if (terminated) escalated += 1
     }
     if (escalated > 0) log.info(s"Escalation sweep escalated $escalated cancellations to TERMINATED")
     escalated

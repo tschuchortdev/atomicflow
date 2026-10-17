@@ -107,11 +107,12 @@ implementation phase.
     spec's `Seq[Any]`: decoding would require a per-key codec registry the
     spec does not provide. Payload strings serve the stated purpose
     ("mainly for logging").
-20. **The spec's open TODO "completion delivery boundary" is resolved**: a
-    workflow flips `is_accepting_signals := false` BEFORE running the
+20. **The spec's open TODO "completion delivery boundary" is resolved** (was:
+    a workflow flips `is_accepting_signals := false` BEFORE running the
     unconsumed-signals handler, so a signal arriving during the handler is
-    rejected as `InstanceAlreadyCompleted` (never reported as delivered and
-    omitted).
+    rejected as `InstanceAlreadyCompleted`; **superseded by entry 91**, which
+    resolves the same TODO by gathering+deleting inside the terminal
+    transaction and checking `terminal_state` in `sendSignal`).
 21. **`Awaitable` carries no `Cacheable` context bound.** The spec is
     self-contradictory (it puts `R : Cacheable` on the enum but also states
     `map` "does not require a `Cacheable[B]`" and that the result codec is
@@ -138,7 +139,10 @@ implementation phase.
 26. **The unconsumed-signals handler also runs on the failure path** (the spec
     ties it to "before the instance is marked complete"); a throwing handler
     on the failure path masks the original exception (unspecified edge,
-    documented behavior).
+    documented behavior). **Superseded by entry 91**: the listener now runs
+    after the transition commits, and a throwing listener is logged and
+    swallowed so it can never mask the workflow outcome. The "also on the
+    failure path" decision stands.
 
 ## Phases 4-5 (cancellation, job runner)
 
@@ -416,7 +420,8 @@ implementation phase.
 
 82. **Signal and completion wakeups are now asynchronous, replacing
     sender/terminal-side wakeups.** `sendSignal` no longer creates wakeups: after
-    row-locking the addressed instance and checking `is_accepting_signals`, it
+    row-locking the addressed instance and checking `is_accepting_signals` (that
+    check was later replaced by `terminal_state IS NULL`; see entry 91), it
     appends the one immutable `Signal` event and commits — no direct-subscriber
     or descendant walk happens on the sender. Likewise, the terminal transitions
     (`terminalTransitionAndEvent` for completed/failed, `escalateTerminated`,
@@ -536,3 +541,225 @@ implementation phase.
     and **not** recreated (the cached step replays without re-executing its
     body); the successor generation's children carry the incremented marker and
     are never matched by the old generation's closure target.
+
+88. **The Updates feature is removed entirely (was: a synchronous
+    request/response channel into an instance).** The user dropped it without
+    replacement: the `Update` type, `UpdateSendResult`, `Step.awaitUpdate`/
+    `awaitUpdate0`, the `WorkflowInstanceId`/`WorkflowInstance`/`WorkflowRuntime`
+    `sendUpdate` forwarders and engine operations, the `UpdateCandidate`/
+    `AwaitUpdateDecision` records, and the `workflow_updates` /
+    `workflow_update_subscriptions` tables are all gone. Both candidate designs
+    — the previously implemented record-based design (Design A) and a
+    signal-based design (Design B) — are kept in `spec/signals-timers.md`
+    ("Updates (unimplemented)") as explicitly unimplemented alternatives for
+    future reference. This supersedes entries 46–50 (Phase 8). The subscription
+    tables are now three (signal, timer, completion); scaladoc and spec prose
+    that listed a fourth update table or an update await kind were reconciled.
+    `V001__init.sql` was edited in place to drop the two tables and their
+    indexes (pre-release; see entry 85).
+
+## Phase 14 (unified discard and one await evaluation path)
+
+89. **The discard/drift/expiry machinery of steps and awaits is unified into
+    one SPI operation `deleteStepOrAwait`, and every await kind evaluates
+    through one path.** `deleteStep`, `retireAwaitSite`, and `invalidateTimer`
+    are replaced by a single `deleteStepOrAwait(run, stepId, stepVersion)`
+    that, in one fenced transaction, deletes the site's `workflow_steps` row
+    and its rows in all three subscription tables (signal, timer, completion).
+    This is a superset of the old `deleteStep` (which deleted only the retry
+    timer subscription): an ordinary user Step's sole subscription is its
+    reserved `"__retry__"` timer, and awaits carry no retry subscriptions of
+    their own, so deleting all three kinds is always safe. `writeStepState`
+    keeps its internal "delete this site's timer subscriptions when writing a
+    state" behavior — it retires a resolved or superseded retry timer
+    atomically within the write itself — and is not routed through
+    `deleteStepOrAwait`.
+    - Timer invalidation is now discard-plus-evaluate across two transactions:
+      the drift/expiry branch deletes the site (row + subscriptions) and then
+      re-evaluates, which registers a fresh timer subscription (new timer id,
+      `now + delay` deadline) and suspends. Previously
+      `invalidateTimer` retired and inserted the replacement subscription in a
+      single transaction; the observable outcome is identical, a crash between
+      the two transactions leaves nothing registered (the lease-recovery sweep
+      or the caller's next `run` re-runs the instance, which re-registers). The spec's "Timer invalidation" semantics (fresh timer id
+      makes the old `TimerFired` inert; a recomputed later deadline means "as
+      if never executed") are unchanged.
+    - `Step.await` routes every awaitable through `awaitRace0` as a
+      single-member race carrying the reserved `""` subscriber key (a plain
+      `WorkflowCompletion` await already did), so the private `awaitSignal` and
+      `awaitTimer` methods are gone. The persisted `step_kind` is `"Await"` for
+      every runtime-computed await; `"AwaitRace"` (entry 70) is retired.
+      Per-kind resolution semantics are unchanged (signal resolution advances
+      the winning key's shared cursor; a suspending evaluation advances each
+      signal key's cursor past examined-and-rejected events; timer and
+      completion members advance nothing).
+    - `replayCachedAwait`'s separate `onDrift`/`onExpired` callbacks collapse
+      into one `onDiscard` (delete via `deleteStepOrAwait`, then re-evaluate),
+      now identical for every site; the success/replay path is unchanged. This
+      supersedes parts of entries 70 and 80.
+
+## Phase 15 (single-statement fence and subscription cleanup helper)
+
+90. **The instance fence is one statement, and every bulk subscription cleanup
+    funnels through one helper (implementation-only).** No observable semantics
+    change.
+
+    - The private `fenced` helper previously row-locked the instance with one
+      `SELECT 1 ... FOR UPDATE` and then re-checked `lease_owner`/`fencing_token`
+      with a second statement. It now issues a single
+      `SELECT 1 ... WHERE ... AND lease_owner = ? AND fencing_token = ? FOR UPDATE`
+      mapped with `.option`: `None` throws [[LeaseLostException]]. This is
+      semantically equivalent under READ COMMITTED because Postgres re-checks
+      the `WHERE` clause against the latest row version after acquiring the
+      lock. Both `lease_owner` and `fencing_token` remain in the predicate (lease
+      recovery clears the owner without bumping the token, so the owner
+      condition is load-bearing). Behavior improvement: a concurrently deleted
+      instance row now surfaces as `LeaseLostException` instead of a doobie
+      "unexpected end of result" error. `continueAsNewTransition` repeated the
+      two-statement fence inline (lock, then owner/token check); it now uses the
+      same single-statement `SELECT generation ... FOR UPDATE`/`.option` shape,
+      throwing `LeaseLostException` on `None` and otherwise running the
+      unchanged body. The fenced `UPDATE` statements
+      (`terminalTransitionAndEvent`, the run-body writes, `renewLease`,
+      `releaseLeaseIfStillOwned`) already carry the
+      fence in the `WHERE` and are untouched.
+    - A new private `deleteAllSubscriptionsIO(workflowId, key, scope, extra)`
+      issues the same `DELETE FROM <table> s WHERE <instance predicate> AND
+      <extra>` against `workflow_signal_subscriptions`,
+      `workflow_timer_subscriptions`, and `workflow_completion_subscriptions`.
+      All hand-written per-table bulk deletes route through it:
+      `terminalCleanupIO` (wakeup plus the three subscription kinds),
+      `deleteSiteSubscriptionsIO` (step id/scope/version),
+      `deleteSubscriptionsUnderScopePathsIO` (scope-path slice),
+      `deleteRegionNestedSubscriptionsIO` (region-interior slice), and
+      `resetWorkflow`'s three `DELETE ... USING workflow_steps` statements (now
+      an `EXISTS (SELECT 1 FROM workflow_steps st WHERE ... st.updated_at >=
+      $boundary AND st.step_id = s.step_id AND st.step_scope_within_instance =
+      s.step_scope_within_instance AND st.step_version = s.step_version)` extra
+      predicate, equivalent to the `USING` inner join). A future fourth
+      subscription kind is added in one place instead of every cleanup path.
+      The single-table retry-timer deletes (`insertRetrySubscriptionIO`,
+      `deleteTimerSubscriptionsIO`) are not per-kind bulk cleanups and remain as
+      they were.
+
+## Phase 16 (in-transaction unconsumed-signal gather; drop `is_accepting_signals`)
+
+91. **Unconsumed signals are gathered and deleted inside the terminal /
+    continue-as-new transaction, and the listener runs after commit
+    (at-most-once).** Supersedes the pre-commit, at-least-once semantics of
+    entry 26 and the boundary mechanism of entry 20 (and builds on entries 19
+    and 82).
+
+    - The four transition paths now gather the visible unconsumed directly
+      addressed `Signal` events (per signal key, in `sequenceId` order after
+      that key's shared cursor, as raw serialized payloads) **inside the same
+      transaction** that locks the instance row and deletes those events. The
+      gather happens before the deletion. `gatherUnconsumedSignalsIO` is the
+      `ConnectionIO` form of the old `gatherUnconsumedSignals`; the old
+      pre-transition `runUnconsumedSignals` flip+gather+invoke helper is
+      deleted.
+    - Return shapes: `terminalTransitionAndEvent` returns
+      `(rowsUpdated, Map[SignalKey, Seq[String]])` (the map is only meaningful
+      when `rowsUpdated == 1`); `continueAsNewTransition` returns the map (and
+      still throws `LeaseLostException` when the lease fence loses);
+      `escalateTerminated` returns `(Boolean, Map[SignalKey, Seq[String]])`;
+      `finalizeCancelledWithoutLease` returns the map, propagated through
+      `closeOneChildIO`/`closeOnePendingChildIO`/`parentClosureSelfCheck` so the
+      sweep/self-check can log it.
+    - The run body invokes `wf.onUnconsumedSignals(map)` **after** the
+      transition transaction commits. Ordering: transition commits → listener
+      runs → the decoded failure is rethrown (failed), or the `Result`/
+      `WorkflowCancelled`/`ContinueAsNew` value is returned. The listener is
+      wrapped in `try/catch { case WorkflowNonFatal(t) => log.warn(...) }` — a
+      throwing listener can no longer mask the workflow outcome (previously a
+      throwing handler on the failure path masked the original exception, entry
+      26). Delivery is now **at-most-once**: a crash between the commit and the
+      call loses the delivery, acceptable for a logging/debug aid (previously
+      at-least-once, re-executed on replay).
+    - On paths with no workflow definition available — `terminate`, the
+      cancellation-escalation sweep, and cancellation of a never-started
+      instance (including a never-started child closed by its parent) — the
+      gathered map is logged at WARN level via the runtime's SLF4J logger,
+      stating that the listener could not run, instead of being silently
+      dropped.
+    - **`workflow_instances.is_accepting_signals` is dropped** from
+      `V001__init.sql` (edited in place, pre-release), together with
+      `setNotAcceptingSignals` and every reference (the flag flip in
+      `terminalTransitionAndEvent`/`escalateTerminated`/`finalizeCancelled
+      WithoutLease`, the re-open in `continueAsNewTransition`). `sendSignal`
+      now rejects with `InstanceAlreadyCompleted` when `terminal_state IS NOT
+      NULL` (still under the row `FOR UPDATE` lock). Because the terminal
+      transition and the gather+delete commit atomically under the same row
+      lock, a signal either commits first — and is thereby included in the
+      gathered map — or is rejected as already-completed. This resolves the
+      spec's open TODO "completion delivery boundary" (`signals-timers.md` open
+      questions #4, now marked **Resolved**).
+    - Spec edits in the same change: `signals-timers.md` ("Basic Signal API"
+      send check, "Unconsumed signals at completion", open question #4),
+      `continue-as-new-fork-reset.md`, and `running-workflows.md`
+      (`continueAsNew` semantics/"Unconsumed signals at the reset boundary",
+      `terminate` bullets).
+
+## Phase 17 (descriptive inheritance columns, policy fixed at creation, one shared ancestry CTE)
+
+92. **Signal-inheritance storage is descriptive, the policy is fixed at child
+    creation, and one shared ancestry CTE serves the read path, the dispatcher,
+    and the full scan.** Supersedes entries 37 and 38 (the text-token storage
+    and the "narrowing schedules conservative wakeups" behavior) and the
+    replay-replacement / broadening-wakeup bullets in
+    `child-signal-inheritance.md` and `sub-workflows-iteration.md`.
+
+    - **Storage columns** (`V001__init.sql`, edited in place; pre-release): the
+      single `inherit_signals VARCHAR` token column is replaced by
+      `inherited_signal_mode VARCHAR NOT NULL DEFAULT 'none'` (`none` | `all` |
+      `prefixes`) and `inherited_signal_prefixes VARCHAR[] NOT NULL DEFAULT '{}'`
+      (meaningful only when the mode is `prefixes`); `inherit_past_events` is
+      renamed `inherit_past_signals` (same meaning);
+      `inherited_events_start_sequence_id` is unchanged.
+      `encodeSignalInheritance`/`decodeSignalInheritance` are deleted;
+      `startChild` writes the mode and prefixes directly. The public
+      `SignalInheritance` API (`none`/`all`/`some(prefixes)`) is unchanged.
+      Test SQL that read the old columns (`ChildrenSuite`, `ContinueAsNewSuite`)
+      is updated.
+    - **Policy fixed at creation.** `updateChildInheritanceIO` and
+      `scheduleDescendantWakeupsIO` are deleted — there is no policy-change
+      mechanism and no ancestry-driven subtree wakeup. In `startChild`'s replay
+      path a stored `(mode, prefixes, inherit_past_signals)` that differs from
+      the replay's specification is kept, and an SLF4J WARN records the
+      divergence; an equal configuration is a silent no-op. The dispatcher's
+      per-key eligibility check and the read path both use the same stored
+      policy, so a child whose policy differs from a replay's specification can
+      only exist via manual row edits, which the next run's read-path check
+      handles.
+    - **One shared ancestry CTE.** The four ancestry walks
+      (`inheritedSourceScopesIO`'s iterative upward walk,
+      `wakeInheritingDescendantsIO`'s downward walk, `scanAllSubscriptions`'s
+      inline recursive CTE capped at depth 64, and the deleted
+      `scheduleDescendantWakeupsIO`) are replaced by a private
+      `inheritedSignalSources(candidates: Fragment)` query composed from two
+      candidate fragments (`signalSubscriberCandidates` for the dispatcher/scan,
+      `runningInstanceCandidate`
+      for the read path). It bakes in the edge rule (the child-side stored
+      mode/prefixes must permit the key), the non-terminal-parent and
+      `child_close_requests` walk cutoffs, and carries each subscription's
+      `inherit_past_signals`/`inherited_events_start_sequence_id` unchanged. It
+      has no depth cap: the walk is bounded by the parent chain, which removes
+      the previous 64-depth inconsistency (only the scan was capped) and keeps
+      the scan, dispatcher, and read path from disagreeing.
+    - **Consumers.** The read path (`readInheritedCandidatesIO`, with
+      `inheritedSourceScopesIO` deleted) joins the source query restricted to
+      the running instance and key to `workflow_events` with the cursor and
+      past-window conditions. The dispatcher's new `wakeSignalInheritors`
+      inserts `DISTINCT` subscriber wakeups whose source set contains the
+      event's instance; the direct-subscriber wakeup (`wakeMatchingSubscribers`)
+      is unchanged. The full scan's `inherited` branch uses the shared query and
+      keeps its "visible, unconsumed candidate" predicate; its `direct` and
+      `completion` branches are unchanged.
+    - `startChild` still reads `MAX(sequence_id)` under the event-append lock
+      for `inherited_events_start_sequence_id` (kept deliberately — starts are
+      rare).
+    - Spec edits in the same change: `child-signal-inheritance.md` (API bullets,
+      reading/lifecycle, PostgreSQL notes), `sub-workflows-iteration.md`
+      (inherited-signals bullets), and `running-workflows.md` ("Sources of
+      wakeups" row removed and the two "inheritance changes" background-path
+      mentions dropped).

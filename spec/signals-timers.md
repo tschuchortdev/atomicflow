@@ -211,8 +211,9 @@ trait WorkflowRuntime {
   execution records owned by the running workflow, and they schedule no work
   themselves.
 - Sending a Signal event briefly acquires a row lock on the addressed workflow
-  instance and checks `is_accepting_signals` to prevent appending an event when
-  that instance is completed or completing. It then acquires the global event
+  instance and checks that it has not reached a terminal state (`terminal_state
+  IS NULL`) to prevent appending an event when that instance is completed or
+  completing. It then acquires the global event
   allocator mutex (pg_advisory_lock in postgres), obtains the next `sequenceId` (`SEQUENCE CACHE 1` in postgres), appends the one immutable event, and commits.
   The sender creates no wakeups: signal and completion wakeups are produced
   asynchronously by the job runner's watermark dispatch and full subscription
@@ -291,7 +292,7 @@ is a `key -> awaitable` pair; the key is that member's **subscriber key**, a
 stable identity within the race that is independent of the member's position.
 Keys must be non-empty, unique within the race, and must not start with `"__"`
 (reserved for engine-internal subscribers). The empty key `""` is reserved for
-single-subscriber sites: plain `Step.await` and update awaits.
+single-subscriber sites: plain `Step.await`.
 
 - Each signal member retains the cursor for its own exact key; `awaitRace` does
   not introduce a cursor shared between keys.
@@ -307,47 +308,68 @@ single-subscriber sites: plain `Step.await` and update awaits.
   successful Step row and that cursor movement are persisted atomically. If no
   candidate is satisfiable, none of the signal cursors advance.
 
-## Updates: signals that return a value
+## Updates (unimplemented)
 
-An **Update** is a `Signal` with a **synchronous response channel**. The purpose of updates is to give some synchronous interactivity to workflows (for example: updating a user's name which requires timely validation), but the concept is not well-thought-out yet. 
+Updates were designed and prototyped but are deliberately **not implemented**
+for now. The feature was dropped without replacement; the two candidate designs
+below are kept for future reference only, and **neither is implemented by the
+runtime**.
 
-Updates are always addressed directly to one workflow instance. They are not
-inherited by children: a synchronous request cannot have one
-unambiguous response if several descendants handle it.
+The motivation was to give workflows some synchronous interactivity (for
+example, updating a user's name, which requires timely validation and a
+response). Both designs are always addressed directly to one workflow instance;
+they are never inherited by children, because a synchronous request cannot have
+one unambiguous response if several descendants handle it.
 
-When an Update is sent, the runtime checks if there is a subscription/await currently registered for that Update, runs the workflow and returns a result, if that run handled the update.
+### Design A — request/response records (the previously implemented design)
 
-```
-:beginning
+An `Update[I, R]` is a `Signal` with a **synchronous response channel**. The
+sender writes an update record; if the instance is free, the sender runs the
+workflow on **its own thread** so the run can handle the record, and then reads
+the response back off the record. Awaiting sites use `Step.awaitUpdate` to
+handle the OLDEST unhandled record for the key: `respond(input)` returns
+`(response, output)`, the `response` is durably persisted onto the record (which
+the blocked sender reads as `UpdateSendResult.Success`), and `output` is
+returned to the workflow body. Optional `idempotencyKey` deduplication reuses an
+existing record for a repeated send, and `persistUnhandledUpdates` controls
+whether a record the run did not handle survives for a later await.
 
-if (workflow is completed) {
-  return InstanceAlreadyCompleted to sender
-}
+Known weaknesses:
 
-if (update key is currently subscribed/awaited) {
-  if (workflow is locked/already running) {
-    wait for lease to run out
-    goto beginning
-  } else {
-    run workflow on the sender's thread, until run finished
-    
-    if (result is set on update's DB record) {
-      return Success(result) to sender
-    } else {
-      return Unhandled to sender
-    }
-  }
-}
-```
+- The sender-thread run needs the **workflow definition** at the send site (the
+  runtime has no registry), so `send` carries a leading `Workflow` argument.
+- A race with a concurrently scheduled runner run can **consume the update on
+  the runner's thread**, leaving the sender reading a stale `Unhandled` even
+  though the update was handled durably.
+- The sender can enter **lease-wait loops**, polling for a busy instance's lease
+  to expire before retrying.
+- The concept carried a lot of machinery: **two extra tables**
+  (`workflow_updates` and `workflow_update_subscriptions`) and **four engine
+  operations** (read candidates, resolve, suspend, plus the send path).
+
+### Design B — signal-based updates
+
+A second design builds entirely on **ordinary signals**, requiring no new engine
+machinery:
+
+- The caller sends a `Signal` carrying a correlation id and the request payload.
+- The workflow awaits that signal in an ordinary `Step.await`, computes the
+  response, and persists it where the caller can read it — for example an
+  at-most-once step keyed by the correlation id, or a response signal addressed
+  back to the caller.
+- The caller polls for, or awaits, the response.
+
+There is no sender-thread execution and no extra engine operations. The
+weakness is caller-side **latency and polling**.
+
+**Both designs are unimplemented alternatives.** The API shapes below are
+illustrative of Design A and are not part of the current library:
 
 ```scala
 class Update[I, R](val key: String)(using val inputCacheable: Cacheable[I], responseCacheable: Cacheable[R])
 
 val nameUpdate = Update[String, ValidationResult]("name-update")
-```
 
-Sending updates:
-```scala
 enum UpdateSendResult[+R] {
   case Success(value: R)
   case Unhandled
@@ -359,39 +381,12 @@ class Update[I, R](...) {
   def send(workflowInstanceId: WorkflowInstanceId, input: I): UpdateSendResult[R] = ???
 }
 
-class WorkflowInstanceId(...) {
-  @throws[WorkflowNotFoundException]
-  def sendUpdate[I, R](u: Update[I, R], input: I): UpdateSendResult[R] = ???
-}
-
-class WorkflowInstance[In, Out](...) {
-  @throws[WorkflowNotFoundException]
-  def sendUpdate[I, R](u: Update[I, R], input: I): UpdateSendResult[R] = ???
-}
-
-trait WorkflowRuntime {
-  @throws[WorkflowNotFoundException]
-  def sendUpdate[I: Cacheable, R: Cacheable](
-      instanceId: WorkflowInstanceId,
-      updateKey: String,
-      input: I,
-      idempotencyKey: String = "", // runtime deduplicates
-      persistUnhandledUpdates: Boolean = false // keep unhandled persisted or drop?
-  ): UpdateResult[R]
-}
-```
-- **idempotencyKey**: runtime deduplicates by this key; same key arriving twice → second is idempotent, sender gets the same result.
-- **persistUnhandledUpdates**: if `true`, an unhandled update remains persisted
-  for later handling; if `false`, it is deleted after workflow completion.
-
-Responding to updates:
-```scala
 object Step {
   def awaitUpdate[I, R, O](stepKey: String, u: Update[I, R])(respond: I => (R, O)): O = ???
 }
 ```
 
-### Causal boundaries between signals
+## Causal boundaries between signals
 
 An API for checkpoints, sharing a cursor between different signal keys, or
 manually moving a signal cursor is deferred. The current API can use `lookBack`
@@ -411,16 +406,17 @@ The library provides a function to await completion of other workflows.
 
 Every workflow can have an `onUnconsumedSignals` handler, mainly for logging.
 
-A signal/update arriving after execution passed its await-site is not lost: the
+A signal arriving after execution passed its await-site is not lost: the
 immutable fact remains available until workflow completion, continue-as-new, or
 another retention boundary removes it.
 
 - **Default: ignore.** Unless a handler is declared, unconsumed signals are
-  ignored. After handling, child relationships are closed and directly
-  addressed `Signal` events are deleted. Children retain cached Step results for
+  ignored. The gathering and deletion of directly addressed `Signal` events, the
+  closing of child relationships, and the terminal transition commit together;
+  children retain cached Step results for
   inherited signals they already consumed, so replay does not require the
   source rows.
-- Optional `onUnconsumedSignals` handler can be passed to the `Workflow` constructor in the same parameter group as the body. It runs as a final step before the instance is marked complete and receives a map of all unconsumed signals:
+- Optional `onUnconsumedSignals` handler can be passed to the `Workflow` constructor in the same parameter group as the body. It runs after the instance has been marked complete (or has continued as new) and receives a map of all unconsumed signals:
   ```scala
   val wf = Workflow("order")(
     (order: Order) => {
@@ -440,13 +436,25 @@ another retention boundary removes it.
     ...
   }
   ```
-  The handler receives `Map[SignalKey, Seq[Any]]` where the values are currently
-  visible events after this workflow instance's cursor for each exact signal
-  key.
-- The onUnconsumedSignals handler is a regular function (may not contain `Step`s) and executed at-least-once.
-- A workflow that is completing sets `is_accepting_signals := false` before
-  executing the unconsumed-signals handler. If signals are no longer accepted,
-  `send` returns `InstanceAlreadyCompleted`.
+  The handler receives `Map[SignalKey, Seq[String]]` where the values are
+  currently visible, raw serialized event payloads after this workflow
+  instance's cursor for each exact signal key (see DEVIATIONS entry 19 for why
+  the payloads are not decoded).
+- The `onUnconsumedSignals` handler is a regular function (may not contain `Step`s). It is invoked **after** the terminal (or continue-as-new) transaction commits, so it is **at-most-once**: a crash between the commit and the invocation loses the delivery, which is acceptable for a logging/debug aid. A handler that throws cannot mask the workflow outcome.
+- Directly addressed `Signal` events are gathered (per key, after cursors) and
+  deleted inside the same terminal/continue-as-new transaction that sets the
+  instance terminal, under that transaction's instance row lock. A signal
+  therefore either commits before the transition — and is included in the
+  handler's map — or arrives after and is rejected as
+  `InstanceAlreadyCompleted` because the instance is already terminal
+  (`terminal_state IS NOT NULL`). This resolves the "completion delivery
+  boundary" question below: a signal can never be reported as delivered and
+  then omitted.
+- On paths with no workflow definition available — force-stop/termination,
+  cancellation escalation, and cancellation of a never-started instance
+  (including a never-started child closed by its parent) — the gathered map
+  cannot be handed to a listener; the runtime logs it at WARN level instead of
+  silently dropping it.
 
 ## Invalidation and await stability
 
@@ -658,10 +666,15 @@ neither shared nor coordinated between different exact signal keys.
 key. Decide whether a typed prefix-group API has a concrete use case before
 introducing cursor interaction between overlapping prefixes and exact keys.
 
-4. **Completion delivery boundary** — **TODO**: Define whether a signal that
-arrives concurrently with the unconsumed-events handler is accepted into that
-handler's batch or rejected as `InstanceAlreadyCompleted`. It must not be
-reported as delivered and then omitted from handling.
+4. **Completion delivery boundary** — **Resolved**: the unconsumed `Signal`
+   events are gathered and deleted inside the terminal/continue-as-new
+   transaction that sets the instance terminal, under that transaction's
+   instance row lock, and the `onUnconsumedSignals` handler is invoked after the
+   commit. A concurrent `send` first row-locks the same instance: if it commits
+   before the transition it is included in the handler's batch; if it arrives
+   after, the committed `terminal_state` makes `send` reject it as
+   `InstanceAlreadyCompleted`. It is therefore never reported as delivered and
+   then omitted from handling.
 
 5. **Broadcast by key prefix** — **TODO**: Define snapshot and aggregate-result
 semantics for the derived bulk operation described above.

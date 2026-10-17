@@ -169,22 +169,26 @@ the child. It defaults to none; `SignalInheritance.all` permits every key and
   events are deleted. The child becomes cancelled or abandoned per its
   `ParentClosePolicy`, and any await Step result it already made remains cached
   for replay.
-- Replaying `startAsChild` replaces the current inheritance configuration.
-  Added prefixes can expose retained events; removed prefixes hide unresolved
-  events. Cached Step results are unaffected. Replaying an unchanged
-  configuration is a no-op and does not wake the subtree.
-- Updating the inheritance configuration does not acquire the child's execution
-  lease. A race with an await concurrently committing its result is deliberately left unordered; either the old or new configuration may be observed.
+- The inheritance configuration is **fixed at child creation**. Replaying
+  `startAsChild` with a different configuration does not replace it: the stored
+  configuration is kept and an SLF4J WARN is logged. Replaying an unchanged
+  configuration is a silent no-op. Cached Step results are unaffected. A child
+  whose policy differs from what a replay specifies can only exist via manual
+  row edits, and the run's read path then applies the stored policy.
 - The active parent, inheritance fields, and
   `inheritedEventsStartSequenceId` are persisted on the child's
   workflow-instance record.
 - Signals are immutable event facts, not copied deliveries. One committed
   send is therefore atomically visible to all currently eligible descendants.
   Awaiting inherited events uses a recursive ancestor query.
-- When the inheritance policy is updated, this may unblock awaits in the child. Thus, all grandchildren need to be scheduled for execution after an inheritance policy update. Descendant scheduling may be asynchronous and reuse the normal
-  workflow wakeup mechanism.
-- Synchronous `Update`s are never inherited because multiple descendant
-  responses would be ambiguous.
+- Because the configuration is fixed at creation, there is no
+  inheritance-policy update and therefore no ancestry-driven subtree wakeup:
+  signal and completion wakeups come only from the run's two wakeup passes,
+  which apply the stored policy (see `running-workflows.md`, "Sources of
+  wakeups").
+- The unimplemented Update design (see `signals-timers.md`) is intentionally not
+  inherited: a synchronous request cannot have one unambiguous response if
+  several descendants handle it.
 
 See `child-signal-inheritance.md` for ordering, cursor, and detachment semantics.
 
@@ -413,7 +417,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
    construct resolves, every branch's pending subscriptions — including those
-   of nested subscopes — are deleted (a subtree delete over all four
+   of nested subscopes — are deleted (a subtree delete over all three
    subscription tables) BEFORE the winner's step row is written, so a losing
    await can never wake the workflow later and a committed winner row never
    coexists with branch subscriptions. The runtime primitive is

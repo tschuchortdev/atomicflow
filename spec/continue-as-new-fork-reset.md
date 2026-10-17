@@ -30,11 +30,13 @@ workflow body does not continue after the call.
   new input are installed as one durable in-place state transition. Current
   execution records include old await subscriptions and wakeups; pending
   `child_close_requests` rows live in their own table and survive the
-  generation erase. The unconsumed-signal handler runs before this transaction
-  while signal acceptance is closed. The directly addressed `Signal` events are
-  deleted before children are delivered; this ordering is unobservable because
-  the inheritance walk treats a parent holding a matching `child_close_requests`
-  row as detached (see `sub-workflows-iteration.md`, `ParentClosePolicy`).
+  generation erase. The unconsumed `Signal` events are gathered (keyed per
+  signal key, after cursors) and then deleted inside this same transaction; the
+  `onUnconsumedSignals` handler runs after the transaction commits. The directly
+  addressed `Signal` events are deleted before children are delivered; this
+  ordering is unobservable because the inheritance walk treats a parent holding
+  a matching `child_close_requests` row as detached (see
+  `sub-workflows-iteration.md`, `ParentClosePolicy`).
 - Children of the old generation are handled asynchronously according to their
   `ParentClosePolicy`: `Cancel` requests cancellation and `Abandon` detaches
   them, delivered at each child's next run start or by the periodic child-close
@@ -43,9 +45,9 @@ workflow body does not continue after the call.
   generation carry a distinct scope (`key@generation+1`) and are never matched
   by the old generation's closure target.
 - Signals receive the same completion-boundary treatment as normal completion.
-  The `onUnconsumedSignals` handler runs before the transition. Once it
-  finishes, directly addressed `Signal` events are deleted. State needed by the
-  successor must be passed in
+  The unconsumed `Signal` events are gathered and deleted inside the transition
+  transaction; the `onUnconsumedSignals` handler then runs after it commits.
+  State needed by the successor must be passed in
   `nextInput`.
 - Cancelled or abandoned children no longer need unprocessed
   inherited events; cached Step results contain their replayable values and do

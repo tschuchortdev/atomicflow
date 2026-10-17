@@ -32,12 +32,17 @@ workerWorkflow.startAsChild(
   events may be visible if they are still ahead of the child's cursor. Events
   deleted when their owning workflow completed or continued as new cannot be
   made visible again.
-- Replaying `startAsChild` replaces the current policy. Added prefixes can
-  expose retained events; removed prefixes hide unresolved events. Cached Step
-  results remain valid.
-- Policy broadening durably schedules coalesced reruns for the affected child
-  subtree. Descendant scheduling may be asynchronous.
-- Synchronous `Update`s are not inherited.
+- The inheritance policy and `inheritPastEvents` are **fixed at child
+  creation**. A replay of `startAsChild` that specifies a different
+  configuration is ignored — the stored configuration is kept — and logs an
+  SLF4J WARN; an unchanged configuration is a silent no-op. There is no
+  policy-change mechanism and no ancestry-driven subtree wakeup: a narrowed or
+  broadened subtree is never woken proactively. A child whose policy differs
+  from what a replay specifies can only exist via manual row edits, which the
+  next run's read-path check handles under the stored policy.
+- The unimplemented Update design (see `signals-timers.md`) is intentionally not
+  inherited: a synchronous request cannot have one unambiguous response if
+  several descendants handle it.
 
 ## Events and ordering
 
@@ -73,12 +78,16 @@ workerWorkflow.startAsChild(
 - An unresolved child await recursively queries parent and grandparent sources
   and selects the earliest visible event for its exact key after the child's
   `(workflowInstanceId, signalKey)` cursor.
-- The active parent, inheritance selector, `inheritPastEvents`, and
-  `inheritedEventsStartSequenceId` live on the child workflow-instance storage
-  record. A separate relationship record is unnecessary.
-- Updating inheritance fields does not acquire the child's execution lease. If
-  it races with persistence of an await result, either the old or new policy may
-  be observed; no visibility revision is required.
+- The active parent, the stored inheritance mode and prefixes, the
+  `inherit_past_signals` flag (persisted form of the `inheritPastEvents`
+  constructor parameter), and `inheritedEventsStartSequenceId` live on the
+  child workflow-instance storage record. A separate relationship record is
+  unnecessary.
+- The inheritance fields are written once, at child creation, in the same
+  transaction that records the parent relationship and captures
+  `inheritedEventsStartSequenceId`. They are not updated afterwards, so they
+  never race with persistence of an await result and no visibility revision is
+  required.
 - Detachment removes inherited visibility for unresolved awaits. Cached Step
   results remain replayable, and directly addressed signals remain valid.
 - When a workflow completes or continues as new, its child relationships are
@@ -96,10 +105,17 @@ workerWorkflow.startAsChild(
 - A global PostgreSQL sequence with `CACHE 1` allocates `sequenceId`s. Every
   event appender takes the same blocking transaction-scoped advisory lock before
   `nextval` and keeps it through commit, so IDs are visible in append order.
-- Use a recursive CTE over `workflow_instances` to obtain allowed ancestor
-  sources for an await.
-- Policy broadening can use a recursive CTE and the existing durable wakeup
-  mechanism to schedule unfinished descendants without copying signal payloads.
+- One recursive CTE over `workflow_instances` enumerates each subscription's
+  eligible ancestor sources by climbing the active-parent chain. The run read
+  path, the watermark dispatcher, and the full subscription scan all compose the
+  same SQL builder, so eligibility cannot drift between them. The walk is
+  bounded by the parent chain (no depth cap), and every subscriber's
+  `inherit_past_signals` flag and `inherited_events_start_sequence_id` are
+  carried up the recursion unchanged.
+- Inheritance configuration is stored descriptively on `workflow_instances`:
+  `inherited_signal_mode` (`none`/`all`/`prefixes`), `inherited_signal_prefixes`
+  (`VARCHAR[]`, meaningful only when the mode is `prefixes`),
+  `inherit_past_signals`, and `inherited_events_start_sequence_id`.
 - The execution lease must not be a row lock held while user code runs.
 
 ## Why this design
@@ -110,7 +126,10 @@ workerWorkflow.startAsChild(
   amplification or a distributed inheritance transaction.
 - Global `sequenceId`s give direct and inherited signals, timers, and workflow
   completions one clear order.
-- Read-time policies make transitive and past-event visibility inexpensive to
-  change; the tradeoff is a recursive ancestor query during unresolved awaits.
+- Visibility is a read-time projection over immutable events and the stored
+  configuration, so no payloads are copied and one append reaches every
+  currently eligible descendant; the tradeoff is a recursive ancestor query
+  during unresolved awaits. The configuration itself is fixed at child
+  creation.
 - Per-workflow, per-key cursors keep consumption local without a processed row
   for every event and recipient.
