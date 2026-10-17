@@ -2,8 +2,8 @@ package atomicflow
 
 import java.time.Instant
 
-/** The durable facts of one workflow_steps row, as read without any lease or
-  * fence. `state` is one of `Started`, `Succeeded`, `Failed`; `statePayload`
+/** A stored step record, read without acquiring an execution lease.
+  * `state` is one of `Started`, `Succeeded`, `Failed`; `statePayload`
   * is the raw, encoded outcome; `inputFingerprints` is the deterministic
   * encoding of the step's named inputs.
   */
@@ -41,8 +41,8 @@ final case class AwaitTimerCandidate(
     createdAt: java.time.Instant
 )
 
-/** The durable wait-site a runtime-computed await resolves into: the identity,
-  * kind, fingerprints, and TTL of the `workflow_steps` row its result lands in.
+/** Identifies the step record where a wait's result will be stored, including
+  * its kind, input fingerprints, and expiry.
   */
 final case class WaitSite(
     stepId: StepId,
@@ -67,9 +67,8 @@ enum Subscriber {
   )
 }
 
-/** One durable fact currently available to one subscriber of a wait-site,
-  * selected by global `sequenceId` across all subscribers so the earliest
-  * satisfying event wins regardless of kind or workflow tree.
+/** A stored event available to a wait's subscriber. Events from all subscribers
+  * are ordered by `sequenceId`, so the earliest matching event wins.
   */
 final case class SubscriberMatch(
     subscriberKey: String,

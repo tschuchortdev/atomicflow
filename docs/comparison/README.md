@@ -1,14 +1,7 @@
 # AtomicFlow vs. Temporal vs. DBOS
 
-A behaviour **and implementation** comparison of three durable-workflow systems.
-
-To keep the comparison honest, this document uses **one vocabulary for all
-three** (based on AtomicFlow's terms). Where a library's own name is needed for
-lookup, it appears once in the glossary and is not repeated in prose. Every
-feature is shown with small equivalent snippets, and every feature has an
-*implementation* discussion that states **how concurrency is controlled** (locks,
-ownership tokens, leases, shards, or "no coordination needed") and **what
-guarantee** results.
+A comparison of workflow behavior, storage, concurrency control, and execution
+guarantees. The glossary maps shared concepts to each library's API terms.
 
 > **Scope & freshness.** Written against the AtomicFlow spec in `spec/` and the
 > public Temporal/DBOS documentation as of 2026-10. External products evolve;
@@ -49,7 +42,7 @@ Use these terms throughout; the third column lists each library's local name.
 | **workflow definition** | The code that defines a workflow | `Workflow[In, Out]` | Workflow Definition / Type | workflow function |
 | **workflow instance** | One durable execution of a definition | `WorkflowInstance` | Workflow Execution | workflow execution |
 | **instance identity** | What uniquely names an instance | `(workflowId, instanceKey, scope)` | `(namespace, workflowId, runId)` | `workflowId` |
-| **generation** | In-place reincarnation counter | `generation` | Run Id (in the execution chain) | — (no continue-as-new) |
+| **generation** | Counter incremented when an instance's history is reset | `generation` | Run Id (in the execution chain) | — (no continue-as-new) |
 | **workflow body** | The user function that is re-run on resume | `body` | Workflow Function | workflow function body |
 | **step** | A durable, individually recoverable unit of side effect | `Step` | Activity | step |
 | **at-most-once step** | A step that never re-runs after a crash | `Step.atMostOnce` | — | — |
@@ -78,7 +71,7 @@ implementation**, not the library's marketing name for it.
 
 ## 2. Consolidated feature matrix
 
-Legend: ✅ first-class · ◑ partial / different-shaped · ❌ absent or out of scope.
+Legend: ✅ supported · ◑ partial or different behavior · ❌ absent or out of scope.
 
 | Feature | AtomicFlow | Temporal | DBOS |
 |---|---|---|---|
@@ -112,8 +105,7 @@ Legend: ✅ first-class · ◑ partial / different-shaped · ❌ absent or out o
 
 ## 3. Architecture at a glance (and where concurrency is arbitrated)
 
-This is the single most important implementation axis: **where does the system
-serialize access to one instance?**
+Where each system serializes access to one instance:
 
 | | AtomicFlow | Temporal | DBOS |
 |---|---|---|---|
@@ -150,7 +142,7 @@ The detailed mechanisms are in
 
 ---
 
-## 4. The three deepest divergences
+## 4. Main differences
 
 1. **Positional vs. ID-addressed steps.** Temporal matches emitted commands to
    Event History *positionally*; DBOS numbers steps by call order (`function_id`).
@@ -168,10 +160,9 @@ The detailed mechanisms are in
 
 3. **Guarantee model.** Temporal exposes at-least-once steps (exactly-once only
    with external idempotency keys); DBOS exposes at-least-once steps and
-   exactly-once *transactions*. AtomicFlow makes the guarantee an explicit,
-   first-class axis (`atLeastOnce` vs `atMostOnce`) orthogonal to per-key cache
-   drift/TTL policy, and offers at-most-once as a genuine "never double-execute"
-   option.
+   exactly-once *transactions*. AtomicFlow exposes `atLeastOnce` and `atMostOnce`
+   separately from input-change and cache-expiry policies. `atMostOnce` skips
+   unresolved attempts after a crash, returning `None`.
 
 ---
 

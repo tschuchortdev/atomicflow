@@ -1,780 +1,136 @@
-# Deviations from the spec
+# Implementation notes and design differences
 
-This document tracks every place where the implementation deviates from the
-spec in `spec/`, with the reason for the deviation. It is updated after every
-implementation phase.
+This document describes the current implementation where it differs from, or
+adds detail to, the documents in `spec/`.
 
-## General / build
+## Build and runtimes
 
-1. **Legacy prototype code removed instead of ported.** The old prototype API
-   (`WorkflowMeta`/`StepMeta` hierarchy, `SignalStore`/`StepCache`/
-   `StepIdempotencyStore` SPI, `DbWorkflowRuntime`, `WorkflowRunSettings`) was
-   deleted rather than migrated: the spec amounts to a rewrite of that surface,
-   and git history (branch `before_impl`) preserves the prototype for
-   reference. `InMemoryWorkflowRuntime` is kept in the tree but commented out
-   (per explicit instruction); it will be re-implemented against the new
-   `WorkflowRuntime` API later.
-2. **`de.lhns/doobie-flyway` dependency dropped.** Plain Flyway
-   (`Flyway.configure().dataSource(ds).load().migrate()`) is used instead of
-   the baseline-migrate wrapper. The wrapper only matters for adopting
-   pre-existing databases with legacy schema state, which the rewrite does not
-   need.
-3. **`doobie-postgres-circe` dependency dropped.** The new schema stores
-   step-input fingerprints as TEXT (see `Fingerprintable.Fingerprint`'s
-   Base64 form), so no `jsonb` codecs are needed.
-4. **neotype / cats-core / circe removed from `core`** (no longer referenced).
-   `Fingerprintable.contramap` replaces the cats `Contravariant` instance.
-5. **Flyway migration `V001__init.sql` replaced instead of appended to.** The
-   new schema is the initial schema of the rewritten library; the prototype
-   schema was never deployed anywhere. Test databases are ephemeral
-   (testcontainers), so checksum history is irrelevant.
+- PostgreSQL is the implemented backend. The commented in-memory prototype does
+  not implement the current `WorkflowRuntime` API.
+- Flyway applies the initial schema at runtime construction. `V001__init.sql`
+  has been edited during pre-release development; it is not an upgrade migration
+  for an existing installation of the prototype.
+- The database runtime uses doobie and plain Flyway. Core code does not depend
+  on cats-core or circe; JSON derivation uses upickle.
+- `TestClock` is in `core` and can be used independently of a storage backend.
 
-## Phase 1 (types & codecs)
+## Serialization
 
-6. **`Cacheable.MsgPack` replaced by `Cacheable.Json`.** The spec's
-   `Cacheable` is String-based (`write: A => String`). The built-in derived
-   codec therefore uses upickle JSON (human-readable in DB rows) instead of
-   binary MessagePack. The old prototype's binary `Cacheable` is gone.
-7. **Envelope/framing format is an implementation detail.** `withFallback`,
-   `unionMostSpecific` and the `WorkflowCompletionResult` codec must record
-   which member codec wrote a payload ("the outer codec records the selected
-   ID and a self-delimiting payload"). The concrete framing used is
-   `<length>:<content>` frames (see `atomicflow.internal.Framing`); the spec
-   leaves the exact format open.
-8. **`unionMostSpecific` performs its "incomparable members" check at codec
-   construction time (runtime), not in a compile-time macro.** The spec says
-   "the derivation macro rejects declarations where two potentially matching
-   members are incomparable". The check (reject a pair where neither runtime
-   class is assignable from the other and at least one is an interface) runs
-   when the union codec is constructed. This is safe (fail-fast on first use)
-   and much simpler than compile-time reflection over `Class` relationships,
-   which Scala 3 cannot express.
-9. **`WorkflowNonFatal` matches `InterruptedException`** (unlike
-   `scala.util.control.NonFatal`). Interrupts carry no workflow semantics
-   ("Thread.interrupt plays no role", `running-workflows.md`), so user cleanup
-   code may handle them; the extractor only excludes fatal JVM errors and
-   `ControlThrowable` (which covers all library control-flow exceptions).
-   This gives broad catches one place to re-express "everything except library
-   control flow".
+- `Cacheable` stores strings. Derived codecs use JSON, replacing the prototype's
+  MessagePack format.
+- Composite codecs store member codec ids and payloads in length-prefixed
+  frames: `<UTF-16 character count>:<content>`.
+- `unionMostSpecific` validates ambiguous runtime classes when the codec is
+  constructed, rather than during macro expansion.
+- Step input hashes are stored as text sorted by input name. Input order does
+  not affect comparison between runs.
+- A step serializes and decodes its result before storing it, then returns the
+  decoded value after the write commits. The first caller and replay callers
+  therefore observe the same serialized representation.
+- Failure encoding uses the configured throwable codec. If it cannot encode a
+  step failure, the step attempts to encode `StepSerializationFailed` with the
+  same codec. If that also fails, the original exception propagates without a
+  stored step failure.
+- `WorkflowNonFatal` includes `InterruptedException`, unlike Scala's `NonFatal`.
+  Both exclude `ControlThrowable`, which is the base of internal suspension,
+  restart, break, and continue-as-new exceptions.
 
-## Phase 2 (Postgres run engine)
+## Runtime API and execution context
 
-10. **Runtime-level lease settings.** `PostgresWorkflowRuntime` takes
-    constructor parameters `leaseDuration` (default 5 minutes) and
-    `leaseAcquireTimeout` (default 30 seconds) for caller-thread runs. The
-    spec pins these only on `JobRunnerSettings` (the runner's runs); external
-    `run` calls need durations too, so the runtime carries its own defaults.
-11. **`TestClock` will ship in `core`**, not "with the in-memory backend" as
-    the spec suggests — the in-memory backend is disabled for this rewrite,
-    and a mutable clock is backend-independent.
-12. **`getExecutionState` takes `(using Cacheable[Throwable])`.** The spec's
-    inspection examples omit it, but `Failed(failure: Throwable)` cannot
-    decode without the application-global throwable codec, which the spec
-    requires at every failure-decode point.
-13. **Drift policies also apply to unresolved `Started` rows.** The spec's
-    "an `ensureUnchanged` difference finds the existing row" is applied to any
-    existing row (including `Started`), which is more conservative than
-    re-executing with changed inputs.
-14. **`StepSerializationFailed` failure payloads are encoded through the
-    application's throwable codec** (a plain `RuntimeException` usually encodes
-    even when the original failure did not; the last resort propagates the
-    original failure unpersisted). The spec's "minimal encoding does not use
-    the failing user codec" is satisfied in outcome (no recursive failure),
-    but the payload is not written with a separate runtime-owned encoding —
-    that would break decode symmetry with the contextual codec on replay.
-    Only manifests with codecs that cannot encode any `RuntimeException`.
-15. **Step input fingerprints are stored as deterministic TEXT sorted by
-    name** (order-insensitive across runs); the spec is silent on ordering.
-16. **Event-kind values are CamelCase** (`Signal`, `TimerFired`,
-    `WorkflowCompleted`) per the spec's envelope table; the plan's original
-    snake_case index predicate was corrected before any data existed.
-17. **`WorkflowSuspendedException`'s constructor is `private[atomicflow]`**;
-    the boundary-catch behavior is tested from a package-`atomicflow` test
-    (users fabricating suspensions would violate the durable-suspension
-    invariant).
+- `WorkflowRuntime` exposes storage and execution operations directly. Backends
+  define `CurrentExecution`, an opaque handle created for one run and passed to
+  runtime operations through `WorkflowContext.currentExecution`.
+- The handle's identity is stable during a run. A backend that mutates its
+  contents must support concurrent access from parallel branches.
+- `WorkflowContext` holds the enclosing step scope and cancellation-suppression
+  depth. Nested scopes pass an immutable copy to their bodies, so a captured
+  context works on another thread without thread-local state.
+- Runtime settings include `leaseDuration` (5 minutes), `leaseAcquireTimeout`
+  (30 seconds), and `durableRetryThreshold` (30 seconds). Caller-thread runs
+  need these settings as well as job-runner executions.
+- `Step.getExecutionState` requires `Cacheable[Throwable]` to decode a stored
+  failure, and reports records even when their cache expiry has passed.
 
-## Phase 3 (signals, timers, awaits)
+## Steps and waits
 
-18. **`RetryPolicy.exponentialBackoff` exists as one method, not the spec's two
-    overloads.** Scala 3 forbids two overloaded alternatives that both define
-    default arguments (verified empirically); the merged method serves both
-    spec signature-block call shapes (`initialDelay = ..., maxCumulativeDelay =
-    ...` and `maxRetries = ..., initialDelay = ...`). `steps.md`'s own example
-    (`start =`, `max =`) contradicts its signature block and is resolved in
-    favor of the latter.
-19. **`onUnconsumedSignals` receives `Map[SignalKey, Seq[String]]`** (raw
-    serialized payloads, in sequenceId order, after cursors) instead of the
-    spec's `Seq[Any]`: decoding would require a per-key codec registry the
-    spec does not provide. Payload strings serve the stated purpose
-    ("mainly for logging").
-20. **The spec's open TODO "completion delivery boundary" is resolved** (was:
-    a workflow flips `is_accepting_signals := false` BEFORE running the
-    unconsumed-signals handler, so a signal arriving during the handler is
-    rejected as `InstanceAlreadyCompleted`; **superseded by entry 91**, which
-    resolves the same TODO by gathering+deleting inside the terminal
-    transaction and checking `terminal_state` in `sendSignal`).
-21. **`Awaitable` carries no `Cacheable` context bound.** The spec is
-    self-contradictory (it puts `R : Cacheable` on the enum but also states
-    `map` "does not require a `Cacheable[B]`" and that the result codec is
-    "required at the `Step.await` call site"). The call-site requirement wins.
-22. **`WorkflowCompletion` carries its composite codec, captured at
-    `.completion` call time** (which now takes `Cacheable[Throwable]`
-    contextually, per "every operation that surfaces the completion takes the
-    codecs contextually"). This makes mapped completion leaves decodable —
-    the spec's named use case for `map` — by decoding via the source's own
-    codec and persisting with the call-site codec.
-23. **Timer subscriptions are backed by a UNIQUE (site, subscriber_key)
-    constraint**, and each durable retry attempt mints a fresh subscription
-    (new timer id, new deadline) atomically with its started-row write — the
-    spec is silent on both; idempotency otherwise rested on the lease fence
-    alone.
-24. **The durable-retry delay threshold is a `PostgresWorkflowRuntime`
-    constructor parameter (`durableRetryThreshold`, default 30 seconds).**
-    The spec attributes it to a `WorkflowRunSettings` type that does not
-    exist in the new API.
-25. **An empty `awaitRace` fails fast** (`require(members.nonEmpty)`): a
-    zero-member race can never satisfy and would violate the
-    suspended-instance invariant. Member keys are validated too: non-empty,
-    unique within the race, and not starting with the reserved `"__"` prefix.
-26. **The unconsumed-signals handler also runs on the failure path** (the spec
-    ties it to "before the instance is marked complete"); a throwing handler
-    on the failure path masks the original exception (unspecified edge,
-    documented behavior). **Superseded by entry 91**: the listener now runs
-    after the transition commits, and a throwing listener is logged and
-    swallowed so it can never mask the workflow outcome. The "also on the
-    failure path" decision stands.
+- Input-change and expiry checks apply to pending `Started` records as well as
+  completed records.
+- `RetryPolicy.exponentialBackoff` is one method with both retry-count and
+  cumulative-delay limits. Scala does not allow both proposed overloads to
+  define default arguments.
+- All supported waits use one evaluation implementation. A single wait has the
+  empty subscriber key; race branches use distinct, non-empty keys. Keys
+  beginning with `__` are reserved for internal subscribers, including retries.
+- `Awaitable` does not require a result codec at construction. `Step.await` or
+  `Step.awaitRace` supplies the codec used to store the result.
+- Mapped awaitables work in `Step.awaitRace`; direct `Step.await` currently
+  rejects them. A workflow-completion awaitable captures the codecs needed to
+  decode its source outcome before mapping.
+- An empty race is rejected. When no event passes a signal filter, evaluation
+  advances the signal cursor past the examined events before suspending.
+- `deleteStepOrAwait` deletes a step record and all its subscriptions in one
+  ownership-checked transaction. Re-evaluation is a separate transaction. A
+  replacement timer gets a fresh id, so its old firing event cannot satisfy it.
+- Timer firing commits before wait evaluation. Its event remains stored if
+  registration, filtering, mapping, or result storage subsequently fails.
+- `firstToRunWithoutSuspension` waits for its concurrent branches to settle.
+  If several complete, the first declared completed branch wins. Branch
+  subscriptions are deleted before storing the winner; a crash before that
+  write can cause branches to run again and choose a different winner.
 
-## Phases 4-5 (cancellation, job runner)
+## Scheduling and cancellation
 
-27. **CREATED-cancel predicate.** "Cancel before first start" finalizes CANCELLED
-    when the instance has no execution state at all (`times_executed = 0` and
-    no rows in workflow_steps/subscriptions/wakeups) — the spec says "has
-    never started and has no execution state to deliver into" without
-    pinning the predicate.
-28. **`JobRunnerSettings` gains a `throwableCacheable` field** (default
-    `forThrowable.genericStringMessageSerializer`). Runner-driven failure
-    terminal outcomes need an explicit codec choice; the spec's settings field
-    list omits one, and hard-coding it silently would violate "choosing the
-    throwable codec is part of workflow behavior and must be explicit".
-29. **Requeue backoff constants** (base 1 second, cap 5 minutes, factor 2) are
-    internal; the spec pins only "capped exponential backoff, unbounded
-    retries". The escalation/recovery sweep batch size (128) is likewise
-    internal (the spec pins only `timerBatchSize`).
-30. **Package-private test hooks**: `JobRunner.runDriverCycle`,
-    `runTimerSweep`/`runEscalationSweep`/`runRecoverySweep`, a loop-less
-    runner constructor, and a `testRunWrapper` fault-injection point. All
-    `private[atomicflow]` — the spec's "Runtime-internal test hooks" category.
-31. **The driver loop dispatches a whole claimed batch to the bounded pool and
-    processes outcomes before claiming again** (bounded pool = backpressure).
-    The spec's pseudocode leaves the await semantics of the dispatch loop
-    open.
+- A runner processes a claimed batch before claiming another. Per-workflow
+  limits control batch share and concurrent execution.
+- Transient execution failures are rescheduled with unbounded retries and
+  exponential delay: 1 second initially, capped at 5 minutes.
+- Signal sends and completion transitions append events without scheduling
+  subscribers in their transactions. Event dispatch handles recent events;
+  the periodic full subscription scan also finds subscriptions that committed
+  concurrently with those events. Both passes retry database deadlocks.
+- Cancellation, lease recovery, and child-close sweeps use batches of 128.
+- Cancellation immediately finalizes an instance only when it has never run
+  and has no step, subscription, or wakeup records. Otherwise it is delivered
+  before the next uncached step or wait.
+- Internal test helpers allow manual driver cycles, sweeps, and injected run
+  failures without starting a background loop.
+- Unconsumed directly addressed signals are gathered and deleted in the same
+  transaction as completion or continue-as-new. The listener receives raw
+  serialized payloads grouped by key, in event order, after commit. Delivery is
+  at-most-once; listener failures are logged. Transitions without a workflow
+  definition log the discarded signals instead.
+- `sendSignal` rejects terminal instances by checking `terminal_state` under
+  the same instance-row lock used by completion. There is no separate
+  `is_accepting_signals` flag.
 
-## Phase 6 (children, inheritance, parallelism)
+## Child workflows and history changes
 
-32. **`step_scope_within_instance` is `NOT NULL DEFAULT '{}'` rather than
-    nullable.** The spec says step/await rows carry a "nullable scope-path
-    column"; Postgres primary-key columns cannot be NULL, and the column
-    participates in the natural keys of `workflow_steps` and all three
-    subscription tables. The empty array is the top-level sentinel.
-33. **Scope-path shortening is not implemented.** The spec once described
-    truncating long scope paths; the current implementation stores full
-    segment arrays and instead rejects an overlong derived scope with an
-    `IllegalArgumentException` at the 1800-character joined-length limit.
-    Deferred as a performance concern (no behavioral difference at sane
-    depths).
-34. **`firstToRunWithoutSuspension` defaults live on the vararg overload
-    only** (Seq form delegates without defaults) — Scala 3 forbids default
-    arguments on two overloaded apply methods (same class of limitation as
-    entry 18).
-35. **`firstToRunWithoutSuspension` records the lowest completed branch index
-    when multiple branches complete in the same execution** (deterministic
-    tie-break); the spec leaves the winner "whichever the implementation
-    observes first".
-36. **`firstToRunWithoutSuspension` accepts an unused `Cacheable[Throwable]`
-    parameter for parity** with the other `Step` constructs (uniform
-    signature); failures are carried by the step machinery, not encoded.
-37. **Signal inheritance selectors persist as text tokens** (`none`, `all`,
-    `some:` + JSON array of prefixes via upickle) — the storage format is an
-    implementation choice the spec leaves open.
-38. **Narrowing an inheritance policy schedules conservative wakeups** (the
-    affected subtree is woken and re-checks eligibility, re-suspending if
-    newly ineligible). The spec requires wakeups only on broadening; the
-    conservative extra wakeups are no-ops.
-
-## Phase 7 (continueAsNew, restartable regions, fork/reset)
-
-39. **`WorkflowRunResult.ContinueAsNew` outcome.** The spec requires the run
-    to end when `continueAsNew` fires but does not name the run outcome; the
-    outcome set gains this case (and the JobRunner treats it as terminal for
-    the claiming run).
-40. **Parallel control-flow crossing is join-then-propagate.** The spec says
-    parallel "handles cleanup of the other branches internally" without
-    pinning the mechanism. Interrupting sibling threads mid-DB-write is
-    unsafe under JDBC (interrupt-swallowing on a dead backend held a row
-    lock indefinitely), so `Workflow.parallel` collects every branch outcome
-    as a value, joins all branches to completion, then propagates: control-flow
-    exception first, then first non-suspension failure, then the combined
-    suspension.
-41. **Enclosing scope and `uncancellable` depth propagate into parallel
-    branch threads.** The spec is silent on branch-thread context; without
-    propagation, steps inside parallel would persist at the empty scope,
-    defeating region restarts and scoped isolation.
-42. **Reset keeps directly-addressed signal events and cursors** (it is a
-    history-erase operation only; only continueAsNew deletes events).
-43. **Fork is allowed from any source state; reset requires a non-terminal
-    instance.** The spec is silent on source states; these are the pinned
-    and documented semantics.
-44. **Fork/reset boundary ties count as "after"** (rows with `updated_at`
-    equal to the selected step's are re-executed — conservative).
-45. **Reset leaves subscriptions of erased steps in place when they have no
-    step row** (benign: re-registration reuses them via ON CONFLICT and
-    consumption is cursor-based).
-
-## Phase 8 (Updates)
-
-46. **`sendUpdate` and its forwarders take a leading `workflow` definition
-    argument** (the sender-thread run needs the definition; the runtime has no
-    registry). The spec's shapes omit it.
-47. **`Step.awaitUpdate` requires `O: Cacheable`** (the await persists its
-    output like every other step construct); the spec's shape omits the bound.
-48. **A `workflow_update_subscriptions` table backs suspended
-    `awaitUpdate`s**, in addition to the spec's update records — the same
-    subscription/wakeup machinery signals use, so a send wakes a suspended
-    awaiter.
-49. **Handled update records are retained only when they carry an
-    idempotency key** (dedup requires them); empty-key handled records are
-    deleted. The spec's "deleted after workflow completion" phrasing is
-    resolved in favor of idempotency.
-50. **Known edge (deferred):** a runner-mode wakeup scheduled for the same
-    instant as a sender-thread run can, in a narrow race, consume the update
-    on the runner's thread and leave the sender reading `Unhandled` — the
-    update IS handled durably; only the sender's synchronous view is stale.
-
-## Phase 9 (final conformance pass)
-
-64. **Metrics export and wakeup-age alerting are out of scope** (project
-    constraint). The spec's observability paragraphs (wakeup-age monitoring,
-    timer-firing lag, "workflow known to no runner" detection) are not
-    implemented; only SLF4J logging exists.
-65. **No lease renewal at await checkpoints.** Renewals happen at step
-    checkpoints; a run spending longer than `leaseDuration` between step
-    checkpoints risks lease loss (bounded, recovers via sweeps).
-66. **`StepContext` as a separate public type is folded into
-    `WorkflowContext`.**
-67. **No `getWorkflowResult` accessor**; `awaitResult` covers terminal-outcome
-    reading.
-68. **Reusing a step id with a different `stepKind` is not a conflict.** Rows
-    are keyed by identity; a kind change follows the same-version
-    compatible-hotfix semantics.
-69. **`Step.await` of a raw `Mapped` awaitable throws.** Composition happens
-    through `Awaitable.map`; awaiting the raw mapped case is a programming
-    error.
-70. **Race rows persist `stepKind = 'AwaitRace'`**, distinct from `'Await'`.
-71. **Draft `design.md` bullets (prefix bulk-start, broadcast send, signal
-    streams) are not implemented** — non-binding draft material.
-72. **`SignalInheritance.some` takes `Seq[SignalKey]`** (Scala 3 enum
-    parameters cannot be varargs; same class as entries 18/34). Scaladoc
-    shows the usage.
-73. **The inheritance ancestor walk is an iterative in-Scala walk, not a
-    recursive CTE** (semantics equivalent; the spec's PostgreSQL notes are
-    non-binding).
-74. **`StepSerializationFailed`'s payload is encoded via the user codec**
-    rather than a runtime-owned minimal encoding with a payload marker (only
-    manifests with broken user codecs).
-75. **Started rows persist an empty `state_payload` sentinel** (arbitrary
-    placeholder for the pre-body state).
-
-## Phase 10 (context-carried scope state)
-
-76. **`WorkflowContext` carries the transient scope/uncancellable state;
-    `PostgresExecution` no longer uses ThreadLocals.** The spec does not
-    detail how `Workflow.scoped`/`Workflow.uncancellable` state reaches Step
-    registrations; the implementation used per-thread ThreadLocals in
-    `PostgresExecution` plus a snapshot/restore protocol for parallel-branch
-    threads. Per the design intent (the `local` of a reader monad), the state
-    now lives immutably on `WorkflowContext` (`scopePath`,
-    `uncancellableDepth`, both `private[atomicflow]`), and every region
-    function passes a derived context to its body. Consequence: the branch
-    parameters of `Workflow.parallel` and `Step.firstToRunWithoutSuspension`
-    are context functions (`WorkflowContext ?=> R`, a public signature
-    change from the spec's `Seq[() => R]` in sub-workflows-iteration.md),
-    and the bodies of `Workflow.restartable`/`Workflow.loop` are context
-    functions ending in `WorkflowContext ?=> R` / `WorkflowContext ?=> S`
-    (a public signature change from the plain function bodies in
-    restartable-regions-loops.md). Branch call sites drop the `() =>`
-    (behavior is otherwise identical; branch bodies are still evaluated at
-    application time).
-    Benefit: Step IDs and cancellation suppression travel with the
-    context value, so code that hops threads and carries the context (e.g.
-    applies a captured `WorkflowContext ?=> R` on another thread) records
-    the correct scope instead of silently corrupting Step IDs; branch fork
-    sites no longer need the snapshot/restore choreography.
-
-## Phase 11 (engine operations on the public runtime SPI)
-
-77. **The durable engine operations live on the public `WorkflowRuntime`
-    trait, behind an opaque per-run handle, instead of on a separate
-    `private[atomicflow]` trait.** The operations previously lived on a
-    `private[atomicflow]` trait `WorkflowExecution` (now deleted), and the
-    spec's `running-workflows.md` framed the public `WorkflowRuntime` trait
-    as deliberately omitting exactly these backend-internal operations. They
-    are now ~35 public methods on `WorkflowRuntime`, each taking the run's
-    handle as its first parameter: the runtime-defined opaque
-    `type CurrentExecution` — created by the runtime at run start,
-    identity-stable for the run's lifetime, contents owned and updatable by
-    the runtime — which workflow code reaches as
-    `WorkflowContext.currentExecution` (path-dependent on the context's
-    runtime, so `runtime` is now a `val`: a `def` cannot prefix a dependent
-    type). The four members that were `private[atomicflow]`
-    (`upsertWakeup`, `readStep`, `startChild`, `getWorkflowInstanceInfo`)
-    are public; `startChild` takes the per-run handle instead of
-    `(parentId, parentGeneration)`. The record types these operations
-    traffic in (`StoredStep`, the `Await*`/update candidate types, the race
-    subscriber/match/decision types) are public in package `atomicflow`. Only
-    the runner-internal operations (wakeup claiming, lease acquisition, the
-    sweeps) remain off the public trait. This entry records the API change;
-    the spec text that previously kept these operations off the trait
-    (`running-workflows.md`, and the `WorkflowContext` sketch in
-    `core-types.md`) was edited in the same change, so no lasting deviation
-    remains. Consequence: workflow and application code see one runtime
-    type, but every engine call needs that runtime's own opaque handle, so
-    the operations cannot be invoked across backends. (A handle from one
-    Postgres runtime instance still typechecks against another instance of
-    the same backend — the database-side lease fence rejects that
-    cross-instance misuse, not the type system.) Benefit:
-    core workflow/step code depends only on the public `WorkflowRuntime`;
-     each backend implements one trait instead of a public/private pair.
-
-## Phase 12 (durable wait-site unification)
-
-78. **The await-specific engine operations are collapsed into one
-     `evaluateWait` protocol.** The nine await operations previously on the
-     public `WorkflowRuntime` trait (`resolveAwaitSignal`,
-     `suspendAwaitSignal`, `fireDueTimers`, `readAwaitTimerCandidates`,
-     `resolveAwaitTimer`, `suspendAwaitTimer`, `fireDueTimerLeaves`,
-     `evaluateAwaitRace`, and the await use of `readAwaitSignalCandidates`)
-     are replaced by a single
-     `evaluateWait(run, site, subscribers)(decide): Option[String]` taking the
-     new public records `WaitSite`, `Subscriber` (enum: Signal / Timer /
-     Completion), `SubscriberMatch`, and `WaitResolution`. `readAwaitSignalCandidates`
-     remains on the trait (it serves `Step.peekSignal`, a plain durable
-     read rather than a wait) and now returns `Vector[SubscriberMatch]` with
-     `subscriberKey = ""`; `invalidateTimer`, the update-await operations, and the
-     step-retry operations are unchanged; the `AwaitRace*` and
-     `AwaitSignalCandidate` record types are deleted. Consequence: all three
-     await kinds (signal, timer, race) now evaluate through one protocol —
-     fire the site's due timer subscriptions in a separate committed
-     transaction (preserving the old global-append mutex width), then one
-     fenced transaction of registration + candidate read + `decide` +
-     atomic resolution — where previously only the race path had this
-     shape and the plain-await fast paths resolved from unfenced reads.
-     `decide` therefore runs while the instance row lock is held (as it
-     always did for races) and must be fast and pure; the scaladoc states
-     this. In `Step.scala`, the four await functions' hand-rolled
-     cached-row replay wrappers are deduplicated into one private
-     `replayCachedAwait` parameterized on their genuine policy differences
-     (timer's retire-and-suspend vs. delete-and-reevaluate; the
-     failure-message prefix). Benefit: one wait-site state machine instead
-     of three parallel orchestration algorithms; adding a wait source means
-     implementing registration and candidate reading for one `Subscriber`
-     case, not a new registration-to-resolution pipeline.
-79. **Race members carry stable, user-chosen subscriber keys; the positional
-     `leaf_idx` is gone.** `Step.awaitRace(stepKey)(members: (String, Awaitable[A])*)`
-     requires each member to be named. The name is a **subscriber key**, a
-     stable identity independent of the member's position, so reordering members
-     cannot re-bind durable subscriptions. Keys must be non-empty, unique within
-     the race, and must not start with the reserved `"__"` prefix; the empty key
-     `""` is reserved for single-subscriber sites (plain `Step.await`, update
-     awaits, `peekSignal`), and step retries use the reserved
-     `"__retry__"`. Schema-wide, `leaf_idx` becomes `subscriber_key` in the
-     three subscription tables and `workflow_update_subscriptions`, and the
-     bare `key` column (the workflow-instance key) is renamed
-     `workflow_instance_key` everywhere; `completed_key` becomes
-     `completed_workflow_instance_key`. The timer subscription's opaque
-     per-incarnation token `subscription_id` is renamed `timer_id`, which
-     keeps it clearly distinct from `subscriber_key` (stable member identity)
-     — `timer_id` names the `TimerFired` event and versions the registration
-     incarnation. `V001__init.sql` is rewritten in place (no migration), as
-     the schema is pre-release.
-80. **Await drift/expiry retires the site's subscriptions, not just its step
-     row.** `retireAwaitSite` (delete the step row and the site's rows in all
-     three subscription tables, in one fenced transaction) replaces
-     `deleteStep` in the `invalidateOn`-drift and `invalidateAfter`-expiry
-     branches of `awaitSignal` and `awaitRace0`. Rationale: make the "a fresh
-     timer id makes the previous incarnation's `TimerFired` structurally
-     inert" guarantee locally evident and robust rather than resting on the
-     fact that await resolution happens to retire subscriptions already.
-      Today's await rows exist only after resolution (a suspended await has no
-      cached row, so drift/expiry cannot fire mid-suspension), which makes the
-      retirement defensive rather than an observable fix.
-
-## Phase 13 (asynchronous signal/completion wakeups)
-
-81. **`V001__init.sql` edited in place** to add the single-row watermark table
-    `workflow_event_dispatch (id, dispatched_through)` (seeded at 0) and two
-    indexes: `workflow_completion_subscriptions_await` (the awaited-instance
-    columns) and `workflow_instances_parent` (the parent columns). Pre-release
-    schema, so no separate migration is introduced (same approach as entries 5
-    and 79). The spec's persistence-model table list gains
-    `workflow_event_dispatch`.
-
-82. **Signal and completion wakeups are now asynchronous, replacing
-    sender/terminal-side wakeups.** `sendSignal` no longer creates wakeups: after
-    row-locking the addressed instance and checking `is_accepting_signals` (that
-    check was later replaced by `terminal_state IS NULL`; see entry 91), it
-    appends the one immutable `Signal` event and commits — no direct-subscriber
-    or descendant walk happens on the sender. Likewise, the terminal transitions
-    (`terminalTransitionAndEvent` for completed/failed, `escalateTerminated`,
-    `finalizeCancelledWithoutLease`) no longer call `wakeCompletionSubscribers`;
-    they still append and keep the `WorkflowCompleted` event. Timer firing is
-    unchanged: the sweep appends `TimerFired` and upserts the owning instance's
-    wakeup in the same transaction. Two definition-agnostic job-runner passes
-    materialize signal/completion wakeups: a best-effort **watermark dispatch**
-    (`JobRunnerSettings.eventDispatchBatchSize`, default 1000; run every driver
-    cycle) that locks the watermark row with `FOR UPDATE SKIP LOCKED`, replays
-    events past the watermark in order, upserts each implied wakeup (`Signal` →
-    direct subscriber + eligible descendants; `WorkflowCompleted` → completion
-    subscribers; `TimerFired` skipped), and advances the watermark to the last
-    processed event in the same transaction (at most one dispatcher runs at a
-    time); and a periodic **full subscription scan**
-    (`JobRunnerSettings.fullSubscriptionScanInterval`, default 1 minute) that
-    wakes every non-terminal instance holding a pending signal/completion
-    subscription with a visible, unconsumed candidate. The scan is the liveness
-    guarantee; the dispatcher is only latency — it can miss a subscription that
-    commits concurrently with an event and then advance its watermark past it.
-    Rationale: writers only append, keeping their transactions short and
-    deadlock-free against subscribers. The corresponding spec edits were made in
-    the same change — `signals-timers.md` ("Basic Signal API", "Persistence
-    model", core model, "Await-signal searches", "Signal invalidation", "Open
-    questions", rationale summary), `running-workflows.md` ("Job runner and
-    scheduling", driver loop, "Sources of wakeups", settings, "Why this design"),
-    and `child-signal-inheritance.md` ("Events and ordering") — so no spec/impl
-    mismatch remains.
-
-83. **The shared exact-key signal cursor now advances on a filter-rejected
-    suspension** (`evaluateWait`). When an await suspends because the filter
-    rejected every examined event, it advances each exact-key cursor to the
-    maximum examined `sequenceId`; previously the cursor was left unchanged.
-    Rejected events are therefore treated as consumed for scheduling — not
-    re-examined on reruns and not repeatedly causing wakeups. Because awaits on
-    the same instance and key share the cursor, a rejection discards those events
-    for all of them, and a later filter change does not reconsider them
-    (consistent with the existing "skipped events are not reconsidered"
-    invalidation note). The spec's core-model suspend branch, "Await-signal
-    searches" bullets, "Signal invalidation", and the "Unsatisfied await
-    performance" TODO were edited in the same change.
-
-84. **The dispatch watermark seeds at 0, so the first dispatch replays the entire
-    event log.** Accepted pre-release: the log is small and each pass is bounded
-    by `eventDispatchBatchSize`. A production rollout would seed the watermark at
-    the current `MAX(sequence_id)`.
-
-85. **Known consequences/limits of the asynchronous-wakeup phase, found in
-    review.**
-    - The cursor-advance-on-rejection semantics (entry 83) mean two concurrent
-      await-sites on the same instance+signal-key with different filters can
-      consume an event for each other: one site's rejection advances the shared
-      cursor, so a `Workflow.parallel` branch awaiting the same key may then miss
-      it. This is the accepted consequence of the shared-cursor model and the
-      reason rejected events are not re-examined.
-    - Because `onUnconsumedSignals` reads after the cursor, filter-rejected
-      events no longer appear in that handler's input.
-    - The inherited full-scan ancestry recursion is capped at 64 edges; deeper
-      chains are handled by the run-time ancestor walk
-      (`inheritedSourceScopesIO`) but not by the scan.
-    - `V001__init.sql` was edited in place (pre-release); any already-migrated
-      database would fail Flyway checksum validation.
-
-
-86. **ParentClosePolicy is delivered asynchronously (was: applied synchronously
-    inside the parent's transition).** A parent's terminal, `continueAsNew`,
-    region-restart, and reset transitions no longer lock or modify child rows;
-    each records a row in the dedicated `child_close_requests` table (keyed by
-    the parent's own identity plus a `target_prefix` and `created_at`; the
-    composite primary key deduplicates identical targets, and the foreign key
-    cascades on parent deletion) whose `target_prefix` is the scope prefix of
-    the children to close (empty = all attached children; otherwise the parent
-    identity + `key@generation` + discarded interior). Delivery happens at the
-    child's own run start (self-check) and by a new driver-loop child-close
-    sweep, one child per short transaction, so no transaction ever locks rows of
-    more than one instance. Consequences:
-    - The active parent pointer (`parentId`) can remain set for a short
-      asynchronous window after the parent closes, and a child may run — even
-      complete — before its cancellation is delivered; `cancelTimeout` now
-      measures from delivery.
-    - Inherited-signal visibility cuts off at the closure *event*, not at
-      delivery: the inheritance walk (run-time walk and full-scan ancestry CTE)
-      treats a terminal parent or a parent holding a matching
-      `child_close_requests` row as detached, so no transitive ancestor event
-      leaks in the window.
-    - The closure record is a row in the dedicated `child_close_requests`
-      table, never a `workflow_steps` row, so the four generic step-handling
-      exclusions that used to protect `step_kind = 'ChildClose'` rows
-      (`continueAsNew`'s generation erase, region-interior erases, fork copies,
-      and reset erases) are gone. A no-child closure writes no row (existence
-      is checked in the parent's transaction). The sweep deletes a row once no
-      attached child matches it.
-    - `startChild` is now fenced on the parent's generation *and* terminal
-      state: a stale orphan run cannot attach a child under an old generation or
-      under a terminal parent. It also takes the parent-row lock before the
-      global event-append lock (matching the terminal transitions' order), and
-      its replay path touches only the child's own row.
-    - A hard-deleted parent detaches its children (self-check/sweep); it never
-      cancels them.
-    - Spec updated in `sub-workflows-iteration.md` ("ParentClosePolicy", "Key
-      derivation"), `continue-as-new-fork-reset.md`, `restartable-regions-loops.md`,
-      and `running-workflows.md` ("Job runner and scheduling", wakeup sources).
-
-87. **`resetWorkflow` now closes all children of the old generation (was:
-    children survived reset).** Previously reset only bumped the generation and
-    erased step history, leaving the old generation's children attached. Now
-    reset records a `child_close_requests` row targeting exactly the
-    pre-increment generation's children (the same target `continueAsNew`
-    uses), delivered asynchronously per `ParentClosePolicy`, so all children of
-    the old generation are closed — including children of old-generation steps
-    at or after the boundary, whose erased steps replay and recreate them — and
-    body replay recreates what
-    is needed. Rationale: a reset discards the old attempt wholesale, so leaving
-    its children running under stale parents would leak them; closing them makes
-    reset's effect on children match continueAsNew's. Consequences: a
-    `startAsChild` inside a cached step strictly before the boundary is closed
-    and **not** recreated (the cached step replays without re-executing its
-    body); the successor generation's children carry the incremented marker and
-    are never matched by the old generation's closure target.
-
-88. **The Updates feature is removed entirely (was: a synchronous
-    request/response channel into an instance).** The user dropped it without
-    replacement: the `Update` type, `UpdateSendResult`, `Step.awaitUpdate`/
-    `awaitUpdate0`, the `WorkflowInstanceId`/`WorkflowInstance`/`WorkflowRuntime`
-    `sendUpdate` forwarders and engine operations, the `UpdateCandidate`/
-    `AwaitUpdateDecision` records, and the `workflow_updates` /
-    `workflow_update_subscriptions` tables are all gone. Both candidate designs
-    — the previously implemented record-based design (Design A) and a
-    signal-based design (Design B) — are kept in `spec/signals-timers.md`
-    ("Updates (unimplemented)") as explicitly unimplemented alternatives for
-    future reference. This supersedes entries 46–50 (Phase 8). The subscription
-    tables are now three (signal, timer, completion); scaladoc and spec prose
-    that listed a fourth update table or an update await kind were reconciled.
-    `V001__init.sql` was edited in place to drop the two tables and their
-    indexes (pre-release; see entry 85).
-
-## Phase 14 (unified discard and one await evaluation path)
-
-89. **The discard/drift/expiry machinery of steps and awaits is unified into
-    one SPI operation `deleteStepOrAwait`, and every await kind evaluates
-    through one path.** `deleteStep`, `retireAwaitSite`, and `invalidateTimer`
-    are replaced by a single `deleteStepOrAwait(run, stepId, stepVersion)`
-    that, in one fenced transaction, deletes the site's `workflow_steps` row
-    and its rows in all three subscription tables (signal, timer, completion).
-    This is a superset of the old `deleteStep` (which deleted only the retry
-    timer subscription): an ordinary user Step's sole subscription is its
-    reserved `"__retry__"` timer, and awaits carry no retry subscriptions of
-    their own, so deleting all three kinds is always safe. `writeStepState`
-    keeps its internal "delete this site's timer subscriptions when writing a
-    state" behavior — it retires a resolved or superseded retry timer
-    atomically within the write itself — and is not routed through
-    `deleteStepOrAwait`.
-    - Timer invalidation is now discard-plus-evaluate across two transactions:
-      the drift/expiry branch deletes the site (row + subscriptions) and then
-      re-evaluates, which registers a fresh timer subscription (new timer id,
-      `now + delay` deadline) and suspends. Previously
-      `invalidateTimer` retired and inserted the replacement subscription in a
-      single transaction; the observable outcome is identical, a crash between
-      the two transactions leaves nothing registered (the lease-recovery sweep
-      or the caller's next `run` re-runs the instance, which re-registers). The spec's "Timer invalidation" semantics (fresh timer id
-      makes the old `TimerFired` inert; a recomputed later deadline means "as
-      if never executed") are unchanged.
-    - `Step.await` routes every awaitable through `awaitRace0` as a
-      single-member race carrying the reserved `""` subscriber key (a plain
-      `WorkflowCompletion` await already did), so the private `awaitSignal` and
-      `awaitTimer` methods are gone. The persisted `step_kind` is `"Await"` for
-      every runtime-computed await; `"AwaitRace"` (entry 70) is retired.
-      Per-kind resolution semantics are unchanged (signal resolution advances
-      the winning key's shared cursor; a suspending evaluation advances each
-      signal key's cursor past examined-and-rejected events; timer and
-      completion members advance nothing).
-    - `replayCachedAwait`'s separate `onDrift`/`onExpired` callbacks collapse
-      into one `onDiscard` (delete via `deleteStepOrAwait`, then re-evaluate),
-      now identical for every site; the success/replay path is unchanged. This
-      supersedes parts of entries 70 and 80.
-
-## Phase 15 (single-statement fence and subscription cleanup helper)
-
-90. **The instance fence is one statement, and every bulk subscription cleanup
-    funnels through one helper (implementation-only).** No observable semantics
-    change.
-
-    - The private `fenced` helper previously row-locked the instance with one
-      `SELECT 1 ... FOR UPDATE` and then re-checked `lease_owner`/`fencing_token`
-      with a second statement. It now issues a single
-      `SELECT 1 ... WHERE ... AND lease_owner = ? AND fencing_token = ? FOR UPDATE`
-      mapped with `.option`: `None` throws [[LeaseLostException]]. This is
-      semantically equivalent under READ COMMITTED because Postgres re-checks
-      the `WHERE` clause against the latest row version after acquiring the
-      lock. Both `lease_owner` and `fencing_token` remain in the predicate (lease
-      recovery clears the owner without bumping the token, so the owner
-      condition is load-bearing). Behavior improvement: a concurrently deleted
-      instance row now surfaces as `LeaseLostException` instead of a doobie
-      "unexpected end of result" error. `continueAsNewTransition` repeated the
-      two-statement fence inline (lock, then owner/token check); it now uses the
-      same single-statement `SELECT generation ... FOR UPDATE`/`.option` shape,
-      throwing `LeaseLostException` on `None` and otherwise running the
-      unchanged body. The fenced `UPDATE` statements
-      (`terminalTransitionAndEvent`, the run-body writes, `renewLease`,
-      `releaseLeaseIfStillOwned`) already carry the
-      fence in the `WHERE` and are untouched.
-    - A new private `deleteAllSubscriptionsIO(workflowId, key, scope, extra)`
-      issues the same `DELETE FROM <table> s WHERE <instance predicate> AND
-      <extra>` against `workflow_signal_subscriptions`,
-      `workflow_timer_subscriptions`, and `workflow_completion_subscriptions`.
-      All hand-written per-table bulk deletes route through it:
-      `terminalCleanupIO` (wakeup plus the three subscription kinds),
-      `deleteSiteSubscriptionsIO` (step id/scope/version),
-      `deleteSubscriptionsUnderScopePathsIO` (scope-path slice),
-      `deleteRegionNestedSubscriptionsIO` (region-interior slice), and
-      `resetWorkflow`'s three `DELETE ... USING workflow_steps` statements (now
-      an `EXISTS (SELECT 1 FROM workflow_steps st WHERE ... st.updated_at >=
-      $boundary AND st.step_id = s.step_id AND st.step_scope_within_instance =
-      s.step_scope_within_instance AND st.step_version = s.step_version)` extra
-      predicate, equivalent to the `USING` inner join). A future fourth
-      subscription kind is added in one place instead of every cleanup path.
-      The single-table retry-timer deletes (`insertRetrySubscriptionIO`,
-      `deleteTimerSubscriptionsIO`) are not per-kind bulk cleanups and remain as
-      they were.
-
-## Phase 16 (in-transaction unconsumed-signal gather; drop `is_accepting_signals`)
-
-91. **Unconsumed signals are gathered and deleted inside the terminal /
-    continue-as-new transaction, and the listener runs after commit
-    (at-most-once).** Supersedes the pre-commit, at-least-once semantics of
-    entry 26 and the boundary mechanism of entry 20 (and builds on entries 19
-    and 82).
-
-    - The four transition paths now gather the visible unconsumed directly
-      addressed `Signal` events (per signal key, in `sequenceId` order after
-      that key's shared cursor, as raw serialized payloads) **inside the same
-      transaction** that locks the instance row and deletes those events. The
-      gather happens before the deletion. `gatherUnconsumedSignalsIO` is the
-      `ConnectionIO` form of the old `gatherUnconsumedSignals`; the old
-      pre-transition `runUnconsumedSignals` flip+gather+invoke helper is
-      deleted.
-    - Return shapes: `terminalTransitionAndEvent` returns
-      `(rowsUpdated, Map[SignalKey, Seq[String]])` (the map is only meaningful
-      when `rowsUpdated == 1`); `continueAsNewTransition` returns the map (and
-      still throws `LeaseLostException` when the lease fence loses);
-      `escalateTerminated` returns `(Boolean, Map[SignalKey, Seq[String]])`;
-      `finalizeCancelledWithoutLease` returns the map, propagated through
-      `closeOneChildIO`/`closeOnePendingChildIO`/`parentClosureSelfCheck` so the
-      sweep/self-check can log it.
-    - The run body invokes `wf.onUnconsumedSignals(map)` **after** the
-      transition transaction commits. Ordering: transition commits → listener
-      runs → the decoded failure is rethrown (failed), or the `Result`/
-      `WorkflowCancelled`/`ContinueAsNew` value is returned. The listener is
-      wrapped in `try/catch { case WorkflowNonFatal(t) => log.warn(...) }` — a
-      throwing listener can no longer mask the workflow outcome (previously a
-      throwing handler on the failure path masked the original exception, entry
-      26). Delivery is now **at-most-once**: a crash between the commit and the
-      call loses the delivery, acceptable for a logging/debug aid (previously
-      at-least-once, re-executed on replay).
-    - On paths with no workflow definition available — `terminate`, the
-      cancellation-escalation sweep, and cancellation of a never-started
-      instance (including a never-started child closed by its parent) — the
-      gathered map is logged at WARN level via the runtime's SLF4J logger,
-      stating that the listener could not run, instead of being silently
-      dropped.
-    - **`workflow_instances.is_accepting_signals` is dropped** from
-      `V001__init.sql` (edited in place, pre-release), together with
-      `setNotAcceptingSignals` and every reference (the flag flip in
-      `terminalTransitionAndEvent`/`escalateTerminated`/`finalizeCancelled
-      WithoutLease`, the re-open in `continueAsNewTransition`). `sendSignal`
-      now rejects with `InstanceAlreadyCompleted` when `terminal_state IS NOT
-      NULL` (still under the row `FOR UPDATE` lock). Because the terminal
-      transition and the gather+delete commit atomically under the same row
-      lock, a signal either commits first — and is thereby included in the
-      gathered map — or is rejected as already-completed. This resolves the
-      spec's open TODO "completion delivery boundary" (`signals-timers.md` open
-      questions #4, now marked **Resolved**).
-    - Spec edits in the same change: `signals-timers.md` ("Basic Signal API"
-      send check, "Unconsumed signals at completion", open question #4),
-      `continue-as-new-fork-reset.md`, and `running-workflows.md`
-      (`continueAsNew` semantics/"Unconsumed signals at the reset boundary",
-      `terminate` bullets).
-
-## Phase 17 (descriptive inheritance columns, policy fixed at creation, one shared ancestry CTE)
-
-92. **Signal-inheritance storage is descriptive, the policy is fixed at child
-    creation, and one shared ancestry CTE serves the read path, the dispatcher,
-    and the full scan.** Supersedes entries 37 and 38 (the text-token storage
-    and the "narrowing schedules conservative wakeups" behavior) and the
-    replay-replacement / broadening-wakeup bullets in
-    `child-signal-inheritance.md` and `sub-workflows-iteration.md`.
-
-    - **Storage columns** (`V001__init.sql`, edited in place; pre-release): the
-      single `inherit_signals VARCHAR` token column is replaced by
-      `inherited_signal_mode VARCHAR NOT NULL DEFAULT 'none'` (`none` | `all` |
-      `prefixes`) and `inherited_signal_prefixes VARCHAR[] NOT NULL DEFAULT '{}'`
-      (meaningful only when the mode is `prefixes`); `inherit_past_events` is
-      renamed `inherit_past_signals` (same meaning);
-      `inherited_events_start_sequence_id` is unchanged.
-      `encodeSignalInheritance`/`decodeSignalInheritance` are deleted;
-      `startChild` writes the mode and prefixes directly. The public
-      `SignalInheritance` API (`none`/`all`/`some(prefixes)`) is unchanged.
-      Test SQL that read the old columns (`ChildrenSuite`, `ContinueAsNewSuite`)
-      is updated.
-    - **Policy fixed at creation.** `updateChildInheritanceIO` and
-      `scheduleDescendantWakeupsIO` are deleted — there is no policy-change
-      mechanism and no ancestry-driven subtree wakeup. In `startChild`'s replay
-      path a stored `(mode, prefixes, inherit_past_signals)` that differs from
-      the replay's specification is kept, and an SLF4J WARN records the
-      divergence; an equal configuration is a silent no-op. The dispatcher's
-      per-key eligibility check and the read path both use the same stored
-      policy, so a child whose policy differs from a replay's specification can
-      only exist via manual row edits, which the next run's read-path check
-      handles.
-    - **One shared ancestry CTE.** The four ancestry walks
-      (`inheritedSourceScopesIO`'s iterative upward walk,
-      `wakeInheritingDescendantsIO`'s downward walk, `scanAllSubscriptions`'s
-      inline recursive CTE capped at depth 64, and the deleted
-      `scheduleDescendantWakeupsIO`) are replaced by a private
-      `inheritedSignalSources(candidates: Fragment)` query composed from two
-      candidate fragments (`signalSubscriberCandidates` for the dispatcher/scan,
-      `runningInstanceCandidate`
-      for the read path). It bakes in the edge rule (the child-side stored
-      mode/prefixes must permit the key), the non-terminal-parent and
-      `child_close_requests` walk cutoffs, and carries each subscription's
-      `inherit_past_signals`/`inherited_events_start_sequence_id` unchanged. It
-      has no depth cap: the walk is bounded by the parent chain, which removes
-      the previous 64-depth inconsistency (only the scan was capped) and keeps
-      the scan, dispatcher, and read path from disagreeing.
-    - **Consumers.** The read path (`readInheritedCandidatesIO`, with
-      `inheritedSourceScopesIO` deleted) joins the source query restricted to
-      the running instance and key to `workflow_events` with the cursor and
-      past-window conditions. The dispatcher's new `wakeSignalInheritors`
-      inserts `DISTINCT` subscriber wakeups whose source set contains the
-      event's instance; the direct-subscriber wakeup (`wakeMatchingSubscribers`)
-      is unchanged. The full scan's `inherited` branch uses the shared query and
-      keeps its "visible, unconsumed candidate" predicate; its `direct` and
-      `completion` branches are unchanged.
-    - `startChild` still reads `MAX(sequence_id)` under the event-append lock
-      for `inherited_events_start_sequence_id` (kept deliberately — starts are
-      rare).
-    - Spec edits in the same change: `child-signal-inheritance.md` (API bullets,
-      reading/lifecycle, PostgreSQL notes), `sub-workflows-iteration.md`
-      (inherited-signals bullets), and `running-workflows.md` ("Sources of
-      wakeups" row removed and the two "inheritance changes" background-path
-      mentions dropped).
-
-93. **`inherited_signal_mode` is merged into `inherited_signal_prefixes`.**
-    The mode token was derivable data: the permitted-prefix set is the complete
-    configuration, so the storage encoding collapses `SignalInheritance` to one
-    `VARCHAR[]` column — an empty array inherits nothing, the single
-    empty-string prefix (a prefix of every key) inherits everything, any other
-    array inherits keys starting with one of its elements. The shared
-    `inheritedSignalSources` query's edge rule shrinks to one uniform
-    `EXISTS (... unnest(prefixes) ... starts_with(key, prefix))` predicate (no
-    mode branch), the recursion carries one column fewer, and a `COMMENT ON
-    COLUMN` documents the encoding in the schema. `signalInheritanceColumns`
-    becomes `permittedSignalPrefixes`; the ignored-change warning and its
-    rendering decode the encoding (empty set → `none`, `[""]` → `all`).
-    Supersedes the storage-columns part of entry 92; the public
-    `SignalInheritance` API and all semantics are unchanged.
+- Scopes are `VARCHAR[]` segment arrays, with an empty array for the top level.
+  Derived child scopes longer than 1800 characters in joined form are rejected
+  rather than shortened.
+- Child-close requests are stored separately and processed in short per-child
+  transactions. Generation and region-iteration scope prefixes prevent a close
+  request for old work from matching newly created children.
+- Signal inheritance is fixed at child creation. Replaying `startAsChild` with
+  a changed policy retains the stored policy and logs a warning.
+- `inherited_signal_prefixes` stores the complete selector: an empty array
+  inherits nothing, `[""]` inherits every key, and other arrays permit matching
+  prefixes. There is no separate mode column. `inherit_past_events` and
+  `inherited_events_start_sequence_id` store the past-event selection.
+- Signal reads, event dispatch, and the full subscription scan share the same
+  recursive ancestor query. Every parent-child link must permit the key; a
+  terminal parent or pending child-close request ends that part of the walk.
+- Parallel execution joins all branches before propagating control flow,
+  failures, or suspension. It does not interrupt a sibling during a JDBC write.
+- `continueAsNew` returns `WorkflowRunResult.ContinueAsNew` and schedules the
+  next generation. It retains the instance identity and signal cursors.
+- Reset retains directly addressed events and cursors. It requires a
+  non-terminal instance; fork can use a source in any state.
+- Fork and reset order stored steps by their last-updated timestamp. Rows with
+  the selected step's timestamp or a later timestamp are rerun. This boundary
+  cannot represent an arbitrary cut across parallel branches.
+- Reset closes children from the old generation, including those created
+  before the selected step. A child started inside a retained cached step is
+  not recreated, because that step's body is not executed on replay.
+- Synchronous updates are not implemented. The two proposed designs in
+  `spec/signals-timers.md` are reference designs, not supported APIs.

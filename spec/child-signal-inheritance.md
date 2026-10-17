@@ -79,7 +79,7 @@ workerWorkflow.startAsChild(
   and selects the earliest visible event for its exact key after the child's
   `(workflowInstanceId, signalKey)` cursor.
 - The active parent, the stored inheritance mode and prefixes, the
-  `inherit_past_signals` flag (persisted form of the `inheritPastEvents`
+  `inherit_past_events` flag (persisted form of the `inheritPastEvents`
   constructor parameter), and `inheritedEventsStartSequenceId` live on the
   child workflow-instance storage record. A separate relationship record is
   unnecessary.
@@ -110,13 +110,13 @@ workerWorkflow.startAsChild(
   path, the watermark dispatcher, and the full subscription scan all compose the
   same SQL builder, so eligibility cannot drift between them. The walk is
   bounded by the parent chain (no depth cap), and every subscriber's
-  `inherit_past_signals` flag and `inherited_events_start_sequence_id` are
+  `inherit_past_events` flag and `inherited_events_start_sequence_id` are
   carried up the recursion unchanged.
 - Inheritance configuration is stored on `workflow_instances` as one column,
   `inherited_signal_prefixes` (`VARCHAR[]`): the set of permitted prefixes.
   An empty array inherits nothing; a single empty-string element (a prefix of
   every key) inherits every key; any other array inherits a key when it starts
-  with one of the listed prefixes. Alongside it: `inherit_past_signals` and
+  with one of the listed prefixes. Alongside it: `inherit_past_events` and
   `inherited_events_start_sequence_id`.
 - The execution lease must not be a row lock held while user code runs.
 

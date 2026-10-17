@@ -13,7 +13,7 @@ import javax.sql.DataSource
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
 
-/** A document-processing batch workflow ported to the atomicflow API: read and
+/** A document-processing batch workflow: read and
   * archive an input file, run virus checks and encryption per document, upload
   * each document to a processing endpoint, poll for the processing outcome, and
   * report the batch result.
@@ -57,9 +57,7 @@ class DocumentProcessingAtomicflow(
     ) { inputFilePath =>
       val batch = readInputFile(inputFilePath)
       archiveInputFile(inputFilePath)
-      // Documents are processed sequentially: per-document step ids are
-      // namespaced by `Workflow.scoped`, and a batch is small, so the old
-      // prototype's `parallelism = 4` concurrency is deliberately not ported.
+      // Process documents sequentially, with separate step records per document id.
       batch.documents.foreach { document =>
         Workflow.scoped(document.documentId) {
           processIndividualDocument(document)
@@ -69,9 +67,7 @@ class DocumentProcessingAtomicflow(
       batch.documents.size
     }
 
-  /** Read and parse the input file. Kept as its own durable step so the parsed
-    * batch survives a crash after archiving; a genuinely missing input file
-    * (first run) is a real failure.
+  /** Store the parsed batch before archiving so replay does not need the original file.
     */
   private def readInputFile(inputFilePath: String)(using ctx: WorkflowContext): FileWithDocumentBatch =
     Step.atLeastOnce[FileWithDocumentBatch]("read-input-file") {
@@ -84,8 +80,7 @@ class DocumentProcessingAtomicflow(
 
   /** Move the input file into the archive. On an at-least-once replay after a
     * crash between `Files.move` and step commit, the file is already gone; that
-    * is treated as already-archived success (matching the workflow4s reference),
-    * not a workflow failure.
+    * is treated as already archived.
     */
   private def archiveInputFile(inputFilePath: String)(using ctx: WorkflowContext): Unit =
     Step.atLeastOnce[Unit]("archive-input-file") {
@@ -171,9 +166,7 @@ object DocumentProcessingAtomicflow {
   private[example] val PollInterval: FiniteDuration = 15.minutes
   private[example] val MaxPollAttempts: Int = 10
 
-  /** The durable outcome of one upload-status poll, modeled as an enum (rather
-    * than stringly-typed comparisons) so the step persists a well-typed value.
-    */
+  /** Stored result of one upload-status poll. */
   enum UploadPollOutcome {
     case ProcessedSuccessfully
     case ProcessedWithErrors(msg: String)

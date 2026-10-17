@@ -136,12 +136,12 @@ DBOS.sleep(1800)   # seconds
 **Implementation.** An AtomicFlow timer subscription is **semantic state, not a
 wakeup hint**: it stores the absolute deadline (so replays never push a timeout
 forward), schedules unattended instances, and versions the registration
-incarnation via `timer_id`. A due timer becomes durable through two paths sharing
+identity via `timer_id`. A due timer becomes durable through two paths sharing
 one primitive — the runner sweep and inline wait-site evaluation both *lock the
 subscription row, re-check that no `TimerFired` event exists, append it*. Firing
 does **not** delete the subscription; only the wait site's resolution does. This
-matters for invalidation: re-registering after `invalidateOn` mints a fresh
-`timer_id`, so the previous incarnation's `TimerFired` event is structurally
+matters for invalidation: re-registering after `invalidateOn` creates a new
+`timer_id`, so the previous subscription's `TimerFired` event is
 inert. Temporal records a `StartTimer` event and a `TimerFired` event fired by the
 server. DBOS persists a wakeup time in the workflow row.
 

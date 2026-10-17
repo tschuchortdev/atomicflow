@@ -106,7 +106,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(seeds.get(), 1, "seed not re-evaluated when the completed region is re-entered on outer replay")
   }
 
-  test("restart discards nested step rows (bounded) and reusing a step ID executes it freshly each looping") {
+  test("restart deletes nested step rows and executes reused step ids in each iteration") {
     val rt = newRuntime
     val stepRuns = new AtomicInteger(0)
     val wf = Workflow[String, String]("rl-discard") { in =>
@@ -118,12 +118,12 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    assertEquals(stepRuns.get(), 6, "the step re-executes freshly in each of the 6 loopings")
-    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final looping's step row remains")
-    assertEquals(countSteps(wf.id, "k"), 2, "region row + final looping's step row")
+    assertEquals(stepRuns.get(), 6, "the step executes in each of the 6 iterations")
+    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final iteration's step row remains")
+    assertEquals(countSteps(wf.id, "k"), 2, "region row and final iteration's step row")
   }
 
-  test("reusing a step/timer ID in a successor looping creates fresh work: the timer fires again each looping") {
+  test("reusing step and timer ids in the next iteration creates new work") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val wf = Workflow[String, String]("rl-timer") { in =>
@@ -136,22 +136,22 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(countTimerSubs(wf.id, "k"), 1, "the first looping awaits one timer")
+    assertEquals(countTimerSubs(wf.id, "k"), 1, "the first iteration awaits one timer")
 
     clock.advanceBy(2.minutes)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "second looping suspends on a fresh timer")
-    assertEquals(countTimerSubs(wf.id, "k"), 1, "the discarded looping's timer subscription was replaced, not accumulated")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "second iteration suspends on a new timer")
+    assertEquals(countTimerSubs(wf.id, "k"), 1, "the discarded iteration's timer subscription was replaced")
 
     clock.advanceBy(2.minutes)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "third looping suspends on a fresh timer")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "third iteration suspends on a new timer")
 
     clock.advanceBy(2.minutes)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-2"))
-    assertEquals(countTimerEvents(wf.id, "k"), 3, "the timer fired once per looping (fresh work each time)")
-    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final looping's await row remains")
+    assertEquals(countTimerEvents(wf.id, "k"), 3, "the timer fired once per iteration")
+    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final iteration's await row remains")
   }
 
-  test("signal cursors survive restart: a consumed signal is not re-consumable in a later looping") {
+  test("signal cursors survive restart: a consumed signal is unavailable in later iterations") {
     val rt = newRuntime
     val sig = Signal[String]("S")
     val wf = Workflow[String, String]("rl-cursor") { in =>
@@ -167,17 +167,17 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(regionPayload(wf.id, "k", "R").map(_._1), Some(0L), "a suspension before restart does not advance restartCount")
 
     sig.send(id, "v0")(using rt)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "looping 1 consumes v0 and suspends awaiting a fresh signal")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "iteration 1 consumes v0 and awaits a new signal")
     assertEquals(regionPayload(wf.id, "k", "R").map(_._1), Some(1L), "restartCount now counts the committed restart")
 
     sig.send(id, "v1")(using rt)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "looping 2 consumes v1, not the already-consumed v0")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "iteration 2 consumes v1, not the already-consumed v0")
 
     sig.send(id, "v2")(using rt)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-2"), "looping 3 consumes v2 and completes")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-2"), "iteration 3 consumes v2 and completes")
   }
 
-  test("children created in a discarded looping are closed per policy and successor loopings use distinct identities") {
+  test("children from discarded iterations close according to policy; later iterations use distinct identities") {
     val rt = newRuntime
     val gate = Signal[String]("gate")
     val childWf = Workflow[String, String]("rl-worker") { in => in }
@@ -196,13 +196,13 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
     val rows = childRows(childWf.id, "c")
-    assertEquals(rows.size, 3, "one distinct child identity per looping")
+    assertEquals(rows.size, 3, "one distinct child identity per iteration")
     val cancelledScopes = rows.filter(_._2.contains("cancelled")).map(_._1)
     val activeScopes = rows.filter(_._2.isEmpty).map(_._1)
-    assertEquals(cancelledScopes.size, 2, "children of the two discarded loopings are cancelled per Cancel policy")
-    assert(cancelledScopes.exists(_.contains("R@0")), "looping 0's child scope carries R@0")
-    assert(cancelledScopes.exists(_.contains("R@1")), "looping 1's child scope carries R@1")
-    assertEquals(activeScopes.size, 1, "the final looping's child stays active")
+    assertEquals(cancelledScopes.size, 2, "children of the two discarded iterations are cancelled")
+    assert(cancelledScopes.exists(_.contains("R@0")), "iteration 0's child scope carries R@0")
+    assert(cancelledScopes.exists(_.contains("R@1")), "iteration 1's child scope carries R@1")
+    assertEquals(activeScopes.size, 1, "the final iteration's child stays active")
     assert(activeScopes.head.contains("R@2"), "the final child carries R@2")
 
     gate.send(parentId, "go")(using rt)
@@ -248,7 +248,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-1"))
   }
 
-  test("bounded state after 50 loopings retains O(1) rows") {
+  test("50 iterations retain only the current region and step records") {
     val rt = newRuntime
     val wf = Workflow[String, String]("rl-bounded") { in =>
       Workflow.loop[Int, String]("R", 0) { (state, loop) =>
@@ -259,7 +259,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final looping's step row remains after 50 loopings")
+    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final iteration's step row remains after 50 iterations")
     assertEquals(countSteps(wf.id, "k"), 2)
   }
 
@@ -278,7 +278,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(stepRuns.get(), 3, "region executed its step in 3 loopings before the outer suspension")
+    assertEquals(stepRuns.get(), 3, "region executed its step in 3 iterations before the outer suspension")
 
     gate.send(id, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done-outer"))
@@ -365,7 +365,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("ok-2"))
     assertEquals(regionPayload(wf.id, "k", "R").map(_._1), Some(2L), "the region committed 2 restarts")
-    assertEquals(stepRuns.get(), 3, "the DB-working sibling's step completed in all 3 loopings")
+    assertEquals(stepRuns.get(), 3, "the sibling's database step completed in all 3 iterations")
   }
 
   test("a step inside parallel under a region persists with the region scope prefix") {
@@ -391,7 +391,7 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     assert(paths.contains(Vector("R@0")), s"the parallel step's scope carries the enclosing region segment: $paths")
   }
 
-  test("a step inside parallel re-executes each looping under a region (scope propagates into branch threads)") {
+  test("a parallel step runs in each region iteration with the enclosing scope") {
     val rt = newRuntime
     val stepRuns = new AtomicInteger(0)
     val wf = Workflow[String, String]("rl-par-loop") { in =>
@@ -408,8 +408,8 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
-    assertEquals(stepRuns.get(), 3, "the parallel step re-executes in each of the 3 loopings (no stale cache)")
-    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final looping's parallel step row remains")
+    assertEquals(stepRuns.get(), 3, "the parallel step executes in each of the 3 iterations")
+    assertEquals(countNonRegionSteps(wf.id, "k"), 1, "only the final iteration's parallel step row remains")
   }
 
   test("children started inside a parallel branch under a region derive the region-scoped identity") {
@@ -431,9 +431,9 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val rows = childRows(childWf.id, "c")
-    assertEquals(rows.size, 2, "one distinct child identity per looping")
-    assert(rows.map(_._1).exists(_.contains("R@0")), "looping 0's child scope carries R@0")
-    assert(rows.map(_._1).exists(_.contains("R@1")), "looping 1's child scope carries R@1")
+    assertEquals(rows.size, 2, "one distinct child identity per iteration")
+    assert(rows.map(_._1).exists(_.contains("R@0")), "iteration 0's child scope carries R@0")
+    assert(rows.map(_._1).exists(_.contains("R@1")), "iteration 1's child scope carries R@1")
   }
 
   test("a restart of a region does not over-close children of a same-id nested region in a sibling subtree") {

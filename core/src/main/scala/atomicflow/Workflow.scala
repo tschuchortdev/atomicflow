@@ -80,10 +80,7 @@ object WorkflowInstance {
   )
 }
 
-/** A workflow definition: the identifying/descriptive fields plus the executable
-  * `body` and its codecs. There is deliberately no separate meta wrapper; every
-  * consumer that needs the definition has the executable object (see
-  * `spec/core-types.md`).
+/** A workflow definition, including its identity, description, body, and codecs.
   *
   * `Cacheable[In]` and `Cacheable[Out]` are captured at construction (the
   * companion's `[In: Cacheable, Out: Cacheable]` context bounds) and are the
@@ -113,8 +110,7 @@ final class Workflow[In, Out] private[atomicflow] (
   ): WorkflowInstance[In, Out] =
     runtime.createAndSchedule(this, instanceKey, in)
 
-  /** Start a child workflow from within this workflow's body (see
-    * `spec/sub-workflows-iteration.md`, "startAsChild"). Create-if-absent a
+  /** Start a child workflow from an executing parent. Create a
     * child under a scope derived from this parent's identity, generation, and
     * enclosing `Workflow.scoped` path; record the parent relationship and
     * inheritance configuration; and schedule the child's first wakeup. The
@@ -147,7 +143,7 @@ final class Workflow[In, Out] private[atomicflow] (
   ): WorkflowRunResult[Out] =
     runtime.runWorkflowInstance(this, WorkflowInstanceId(id, instanceKey))
 
-  /** Atomically create-if-absent and run on the caller thread. */
+  /** Create the instance if absent, then run it on the caller thread. */
   def createAndRun(instanceKey: WorkflowInstanceKey, in: In)(using
       runtime: WorkflowRuntime,
       cacheableThrowable: Cacheable[Throwable]
@@ -197,8 +193,7 @@ object Workflow {
     * gap between calls.
     *
     * Not a cancellation checkpoint, and available only inside an executing
-    * workflow (the `(using WorkflowContext)` requirement makes external or
-    * off-thread calls unrepresentable).
+    * workflow through its `WorkflowContext`.
     *
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
@@ -211,7 +206,7 @@ object Workflow {
     */
   def versionAtCreation(using ctx: WorkflowContext): Long = ctx.versionAtCreation
 
-  /** The recursive tail transition: ends the current execution and restarts the
+  /** Ends the current execution and restarts the
     * same logical workflow with `nextInput` and a fresh history, in place. The
     * generation is incremented and the previous generation's execution records
     * (Step rows, subscriptions, wakeups) are erased; exact-key signal cursors
@@ -226,8 +221,8 @@ object Workflow {
     * a subsequent `run` (or the job runner) executes it from the top.
     *
     * The next input is encoded with the local `Cacheable` and decoded by the
-    * runtime with this workflow's input codec, which the type system ties to
-    * `nextInput` by convention; a mismatch fails the run.
+    * runtime with this workflow's input codec. The caller must supply the
+    * workflow's input type; an incompatible encoding fails the run.
     */
   def continueAsNew[A: Cacheable](nextInput: A)(using ctx: WorkflowContext): Nothing = {
     val encoded = summon[Cacheable[A]].write(nextInput)
@@ -246,25 +241,23 @@ object Workflow {
     * it are closed per their `ParentClosePolicy`; the body then re-enters
     * locally in the same run (the outer workflow is not replayed to begin the
     * next generation). Returning normally completes the region with `R`; the
-    * final looping is kept, so on an outer replay the body re-runs and reuses
+    * final iteration is kept, so on an outer replay the body re-runs and reuses
     * its cached records rather than caching the whole region value.
     *
-    * `restartCount` counts committed restarts, not crash replays. This is the
-    * dual of [[loop]]: use [[restartable]] when continuing is exceptional and
-    * returning the result is the normal path. Both expose the same durable
-    * transitions and the same `restartCount` metadata.
+    * `restartCount` counts committed restarts, not crash replays. Return the result
+    * to finish, or call `restart` to continue with new state. [[loop]] uses the
+    * opposite return convention but stores state and restart counts in the same way.
     */
   def restartable[S: Cacheable, R](id: String, initialState: => S)(
       body: (S, RestartableScope[S]) => WorkflowContext ?=> R
   )(using
       ctx: WorkflowContext
   ): R =
-    regionLoop(id, initialState) { (state, scope) =>
+    runRestartableRegion(id, initialState) { (state, scope) =>
       body(state, scope)
     }
 
-  /** Runs a looping region: the dual of [[restartable]] — use [[loop]] when
-    * continuing is the normal path and breaking with the result is exceptional.
+  /** Runs a stored loop. Return the next state to continue, or call `break` to finish.
     * The body returns the next state `S` to continue, or calls
     * `loop.break(result)` to complete the region with `R`. It has exactly the
     * same durable transitions, region semantics, and `restartCount` metadata as
@@ -277,7 +270,7 @@ object Workflow {
   )(using
       ctx: WorkflowContext
   ): R =
-    regionLoop(id, initialState) { (state, scope) =>
+    runRestartableRegion(id, initialState) { (state, scope) =>
       val loopScope = new LoopScope[R] {
         override def restartCount: Long = scope.restartCount
         override def break(result: R): Nothing = throw new RegionBreakException(result)
@@ -292,11 +285,11 @@ object Workflow {
   /** The single shared implementation behind [[restartable]] and [[loop]]. The
     * body uses a [[RestartableScope]]: a normal return completes the region with
     * `R`; `scope.restart` throws [[RegionRestartException]] to start the next
-    * generation. [[loop]] adapts its own body onto this shape (a normal return
+    * generation. [[loop]] adapts its body to this rule (a normal return
     * becomes a restart, `break` throws [[RegionBreakException]]). Both control
     * exceptions are caught here and unwound to the region boundary.
     */
-  private def regionLoop[S: Cacheable, R](id: String, initialState: => S)(
+  private def runRestartableRegion[S: Cacheable, R](id: String, initialState: => S)(
       body: (S, RestartableScope[S]) => WorkflowContext ?=> R
   )(using
       ctx: WorkflowContext
@@ -359,7 +352,7 @@ object Workflow {
     f(using ctx.copy(uncancellableDepth = ctx.uncancellableDepth + 1))
 
   /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
-    * with `scopeKey` (see `spec/sub-workflows-iteration.md`, "Primitives"), so
+    * with `scopeKey`, so
     * the same step definitions can execute independently per element. Scopes
     * nest arbitrarily; the full scope is the array of enclosing segment keys.
     */

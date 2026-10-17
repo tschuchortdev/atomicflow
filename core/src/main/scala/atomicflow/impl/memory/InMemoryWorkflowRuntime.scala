@@ -1,7 +1,5 @@
-// NOTE: Disabled during the spec-conformant rewrite (see spec/).
-// The in-memory backend will be re-implemented against the new runtime API
-// (running-workflows.md, "Settings and backends") in a follow-up.
-// The previous prototype implementation is kept below for reference.
+// Disabled prototype: this implementation does not support the current WorkflowRuntime API.
+// Use atomicflow.impl.db.PostgresWorkflowRuntime.
 
 /*
 package atomicflow.impl.memory

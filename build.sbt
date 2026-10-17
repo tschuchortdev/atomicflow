@@ -4,7 +4,7 @@ ThisBuild / version := "0.1.0-SNAPSHOT"
 
 ThisBuild / scalaVersion := "3.7.3"
 
-val V = new {
+val dependencyVersions = new {
   val circe = "0.14.14"
   val doobie = "1.0.0-RC9"
   val flywayPostgres = "11.10.0"
@@ -17,7 +17,6 @@ val V = new {
 }
 
 lazy val root = (project in file("."))
-  //.settings(commonSettings)
   .settings(
     name := "atomicflow",
     publishArtifact := false,
@@ -29,11 +28,11 @@ lazy val core = project
   .settings(
     name := "atomicflow-core",
     libraryDependencies ++= Seq(
-      "ch.qos.logback" % "logback-classic" % V.logbackClassic % Test,
-      "com.lihaoyi" %% "upickle" % V.upickle,
-      "com.softwaremill.ox" %% "core" % V.ox,
-      "org.scalameta" %% "munit" % V.munit % Test,
-      "org.slf4j" % "slf4j-api" % V.slf4j,
+      "ch.qos.logback" % "logback-classic" % dependencyVersions.logbackClassic % Test,
+      "com.lihaoyi" %% "upickle" % dependencyVersions.upickle,
+      "com.softwaremill.ox" %% "core" % dependencyVersions.ox,
+      "org.scalameta" %% "munit" % dependencyVersions.munit % Test,
+      "org.slf4j" % "slf4j-api" % dependencyVersions.slf4j,
     )
   )
 
@@ -42,13 +41,13 @@ lazy val db = project
   .settings(
     name := "atomicflow-db",
     libraryDependencies ++= Seq(
-      "ch.qos.logback" % "logback-classic" % V.logbackClassic % Test,
-      "org.flywaydb" % "flyway-database-postgresql" % V.flywayPostgres,
-      "org.tpolecat" %% "doobie-core" % V.doobie,
-      "org.tpolecat" %% "doobie-postgres" % V.doobie,
-      "org.tpolecat" %% "doobie-hikari" % V.doobie,
-      "org.testcontainers" % "testcontainers" % V.testcontainers % Test,
-      "org.testcontainers" % "postgresql" % V.testcontainers % Test
+      "ch.qos.logback" % "logback-classic" % dependencyVersions.logbackClassic % Test,
+      "org.flywaydb" % "flyway-database-postgresql" % dependencyVersions.flywayPostgres,
+      "org.tpolecat" %% "doobie-core" % dependencyVersions.doobie,
+      "org.tpolecat" %% "doobie-postgres" % dependencyVersions.doobie,
+      "org.tpolecat" %% "doobie-hikari" % dependencyVersions.doobie,
+      "org.testcontainers" % "testcontainers" % dependencyVersions.testcontainers % Test,
+      "org.testcontainers" % "postgresql" % dependencyVersions.testcontainers % Test
     )
   )
 
@@ -68,13 +67,13 @@ lazy val example = project
       "co.fs2" %% "fs2-core" % "3.12.0",
       "co.fs2" %% "fs2-io" % "3.12.0",
       "co.fs2" %% "fs2-reactive-streams" % "3.12.0",
-      "io.circe" %% "circe-core" % V.circe,
-      "io.circe" %% "circe-parser" % V.circe,
-      "io.circe" %% "circe-generic" % V.circe,
+      "io.circe" %% "circe-core" % dependencyVersions.circe,
+      "io.circe" %% "circe-parser" % dependencyVersions.circe,
+      "io.circe" %% "circe-generic" % dependencyVersions.circe,
     ),
     // Test dependencies
     libraryDependencies ++= Seq(
-      "org.scalameta" %% "munit" % V.munit,
+      "org.scalameta" %% "munit" % dependencyVersions.munit,
       "org.testcontainers" % "testcontainers" % "1.21.3",
       "org.testcontainers" % "postgresql" % "1.21.3",
       "org.scalamock" %% "scalamock" % "7.5.0",

@@ -38,7 +38,7 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       scope: Vector[String]
   ): (Vector[String], Boolean) =
     run(
-      sql"""SELECT inherited_signal_prefixes, inherit_past_signals FROM workflow_instances
+      sql"""SELECT inherited_signal_prefixes, inherit_past_events FROM workflow_instances
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope"""
         .query[(Vector[String], Boolean)].unique
     )

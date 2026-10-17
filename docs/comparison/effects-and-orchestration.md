@@ -53,12 +53,12 @@ workflow. Both positional schemes are why determinism is mandatory.
 
 ---
 
-## 2. Execution guarantees (the central divergence)
+## 2. Execution guarantees
 
-AtomicFlow exposes two orthogonal axes (`spec/steps.md`):
+AtomicFlow separates two policies (see [`steps.md`](../../spec/steps.md)):
 
-- **Axis 1 — guarantee:** `atLeastOnce` vs `atMostOnce`.
-- **Axis 2 — cache-drift policy:** `ensureUnchanged`, `invalidateOn`, `invalidateAfter` (TTL).
+- **Crash recovery:** `atLeastOnce` or `atMostOnce`.
+- **Cached-result reuse:** `ensureUnchanged`, `invalidateOn`, `invalidateAfter` (TTL).
 
 Both guarantees persist a `Started` row before the body and differ only for an
 unresolved `Started` row on replay:
@@ -168,7 +168,7 @@ RetryPolicy(initial_interval=timedelta(seconds=1), backoff_coefficient=2.0, maxi
 | Policy | `never` / `fixedDelay` / `exponentialBackoff` | interval/coefficient/attempts/non-retryable | attempts/interval/backoff/`should_retry` |
 | Long delay | **durable suspension** above `durableRetryThreshold`, inline sleep below | durable timer, server-driven | durable, DB wakeup |
 | Crash during retry | "as if the retry was never begun" | server redelivers | checkpoint-driven |
-| Separate from at-least/at-most-once | ✅ documented as orthogonal | step-level | step-level |
+| Separate from at-least/at-most-once | ✅ separate policy | step-level | step-level |
 
 **Implementation.** AtomicFlow makes the delay itself durable: a delay longer
 than `durableRetryThreshold` becomes an ordinary **timer subscription** (the run

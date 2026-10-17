@@ -176,7 +176,7 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
     val (sub2, d2) = subs.head
-    assertNotEquals(sub2, sub1, "a fresh subscription id is minted on invalidation")
+    assertNotEquals(sub2, sub1, "invalidation creates a new subscription id")
     assertEquals(d2, Instant.parse("2026-01-02T00:03:00Z"), "the deadline recomputes to now + delay")
     assertEquals(timerFiredCount(sub2), 0, "the new subscription has no event of its own")
     assertEquals(timerFiredCount(sub1), 1, "the old event remains but is not reused")
@@ -205,7 +205,7 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
     val (sub2, d2) = subs.head
-    assertNotEquals(sub2, sub1, "a fresh subscription is minted after the TTL expires")
+    assertNotEquals(sub2, sub1, "cache expiry creates a new subscription")
     assertEquals(d2, Instant.parse("2026-01-02T00:03:20Z"), "the deadline recomputes to now + delay")
     assertEquals(timerFiredCount(sub2), 0, "the fresh subscription has no event of its own")
     assertEquals(timerFiredCount(sub1), 1, "the old event remains but is inert")

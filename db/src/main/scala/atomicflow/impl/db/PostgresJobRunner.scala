@@ -11,13 +11,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.*
 import cats.syntax.all.*
 
-/** The PostgreSQL job runner: a driver loop that claims due wakeups from the
-  * shared tables (registry-filtered, with per-workflow fairness, claim-atomic
-  * lease acquisition) and dispatches them onto a bounded worker pool, executing
-  * each instance through the same body code path as the public run API.
-  *
-  * Bound to its [[PostgresWorkflowRuntime]]; runner and runtime are one
-  * implementation family.
+/** Claims scheduled workflow runs and executes them on a bounded worker pool.
+  * A claim acquires the execution lease and removes the wakeup in one transaction.
+  * Only registered workflow definitions are run; each workflow gets a batch limit.
   */
 final class PostgresJobRunner private[atomicflow] (
     runtime: PostgresWorkflowRuntime,
@@ -42,7 +38,7 @@ final class PostgresJobRunner private[atomicflow] (
     * and leases: user-configurable via `JobRunnerSettings.workerId`, otherwise
     * a generated unique id — two runners of the same runtime never share one.
     */
-  private val runnerWorker: String =
+  private val runnerWorkerId: String =
     settings.workerId.getOrElse(s"jobrunner-${java.util.UUID.randomUUID()}")
 
   private val stopped = new AtomicBoolean(false)
@@ -50,38 +46,37 @@ final class PostgresJobRunner private[atomicflow] (
   private val RequeueBackoffBase: FiniteDuration = 1.second
   private val RequeueBackoffCap: FiniteDuration = 5.minutes
 
-  private def backoffDelay(attempts: Int): FiniteDuration = {
+  private def requeueDelay(attempts: Int): FiniteDuration = {
     val baseNanos = RequeueBackoffBase.toNanos
     val delayNanos = baseNanos * (1L << math.min(attempts, 30))
     (delayNanos.nanos) min RequeueBackoffCap
   }
 
-  private val permitCounts = new ConcurrentHashMap[WorkflowId, java.lang.Integer]()
+  private val runningInstanceCounts = new ConcurrentHashMap[WorkflowId, java.lang.Integer]()
 
-  private def atCapacity(workflowId: WorkflowId): Boolean =
-    permitCounts.getOrDefault(workflowId, java.lang.Integer.valueOf(0)).intValue() >=
+  private def isWorkflowAtCapacity(workflowId: WorkflowId): Boolean =
+    runningInstanceCounts.getOrDefault(workflowId, java.lang.Integer.valueOf(0)).intValue() >=
       settings.maxConcurrentInstances(workflowId)
 
   private def acquirePermit(workflowId: WorkflowId): Unit =
-    permitCounts.merge(workflowId, java.lang.Integer.valueOf(1), (a: Integer, b: Integer) =>
+    runningInstanceCounts.merge(workflowId, java.lang.Integer.valueOf(1), (a: Integer, b: Integer) =>
       java.lang.Integer.valueOf(a + b)
     )
 
   private def releasePermit(workflowId: WorkflowId): Unit =
-    permitCounts.computeIfPresent(
+    runningInstanceCounts.computeIfPresent(
       workflowId,
       (_: WorkflowId, v: java.lang.Integer) => if (v <= 1) null else java.lang.Integer.valueOf(v - 1)
     )
 
-  /** Fault-injection point around a dispatched run: by default identity, a test may
-    * replace it to simulate an infrastructure failure that aborts a claimed run
-    * before the body runs (producing a transient, terminal-unset, lease-still-ours
-    * outcome). Package-private test hook; write from test threads only.
+  /** Tests can replace this function to fail a claimed run before its body starts.
+    * The lease remains owned and the instance has no terminal state, allowing
+    * tests to verify that the runner schedules another attempt.
     */
   @volatile
   private[atomicflow] var testRunWrapper: (() => Unit) => Unit = run => run()
 
-  private val ownedPool: Option[ExecutorService] =
+  private val ownedWorkerPool: Option[ExecutorService] =
     if (settings.executor.isDefined) None
     else
       Some(
@@ -98,15 +93,15 @@ final class PostgresJobRunner private[atomicflow] (
         )
       )
 
-  private val pool: Executor = settings.executor.getOrElse(ownedPool.get)
+  private val workerExecutor: Executor = settings.executor.getOrElse(ownedWorkerPool.get)
 
-  private def jittered(d: FiniteDuration): Long = {
-    val base = d.toNanos
+  private def jitteredPollDelayMillis(interval: FiniteDuration): Long = {
+    val base = interval.toNanos
     val jitter = ((base * 0.2) * (math.random * 2 - 1)).toLong
     math.max(1L, (base + jitter) / 1000000L)
   }
 
-  private final case class ClaimRow(
+  private final case class DueWakeupRow(
       workflowId: WorkflowId,
       instanceKey: WorkflowInstanceKey,
       scope: Vector[String],
@@ -129,7 +124,7 @@ final class PostgresJobRunner private[atomicflow] (
     * `FOR UPDATE SKIP LOCKED`. Runs in the caller's transaction so the lease
     * acquire and the wakeup delete are atomic with it.
     */
-  private def claimOnce(): Vector[ClaimedInstance] = {
+  private def claimDueWakeups(): Vector[ClaimedInstance] = {
     val now = runtime.clock.instant()
     val ids: List[WorkflowId] = registry.keys.toList
     val query =
@@ -155,17 +150,17 @@ final class PostgresJobRunner private[atomicflow] (
       """
     runtime.runTransaction {
       for {
-        rows <- query.query[ClaimRow].to[Vector]
+        rows <- query.query[DueWakeupRow].to[Vector]
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
-          if (atCapacity(row.workflowId)) deferRowIO(row, now).as(acc)
+          if (isWorkflowAtCapacity(row.workflowId)) deferWakeupIO(row, now).as(acc)
           else
-            runtime.tryAcquireOnceIO(row.workflowId, row.instanceKey, row.scope, runnerWorker, settings.leaseDuration).flatMap {
+            runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope, runnerWorkerId, settings.leaseDuration).flatMap {
               case Some(token) =>
                 sql"""DELETE FROM workflow_wakeups
                       WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
                         AND scheduled_at = ${row.scheduledAt}""".update.run.map { _ =>
                   acquirePermit(row.workflowId)
-                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorker, token, row.attempts, row.createdAt)
+                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorkerId, token, row.attempts, row.createdAt)
                 }
               case None => acc.pure[ConnectionIO]
             }
@@ -179,7 +174,7 @@ final class PostgresJobRunner private[atomicflow] (
     * workflow neither starves the FIFO batch nor pins a worker. Matches the row's
     * seen `scheduled_at` so a concurrently requeued/future row is not clobbered.
     */
-  private def deferRowIO(row: ClaimRow, now: java.time.Instant): ConnectionIO[Unit] = {
+  private def deferWakeupIO(row: DueWakeupRow, now: java.time.Instant): ConnectionIO[Unit] = {
     val deferred = now.plus(java.time.Duration.ofNanos(settings.capacityRetryDelay.toNanos))
     sql"""UPDATE workflow_wakeups
           SET scheduled_at = $deferred
@@ -196,7 +191,7 @@ final class PostgresJobRunner private[atomicflow] (
     */
   private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int, createdAt: java.time.Instant): Unit = {
     val now = runtime.clock.instant()
-    val scheduled = now.plus(java.time.Duration.ofNanos(backoffDelay(attempts).toNanos))
+    val scheduled = now.plus(java.time.Duration.ofNanos(requeueDelay(attempts).toNanos))
     runtime.runTransaction {
       sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, scheduled_at, attempts)
             VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduled, ${attempts + 1})
@@ -263,7 +258,7 @@ final class PostgresJobRunner private[atomicflow] (
     val latch = new CountDownLatch(claimed.size)
     claimed.foreach { c =>
       try {
-        pool.execute(() => {
+        workerExecutor.execute(() => {
           try dispatchRun(c)
           catch {
             case e: Throwable => log.warn(s"Uncaught error dispatching ${c.instanceId}", e)
@@ -294,11 +289,11 @@ final class PostgresJobRunner private[atomicflow] (
       scope: Vector[String]
   )
 
-  /** Path 1 timer firing: the scheduler sweep. Claims due, not-yet-fired timer
+  /** Background timer firing. Claims due, not-yet-fired timer
     * subscriptions of non-terminal instances in deadline order, bounded by
     * `timerBatchSize`, locking the subscription rows with `FOR UPDATE OF s SKIP
     * LOCKED` (the claim; no delete). Each claimed row is then fired in its own
-    * transaction via the shared [[PostgresWorkflowRuntime.fireTimerSubscriptionIO]]
+    * transaction via the shared [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]]
     * primitive, which re-checks no event exists under the lock. The subscription
     * row survives firing. Definition-agnostic: services every workflow in the
     * shared tables. Returns the number of timers fired.
@@ -325,7 +320,7 @@ final class PostgresJobRunner private[atomicflow] (
     }
     var fired = 0
     rows.foreach { row =>
-      if (runtime.runTransaction(runtime.fireTimerSubscriptionIO(row.timerId, row.workflowId, row.instanceKey, row.scope)))
+      if (runtime.runTransaction(runtime.fireTimerSubscriptionQ(row.timerId, row.workflowId, row.instanceKey, row.scope)))
         fired += 1
     }
     if (fired > 0) log.debug(s"Timer sweep fired $fired due timers")
@@ -438,7 +433,7 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def runDriverCycle(): Unit = {
     if (stopped.get) throw new IllegalStateException("Job runner is stopped")
     runSweepsDue()
-    val claimed = claimOnce()
+    val claimed = claimDueWakeups()
     lastClaimedBatch = claimed.map(_.instanceId)
     dispatchAndAwait(claimed)
   }
@@ -462,9 +457,9 @@ final class PostgresJobRunner private[atomicflow] (
     while (!stopped.get) {
       try {
         runSweepsDue()
-        val claimed = claimOnce()
+        val claimed = claimDueWakeups()
         if (claimed.isEmpty) {
-          Thread.sleep(jittered(settings.pollInterval))
+          Thread.sleep(jitteredPollDelayMillis(settings.pollInterval))
           backoff = settings.pollInterval
         } else {
           lastClaimedBatch = claimed.map(_.instanceId)
@@ -498,7 +493,7 @@ final class PostgresJobRunner private[atomicflow] (
       } catch {
         case _: InterruptedException => Thread.currentThread().interrupt()
       }
-      ownedPool match {
+      ownedWorkerPool match {
         case Some(es) =>
           es.shutdown()
           try {
