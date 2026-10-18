@@ -64,13 +64,13 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(inputOf(wf.id, "key-3"), Some(Cacheable[String].write("hello")))
   }
 
-  test("createAndSchedule and createAndRun on existing instance with different input throw") {
+  test("createAndScheduleForAsyncRun and createAndRun on existing instance with different input throw") {
     val rt = newRuntime
     val wf = workflow("wf-4")
     rt.createWorkflowInstance(wf, "key-4", "hello")
 
     intercept[WorkflowInputConflictException] {
-      rt.createAndSchedule(wf, "key-4", "world")
+      rt.createAndScheduleForAsyncRun(wf, "key-4", "world")
     }
     intercept[WorkflowInputConflictException] {
       rt.createAndRun(wf, "key-4", "world")
@@ -88,27 +88,27 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(inputOf(wf.id, "key-5"), Some(Cacheable[String].write("b")))
   }
 
-  test("createAndSchedule upserts a wakeup row; second call does not reset created_at") {
+  test("createAndScheduleForAsyncRun upserts a wakeup row; second call does not reset created_at") {
     val rt = newRuntime
     val wf = workflow("wf-6")
-    rt.createAndSchedule(wf, "key-6", "a")
+    rt.createAndScheduleForAsyncRun(wf, "key-6", "a")
 
     val before = wakeup(wf.id, "key-6")
     assertEquals(before.map(_._3), Some(0))
 
     Thread.sleep(30)
-    rt.createAndSchedule(wf, "key-6", "a")
+    rt.createAndScheduleForAsyncRun(wf, "key-6", "a")
     val after = wakeup(wf.id, "key-6")
 
     assertEquals(after.map(_._1), before.map(_._1))
     assertEquals(after.map(_._3), Some(0))
   }
 
-  test("createAndSchedule derives scheduled_at from the injected clock") {
+  test("createAndScheduleForAsyncRun derives scheduled_at from the injected clock") {
     val fixed = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC)
     val rt = newRuntime(fixed)
     val wf = workflow("wf-8")
-    rt.createAndSchedule(wf, "key-8", "a")
+    rt.createAndScheduleForAsyncRun(wf, "key-8", "a")
 
     assertEquals(wakeup(wf.id, "key-8").map(_._2), Some(Instant.parse("2026-01-01T00:00:00Z")))
   }

@@ -63,7 +63,7 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       runner.runDriverCycle()
-      assertEquals(inst.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("got:hi"))
+      assertEquals(inst.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("got:hi"))
     } finally runner.stop(1.second)
   }
 

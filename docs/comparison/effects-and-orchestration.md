@@ -380,7 +380,7 @@ re-executed/erased. DBOS's fork creates a new workflow id, copying the first
 
 **AtomicFlow**
 ```scala
-wf.createAndSchedule("order-1", order)   // registrar + upsert a wakeup
+wf.createAndScheduleForAsyncRun("order-1", order)   // registrar + upsert a wakeup
 runtime.startJobRunner(Seq(orderWf, payWf), JobRunnerSettings(...))
 ```
 **Temporal**

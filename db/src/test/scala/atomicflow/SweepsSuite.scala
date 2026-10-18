@@ -348,8 +348,8 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     }
     val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndSchedule("k", "in")(using rt)
-      assertEquals(inst.awaitResult(10.seconds)(using rt), WorkflowRunResult.Result("done"))
+      val inst = wf.createAndScheduleForAsyncRun("k", "in")(using rt)
+      assertEquals(inst.blockUntilCompleted(10.seconds)(using rt), WorkflowRunResult.Result("done"))
     } finally runner.stop(1.second)
   }
 
@@ -384,7 +384,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       override def read(serialized: String): Throwable = new RuntimeException(serialized)
     }
     val wf = Workflow[String, String](id = "codec") { _ => throw new RuntimeException("boom") }
-    rt.createAndSchedule(wf, "k", "x")
+    rt.createAndScheduleForAsyncRun(wf, "k", "x")
     val runner = rt.startJobRunnerForTests(
       Seq(wf),
       JobRunnerSettings.forTests.copy(throwableCacheable = custom)

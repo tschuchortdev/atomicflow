@@ -177,7 +177,7 @@ body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded 
 The terminal outcome of a failed workflow is serialized with the same
 application-global `Cacheable[Throwable]` (see `running-workflows.md`).
 
-- The global given is in scope at the workflow boundary: `run`/`awaitResult`
+- The global given is in scope at the workflow boundary: `run`/`blockUntilCompleted`
   and the completion awaitable take it contextually, just as every Step call
   does.
 - The stored outcome payload records the selected codec IDs per the

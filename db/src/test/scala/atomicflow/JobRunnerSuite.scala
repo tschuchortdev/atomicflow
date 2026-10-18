@@ -66,12 +66,12 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Option[String]].unique
     )
 
-  test("started runner claims the createAndSchedule wakeup and completes the instance autonomously") {
+  test("started runner claims the createAndScheduleForAsyncRun wakeup and completes the instance autonomously") {
     val rt = newRuntime
     val runner = rt.startJobRunner(Seq(simpleWf("auto")), JobRunnerSettings.forTests)
     try {
-      val inst = simpleWf("auto").createAndSchedule("k", "x")(using rt)
-      assertEquals(inst.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-x"))
+      val inst = simpleWf("auto").createAndScheduleForAsyncRun("k", "x")(using rt)
+      assertEquals(inst.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("done-x"))
     } finally runner.stop(1.second)
   }
 
@@ -84,10 +84,10 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     }
     val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndSchedule("k", "in")(using rt)
+      val inst = wf.createAndScheduleForAsyncRun("k", "in")(using rt)
       waitUntil(subscriptionExists(wf.id, "k", "greet"))
       signal.send(inst.id, "hello")(using rt)
-      assertEquals(inst.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("got:hello"))
+      assertEquals(inst.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("got:hello"))
     } finally runner.stop(1.second)
   }
 
@@ -97,7 +97,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wfB = simpleWf("rb")
     val runner = rt.startJobRunnerForTests(Seq(wfA), JobRunnerSettings.forTests)
     try {
-      wfB.createAndSchedule("k", "x")(using rt)
+      wfB.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.runDriverCycle()
       assert(wakeupExists(wfB.id, "k"), "the unknown workflow's wakeup must persist")
       assertEquals(runner.lastClaimedBatch, Vector.empty)
@@ -108,8 +108,8 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val rt = newRuntime
     val wfA = simpleWf("fa")
     val wfB = simpleWf("fb")
-    (1 to 3).foreach(i => wfA.createAndSchedule(s"a$i", "x")(using rt))
-    (1 to 3).foreach(i => wfB.createAndSchedule(s"b$i", "x")(using rt))
+    (1 to 3).foreach(i => wfA.createAndScheduleForAsyncRun(s"a$i", "x")(using rt))
+    (1 to 3).foreach(i => wfB.createAndScheduleForAsyncRun(s"b$i", "x")(using rt))
     val runner = rt.startJobRunnerForTests(
       Seq(wfA, wfB),
       JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 1, wakeupBatchSize = 2)
@@ -126,7 +126,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
   test("claim deletes a wakeup only when the lease is obtained") {
     val rt = newRuntime
     val wf = simpleWf("atomic")
-    wf.createAndSchedule("k", "x")(using rt)
+    wf.createAndScheduleForAsyncRun("k", "x")(using rt)
     run(
       sql"""UPDATE workflow_instances
             SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
@@ -145,7 +145,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "fail") { _ =>
       throw new RuntimeException("boom")
     }
-    rt.createAndSchedule(wf, "k", "x")
+    rt.createAndScheduleForAsyncRun(wf, "k", "x")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       runner.runDriverCycle()
@@ -172,15 +172,15 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       }
       "a-done"
     }
-    val bInst = bWf.createAndSchedule("bk", "in")(using rt)
-    val aInst = aWf.createAndSchedule("ak", "in")(using rt)
+    val bInst = bWf.createAndScheduleForAsyncRun("bk", "in")(using rt)
+    val aInst = aWf.createAndScheduleForAsyncRun("ak", "in")(using rt)
     val runner = rt.startJobRunner(
       Seq(aWf, bWf),
       JobRunnerSettings.forTests.copy(pollInterval = 30.seconds)
     )
     try {
-      assertEquals(aInst.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("a-done"))
-      assertEquals(bInst.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("b-done"))
+      assertEquals(aInst.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("a-done"))
+      assertEquals(bInst.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("b-done"))
     } finally runner.stop(1.second)
   }
 
@@ -191,10 +191,10 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val r1 = rt.startJobRunner(Seq(wfA), JobRunnerSettings.forTests)
     val r2 = rt.startJobRunner(Seq(wfB), JobRunnerSettings.forTests)
     try {
-      val a = wfA.createAndSchedule("k", "a")(using rt)
-      val b = wfB.createAndSchedule("k", "b")(using rt)
-      assertEquals(a.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-a"))
-      assertEquals(b.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-b"))
+      val a = wfA.createAndScheduleForAsyncRun("k", "a")(using rt)
+      val b = wfB.createAndScheduleForAsyncRun("k", "b")(using rt)
+      assertEquals(a.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("done-a"))
+      assertEquals(b.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("done-b"))
     } finally {
       r1.stop(1.second)
       r1.stop(1.second)
@@ -202,8 +202,8 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     }
     val r3 = rt.startJobRunner(Seq(wfA), JobRunnerSettings.forTests)
     try {
-      val c = wfA.createAndSchedule("k2", "c")(using rt)
-      assertEquals(c.awaitResult(5.seconds)(using rt), WorkflowRunResult.Result("done-c"))
+      val c = wfA.createAndScheduleForAsyncRun("k2", "c")(using rt)
+      assertEquals(c.blockUntilCompleted(5.seconds)(using rt), WorkflowRunResult.Result("done-c"))
     } finally r3.stop(1.second)
   }
 
@@ -224,9 +224,9 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     }
     val runner = rt.startJobRunner(Seq(wf), JobRunnerSettings.forTests)
     try {
-      wf.createAndSchedule("a", "a")(using rt)
+      wf.createAndScheduleForAsyncRun("a", "a")(using rt)
       assert(aStarted.await(10, TimeUnit.SECONDS), "the in-flight run must start")
-      wf.createAndSchedule("b", "b")(using rt)
+      wf.createAndScheduleForAsyncRun("b", "b")(using rt)
       val stopDone = new CountDownLatch(1)
       val stopThread = new Thread(() => {
         runner.stop(5.seconds)
@@ -257,7 +257,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWf("req")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndSchedule("k", "x")(using rt)
+      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       clock.advanceBy(10.seconds)
       runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
       runner.runDriverCycle()
@@ -276,7 +276,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWf("req2")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndSchedule("k", "x")(using rt)
+      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       deleteWakeup(wf.id, "k")
       runner.requeueTransient(inst.id, 0, t0)
       val first = wakeupRow(wf.id, "k").get
@@ -298,7 +298,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWf("reqok")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndSchedule("k", "x")(using rt)
+      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
       runner.runDriverCycle()
       assertEquals(wakeupRow(wf.id, "k").get._3, 1)
@@ -317,7 +317,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWf("leaselost")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
-      wf.createAndSchedule("k", "x")(using rt)
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.testRunWrapper = { _ =>
         run(
           sql"""UPDATE workflow_instances SET lease_owner = 'other', fencing_token = fencing_token + 1,
@@ -341,8 +341,8 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     )
     val runner = rt.startJobRunnerForTests(Seq(wf), settings)
     try {
-      wf.createAndSchedule("k1", "x")(using rt)
-      wf.createAndSchedule("k2", "x")(using rt)
+      wf.createAndScheduleForAsyncRun("k1", "x")(using rt)
+      wf.createAndScheduleForAsyncRun("k2", "x")(using rt)
       runner.runDriverCycle()
       assertEquals(runner.lastClaimedBatch.size, 1, "only one instance may be claimed under the cap")
       val deferred = wakeupRow(wf.id, "k2").get
@@ -366,7 +366,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     )
     val runner = rt.startJobRunnerForTests(Seq(wf), settings)
     try {
-      wf.createAndSchedule("k", "x")(using rt)
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.testRunWrapper = _ => throw new RuntimeException("boom")
       runner.runDriverCycle()
       assertEquals(wakeupRow(wf.id, "k").get._3, 1, "transient failure requeued the wakeup")
@@ -381,8 +381,8 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val rt = newRuntime
     val wfA = simpleWf("bursta")
     val wfB = simpleWf("burstb")
-    (1 to 10).foreach(i => wfA.createAndSchedule(s"a$i", "x")(using rt))
-    (1 to 10).foreach(i => wfB.createAndSchedule(s"b$i", "x")(using rt))
+    (1 to 10).foreach(i => wfA.createAndScheduleForAsyncRun(s"a$i", "x")(using rt))
+    (1 to 10).foreach(i => wfB.createAndScheduleForAsyncRun(s"b$i", "x")(using rt))
     val runner = rt.startJobRunnerForTests(
       Seq(wfA, wfB),
       JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 4, wakeupBatchSize = 8)
@@ -410,7 +410,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
         JobRunnerSettings.forTests.copy(executor = Some(executor))
       )
       try {
-        wf.createAndSchedule("k", "x")(using rt)
+        wf.createAndScheduleForAsyncRun("k", "x")(using rt)
         runner.runDriverCycle()
         assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
         val name = threadName.get()
@@ -429,7 +429,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val settings = JobRunnerSettings.forTests.copy(maxConcurrentInstances = _ => 0)
     val runner = rt.startJobRunnerForTests(Seq(wf), settings)
     try {
-      val inst = wf.createAndSchedule("k", "x")(using rt)
+      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       assertEquals(rt.runWorkflowInstance(wf, inst.id), WorkflowRunResult.Result("done-x"))
       assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
     } finally runner.stop(1.second)

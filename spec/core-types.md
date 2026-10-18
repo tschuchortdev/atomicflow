@@ -52,12 +52,15 @@ final class Signal[A](
 final class WorkflowContext(
   val instanceId: WorkflowInstanceId,
   val versionAtCreation: Long,
-  val runtime: WorkflowRuntime
+  val runtime: WorkflowRuntime,
+  // The same runtime viewed through its library-core operations. Library-only;
+  // application code never sees it.
+  internals: WorkflowRuntimeInternals
 )(
-  // The runtime's opaque per-run execution handle: created by the runtime,
-  // identity-stable for the run, contents runtime-owned. Dependent second
-  // parameter list so the type can be prefixed by runtime.
-  val currentExecution: runtime.CurrentExecution
+  // The backend's opaque per-run execution handle: created when the run's lease
+  // is acquired, identity-stable for the run, contents backend-owned. Dependent
+  // second parameter list so the type can be prefixed by internals.
+  val currentExecution: internals.Lease
 )
 
 trait StepContext[Out] {
@@ -76,7 +79,7 @@ trait StepContext[Out] {
 final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
   def run()(using WorkflowRuntime): WorkflowRunResult[Out]
-  def awaitResult(timeout: FiniteDuration)(using WorkflowRuntime): WorkflowRunResult[Out]
+  def blockUntilCompleted(timeout: FiniteDuration)(using WorkflowRuntime): WorkflowRunResult[Out]
   def getInfo()(using WorkflowRuntime): WorkflowInstance.Info   // fresh from DB
   // Awaitable of this instance's completion; yields a WorkflowCompletionResult[Out]
   // (see running-workflows.md). Codecs resolve at the await call site.
