@@ -22,11 +22,11 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
       parentScope: Option[Vector[String]]
   )
 
-  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Option[ChildRow] =
+  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Option[ChildRow] =
     run(
       sql"""SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_instance_scope
             FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
           (Option[String], Int, Option[Instant], Option[String], Option[String], Option[Vector[String]])
         ].option
     ).map { case (t, te, c, pw, pk, ps) => ChildRow(t, te, c, pw, pk, ps) }
@@ -173,7 +173,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "start").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.ContinueAsNew)
 
-    val scope = Vector("can-parent4", "p@0")
+    val scope = ScopePath("can-parent4", "p@0")
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(childRow(childWf.id, "cancel-child", scope).get.terminalState, Some("cancelled"))
     val ab = childRow(childWf.id, "abandon-child", scope).get
@@ -201,7 +201,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "first").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("can-parent3", "p@0")
+    val scope = ScopePath("can-parent3", "p@0")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "cancel-child", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
@@ -231,7 +231,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "p", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("can-parent5", "p@0")
+    val scope = ScopePath("can-parent5", "p@0")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "c", scope).head.id
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.ContinueAsNew)
 
@@ -241,7 +241,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row.parentScope, Some(Vector.empty))
     val inherit = run(
       sql"""SELECT inherited_signal_prefixes, inherit_past_events FROM workflow_instances
-            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = $scope""".query[(Vector[String], Boolean)].unique
+            WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'c' AND workflow_instance_scope = ${scope.segments}""".query[(Vector[String], Boolean)].unique
     )
     assertEquals(inherit._1, Vector(""), "the inheritance configuration is unchanged")
     assertEquals(inherit._2, false)

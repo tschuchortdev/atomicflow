@@ -17,16 +17,16 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
   private val t2 = t1.plusSeconds(10)
   private val t3 = t2.plusSeconds(10)
 
-  private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String] = Vector.empty): Int =
+  private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath = ScopePath.empty): Int =
     run(
       sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[Int].unique
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[Int].unique
     )
 
-  private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String] = Vector.empty): Set[String] =
+  private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath = ScopePath.empty): Set[String] =
     run(
       sql"""SELECT step_id FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[String].to[Set]
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[String].to[Set]
     )
 
   private def setUpdatedAt(
@@ -101,7 +101,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
 
     val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
     assertEquals(fork.id.workflowInstanceKey, "fork")
-    assertEquals(fork.id.scope, Vector.empty)
+    assertEquals(fork.id.scope, ScopePath.empty)
     assertEquals(stepIds(wf.id, "fork"), Set("A"), "only the strictly-before step A is copied")
 
     assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.Result("done"))

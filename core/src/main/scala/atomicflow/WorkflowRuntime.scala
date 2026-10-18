@@ -63,10 +63,10 @@ trait WorkflowRuntime {
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: String,
+      stepKind: StepKind,
       state: StoredStep.State,
-      inputFingerprints: String,
-      payload: String,
+      inputFingerprints: InputFingerprints,
+      payload: SerializedValue,
       expiresAt: Option[Instant]
   ): Unit
 
@@ -93,9 +93,9 @@ trait WorkflowRuntime {
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      retryPayload: String,
+      stepKind: StepKind,
+      inputFingerprints: InputFingerprints,
+      retryPayload: SerializedValue,
       deadline: Instant,
       expiresAt: Option[Instant]
   ): Unit
@@ -143,7 +143,7 @@ trait WorkflowRuntime {
       run: CurrentExecution,
       site: WaitSite,
       subscribers: Vector[Subscriber]
-  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[String]
+  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[SerializedValue]
 
   /** Delete every subscription row whose `step_scope_within_instance` equals one
     * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
@@ -157,14 +157,14 @@ trait WorkflowRuntime {
     * re-deletes; a committed winner row therefore never coexists with branch
     * subscriptions.
     */
-  def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[Vector[String]]): Unit
+  def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[ScopePath]): Unit
 
   /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
     * located at `regionId` under `parentScopePath`: its encoded state and its
     * committed `restartCount`. `None` when the region has never been created
     * (first creation, so the by-name seed must be evaluated).
     */
-  def readRegionState(run: CurrentExecution, regionId: String, parentScopePath: Vector[String]): Option[(String, Long)]
+  def readRegionState(run: CurrentExecution, regionId: String, parentScopePath: ScopePath): Option[RegionState]
 
   /** The single writer of a `Workflow.restartable`/`Workflow.loop` region's row:
     * persist exactly `restartCount` and `serializedState`, creating the row if
@@ -180,9 +180,8 @@ trait WorkflowRuntime {
   def upsertRegion(
       run: CurrentExecution,
       regionId: String,
-      parentScopePath: Vector[String],
-      restartCount: Long,
-      serializedState: String
+      parentScopePath: ScopePath,
+      state: RegionState
   ): Unit
 
   /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
@@ -346,7 +345,7 @@ trait WorkflowRuntime {
       inheritSignals: SignalInheritance,
       inheritPastEvents: Boolean,
       run: CurrentExecution,
-      enclosingScopePath: Vector[String]
+      enclosingScopePath: ScopePath
   )(using Cacheable[In]): WorkflowInstance[In, Out]
 
   /** The active children of `parentId`: instances whose parent relationship
@@ -393,14 +392,14 @@ trait WorkflowRuntime {
   }
 
   /** Key-prefix query over instances of one workflow definition, scoped exactly
-    * to `scope` (`Vector.empty` = top-level only). The prefix is matched
+    * to `scope` ([[ScopePath.empty]] = top-level only). The prefix is matched
     * literally: `%` and `_` in the user prefix are escaped, not treated as
     * wildcards.
     */
   def getWorkflowInstancesByPrefix(
       workflowId: WorkflowId,
       keyPrefix: WorkflowInstanceKey,
-      scope: Vector[String] = Vector.empty
+      scope: ScopePath = ScopePath.empty
   ): Vector[WorkflowInstance.Info]
 
   /** Instances of one workflow definition that have not reached a terminal
@@ -422,7 +421,7 @@ trait WorkflowRuntime {
   def deleteWorkflowInstancesByPrefix(
       workflowId: WorkflowId,
       keyPrefix: WorkflowInstanceKey,
-      scope: Vector[String] = Vector.empty
+      scope: ScopePath = ScopePath.empty
   ): Long
 
   /** Passive waiter for an instance's terminal outcome: polls the stored

@@ -1,7 +1,7 @@
 package atomicflow.impl.db
 
 import atomicflow.*
-import atomicflow.internal.{Framing, ScopePath}
+import atomicflow.internal.Framing
 import cats.effect.IO
 import cats.syntax.all.*
 import doobie.*
@@ -190,7 +190,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def readRestartBoundaryQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       stepId: StepId
   ): ConnectionIO[Option[java.time.Instant]] =
     sql"""SELECT updated_at FROM workflow_steps
@@ -208,7 +208,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val sourceKey = sourceInstanceId.workflowInstanceKey
     val sourceScope = sourceInstanceId.scope
     val newWorkflowId = workflow.id
-    val newId = WorkflowInstanceId(newWorkflowId, newInstanceKey, Vector.empty)
+    val newId = WorkflowInstanceId(newWorkflowId, newInstanceKey, ScopePath.empty)
 
     runTransaction {
       for {
@@ -226,7 +226,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         _ <- boundary match {
           case None =>
             throw new InvalidRestartStepException(
-              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.mkString("/")}' does not identify an executed step of $sourceInstanceId"
+              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.encoded}' does not identify an executed step of $sourceInstanceId"
             )
           case _ => ().pure[ConnectionIO]
         }
@@ -243,7 +243,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                    FROM workflow_steps
                    WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
                      AND updated_at < $boundary""".update.run
-        _ <- upsertWakeupQ(newId.workflowId, newInstanceKey, Vector.empty, clock.instant())
+        _ <- upsertWakeupQ(newId.workflowId, newInstanceKey, ScopePath.empty, clock.instant())
       } yield ()
     }
     WorkflowInstance(workflow, newId)
@@ -274,7 +274,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         _ <- boundary match {
           case None =>
             throw new InvalidRestartStepException(
-              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.mkString("/")}' does not identify an executed step of $sourceInstanceId"
+              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.encoded}' does not identify an executed step of $sourceInstanceId"
             )
           case _ => ().pure[ConnectionIO]
         }
@@ -297,7 +297,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
         // created before the reset boundary are closed; body replay recreates
         // what is needed. The successor generation's children carry the
         // incremented marker and never match this target.
-        _ <- insertChildCloseRequestQ(wf, key, scope, scope ++ Vector(wf, s"$key@$generation"))
+        _ <- insertChildCloseRequestQ(wf, key, scope, scope.segments ++ Vector(wf, s"$key@$generation"))
         _ <- sql"""UPDATE workflow_instances SET generation = generation + 1
                    WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run
         _ <- upsertWakeupQ(wf, key, scope, now)
@@ -342,7 +342,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       childInstanceId: WorkflowInstanceId,
       childWorkflowId: WorkflowId,
       childInstanceKey: WorkflowInstanceKey,
-      childScope: Vector[String],
+      childScope: ScopePath,
       specifiedPrefixes: Vector[String],
       specifiedInheritPastEvents: Boolean
   ): Unit = {
@@ -494,7 +494,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       inheritSignals: SignalInheritance,
       inheritPastEvents: Boolean,
       run: CurrentExecution,
-      enclosingScopePath: Vector[String]
+      enclosingScopePath: ScopePath
   )(using cacheable: Cacheable[In]): WorkflowInstance[In, Out] = {
     val parentId = run.instanceId
     val parentGeneration = run.generation
@@ -647,7 +647,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def hasExecutionStateQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Boolean] =
     for {
       steps <- sql"""SELECT 1 FROM workflow_steps
@@ -668,7 +668,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def upsertWakeupQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       now: java.time.Instant
   ): ConnectionIO[Unit] =
     sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, scheduled_at, attempts)
@@ -688,7 +688,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def finalizeCancelledWithoutLease(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Map[SignalKey, Seq[String]]] = {
     val payload = Framing.write("cancelled")
     for {
@@ -716,7 +716,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def terminalCleanupIO(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Unit] =
     for {
       _ <- sql"""DELETE FROM workflow_wakeups
@@ -732,7 +732,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def deleteDirectSignalEventsQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Unit] =
     sql"""DELETE FROM workflow_events
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -765,7 +765,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def insertChildCloseRequestQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       target: Vector[String]
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
@@ -794,7 +794,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * an already-terminal child is a delivery no-op.
     */
   private def closeOneChildQ(
-      child: (WorkflowId, WorkflowInstanceKey, Vector[String], Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+      child: (WorkflowId, WorkflowInstanceKey, ScopePath, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
   ): ConnectionIO[Map[SignalKey, Seq[String]]] = {
     val now = clock.instant()
     val (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) = child
@@ -851,7 +851,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   WHERE c.parent_workflow_id IS NOT NULL
                     AND c.workflow_instance_scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
                   ORDER BY c.workflow_id, c.workflow_instance_key, c.workflow_instance_scope
-                  LIMIT $limit""".query[(WorkflowId, WorkflowInstanceKey, Vector[String])].to[Vector]
+                  LIMIT $limit""".query[(WorkflowId, WorkflowInstanceKey, ScopePath)].to[Vector]
           orphans <-
             sql"""SELECT c.workflow_id, c.workflow_instance_key, c.workflow_instance_scope
                   FROM workflow_instances c
@@ -862,7 +862,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                         AND p.workflow_instance_key = c.parent_instance_key
                         AND p.workflow_instance_scope = c.parent_instance_scope)
                   ORDER BY c.workflow_id, c.workflow_instance_key, c.workflow_instance_scope
-                  LIMIT $limit""".query[(WorkflowId, WorkflowInstanceKey, Vector[String])].to[Vector]
+                  LIMIT $limit""".query[(WorkflowId, WorkflowInstanceKey, ScopePath)].to[Vector]
         } yield closable.map(("closable", _)) ++ orphans.map(("orphan", _))
       }
     }
@@ -899,7 +899,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def closeOnePendingChildQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       orphan: Boolean
   ): ConnectionIO[(Boolean, Map[SignalKey, Seq[String]])] =
     for {
@@ -907,7 +907,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                    FROM workflow_instances
                    WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                    FOR UPDATE""".query[
-              (Option[String], Option[String], Option[Vector[String]], Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+              (Option[String], Option[String], Option[ScopePath], Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
             ].option
       done <- row match {
         case Some((Some(pwf), Some(pkey), Some(pscope), policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt)) =>
@@ -952,7 +952,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def parentClosureSelfCheck(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): (Boolean, Map[SignalKey, Seq[String]]) = {
     val now = clock.instant()
     runTransaction {
@@ -961,7 +961,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      FROM workflow_instances
                      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                      FOR UPDATE""".query[
-                (Int, Option[String], Option[String], Option[String], Option[Vector[String]], Option[String])
+                (Int, Option[String], Option[String], Option[String], Option[ScopePath], Option[String])
               ].option
         abort <- row match {
           case Some((timesExecuted, None, Some(pwf), Some(pkey), Some(pscope), policy)) =>
@@ -1057,7 +1057,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def continueAsNewTransition(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       worker: String,
       token: Long,
       newSerializedInput: String
@@ -1078,7 +1078,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                          WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run
               _ <- terminalCleanupIO(workflowId, key, scope)
               _ <- insertChildCloseRequestQ(workflowId, key, scope,
-                                         scope ++ Vector(workflowId, s"$key@$generation"))
+                                         scope.segments ++ Vector(workflowId, s"$key@$generation"))
               _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
               _ <- sql"""UPDATE workflow_instances
                          SET input = $newSerializedInput, generation = generation + 1
@@ -1155,7 +1155,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       timerId: java.util.UUID,
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Boolean] = {
     val now = clock.instant()
     for {
@@ -1222,7 +1222,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               sql"""SELECT sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key
                     FROM workflow_events WHERE sequence_id > $through
                     ORDER BY sequence_id LIMIT $batchSize""".query[
-                  (Long, String, WorkflowId, WorkflowInstanceKey, Vector[String], String)
+                  (Long, String, WorkflowId, WorkflowInstanceKey, ScopePath, String)
                 ].to[Vector].flatMap { events =>
                   events.traverse_ { case (_, kind, wf, k, s, ek) =>
                     kind match {
@@ -1449,7 +1449,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                       case _: LeaseLostException =>
                         throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
                       case e: ContinueAsNewException =>
-                        val newInput = wf.inputCacheable.read(e.encoded)
+                        val newInput = wf.inputCacheable.read(e.encoded.raw)
                         val newSerializedInput = wf.inputCacheable.write(newInput)
                         val unconsumed = continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
                         invokeUnconsumedSignalsListener(wf, instanceId, unconsumed)
@@ -1510,7 +1510,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private[atomicflow] def tryAcquireLeaseQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       worker: String,
       leaseDuration: FiniteDuration
   ): ConnectionIO[Option[Long]] = {
@@ -1530,7 +1530,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def acquireLease(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       worker: String,
       leaseDuration: FiniteDuration,
       leaseAcquireTimeout: FiniteDuration
@@ -1585,7 +1585,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def terminalTransitionAndEvent(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       worker: String,
       token: Long,
       state: String,
@@ -1619,7 +1619,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def gatherUnconsumedSignalsQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Map[SignalKey, Seq[String]]] =
     sql"""SELECT event_key, payload FROM workflow_events
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -1672,7 +1672,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def wakeCompletionSubscribers(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
     for {
@@ -1682,7 +1682,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               ON i.workflow_id = s.workflow_id AND i.workflow_instance_key = s.workflow_instance_key AND i.workflow_instance_scope = s.workflow_instance_scope
             WHERE s.completed_workflow_id = $workflowId AND s.completed_workflow_instance_key = $key AND s.completed_workflow_instance_scope = $scope
               AND i.terminal_state IS NULL""".query[
-          (WorkflowId, WorkflowInstanceKey, Vector[String])
+          (WorkflowId, WorkflowInstanceKey, ScopePath)
         ].to[Vector]
       _ <- subscribers.traverse_ { case (subWf, subKey, subScope) =>
         sql"""
@@ -1699,7 +1699,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def appendCompletedEvent(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       payload: String
   ): ConnectionIO[Unit] =
     appendEvent(workflowId, key, scope, "WorkflowCompleted", "", payload)
@@ -1712,7 +1712,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def appendEvent(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       kind: String,
       eventKey: String,
       payload: String
@@ -1787,7 +1787,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def wakeMatchingSubscribers(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       signalKey: SignalKey
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
@@ -1821,7 +1821,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def wakeSignalInheritors(
       sourceWorkflowId: WorkflowId,
       sourceInstanceKey: WorkflowInstanceKey,
-      sourceScope: Vector[String],
+      sourceScope: ScopePath,
       signalKey: SignalKey
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
@@ -1835,7 +1835,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def readTerminalAndReturn[Out](
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       outCacheable: Cacheable[Out],
       completionCodec: Cacheable[WorkflowCompletionResult[Out]],
       instanceId: WorkflowInstanceId
@@ -1905,9 +1905,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def readStepRow(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       stepId: String,
-      stepScopePath: Vector[String],
+      stepScopePath: ScopePath,
       stepVersion: Long
   ): Option[StoredStep] =
     runTransaction {
@@ -1917,7 +1917,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           (String, String, String, Option[java.time.Instant])
         ].option
     }.map { case (kind, payload, fingerprints, expiresAt) =>
-      StoredStep(StoredStep.State.fromString(kind), payload, fingerprints, expiresAt)
+      StoredStep(StoredStep.State.fromString(kind), SerializedValue.of(payload), InputFingerprints.of(fingerprints), expiresAt)
     }
 
   /** Escapes `%`, `_`, and the escape character itself so the caller's prefix is
@@ -1938,7 +1938,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       Long,
       Option[String],
       Option[String],
-      Option[Vector[String]],
+      Option[ScopePath],
       java.time.Instant,
       Option[java.time.Instant],
       Int,
@@ -1959,9 +1959,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     case other        => throw new StepSerializationFailed(s"Unknown terminal state '$other'")
   }
 
-  private def toInfo(workflowId: WorkflowId, scope: Vector[String], r: InfoRow): WorkflowInstance.Info = {
+  private def toInfo(workflowId: WorkflowId, scope: ScopePath, r: InfoRow): WorkflowInstance.Info = {
     val (key, versionAtCreation, generation, parentWf, parentKey, parentScope, createdAt, lastRunAt, timesExecuted, terminal) = r
-    val parentId = parentWf.map(pwf => WorkflowInstanceId(pwf, parentKey.getOrElse(""), parentScope.getOrElse(Vector.empty)))
+    val parentId = parentWf.map(pwf => WorkflowInstanceId(pwf, parentKey.getOrElse(""), parentScope.getOrElse(ScopePath.empty)))
     WorkflowInstance.Info(
       id = WorkflowInstanceId(workflowId, key, scope),
       parentId = parentId,
@@ -1977,7 +1977,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def getWorkflowInstancesByPrefix(
       workflowId: WorkflowId,
       keyPrefix: WorkflowInstanceKey,
-      scope: Vector[String] = Vector.empty
+      scope: ScopePath = ScopePath.empty
   ): Vector[WorkflowInstance.Info] = {
     val pattern = escapeLikePrefix(keyPrefix) + "%"
     runTransaction {
@@ -1997,13 +1997,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runTransaction {
       (InfoSelect ++ fr"WHERE workflow_id = $workflowId AND workflow_instance_scope = '{}' AND terminal_state IS NULL " ++
         waitingCond ++ fr"ORDER BY workflow_instance_key " ++ limitFrag).query[InfoRow].to[Vector]
-    }.map(toInfo(workflowId, Vector.empty, _))
+    }.map(toInfo(workflowId, ScopePath.empty, _))
   }
 
   override def deleteWorkflowInstancesByPrefix(
       workflowId: WorkflowId,
       keyPrefix: WorkflowInstanceKey,
-      scope: Vector[String] = Vector.empty
+      scope: ScopePath = ScopePath.empty
   ): Long = {
     val pattern = escapeLikePrefix(keyPrefix) + "%"
     runTransaction {
@@ -2085,7 +2085,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
             WHERE parent_workflow_id = ${parentId.workflowId}
               AND parent_instance_key = ${parentId.workflowInstanceKey}
               AND parent_instance_scope = ${parentId.scope}
-            ORDER BY workflow_id, workflow_instance_key, workflow_instance_scope""".query[(WorkflowId, Vector[String], InfoRow)].to[Vector]
+            ORDER BY workflow_id, workflow_instance_key, workflow_instance_scope""".query[(WorkflowId, ScopePath, InfoRow)].to[Vector]
     }
     rows.map { case (wf, scope, r) => toInfo(wf, scope, r) }
   }
@@ -2100,10 +2100,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: String,
+      stepKind: StepKind,
       state: StoredStep.State,
-      inputFingerprints: String,
-      payload: String,
+      inputFingerprints: InputFingerprints,
+      payload: SerializedValue,
       expiresAt: Option[Instant]
   ): Unit =
     runLeaseCheckedTransaction(run) {
@@ -2128,9 +2128,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: String,
-      inputFingerprints: String,
-      retryPayload: String,
+      stepKind: StepKind,
+      inputFingerprints: InputFingerprints,
+      retryPayload: SerializedValue,
       deadline: Instant,
       expiresAt: Option[Instant]
   ): Unit =
@@ -2190,7 +2190,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                         ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
         inherited <- readInheritedCandidatesQ(run, signalKey, cursor)
       } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
-        SubscriberMatch("", seq, payload, createdAt)
+        SubscriberMatch("", seq, SerializedValue.of(payload), createdAt)
       }
     }
 
@@ -2198,7 +2198,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       run: CurrentExecution,
       site: WaitSite,
       subscribers: Vector[Subscriber]
-  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[String] = {
+  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[SerializedValue] = {
     runLeaseCheckedTransaction(run)(fireDueTimerSubscriptionsQ(run, site.stepId, site.stepVersion))
     runLeaseCheckedTransaction(run) {
       for {
@@ -2238,14 +2238,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  override def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[Vector[String]]): Unit =
+  override def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[ScopePath]): Unit =
     runLeaseCheckedTransaction(run)(deleteSubscriptionsUnderScopePathsQ(run, scopePaths))
 
   override def readRegionState(
       run: CurrentExecution,
       regionId: String,
-      parentScopePath: Vector[String]
-  ): Option[(String, Long)] =
+      parentScopePath: ScopePath
+  ): Option[RegionState] =
     runTransaction {
       sql"""SELECT state_payload FROM workflow_steps
             WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
@@ -2256,11 +2256,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def upsertRegion(
       run: CurrentExecution,
       regionId: String,
-      parentScopePath: Vector[String],
-      restartCount: Long,
-      serializedState: String
+      parentScopePath: ScopePath,
+      state: RegionState
   ): Unit =
     runLeaseCheckedTransaction(run) {
+      val restartCount = state.restartCount
       val base = regionIterationScope(regionId, parentScopePath, restartCount - 1)
       val now = clock.instant()
       for {
@@ -2273,11 +2273,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
             run.workflowId,
             run.instanceKey,
             run.instanceScope,
-            run.instanceScope ++ Vector(run.workflowId, s"${run.instanceKey}@${run.generation}") ++ base
+            run.instanceScope.segments ++ Vector(run.workflowId, s"${run.instanceKey}@${run.generation}") ++ base.segments
           )
         else ().pure[ConnectionIO]
         _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${encodeRegionState(restartCount, serializedState)}, '', NULL, $now, $now)
+              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${encodeRegionState(restartCount, state.serializedState.raw)}, '', NULL, $now, $now)
               ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance)
               DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
       } yield ()
@@ -2345,16 +2345,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
       run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: String,
+      stepKind: StepKind,
       state: StoredStep.State,
-      inputFingerprints: String,
-      payload: String,
+      inputFingerprints: InputFingerprints,
+      payload: SerializedValue,
       expiresAt: Option[java.time.Instant]
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
     val kind = state.toString
+    val stepKindName = stepKind.persistedName
+    val fingerprintText = inputFingerprints.raw
+    val payloadText = payload.raw
     sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKind, $kind, $payload, $inputFingerprints, $expiresAt, $now, $now)
+          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $fingerprintText, $expiresAt, $now, $now)
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance) DO UPDATE
           SET state_kind = $kind, state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
       _ => ()
@@ -2428,7 +2431,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                           ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
           inherited <- readInheritedCandidatesQ(run, signalKey, cursor)
         } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
-          SubscriberMatch(subscriberKey, seq, payload, createdAt)
+          SubscriberMatch(subscriberKey, seq, SerializedValue.of(payload), createdAt)
         }
       case Subscriber.Timer(subscriberKey, _) =>
         for {
@@ -2442,7 +2445,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                     WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
                       AND event_kind = 'TimerFired' AND event_key = ${id.toString}
                     ORDER BY sequence_id""".query[(Long, java.time.Instant)].to[Vector]
-                .map(_.map { case (seq, createdAt) => SubscriberMatch(subscriberKey, seq, "", createdAt) })
+                .map(_.map { case (seq, createdAt) => SubscriberMatch(subscriberKey, seq, SerializedValue.of(""), createdAt) })
           }
         } yield events
       case Subscriber.Completion(subscriberKey, completedWorkflowId, completedWorkflowInstanceKey, completedScope) =>
@@ -2450,7 +2453,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               WHERE workflow_id = $completedWorkflowId AND workflow_instance_key = $completedWorkflowInstanceKey AND workflow_instance_scope = $completedScope
                 AND event_kind = 'WorkflowCompleted' AND event_key = ''
               ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-          .map(_.map { case (seq, payload, createdAt) => SubscriberMatch(subscriberKey, seq, payload, createdAt) })
+          .map(_.map { case (seq, payload, createdAt) => SubscriberMatch(subscriberKey, seq, SerializedValue.of(payload), createdAt) })
     }
 
   /** Deletes the instance's subscription rows from all three subscription
@@ -2466,7 +2469,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def deleteAllSubscriptionsQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       extra: Fragment = Fragment.empty
   ): ConnectionIO[Unit] = {
     val instanceFilter =
@@ -2496,14 +2499,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * a prefix), across all three subscription tables. `scopePaths` are always
     * non-empty, so the array-prefix equality is a valid slice predicate.
     */
-  private def deleteSubscriptionsUnderScopePathsQ(run: CurrentExecution, scopePaths: Seq[Vector[String]]): ConnectionIO[Unit] =
+  private def deleteSubscriptionsUnderScopePathsQ(run: CurrentExecution, scopePaths: Seq[ScopePath]): ConnectionIO[Unit] =
     scopePaths.traverse_ { path =>
-      require(path.nonEmpty, "a step scope path must never be empty; an empty prefix would match every row")
+      require(path.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every row")
       deleteAllSubscriptionsQ(
         run.workflowId,
         run.instanceKey,
         run.instanceScope,
-        fr"step_scope_within_instance[1:${path.length}] = $path"
+        fr"step_scope_within_instance[1:${path.segments.length}] = $path"
       )
     }
 
@@ -2546,8 +2549,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * segment. Nested Step/Await rows and children of the iteration live under this
     * prefix; the region's own row lives at the parent scope path (one level up).
     */
-  private def regionIterationScope(regionId: String, parentScopePath: Vector[String], restartCount: Long): Vector[String] =
-    parentScopePath :+ s"$regionId@$restartCount"
+  private def regionIterationScope(regionId: String, parentScopePath: ScopePath, restartCount: Long): ScopePath =
+    parentScopePath.appended(s"$regionId@$restartCount")
 
   /** The wrapped payload of a region row: its committed `restartCount` and the
     * encoded user state, stored in the step row's `state_payload`.
@@ -2557,9 +2560,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
   private def encodeRegionState(restartCount: Long, serializedState: String): String =
     upickle.default.write(RegionPayload(restartCount, serializedState))
 
-  private def decodeRegionState(payload: String): (String, Long) = {
+  private def decodeRegionState(payload: String): RegionState = {
     val storedState = upickle.default.read[RegionPayload](payload)
-    (storedState.state, storedState.count)
+    RegionState(storedState.count, SerializedValue.of(storedState.state))
   }
 
   /** Deletes the nested Step rows under the region's interior subtree: rows whose
@@ -2569,10 +2572,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * `child_close_requests` table, never in `workflow_steps`, so they are never
     * caught by this delete.
     */
-  private def deleteRegionNestedStepsQ(run: CurrentExecution, base: Vector[String]): ConnectionIO[Unit] =
+  private def deleteRegionNestedStepsQ(run: CurrentExecution, base: ScopePath): ConnectionIO[Unit] =
     sql"""DELETE FROM workflow_steps
           WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
-            AND step_scope_within_instance[1:${base.length}] = $base""".update.run.map(_ => ())
+            AND step_scope_within_instance[1:${base.segments.length}] = $base""".update.run.map(_ => ())
 
   /** Deletes the nested subscription rows under the region's interior subtree:
     * rows whose `step_scope_within_instance` is `base` or lies beneath it, in
@@ -2580,12 +2583,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * interior base (always non-empty), so the array-prefix equality is a valid
     * slice predicate.
     */
-  private def deleteRegionNestedSubscriptionsQ(run: CurrentExecution, base: Vector[String]): ConnectionIO[Unit] =
+  private def deleteRegionNestedSubscriptionsQ(run: CurrentExecution, base: ScopePath): ConnectionIO[Unit] =
     deleteAllSubscriptionsQ(
       run.workflowId,
       run.instanceKey,
       run.instanceScope,
-      fr"step_scope_within_instance[1:${base.length}] = $base"
+      fr"step_scope_within_instance[1:${base.segments.length}] = $base"
     )
 
   /** The per-run execution handle of this runtime: the fencing identity of one
@@ -2599,7 +2602,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       val fencingToken: Long,
       val workflowId: WorkflowId,
       val instanceKey: WorkflowInstanceKey,
-      val instanceScope: Vector[String],
+      val instanceScope: ScopePath,
       val generation: Long
   ) {
 

@@ -24,13 +24,13 @@ final class WorkflowSuspendedException private[atomicflow] (
 }
 
 /** Thrown by `Workflow.continueAsNew` to abort the current body and restart the
-  * instance with new input. Carries the [[encoded]] string for the next input,
+  * instance with new input. Carries the [[encoded]] value for the next input,
   * serialized with the caller's local `Cacheable`. The runtime
   * decodes them with the current workflow definition's input codec when it
   * commits the transition. The caller must supply the workflow's input type;
   * an incompatible encoding fails the run.
   */
-final class ContinueAsNewException private[atomicflow] (val encoded: String) extends WorkflowControlFlowException {
+final class ContinueAsNewException private[atomicflow] (val encoded: SerializedValue) extends WorkflowControlFlowException {
   override def toString: String = "ContinueAsNewException"
 }
 
@@ -42,7 +42,7 @@ final class ContinueAsNewException private[atomicflow] (val encoded: String) ext
   * previous iteration's nested rows and subscriptions, closing its children), and
   * re-enters the body locally in the same run.
   */
-final class RegionRestartException private[atomicflow] (val serializedState: String) extends WorkflowControlFlowException {
+final class RegionRestartException private[atomicflow] (val serializedState: SerializedValue) extends WorkflowControlFlowException {
   override def toString: String = "RegionRestartException"
 }
 
