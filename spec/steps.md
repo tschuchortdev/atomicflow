@@ -97,7 +97,7 @@ object RetryPolicy {
 }
 ```
 
-- Delays at or below `WorkflowRuntime.durableRetryThreshold` block the executing thread. Longer delays suspend on a stored timer. Set the threshold when constructing `PostgresWorkflowRuntime`.
+- Delays at or below `WorkflowRuntime.durableRetryThreshold` block the executing thread. Longer delays persist a `RetryPending` step row carrying the retry bookkeeping and the deadline at which the body may run again (replacing the site's retry timer subscription with one at that deadline; the fired `TimerFired` event only wakes the instance). Set the threshold when constructing `PostgresWorkflowRuntime`.
 - The `failure` is the exact exception thrown by the Step body. If the policy decides to retry, it will not be serialized and cached.
 - `invalidateAfter` also invalidates ongoing retries or terminal failures. It is as if the step never executed before.
 - If the application crashes during a retry, it is as if the retry was never begun (scheduled retry in the database is not touched until the Step body has returned/thrown).
@@ -230,7 +230,7 @@ Steps, runtime-computed awaits, `Step.firstToRunWithoutSuspension`, and
 ```text
 workflow_steps (
   workflowInstanceId, stepId, stepVersion, stepKind, stateKind, statePayload,
-  inputFingerprints, expiresAt, createdAt, updatedAt
+  retryDeadline, inputFingerprints, expiresAt, createdAt, updatedAt
 )
 ```
 
@@ -239,8 +239,12 @@ workflow_steps (
   positive. Reusing an ID with an incompatible `stepKind` is a conflict.
 - `stepKind` distinguishes `AtLeastOnce`, `AtMostOnce`, `Await`,
   `FirstToRunWithoutSuspension`, and `RestartableRegion`.
-- `stateKind` distinguishes `Started`, `Succeeded`, `Failed`. 
-- `RestartableRegion` is permanently in state `Started` after the record was created. 
+- `stateKind` distinguishes `Started`, `RetryPending`, `Succeeded`, `Failed`.
+- `RestartableRegion` is permanently in state `Started` after the record was created.
+- `retryDeadline` is non-null only for `RetryPending`: the clock instant at which
+  the step body may run again. Core compares it against its clock to decide
+  due-ness; the retry's timer subscription is kept only to wake the instance at
+  that deadline, and a fired retry `TimerFired` event is never read by core.
 - `statePayload` is a runtime-owned encoded value, so it
   can carry a returned value, failure, retry bookkeeping, or a region's
   `(restartCount, currentState)` without kind-specific nullable columns.

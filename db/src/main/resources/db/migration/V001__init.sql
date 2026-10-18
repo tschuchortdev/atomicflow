@@ -70,6 +70,7 @@ CREATE TABLE workflow_steps (
   step_kind VARCHAR NOT NULL,
   state_kind VARCHAR NOT NULL,
   state_payload VARCHAR NOT NULL,
+  retry_deadline TIMESTAMPTZ,
   input_fingerprints VARCHAR NOT NULL,
   expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),

@@ -23,8 +23,9 @@ object Step {
     *
     * Delays at or below the runtime's durable-retry threshold are applied as
     * inline `Thread.sleep`s inside the run; delays above it become durable
-    * suspensions (an ordinary timer subscription) so the workflow survives a
-    * crash while waiting.
+    * suspensions, persisted as a `RetryPending` step row whose deadline governs
+    * when the body may run again (a timer subscription is kept only to wake the
+    * instance at that deadline) so the workflow survives a crash while waiting.
     */
   trait RetryPolicy {
 
@@ -200,9 +201,9 @@ object Step {
     * [[Step.RetryPolicy.never]] (as does the at-least-once default), so both
     * guarantees share a single execution path. A retry delay at or below the
     * runtime's durable-retry threshold sleeps inline inside the run; a delay
-    * above it durably suspends the step (a `started` row carrying retry
-    * bookkeeping plus an ordinary timer subscription) and resumes after the
-    * deadline.
+    * above it durably suspends the step as a `RetryPending` row carrying the
+    * retry bookkeeping and the deadline at which the body may run again and
+    * resumes once that deadline is due.
     */
   private def runStep[A: Cacheable as valueCodec](
       kind: StepKind,
@@ -266,23 +267,28 @@ object Step {
     def runBody(resumed: Option[RetryState]): A = {
       throwIfCancelled
       var bookkeeping = resumed.getOrElse {
-        internals.writeStepState(
+        internals.writeStep(
           stepId,
           stepVersion,
           kind,
-          StoredStep.State.Started,
-          InputFingerprints.of(fingerprints),
-          SerializedValue.of(""),
-          None
+          StoredStep(
+            StoredStep.State.Started,
+            InputFingerprints.of(fingerprints),
+            None
+          )
         )
         RetryState.initial
       }
       while (true) {
         try {
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(body)
-          internals.writeStepState(
-            stepId, stepVersion, kind, StoredStep.State.Succeeded, InputFingerprints.of(fingerprints),
-            SerializedValue.of(serialized), expiresAt
+          internals.writeStep(
+            stepId, stepVersion, kind,
+            StoredStep(
+              StoredStep.State.Succeeded(SerializedValue.of(serialized)),
+              InputFingerprints.of(fingerprints),
+              expiresAt
+            )
           )
           return decoded
         } catch {
@@ -296,9 +302,13 @@ object Step {
             ) match {
               case None =>
                 val (payload, toThrow) = serializeFailure(t)
-                internals.writeStepState(
-                  stepId, stepVersion, kind, StoredStep.State.Failed, InputFingerprints.of(fingerprints),
-                  SerializedValue.of(payload), expiresAt
+                internals.writeStep(
+                  stepId, stepVersion, kind,
+                  StoredStep(
+                    StoredStep.State.Failed(SerializedValue.of(payload)),
+                    InputFingerprints.of(fingerprints),
+                    expiresAt
+                  )
                 )
                 throw toThrow
               case Some(delay) =>
@@ -307,14 +317,15 @@ object Step {
                   java.util.concurrent.TimeUnit.NANOSECONDS.sleep(delay.toNanos)
                 else {
                   val deadline = internals.clock.instant().plus(java.time.Duration.ofNanos(delay.toNanos))
-                  internals.suspendStepRetry(
+                  internals.writeStep(
                     stepId,
                     stepVersion,
                     kind,
-                    InputFingerprints.of(fingerprints),
-                    SerializedValue.of(RetryState.encode(bookkeeping)),
-                    deadline,
-                    expiresAt
+                    StoredStep(
+                      StoredStep.State.RetryPending(SerializedValue.of(RetryState.encode(bookkeeping)), deadline),
+                      InputFingerprints.of(fingerprints),
+                      expiresAt
+                    )
                   )
                   throw new WorkflowSuspendedException
                 }
@@ -324,29 +335,34 @@ object Step {
       throw new IllegalStateException("unreachable: the retry loop returns or throws")
     }
 
-    val rawExisting = internals.lookupStep(stepId, stepVersion)
+    val rawExisting = internals.readStep(ctx.instanceId, stepId, stepVersion)
     val replayable =
       rawExisting.filterNot(row =>
         isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)
       )
-    if (rawExisting.isDefined && replayable.isEmpty) internals.deleteStepOrAwait(stepId, stepVersion)
+    if (rawExisting.isDefined && replayable.isEmpty) internals.deleteStep(stepId, stepVersion)
 
     replayable match {
       case None => Some(runBody(None))
 
       case Some(row) =>
         row.state match {
-          case StoredStep.State.Succeeded =>
-            Some(decodeStored(valueCodec, stepKey)(row.statePayload.raw))
-          case StoredStep.State.Failed =>
-            throw decodeStoredFailure(throwableCodec, stepKey)(row.statePayload.raw)
+          case StoredStep.State.Succeeded(payload) =>
+            Some(decodeStored(valueCodec, stepKey)(payload.raw))
+          case StoredStep.State.Failed(payload) =>
+            throw decodeStoredFailure(throwableCodec, stepKey)(payload.raw)
           case StoredStep.State.Started if kind == StepKind.AtMostOnce =>
             None
-          case StoredStep.State.Started if row.statePayload.raw.startsWith(RetryState.payloadPrefix) =>
-            if (!internals.fireStepRetryIfDue(stepId, stepVersion)) throw new WorkflowSuspendedException
-            Some(runBody(Some(RetryState.decode(row.statePayload.raw))))
           case StoredStep.State.Started =>
             Some(runBody(None))
+          case StoredStep.State.RetryPending(bookkeeping, deadline) =>
+            // A fresh instant, not the `now` read at the top of runStep: the
+            // wakeup that resumed this run is produced against the sweeper's
+            // clock, which can be ahead of this JVM's, and a stale comparison
+            // would re-suspend an already-due retry that will never be woken again.
+            if (!deadline.isAfter(internals.clock.instant()))
+              Some(runBody(Some(RetryState.decode(bookkeeping.raw))))
+            else throw new WorkflowSuspendedException
         }
     }
   }
@@ -370,11 +386,12 @@ object Step {
       case None => StepExecutionState.NeverStarted
       case Some(row) =>
         row.state match {
-          case StoredStep.State.Succeeded =>
-            StepExecutionState.Completed(decodeStored(valueCodec, key)(row.statePayload.raw))
-          case StoredStep.State.Failed =>
-            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(row.statePayload.raw))
-          case StoredStep.State.Started => StepExecutionState.Started
+          case StoredStep.State.Succeeded(payload) =>
+            StepExecutionState.Completed(decodeStored(valueCodec, key)(payload.raw))
+          case StoredStep.State.Failed(payload) =>
+            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(payload.raw))
+          case StoredStep.State.Started | StoredStep.State.RetryPending(_, _) =>
+            StepExecutionState.Started
         }
     }
   }
@@ -586,24 +603,32 @@ object Step {
         // first-wins marker, so a crash in between leaves no marker and the next
         // run re-evaluates from scratch and re-deletes.
         internals.deleteSubscriptionsUnderScopePaths(branchPaths)
-        internals.writeStepState(
-          scopedStepId, 0L, StepKind.FirstToRun, StoredStep.State.Succeeded, InputFingerprints.of(fingerprints),
-          SerializedValue.of(serialized), None
+        internals.writeStep(
+          scopedStepId, 0L, StepKind.FirstToRun,
+          StoredStep(
+            StoredStep.State.Succeeded(SerializedValue.of(serialized)),
+            InputFingerprints.of(fingerprints),
+            None
+          )
         )
         decoded
       }
     }
 
-    val rawExisting = internals.lookupStep(scopedStepId, 0L)
+    val rawExisting = internals.readStep(ctx.instanceId, scopedStepId, 0L)
     val replayable =
       rawExisting.filterNot(row =>
         isExpired(row, now) || haveInputsChanged(stepId, row, ensureUnchanged, invalidateOn)
       )
-    if (rawExisting.isDefined && replayable.isEmpty) internals.deleteStepOrAwait(scopedStepId, 0L)
+    if (rawExisting.isDefined && replayable.isEmpty) internals.deleteStep(scopedStepId, 0L)
 
     replayable match {
-      case Some(row) if row.state == StoredStep.State.Succeeded => decodeStored(valueCodec, stepId)(row.statePayload.raw)
-      case _                                                    => evaluate()
+      case Some(row) =>
+        row.state match {
+          case StoredStep.State.Succeeded(payload) => decodeStored(valueCodec, stepId)(payload.raw)
+          case _                                   => evaluate()
+        }
+      case None => evaluate()
     }
   }
 
@@ -612,7 +637,7 @@ object Step {
     * fingerprint conflict throws, and an existing row that has drifted
     * (`invalidateOn` fingerprint change) or expired (its TTL elapsed) triggers
     * the site's single `onDiscard` policy. `onDiscard` discards the site
-    * (`deleteStepOrAwait`) and then evaluates it afresh; an unresolved
+    * (`deleteStep`) and then evaluates it afresh; an unresolved
     * (`started`) site also just evaluates. The stored-failure
     * `StepSerializationFailed` message uses the `"Await"` prefix.
     */
@@ -629,7 +654,7 @@ object Step {
     given ctx.internals.Lease = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
     val now = internals.clock.instant()
-    val rawExisting = internals.lookupStep(stepId, 0L)
+    val rawExisting = internals.readStep(ctx.instanceId, stepId, 0L)
     val existing = rawExisting.filterNot(isExpired(_, now))
 
     existing match {
@@ -640,10 +665,10 @@ object Step {
         if (haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)) onDiscard()
         else
           row.state match {
-            case StoredStep.State.Succeeded => decode(row.statePayload.raw)
-            case StoredStep.State.Failed =>
+            case StoredStep.State.Succeeded(payload) => decode(payload.raw)
+            case StoredStep.State.Failed(_) =>
               throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
-            case StoredStep.State.Started => evaluate()
+            case StoredStep.State.Started | StoredStep.State.RetryPending(_, _) => evaluate()
           }
     }
   }
@@ -655,7 +680,7 @@ object Step {
     *
     * An existing non-expired `succeeded` row replays; `ensureUnchanged`
     * conflicts throw; an `invalidateOn` change or an expired row discards the
-    * site (`deleteStepOrAwait`: its step row plus every subscription) and
+    * site (`deleteStep`: its step row plus every subscription) and
     * re-evaluates from scratch, so no stale registration can satisfy the new
     * registration.
     */
@@ -694,7 +719,7 @@ object Step {
     }
 
     def discardAndEvaluate(): A = {
-      internals.deleteStepOrAwait(stepId, 0L)
+      internals.deleteStep(stepId, 0L)
       evaluate()
     }
 
@@ -913,10 +938,9 @@ object Step {
       case _                 => None
     }
 
-  /** Retry bookkeeping persisted in a `started` row's payload while an
+  /** Retry bookkeeping carried in a `RetryPending` step row while an
     * at-least-once step waits for a durable retry deadline. Encoded as
-    * `retry:<failedAttempts>:<cumulativeNanos>:<lastNanos>` (`-1` for no last
-    * delay).
+    * `failedAttempts:cumulativeNanos:lastNanos` (`-1` for no last delay).
     */
   private final case class RetryState(
       failedAttempts: Int,
@@ -928,18 +952,19 @@ object Step {
   }
 
   private object RetryState {
-    val payloadPrefix = "retry:"
     val initial: RetryState = RetryState(0, 0.seconds, None)
 
     def encode(state: RetryState): String =
-      s"$payloadPrefix${state.failedAttempts}:${state.cumulativeDelay.toNanos}:${state.lastDelay.fold(-1L)(_.toNanos)}"
+      s"${state.failedAttempts}:${state.cumulativeDelay.toNanos}:${state.lastDelay.fold(-1L)(_.toNanos)}"
 
     def decode(payload: String): RetryState = {
       val parts = payload.split(":")
+      if (parts.length != 3)
+        throw new StepSerializationFailed(s"Stored retry bookkeeping could not be decoded: '$payload'")
       val lastDelay =
-        if (parts(3).toLong == -1L) None
-        else Some(FiniteDuration(parts(3).toLong, NANOSECONDS))
-      RetryState(parts(1).toInt, FiniteDuration(parts(2).toLong, NANOSECONDS), lastDelay)
+        if (parts(2).toLong == -1L) None
+        else Some(FiniteDuration(parts(2).toLong, NANOSECONDS))
+      RetryState(parts(0).toInt, FiniteDuration(parts(1).toLong, NANOSECONDS), lastDelay)
     }
   }
 

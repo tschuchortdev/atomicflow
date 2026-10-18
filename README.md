@@ -114,7 +114,8 @@ for completion; it does not execute the workflow.
   `invalidateAfter` sets cache expiry.
 - **Retries:** `Step.RetryPolicy` retries failures in at-least-once steps.
   Short delays block the executing thread; delays above the runtime's
-  `durableRetryThreshold` suspend until a stored timer fires. A stored terminal
+  `durableRetryThreshold` durably suspend the step until its stored retry
+  deadline is due (a timer wakes the instance). A stored terminal
   failure is replayed, not retried by calling `run` again.
 - **Scopes and parallel work:** `Workflow.scoped` gives steps a nested
   namespace. `Workflow.parallel` runs branches concurrently and waits for all

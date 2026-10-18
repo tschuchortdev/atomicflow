@@ -3,32 +3,49 @@ package atomicflow
 import java.time.Instant
 
 /** A stored step record, read without acquiring an execution lease.
-  * `state` is one of `Started`, `Succeeded`, `Failed`; `statePayload`
-  * is the raw, encoded outcome; `inputFingerprints` is the deterministic
-  * encoding of the step's named inputs.
+  * `state` is the persisted state of the step row; `inputFingerprints` is the
+  * deterministic encoding of the step's named inputs.
   */
 final case class StoredStep(
     state: StoredStep.State,
-    statePayload: SerializedValue,
     inputFingerprints: InputFingerprints,
     expiresAt: Option[Instant]
 )
 
 object StoredStep {
 
-  /** The `state_kind` of a `workflow_steps` row; stored as `toString`.
+  /** The persisted state of a step row. Only `Succeeded` and `Failed` carry a
+    * payload; `RetryPending` carries the opaque retry bookkeeping and the
+    * deadline at which the step body may run again.
     */
   enum State {
-    case Started, Succeeded, Failed
+    case Started
+    case RetryPending(bookkeeping: SerializedValue, deadline: Instant)
+    case Succeeded(payload: SerializedValue)
+    case Failed(payload: SerializedValue)
   }
 
   object State {
 
-    /** Parses the stored DB value. Only the three written values are valid. */
-    def fromString(s: String): State =
-      values
-        .find(_.toString == s)
-        .getOrElse(throw new IllegalArgumentException(s"Unknown step state_kind '$s'"))
+    /** Reconstructs a persisted state from the row's `state_kind` name together
+      * with its `state_payload` and `retry_deadline` columns. Only the four
+      * written `state_kind` values are valid; `RetryPending` requires a non-null
+      * deadline.
+      */
+    def fromString(kind: String, payload: SerializedValue, retryDeadline: Option[Instant]): State =
+      kind match {
+        case "Started" => Started
+        case "RetryPending" =>
+          RetryPending(
+            payload,
+            retryDeadline.getOrElse(
+              throw new IllegalArgumentException("RetryPending step row is missing its retry_deadline")
+            )
+          )
+        case "Succeeded" => Succeeded(payload)
+        case "Failed"    => Failed(payload)
+        case other       => throw new IllegalArgumentException(s"Unknown step state_kind '$other'")
+      }
   }
 }
 

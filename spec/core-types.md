@@ -79,7 +79,7 @@ trait StepContext[Out] {
 final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
   def run()(using WorkflowRuntime): WorkflowRunResult[Out]
-  def blockUntilCompleted(timeout: FiniteDuration)(using WorkflowRuntime): WorkflowRunResult[Out]
+  def blockUntilCompleted(timeout: FiniteDuration, pollInterval: FiniteDuration = 50.milliseconds)(using WorkflowRuntime): WorkflowRunResult[Out]
   def getInfo()(using WorkflowRuntime): WorkflowInstance.Info   // fresh from DB
   // Awaitable of this instance's completion; yields a WorkflowCompletionResult[Out]
   // (see running-workflows.md). Codecs resolve at the await call site.

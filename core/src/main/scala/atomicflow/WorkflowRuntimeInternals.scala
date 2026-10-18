@@ -1,7 +1,6 @@
 package atomicflow
 
 import java.time.Clock
-import java.time.Instant
 import scala.concurrent.duration.FiniteDuration
 
 /** The shape core requires of a backend's per-run execution handle: the
@@ -62,25 +61,26 @@ trait WorkflowRuntimeInternals {
   def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
   /** Read a stored step without checking lease ownership, or `None` if absent.
-    * Reports the stored row even if it has expired.
+    * Reports the stored row even if it has expired. This is the single read path
+    * for steps; it is used both by `Step.runStep` and by `Step.getExecutionState`.
     */
-  def lookupStep(stepId: StepId, stepVersion: Long)(using Lease): Option[StoredStep]
-
-  /** Replace (or create) the step row, fenced: `state` is `Started` (an
-    * unresolved row, its `payload` empty or carrying retry bookkeeping), or the
-    * terminal `Succeeded`/`Failed`. The site's retry timer subscription is
-    * retired in the same transaction, so a resolved or superseded retry can
-    * never be re-fired.
-    */
-  def writeStepState(
+  def readStep(
+      instanceId: WorkflowInstanceId,
       stepId: StepId,
-      stepVersion: Long,
-      stepKind: StepKind,
-      state: StoredStep.State,
-      inputFingerprints: InputFingerprints,
-      payload: SerializedValue,
-      expiresAt: Option[Instant]
-  )(using Lease): Unit
+      stepVersion: Long
+  ): Option[StoredStep]
+
+  /** Replace (or create) the step row, fenced. The state, payload, input
+    * fingerprints, and expiry all travel inside `step`: `Started` is an
+    * unresolved row with an empty payload, `RetryPending` carries the retry
+    * bookkeeping and the deadline at which the body may run again, and
+    * `Succeeded`/`Failed` carry the terminal outcome. When `step.state` is
+    * `RetryPending`, the site's internal retry timer subscription is replaced
+    * with one at the new deadline; for every other state, the site's timer
+    * subscriptions are deleted. The step row and its retry subscription are
+    * written atomically, so a resolved or superseded retry can never re-fire.
+    */
+  def writeStep(stepId: StepId, stepVersion: Long, stepKind: StepKind, step: StoredStep)(using Lease): Unit
 
   /** Delete a step record and all its signal, timer, and completion subscriptions
     * in one transaction, checking execution ownership. Used when inputs change
@@ -91,34 +91,13 @@ trait WorkflowRuntimeInternals {
     * between deletion and evaluation, lease recovery or the next manual run
     * evaluates the operation and registers its subscriptions again.
     */
-  def deleteStepOrAwait(stepId: StepId, stepVersion: Long)(using Lease): Unit
+  def deleteStep(stepId: StepId, stepVersion: Long)(using Lease): Unit
 
-  /** Durably suspend an at-least-once step for a retry, fenced, in one
-    * transaction: persist (or refresh) the `started` step row carrying the
-    * runtime-owned retry bookkeeping in `retryPayload` and its `expiresAt`, and
-    * register the retry's timer subscription (deadline = `now + delay`) under
-    * the reserved `"__retry__"` subscriber key, which cannot collide with user
-    * awaits of the same site. The step body is NOT executed until the
-    * subscription is due.
+  /** Reads the full persisted state of an instance, or `None` when absent. No
+    * lease is required; serves both the run path and `getInfo`, and backs the
+    * core-owned `blockUntilCompleted` poll.
     */
-  def suspendStepRetry(
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: StepKind,
-      inputFingerprints: InputFingerprints,
-      retryPayload: SerializedValue,
-      deadline: Instant,
-      expiresAt: Option[Instant]
-  )(using Lease): Unit
-
-  /** Fire this step's due retry timers in one transaction after checking execution
-    * ownership. For each subscription with `deadline <= now`, lock it, check that
-    * no `TimerFired` event exists yet, and append one. The subscription row
-    * survives firing; only resolution retires it. Returns whether a `TimerFired`
-    * event now exists for the site, distinguishing a due retry (resume the body)
-    * from one still waiting (suspend).
-    */
-  def fireStepRetryIfDue(stepId: StepId, stepVersion: Long)(using Lease): Boolean
+  def readInstance(instanceId: WorkflowInstanceId): Option[InstanceRecord]
 
   /** Read stored signals visible to this instance for `signalKey`, after its
     * cursor and in sequence order. No lease check is required and the cursor is not
@@ -192,15 +171,6 @@ trait WorkflowRuntimeInternals {
       parentScopePath: ScopePath,
       state: RegionState
   )(using Lease): Unit
-
-  /** Read a stored step without acquiring an execution lease.
-    * Used by `Step.getExecutionState`.
-    */
-  def readStep(
-      instanceId: WorkflowInstanceId,
-      stepId: StepId,
-      stepVersion: Long
-  ): Option[StoredStep]
 
   /** Start a child workflow of an executing parent: create-if-absent a child
     * instance under a scope derived from the parent's identity, generation, and

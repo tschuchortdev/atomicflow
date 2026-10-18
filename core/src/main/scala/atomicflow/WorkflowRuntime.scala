@@ -2,8 +2,10 @@ package atomicflow
 
 import org.slf4j.LoggerFactory
 
+import java.util.concurrent.TimeUnit
+
 import scala.annotation.implicitNotFound
-import scala.concurrent.duration.{Duration, FiniteDuration}
+import scala.concurrent.duration.*
 
 /** The application-facing view of a workflow runtime: creates, runs, and
   * manages workflow instances. Some methods are final and composed here from
@@ -227,10 +229,11 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
 
   /** Decodes a terminal instance's persisted outcome and returns or throws it,
     * without executing the body. Used when a run finds the instance already
-    * terminal, or when a concurrent writer won the terminal transition.
+    * terminal, or when a concurrent writer won the terminal transition. Only the
+    * definition's output codec is needed, so any `Workflow[?, Out]` suffices.
     */
-  final private[atomicflow] def decodeTerminal[In, Out](
-      workflow: Workflow[In, Out],
+  final private[atomicflow] def decodeTerminal[Out](
+      workflow: Workflow[?, Out],
       record: InstanceRecord
   )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
     given Cacheable[Out] = workflow.outputCacheable
@@ -361,22 +364,54 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     */
   def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info]
 
-  /** Passive waiter for an instance's terminal outcome: polls the stored
-    * terminal projection until a terminal state is reached or `timeout`
-    * elapses, then throws [[java.util.concurrent.TimeoutException]]. Never
-    * executes the workflow. Terminal outcomes decode exactly as `run` on a
-    * terminal instance.
+  /** Passive waiter for an instance's terminal outcome: polls the persisted
+    * instance row until a terminal state is reached or `timeout` elapses, then
+    * throws [[java.util.concurrent.TimeoutException]]. Never executes the
+    * workflow. Terminal outcomes decode exactly as `run` on a terminal instance.
+    *
+    * Each poll reads the full instance row through [[readInstance]]; a missing
+    * instance throws [[WorkflowNotFoundException]] on any poll that finds the
+    * row absent. The loop always performs one immediate poll, so a zero timeout
+    * still observes an already-terminal instance. `pollInterval` must be
+    * positive and is slept between polls with nanosecond precision, so
+    * sub-millisecond intervals are honored.
     */
+  @throws[WorkflowNotFoundException]
   @throws[java.util.concurrent.TimeoutException]
-  def blockUntilCompleted[Out](
+  final def blockUntilCompleted[Out](
       instance: WorkflowInstance[?, Out],
-      timeout: FiniteDuration
-  )(using Cacheable[Throwable]): WorkflowRunResult[Out]
+      timeout: FiniteDuration,
+      pollInterval: FiniteDuration = 50.milliseconds
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
+    require(pollInterval > Duration.Zero, s"pollInterval must be positive, was $pollInterval")
+    val deadlineNanos = System.nanoTime() + timeout.toNanos
+    var terminal: Option[InstanceRecord] = None
+    var expired = false
+    while (terminal.isEmpty && !expired) {
+      val record = readInstance(instance.id).getOrElse(
+        throw new WorkflowNotFoundException(s"Workflow instance not found: ${instance.id}")
+      )
+      if (record.terminalState.isDefined) terminal = Some(record)
+      else if (System.nanoTime() >= deadlineNanos) expired = true
+      else TimeUnit.NANOSECONDS.sleep(pollInterval.toNanos)
+    }
+    terminal match {
+      case Some(record) => decodeTerminal(instance.workflow, record)
+      case None =>
+        throw new java.util.concurrent.TimeoutException(
+          s"Workflow instance did not reach a terminal state within $timeout: ${instance.id}"
+        )
+    }
+  }
 
   /** The persisted data view of an instance, fresh from the database. */
-  def getWorkflowInstanceInfo[In, Out](
+  @throws[WorkflowNotFoundException]
+  final def getWorkflowInstanceInfo[In, Out](
       instance: WorkflowInstance[In, Out]
-  ): WorkflowInstance.Info
+  ): WorkflowInstance.Info =
+    readInstance(instance.id)
+      .map(_.info)
+      .getOrElse(throw new WorkflowNotFoundException(s"Workflow instance not found: ${instance.id}"))
 
   /** Creates and starts a job runner over the given definition registry.
     * Implemented per backend: the runner executes backend-internal operations
