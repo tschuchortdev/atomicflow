@@ -104,7 +104,7 @@ final class PostgresJobRunner private[atomicflow] (
   private final case class DueWakeupRow(
       workflowId: WorkflowId,
       instanceKey: WorkflowInstanceKey,
-      scope: Vector[String],
+      scope: ScopePath,
       createdAt: java.time.Instant,
       scheduledAt: java.time.Instant,
       attempts: Int
@@ -280,13 +280,13 @@ final class PostgresJobRunner private[atomicflow] (
       timerId: java.util.UUID,
       workflowId: WorkflowId,
       instanceKey: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   )
 
   private final case class InstanceRow(
       workflowId: WorkflowId,
       instanceKey: WorkflowInstanceKey,
-      scope: Vector[String]
+      scope: ScopePath
   )
 
   /** Background timer firing. Claims due, not-yet-fired timer

@@ -6,7 +6,7 @@ class ControlFlowSuite extends FunSuite:
 
   test("WorkflowNonFatal excludes library control-flow exceptions") {
     assertEquals(WorkflowNonFatal.unapply(WorkflowSuspendedException()), None)
-    assertEquals(WorkflowNonFatal.unapply(ContinueAsNewException("input")), None)
+    assertEquals(WorkflowNonFatal.unapply(ContinueAsNewException(SerializedValue.of("input"))), None)
   }
 
   test("WorkflowNonFatal includes WorkflowCancelledException so cleanup code can catch it") {

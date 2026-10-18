@@ -9,8 +9,8 @@ import java.time.Instant
   */
 final case class StoredStep(
     state: StoredStep.State,
-    statePayload: String,
-    inputFingerprints: String,
+    statePayload: SerializedValue,
+    inputFingerprints: InputFingerprints,
     expiresAt: Option[Instant]
 )
 
@@ -47,8 +47,8 @@ final case class AwaitTimerCandidate(
 final case class WaitSite(
     stepId: StepId,
     stepVersion: Long,
-    stepKind: String,
-    inputFingerprints: String,
+    stepKind: StepKind,
+    inputFingerprints: InputFingerprints,
     expiresAt: Option[Instant]
 )
 
@@ -63,7 +63,7 @@ enum Subscriber {
       subscriberKey: String,
       completedWorkflowId: WorkflowId,
       completedWorkflowInstanceKey: WorkflowInstanceKey,
-      completedScope: Vector[String]
+      completedScope: ScopePath
   )
 }
 
@@ -73,7 +73,7 @@ enum Subscriber {
 final case class SubscriberMatch(
     subscriberKey: String,
     sequenceId: Long,
-    payload: String,
+    payload: SerializedValue,
     createdAt: Instant
 )
 
@@ -83,6 +83,12 @@ final case class SubscriberMatch(
   * winning event's `sequenceId`.
   */
 final case class WaitResolution(
-    payload: String,
+    payload: SerializedValue,
     advanceSignalCursor: Option[(SignalKey, Long)]
 )
+
+/** The persisted state of a `Workflow.restartable`/`Workflow.loop` region:
+  * its committed `restartCount` plus the encoded user state of the current
+  * generation.
+  */
+final case class RegionState(restartCount: Long, serializedState: SerializedValue)

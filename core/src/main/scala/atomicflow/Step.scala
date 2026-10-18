@@ -12,8 +12,6 @@ import scala.concurrent.duration.*
   */
 object Step {
 
-  private enum ExecutionGuarantee { case AtLeastOnce, AtMostOnce }
-
   /** A retry policy for `Step.atLeastOnce`. A policy decides, from the failure thrown by the
     * step body and the retry bookkeeping accumulated so far, whether to retry
     * and after what delay.
@@ -154,7 +152,7 @@ object Step {
       invalidateAfter: Duration = Duration.Inf,
       retry: Step.RetryPolicy = Step.RetryPolicy.never
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    runStep(ExecutionGuarantee.AtLeastOnce, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
+    runStep(StepKind.AtLeastOnce, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
   /** An at-most-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record yields `None`
@@ -180,7 +178,7 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runStep(ExecutionGuarantee.AtMostOnce, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
+    runStep(StepKind.AtMostOnce, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** The cancellation checkpoint for new work (a Step body about to execute, or
     * an await about to be evaluated): unless the `Workflow.uncancellable` depth
@@ -207,7 +205,7 @@ object Step {
     * deadline.
     */
   private def runStep[A: Cacheable as valueCodec](
-      guarantee: ExecutionGuarantee,
+      kind: StepKind,
       stepKey: String,
       stepVersion: Long,
       ensureUnchanged: Seq[StepInput[?]],
@@ -218,7 +216,6 @@ object Step {
     val rt: ctx.runtime.type = ctx.runtime
     val run = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
-    val stepKind = guarantee.toString
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = rt.clock.instant()
     val expiresAt = expiryOf(invalidateAfter, now)
@@ -273,10 +270,10 @@ object Step {
           run,
           stepId,
           stepVersion,
-          stepKind,
+          kind,
           StoredStep.State.Started,
-          fingerprints,
-          "",
+          InputFingerprints.of(fingerprints),
+          SerializedValue.of(""),
           None
         )
         RetryState.initial
@@ -285,7 +282,8 @@ object Step {
         try {
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(body)
           rt.writeStepState(
-            run, stepId, stepVersion, stepKind, StoredStep.State.Succeeded, fingerprints, serialized, expiresAt
+            run, stepId, stepVersion, kind, StoredStep.State.Succeeded, InputFingerprints.of(fingerprints),
+            SerializedValue.of(serialized), expiresAt
           )
           return decoded
         } catch {
@@ -300,7 +298,8 @@ object Step {
               case None =>
                 val (payload, toThrow) = serializeFailure(t)
                 rt.writeStepState(
-                  run, stepId, stepVersion, stepKind, StoredStep.State.Failed, fingerprints, payload, expiresAt
+                  run, stepId, stepVersion, kind, StoredStep.State.Failed, InputFingerprints.of(fingerprints),
+                  SerializedValue.of(payload), expiresAt
                 )
                 throw toThrow
               case Some(delay) =>
@@ -313,9 +312,9 @@ object Step {
                     run,
                     stepId,
                     stepVersion,
-                    stepKind,
-                    fingerprints,
-                    RetryState.encode(bookkeeping),
+                    kind,
+                    InputFingerprints.of(fingerprints),
+                    SerializedValue.of(RetryState.encode(bookkeeping)),
                     deadline,
                     expiresAt
                   )
@@ -340,14 +339,14 @@ object Step {
       case Some(row) =>
         row.state match {
           case StoredStep.State.Succeeded =>
-            Some(decodeStored(valueCodec, stepKey)(row.statePayload))
+            Some(decodeStored(valueCodec, stepKey)(row.statePayload.raw))
           case StoredStep.State.Failed =>
-            throw decodeStoredFailure(throwableCodec, stepKey)(row.statePayload)
-          case StoredStep.State.Started if guarantee == ExecutionGuarantee.AtMostOnce =>
+            throw decodeStoredFailure(throwableCodec, stepKey)(row.statePayload.raw)
+          case StoredStep.State.Started if kind == StepKind.AtMostOnce =>
             None
-          case StoredStep.State.Started if row.statePayload.startsWith(RetryState.payloadPrefix) =>
+          case StoredStep.State.Started if row.statePayload.raw.startsWith(RetryState.payloadPrefix) =>
             if (!rt.fireStepRetryIfDue(run, stepId, stepVersion)) throw new WorkflowSuspendedException
-            Some(runBody(Some(RetryState.decode(row.statePayload))))
+            Some(runBody(Some(RetryState.decode(row.statePayload.raw))))
           case StoredStep.State.Started =>
             Some(runBody(None))
         }
@@ -374,9 +373,9 @@ object Step {
       case Some(row) =>
         row.state match {
           case StoredStep.State.Succeeded =>
-            StepExecutionState.Completed(decodeStored(valueCodec, key)(row.statePayload))
+            StepExecutionState.Completed(decodeStored(valueCodec, key)(row.statePayload.raw))
           case StoredStep.State.Failed =>
-            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(row.statePayload))
+            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(row.statePayload.raw))
           case StoredStep.State.Started => StepExecutionState.Started
         }
     }
@@ -499,7 +498,7 @@ object Step {
     */
   def peekSignal[A](signal: Signal[A])(using ctx: WorkflowContext): Seq[A] =
     ctx.runtime.readAwaitSignalCandidates(ctx.currentExecution, signal.key).map { candidate =>
-      try signal.cacheable.read(candidate.payload)
+      try signal.cacheable.read(candidate.payload.raw)
       catch {
         case _: Throwable => throw new StepSerializationFailed(s"Signal '${signal.key}' payload could not be decoded")
       }
@@ -563,15 +562,15 @@ object Step {
     def branchSegment(key: String): String =
       s"$stepId/$key"
 
-    def branchPath(base: Vector[String], key: String): Vector[String] =
-      base :+ branchSegment(key)
+    def branchPath(base: ScopePath, key: String): ScopePath =
+      base.appended(branchSegment(key))
 
     def evaluate(): R = {
       throwIfCancelled
       val baseScope = ctx.currentScope
       val baseScopePath = ctx.scopePath
       val branchPaths = branches.map((key, _) => branchPath(baseScope, key))
-      val branchContexts = branches.map((key, _) => ctx.copy(scopePath = baseScopePath :+ branchSegment(key)))
+      val branchContexts = branches.map((key, _) => ctx.copy(scopePath = baseScopePath.appended(branchSegment(key))))
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
@@ -590,7 +589,8 @@ object Step {
         // run re-evaluates from scratch and re-deletes.
         rt.deleteSubscriptionsUnderScopePaths(run, branchPaths)
         rt.writeStepState(
-          run, scopedStepId, 0L, "FirstToRunWithoutSuspension", StoredStep.State.Succeeded, fingerprints, serialized, None
+          run, scopedStepId, 0L, StepKind.FirstToRun, StoredStep.State.Succeeded, InputFingerprints.of(fingerprints),
+          SerializedValue.of(serialized), None
         )
         decoded
       }
@@ -604,7 +604,7 @@ object Step {
     if (rawExisting.isDefined && replayable.isEmpty) rt.deleteStepOrAwait(run, scopedStepId, 0L)
 
     replayable match {
-      case Some(row) if row.state == StoredStep.State.Succeeded => decodeStored(valueCodec, stepId)(row.statePayload)
+      case Some(row) if row.state == StoredStep.State.Succeeded => decodeStored(valueCodec, stepId)(row.statePayload.raw)
       case _                                                    => evaluate()
     }
   }
@@ -642,7 +642,7 @@ object Step {
         if (haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)) onDiscard()
         else
           row.state match {
-            case StoredStep.State.Succeeded => decode(row.statePayload)
+            case StoredStep.State.Succeeded => decode(row.statePayload.raw)
             case StoredStep.State.Failed =>
               throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
             case StoredStep.State.Started => evaluate()
@@ -688,9 +688,9 @@ object Step {
 
     def evaluate(): A = {
       throwIfCancelled
-      val site = WaitSite(stepId, 0L, "Await", fingerprints, expiresAt)
+      val site = WaitSite(stepId, 0L, StepKind.Await, InputFingerprints.of(fingerprints), expiresAt)
       rt.evaluateWait(run, site, subscribers.map(_._1))(pickRaceWinner(subscribers)) match {
-        case Some(payload) => decode(payload)
+        case Some(payload) => decode(payload.raw)
         case None          => throw new WorkflowSuspendedException
       }
     }
@@ -730,7 +730,7 @@ object Step {
     if (picks.isEmpty) None
     else {
       val (seq, payload, key) = picks.minBy(_._1)
-      Some(WaitResolution(payload, key.map(k => (k, seq))))
+      Some(WaitResolution(SerializedValue.of(payload), key.map(k => (k, seq))))
     }
   }
 
@@ -762,7 +762,7 @@ object Step {
               }
               withinLookBack && {
                 val decoded =
-                  try signalCodec.read(c.payload)
+                  try signalCodec.read(c.payload.raw)
                   catch {
                     case _: Throwable =>
                       throw new StepSerializationFailed(s"Signal '${signal.key}' payload could not be decoded")
@@ -772,7 +772,7 @@ object Step {
             }
             matching.map { c =>
               val serialized =
-                try valueCodec.write(mapResult(signalCodec.read(c.payload)))
+                try valueCodec.write(mapResult(signalCodec.read(c.payload.raw)))
                 catch {
                   case _: Throwable =>
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' result could not be encoded")
@@ -808,7 +808,7 @@ object Step {
           override def pick(candidates: Vector[SubscriberMatch]): Option[(Long, String, Option[SignalKey])] =
             candidates.find(_.subscriberKey == branchKey).map { c =>
               val decoded =
-                try wc.completionCacheable.read(c.payload)
+                try wc.completionCacheable.read(c.payload.raw)
                 catch {
                   case _: Throwable =>
                     throw new StepSerializationFailed(s"Subscriber '$branchKey' completion could not be decoded")
@@ -896,7 +896,7 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]]
   ): Boolean = {
-    val stored = parseFingerprints(row.inputFingerprints)
+    val stored = parseFingerprints(row.inputFingerprints.raw)
     for (input <- ensureUnchanged) {
       if (stored.get(input.name) != Some(fingerprintOf(input)))
         throw new StepInputConflictException(

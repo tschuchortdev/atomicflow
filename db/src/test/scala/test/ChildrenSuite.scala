@@ -23,11 +23,11 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
       parentClosePolicy: Option[String]
   )
 
-  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Option[ChildRow] =
+  private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Option[ChildRow] =
     run(
       sql"""SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy
             FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
           (Option[String], Int, Option[Instant], Option[String], Option[String], Option[Vector[String]], Option[String])
         ].option
     ).map { case (t, te, c, pw, pk, ps, pcp) => ChildRow(t, te, c, pw, pk, ps, pcp) }
@@ -37,13 +37,13 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
       sql"""SELECT workflow_instance_scope FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key ORDER BY workflow_instance_scope""".query[Vector[String]].to[Vector]
     )
 
-  private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Boolean =
+  private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[Int].option
+      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[Int].option
     ).isDefined
 
-  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: Vector[String]): Unit =
-    run(sql"""DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run)
+  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Unit =
+    run(sql"""DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".update.run)
     ()
 
   test("startAsChild creates a child with a derived scope, records parent identity, and never runs it inline") {
@@ -63,7 +63,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     val row = childRow(childWf.id, "worker-1", scope).get
     assertEquals(row.terminalState, None)
     assertEquals(row.timesExecuted, 0, "the child must not be run inline on the parent's thread")
@@ -94,7 +94,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val info = children.head
     assertEquals(info.parentId, Some(parentId))
     assertEquals(info.id.workflowInstanceKey, "worker-1")
-    assertEquals(info.id.scope, Vector("orders", "order-42@0"))
+    assertEquals(info.id.scope, ScopePath("orders", "order-42@0"))
 
     gate.send(parentId, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
@@ -180,7 +180,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, None)
 
     gate.send(parentId, "go")(using rt)
@@ -209,7 +209,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     val childId = rt.getWorkflowInstancesByPrefix(childWf.id, "worker-1", scope).head.id
     val childHandle = rt.getWorkflowInstance(childWf, childId)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
@@ -240,11 +240,11 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     val future = Instant.now().plusSeconds(3600)
     run(sql"""UPDATE workflow_instances
               SET lease_owner = 'x', lease_expires_at = $future, times_executed = 1
-              WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".update.run)
+              WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}""".update.run)
     deleteWakeup(childWf.id, "worker-1", scope)
 
     rt.terminate(parentId)
@@ -269,7 +269,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, None)
 
     gate.send(parentId, "go")(using rt)
@@ -297,7 +297,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     rt.terminate(parentId)
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, Some("cancelled"))
@@ -349,7 +349,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val childHandle = rt.getWorkflowInstance(childWf, childId)
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("HI"))
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     assert(!hasWakeup(childWf.id, "worker-1", scope), "a terminal child has no wakeup after completion")
 
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("HI"))
@@ -367,7 +367,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     }
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
 
     val childId = rt.getChildWorkflowInstances(parentId).head.id
     val childHandle = rt.getWorkflowInstance(childWf, childId)
@@ -375,7 +375,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assert(!hasWakeup(childWf.id, "worker-1", scope), "terminal child wakeup is cleaned up")
 
     run(sql"""UPDATE workflow_instances SET input = 'OTHER'
-              WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".update.run)
+              WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}""".update.run)
 
     intercept[StepFailed] {
       rt.runWorkflowInstance(parentWf, parentId)
@@ -393,9 +393,9 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
-    val scope = Vector("orders", "order-42@0")
+    val scope = ScopePath("orders", "order-42@0")
     val stored = run(sql"""SELECT inherited_signal_prefixes FROM workflow_instances
-                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = $scope""".query[Vector[String]].unique)
+                           WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}""".query[Vector[String]].unique)
     assertEquals(stored, Vector("a/\nb", "c,d"), "prefixes are stored verbatim as array elements, including newlines")
   }
 }

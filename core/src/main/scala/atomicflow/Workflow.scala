@@ -226,7 +226,7 @@ object Workflow {
     */
   def continueAsNew[A: Cacheable](nextInput: A)(using ctx: WorkflowContext): Nothing = {
     val encoded = summon[Cacheable[A]].write(nextInput)
-    throw new ContinueAsNewException(encoded)
+    throw new ContinueAsNewException(SerializedValue.of(encoded))
   }
 
   /** Runs a restartable region: a subscope (like [[scoped]]) whose interior
@@ -300,12 +300,12 @@ object Workflow {
     val parentScopePath = ctx.scopePath
     val parentScope = ctx.currentScope
     val row = rt.readRegionState(run, id, parentScope)
-    val startCount = row.map(_._2).getOrElse(0L)
+    val startCount = row.map(_.restartCount).getOrElse(0L)
     val firstState: S = row match {
-      case Some((state, _)) => cacheable.read(state)
+      case Some(regionState) => cacheable.read(regionState.serializedState.raw)
       case None =>
         val seed = initialState
-        rt.upsertRegion(run, id, parentScope, 0L, cacheable.write(seed))
+        rt.upsertRegion(run, id, parentScope, RegionState(0L, SerializedValue.of(cacheable.write(seed))))
         seed
     }
 
@@ -314,20 +314,20 @@ object Workflow {
     var result: R = null.asInstanceOf[R]
     var done = false
     while (!done) {
-      val regionCtx = ctx.copy(scopePath = parentScopePath :+ regionSegment(id, count))
+      val regionCtx = ctx.copy(scopePath = parentScopePath.appended(regionSegment(id, count)))
       val scope = new RestartableScope[S] {
         override def restartCount: Long = count
         override def restart(nextState: S): Nothing =
-          throw new RegionRestartException(cacheable.write(nextState))
+          throw new RegionRestartException(SerializedValue.of(cacheable.write(nextState)))
       }
       try {
         result = body(state, scope)(using regionCtx)
         done = true
       } catch {
         case e: RegionRestartException =>
-          rt.upsertRegion(run, id, parentScope, count + 1, e.serializedState)
+          rt.upsertRegion(run, id, parentScope, RegionState(count + 1, e.serializedState))
           count += 1
-          state = cacheable.read(e.serializedState)
+          state = cacheable.read(e.serializedState.raw)
         case e: RegionBreakException[R] =>
           result = e.result
           done = true
@@ -368,7 +368,7 @@ object Workflow {
 
   private def withScope[R](segment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
     require(segment.nonEmpty, "Workflow.scoped requires a non-empty scope")
-    body(using ctx.copy(scopePath = ctx.scopePath :+ segment))
+    body(using ctx.copy(scopePath = ctx.scopePath.appended(segment)))
   }
 
   /** Runs one by-name block, catches its suspension instead of propagating it,
