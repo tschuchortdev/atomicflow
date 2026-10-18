@@ -19,11 +19,11 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey,
       stepId: String,
       stepVersion: Long
-  ): Option[(String, String, Option[Instant])] =
+  ): Option[(String, String, Option[Instant], Option[Instant])] =
     run(
-      sql"""SELECT state_kind, state_payload, expires_at FROM workflow_steps
+      sql"""SELECT state_kind, state_payload, retry_deadline, expires_at FROM workflow_steps
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion""".query[
-          (String, String, Option[Instant])
+          (String, String, Option[Instant], Option[Instant])
         ].option
     )
 
@@ -71,7 +71,12 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(counter.get(), 1)
-    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Started"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("RetryPending"))
+    assertEquals(
+      stepRow(wf.id, "k", "step", 1).flatMap(_._3),
+      Some(Instant.parse("2026-01-02T01:00:00Z")),
+      "the stored deadline is what a re-run compares against its clock"
+    )
     val subs = timerSubscriptions(wf.id, "k")
     assertEquals(subs.length, 1)
     assertEquals(subs.head._2, Instant.parse("2026-01-02T01:00:00Z"))
@@ -80,6 +85,7 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("recovered"))
     assertEquals(counter.get(), 2)
     assertEquals(stepRow(wf.id, "k", "step", 1).map(_._1), Some("Succeeded"))
+    assertEquals(stepRow(wf.id, "k", "step", 1).flatMap(_._3), None, "a terminal write clears the retry deadline")
     assertEquals(timerSubscriptions(wf.id, "k"), Vector.empty, "the retry subscription is retired on success")
   }
 

@@ -518,7 +518,7 @@ the same outcome as the run that completed the instance.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
 - Suspension, reset, and continue-as-new each use a distinct internal control-flow exception — suspension's is `WorkflowSuspendedException`. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
-- `blockUntilCompleted(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` polls until the instance has a terminal outcome or the required timeout expires. It returns `WorkflowRunResult[Out]` or throws the stored failure. It never executes the workflow or fires timers. Progress requires a runner or explicit `run` calls. PostgreSQL uses polling; `LISTEN/NOTIFY` is a possible future optimization.
+- `blockUntilCompleted(timeout, pollInterval)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` polls the persisted instance row until the instance has a terminal outcome or the required timeout expires. It returns `WorkflowRunResult[Out]` or throws the stored failure. It never executes the workflow or fires timers. Progress requires a runner or explicit `run` calls. The poll interval defaults to `50.milliseconds`; each poll re-reads the full instance row (`readInstance`). `LISTEN/NOTIFY` is a possible future optimization.
 
 ## Multi-instance operations
 

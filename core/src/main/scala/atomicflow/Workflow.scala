@@ -4,7 +4,7 @@ import atomicflow.impl.Sha256Fingerprinter
 
 import java.time.Instant
 import scala.annotation.targetName
-import scala.concurrent.duration.FiniteDuration
+import scala.concurrent.duration.*
 import scala.util.control.NonFatal
 
 /** The typed handle of a workflow instance, obtained only from the runtime. It
@@ -34,11 +34,14 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
     */
   @throws[WorkflowNotFoundException]
   @throws[java.util.concurrent.TimeoutException]
-  def blockUntilCompleted(timeout: FiniteDuration)(using
+  def blockUntilCompleted(
+      timeout: FiniteDuration,
+      pollInterval: FiniteDuration = 50.milliseconds
+  )(using
       runtime: WorkflowRuntime,
       cacheableThrowable: Cacheable[Throwable]
   ): WorkflowRunResult[Out] =
-    runtime.blockUntilCompleted(this, timeout)
+    runtime.blockUntilCompleted(this, timeout, pollInterval)
 
   /** The persisted data view of this instance, fresh from the database. */
   def getInfo()(using runtime: WorkflowRuntime): WorkflowInstance.Info =
@@ -178,12 +181,17 @@ object Workflow {
   def blockUntilCompleted[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
-      timeout: FiniteDuration
+      timeout: FiniteDuration,
+      pollInterval: FiniteDuration = 50.milliseconds
   )(using
       runtime: WorkflowRuntime,
       cacheableThrowable: Cacheable[Throwable]
   ): WorkflowRunResult[Out] =
-    runtime.blockUntilCompleted(WorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey)), timeout)
+    runtime.blockUntilCompleted(
+      WorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey)),
+      timeout,
+      pollInterval
+    )
 
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The

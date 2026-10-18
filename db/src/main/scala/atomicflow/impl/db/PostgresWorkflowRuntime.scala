@@ -66,9 +66,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Well-known advisory-lock key for the global event-append protocol. */
   private val EventAppendLockKey: Long = 844810493715605001L
 
-  /** Poll cadence of the passive `blockUntilCompleted` waiter. */
-  private val BlockUntilCompletedPollIntervalMillis: Long = 50L
-
   private def clearInterrupt(): Unit = Thread.interrupted()
 
   private[atomicflow] def runTransaction[A](transaction: ConnectionIO[A]): A = {
@@ -241,8 +238,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
             s"Workflow instance already exists under the fork key: $newId"
           )
         else ().pure[ConnectionIO]
-        _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-                   SELECT $newWorkflowId, $newInstanceKey, '{}', step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at
+        // Copied rows keep their persisted state, except an unresolved retry
+        // (`RetryPending`): its timer subscription is not copied, so rewriting
+        // the row to a plain `Started` makes the fork re-execute the step body
+        // instead of suspending on a deadline nothing would ever wake it for.
+        _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
+                   SELECT $newWorkflowId, $newInstanceKey, '{}', step_id, step_scope_within_instance, step_version, step_kind,
+                     CASE WHEN state_kind = 'RetryPending' THEN 'Started' ELSE state_kind END,
+                     CASE WHEN state_kind = 'RetryPending' THEN '' ELSE state_payload END,
+                     CASE WHEN state_kind = 'RetryPending' THEN NULL ELSE retry_deadline END,
+                     input_fingerprints, expires_at, created_at, updated_at
                    FROM workflow_steps
                    WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
                      AND updated_at < $boundary""".update.run
@@ -1320,7 +1325,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     clearInterrupt()
 
-    val initial = readInstanceRecord(instance).getOrElse(
+    val initial = readInstance(instance).getOrElse(
       throw new WorkflowNotFoundException(s"Workflow instance not found: $instance")
     )
     initial.terminalState match {
@@ -1375,69 +1380,82 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val fresh = readFencedInstanceRecord(instance, worker, token).getOrElse(
       throw LeaseLostException(instance)
     )
-    fresh._1.terminalState match {
-      case Some(_) => Left(fresh._1)
+    fresh.terminalState match {
+      case Some(_) => Left(fresh)
       case None =>
         val parentCloseAbort =
-          if (fresh._2.isDefined) {
+          if (fresh.parentId.isDefined) {
             val (aborted, unconsumed) = parentClosureSelfCheck(workflowId, key, scope)
             logDroppedUnconsumedSignals(instance, unconsumed)
             aborted
           } else false
         if (parentCloseAbort) {
           log.info(s"Workflow instance $instance cancelled by pending parent close before first execution")
-          Left(readInstanceRecord(instance).getOrElse(throw LeaseLostException(instance)))
+          Left(readInstance(instance).getOrElse(throw LeaseLostException(instance)))
         } else {
           log.debug(s"Running workflow instance $instance (fencingToken=$token)")
-          Right(new PostgresCurrentExecution(worker, token, workflowId, key, scope, fresh._1.generation, fresh._1))
+          Right(new PostgresCurrentExecution(worker, token, workflowId, key, scope, fresh.generation, fresh))
         }
     }
   }
 
   /** Reads the full persisted state of an instance as an [[InstanceRecord]]. */
-  private def readInstanceRecord(instanceId: WorkflowInstanceId): Option[InstanceRecord] =
+  override def readInstance(instanceId: WorkflowInstanceId): Option[InstanceRecord] =
     runTransaction {
-      sql"""SELECT input, workflow_version_at_creation, generation, terminal_state, terminal_outcome
-            FROM workflow_instances
-            WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
-              AND workflow_instance_scope = ${instanceId.scope}""".query[
-          (String, Long, Long, Option[String], Option[String])
-        ].option
+      (InstanceSelect ++ fr"""WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
+              AND workflow_instance_scope = ${instanceId.scope}""").query[InstanceRow].option
     }.map(toInstanceRecord(instanceId, _))
 
-  /** Reads the full persisted state of an instance fenced by `worker`/`token`,
-    * together with its current parent pointer (used to skip the parent-close
-    * self-check for top-level instances).
+  /** Reads the full persisted state of an instance fenced by `worker`/`token`.
+    * The lease-fence predicate is part of the WHERE clause, so a row whose lease
+    * no longer belongs to this run matches nothing.
     */
   private def readFencedInstanceRecord(
       instanceId: WorkflowInstanceId,
       worker: String,
       token: Long
-  ): Option[(InstanceRecord, Option[String])] =
+  ): Option[InstanceRecord] =
     runTransaction {
-      sql"""SELECT input, workflow_version_at_creation, generation, terminal_state, terminal_outcome, parent_workflow_id
-            FROM workflow_instances
-            WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
+      (InstanceSelect ++ fr"""WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
               AND workflow_instance_scope = ${instanceId.scope}
-              AND lease_owner = $worker AND fencing_token = $token""".query[
-          (String, Long, Long, Option[String], Option[String], Option[String])
-        ].option
-    }.map { case (input, version, generation, terminal, outcome, parent) =>
-      (toInstanceRecord(instanceId, (input, version, generation, terminal, outcome)), parent)
-    }
+              AND lease_owner = $worker AND fencing_token = $token""").query[InstanceRow].option
+    }.map(toInstanceRecord(instanceId, _))
 
-  private def toInstanceRecord(
-      instanceId: WorkflowInstanceId,
-      row: (String, Long, Long, Option[String], Option[String])
-  ): InstanceRecord = {
-    val (input, version, generation, terminal, outcome) = row
+  /** The columns backing an [[InstanceRecord]], in `InstanceSelect` order. */
+  private type InstanceRow = (
+      String,
+      Long,
+      Long,
+      Option[String],
+      Option[String],
+      Option[String],
+      Option[String],
+      Option[ScopePath],
+      java.time.Instant,
+      Option[java.time.Instant],
+      Int
+  )
+
+  private val InstanceSelect: Fragment =
+    fr"""SELECT input, workflow_version_at_creation, generation, terminal_state, terminal_outcome,
+         parent_workflow_id, parent_instance_key, parent_instance_scope, created_at, last_run_at, times_executed
+         FROM workflow_instances"""
+
+  private def toInstanceRecord(instanceId: WorkflowInstanceId, row: InstanceRow): InstanceRecord = {
+    val (input, version, generation, terminal, outcome, parentWf, parentKey, parentScope, createdAt, lastRunAt, timesExecuted) =
+      row
+    val parentId = parentWf.map(pwf => WorkflowInstanceId(pwf, parentKey.getOrElse(""), parentScope.getOrElse(ScopePath.empty)))
     InstanceRecord(
-      instanceId,
-      SerializedValue.of(input),
-      version,
-      generation,
-      terminal.map(decodeTerminalState),
-      outcome.map(SerializedValue.of)
+      instanceId = instanceId,
+      input = SerializedValue.of(input),
+      versionAtCreation = version,
+      generation = generation,
+      terminalState = terminal.map(decodeTerminalState),
+      terminalOutcome = outcome.map(SerializedValue.of),
+      parentId = parentId,
+      createdAt = createdAt,
+      lastRunAt = lastRunAt,
+      timesExecuted = timesExecuted
     )
   }
 
@@ -1454,7 +1472,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     workflow match {
       case wf: Workflow[i, o] =>
         clearInterrupt()
-        val initial = readInstanceRecord(instanceId).getOrElse(
+        val initial = readInstance(instanceId).getOrElse(
           throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
         )
         initial.terminalState match {
@@ -1494,7 +1512,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     if (updated == 1) CompletionResult.Applied(unconsumed)
     else
       CompletionResult.AlreadyTerminal(
-        readInstanceRecord(lease.instanceId).getOrElse(throw LeaseLostException(lease.instanceId))
+        readInstance(lease.instanceId).getOrElse(throw LeaseLostException(lease.instanceId))
       )
   }
 
@@ -1825,47 +1843,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING""").update.run.map(_ => ())
   }
 
-  /** Decodes a terminal instance's stored outcome and returns/thrown it, without
-    * executing the body.
-    */
-  private def handleTerminalRead[Out](
-      state: String,
-      outcome: Option[String],
-      outCacheable: Cacheable[Out],
-      completionCodec: Cacheable[WorkflowCompletionResult[Out]],
-      instanceId: WorkflowInstanceId
-  ): WorkflowRunResult[Out] = {
-    def decode(): WorkflowCompletionResult[Out] = {
-      val payload = outcome.getOrElse(
-        throw new StepSerializationFailed(s"Terminal instance $instanceId has no terminal outcome")
-      )
-      try completionCodec.read(payload)
-      catch {
-        case _: Throwable =>
-          throw new StepSerializationFailed(s"Terminal outcome of $instanceId could not be decoded")
-      }
-    }
-
-    state match {
-      case "completed" =>
-        decode() match {
-          case WorkflowCompletionResult.Completed(v) => WorkflowRunResult.Result(v)
-          case other =>
-            throw new StepSerializationFailed(s"Terminal instance $instanceId stored a non-completed outcome as completed")
-        }
-      case "failed" =>
-        decode() match {
-          case WorkflowCompletionResult.Failed(t) => throw t
-          case other =>
-            throw new StepSerializationFailed(s"Terminal instance $instanceId stored a non-failed outcome as failed")
-        }
-      case "cancelled" => WorkflowRunResult.WorkflowCancelled
-      case "terminated" => WorkflowRunResult.WorkflowTerminated
-      case other =>
-        throw new StepSerializationFailed(s"Unknown terminal state '$other' for instance $instanceId")
-    }
-  }
-
   override def readStep(
       instanceId: WorkflowInstanceId,
       stepId: StepId,
@@ -1889,13 +1866,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepVersion: Long
   ): Option[StoredStep] =
     runTransaction {
-      sql"""SELECT state_kind, state_payload, input_fingerprints, expires_at FROM workflow_steps
+      sql"""SELECT state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
               AND step_id = $stepId AND step_scope_within_instance = $stepScopePath AND step_version = $stepVersion""".query[
-          (String, String, String, Option[java.time.Instant])
+          (String, String, Option[java.time.Instant], String, Option[java.time.Instant])
         ].option
-    }.map { case (kind, payload, fingerprints, expiresAt) =>
-      StoredStep(StoredStep.State.fromString(kind), SerializedValue.of(payload), InputFingerprints.of(fingerprints), expiresAt)
+    }.map { case (kind, payload, retryDeadline, fingerprints, expiresAt) =>
+      StoredStep(
+        StoredStep.State.fromString(kind, SerializedValue.of(payload), retryDeadline),
+        InputFingerprints.of(fingerprints),
+        expiresAt
+      )
     }
 
   /** Escapes `%`, `_`, and the escape character itself so the caller's prefix is
@@ -1994,67 +1975,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  override def blockUntilCompleted[Out](
-      instance: WorkflowInstance[?, Out],
-      timeout: FiniteDuration
-  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
-    val workflow = instance.workflow
-    val instanceId = instance.id
-    val workflowId = instanceId.workflowId
-    val key = instanceId.workflowInstanceKey
-    val scope = instanceId.scope
-    val outCacheable = workflow.outputCacheable
-    given Cacheable[Out] = outCacheable
-    val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
-
-    def readTerminalOrThrowMissing(): Option[(String, Option[String])] = {
-      val row = runTransaction {
-        sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-              WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
-            (Option[String], Option[String])
-          ].option
-      }
-      row match {
-        case None => throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-        case Some((state, outcome)) => state.map(s => (s, outcome))
-      }
-    }
-
-    val deadlineNanos = System.nanoTime() + timeout.toNanos
-    var terminal: Option[(String, Option[String])] = None
-    var expired = false
-    while (terminal.isEmpty && !expired) {
-      terminal = readTerminalOrThrowMissing()
-      if (terminal.isEmpty) {
-        if (System.nanoTime() >= deadlineNanos) expired = true
-        else Thread.sleep(BlockUntilCompletedPollIntervalMillis)
-      }
-    }
-
-    terminal match {
-      case Some((state, outcome)) => handleTerminalRead(state, outcome, outCacheable, completionCodec, instanceId)
-      case None =>
-        throw new java.util.concurrent.TimeoutException(
-          s"Workflow instance did not reach a terminal state within $timeout: $instanceId"
-        )
-    }
-  }
-
-  override def getWorkflowInstanceInfo[In, Out](
-      instance: WorkflowInstance[In, Out]
-  ): WorkflowInstance.Info = {
-    val instanceId = instance.id
-    val row = runTransaction {
-      (InfoSelect ++ fr"WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey} AND workflow_instance_scope = ${instanceId.scope}")
-        .query[InfoRow]
-        .option
-    }
-    row match {
-      case Some(r) => toInfo(instanceId.workflowId, instanceId.scope, r)
-      case None    => throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-    }
-  }
-
   override def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info] = {
     val rows = runTransaction {
       sql"""SELECT workflow_id, workflow_instance_scope, workflow_instance_key, workflow_version_at_creation, generation,
@@ -2071,88 +1991,31 @@ class PostgresWorkflowRuntime private[atomicflow] (
   // ---- Engine operations of the WorkflowRuntimeInternals SPI. Each uses this
   // ---- run's PostgresCurrentExecution handle carrying the run's fencing identity.
 
-  override def lookupStep(stepId: StepId, stepVersion: Long)(using lease: Lease): Option[StoredStep] =
-    readStepRow(lease.workflowId, lease.instanceKey, lease.instanceScope, stepId.key, stepId.scope, stepVersion)
-
-  override def writeStepState(
+  override def writeStep(
       stepId: StepId,
       stepVersion: Long,
       stepKind: StepKind,
-      state: StoredStep.State,
-      inputFingerprints: InputFingerprints,
-      payload: SerializedValue,
-      expiresAt: Option[Instant]
+      step: StoredStep
   )(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease) {
       for {
-        _ <- upsertStepStateQ(
-          lease, stepId, stepVersion, stepKind, state, inputFingerprints, payload, expiresAt
-        )
-        _ <- deleteTimerSubscriptionsQ(lease, stepId, stepVersion)
+        _ <- upsertStepStateQ(lease, stepId, stepVersion, stepKind, step)
+        _ <- step.state match {
+          case StoredStep.State.RetryPending(_, deadline) =>
+            insertRetrySubscriptionQ(lease, stepId, stepVersion, deadline)
+          case _ =>
+            deleteTimerSubscriptionsQ(lease, stepId, stepVersion)
+        }
       } yield ()
     }
 
-  override def deleteStepOrAwait(stepId: StepId, stepVersion: Long)(using lease: Lease): Unit =
+  override def deleteStep(stepId: StepId, stepVersion: Long)(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease) {
       for {
         _ <- sql"""DELETE FROM workflow_steps
                    WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope} AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion""".update.run
         _ <- deleteSiteSubscriptionsQ(lease, stepId, stepVersion)
       } yield ()
-    }
-
-  override def suspendStepRetry(
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: StepKind,
-      inputFingerprints: InputFingerprints,
-      retryPayload: SerializedValue,
-      deadline: Instant,
-      expiresAt: Option[Instant]
-  )(using lease: Lease): Unit =
-    runLeaseCheckedTransaction(lease) {
-      for {
-        _ <- upsertStepStateQ(
-          lease,
-          stepId,
-          stepVersion,
-          stepKind,
-          StoredStep.State.Started,
-          inputFingerprints,
-          retryPayload,
-          expiresAt
-        )
-        _ <- insertRetrySubscriptionQ(lease, stepId, stepVersion, deadline)
-      } yield ()
-    }
-
-  override def fireStepRetryIfDue(stepId: StepId, stepVersion: Long)(using lease: Lease): Boolean =
-    runLeaseCheckedTransaction(lease) {
-      val now = clock.instant()
-      for {
-        subs <- sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
-                      WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-                        AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey
-                      ORDER BY deadline, timer_id
-                      FOR UPDATE""".query[(java.util.UUID, Instant)].to[Vector]
-        _ <- subs.collect { case (subId, deadline) if !deadline.isAfter(now) => subId }.traverse_ { subId =>
-          for {
-            exists <- sql"""SELECT 1 FROM workflow_events
-                            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-                              AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-            _ <- if (exists.isEmpty) appendEvent(lease.workflowId, lease.instanceKey, lease.instanceScope, "TimerFired", subId.toString, "")
-                 else ().pure[ConnectionIO]
-          } yield ()
-        }
-        fired <- if (subs.isEmpty) false.pure[ConnectionIO]
-                 else {
-                   val idStrings = subs.map(_._1.toString)
-                   fr"""SELECT 1 FROM workflow_events
-                         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-                           AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
-                         LIMIT 1""".query[Int].option.map(_.isDefined)
-                 }
-      } yield fired
     }
 
   override def readAwaitSignalCandidates(signalKey: SignalKey)(using lease: Lease): Vector[SubscriberMatch] =
@@ -2189,10 +2052,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      site.stepId,
                      site.stepVersion,
                      site.stepKind,
-                     StoredStep.State.Succeeded,
-                     site.inputFingerprints,
-                     r.payload,
-                     site.expiresAt
+                     StoredStep(
+                       StoredStep.State.Succeeded(r.payload),
+                       site.inputFingerprints,
+                       site.expiresAt
+                     )
                    )
               _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorQ(lease, k, seq) }
               _ <- deleteSiteSubscriptionsQ(lease, site.stepId, site.stepVersion)
@@ -2317,20 +2181,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepId: StepId,
       stepVersion: Long,
       stepKind: StepKind,
-      state: StoredStep.State,
-      inputFingerprints: InputFingerprints,
-      payload: SerializedValue,
-      expiresAt: Option[java.time.Instant]
+      step: StoredStep
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
-    val kind = state.toString
     val stepKindName = stepKind.persistedName
-    val fingerprintText = inputFingerprints.raw
-    val payloadText = payload.raw
-    sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $fingerprintText, $expiresAt, $now, $now)
+    val fingerprintText = step.inputFingerprints.raw
+    val (kind, payloadText, retryDeadline): (String, String, Option[java.time.Instant]) =
+      step.state match {
+        case StoredStep.State.Started =>
+          ("Started", "", None)
+        case StoredStep.State.RetryPending(bookkeeping, deadline) =>
+          ("RetryPending", bookkeeping.raw, Some(deadline))
+        case StoredStep.State.Succeeded(payload) =>
+          ("Succeeded", payload.raw, None)
+        case StoredStep.State.Failed(payload) =>
+          ("Failed", payload.raw, None)
+      }
+    sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
+          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $retryDeadline, $fingerprintText, ${step.expiresAt}, $now, $now)
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance) DO UPDATE
-          SET state_kind = $kind, state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
+          SET state_kind = $kind, state_payload = EXCLUDED.state_payload, retry_deadline = EXCLUDED.retry_deadline, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
       _ => ()
     )
   }

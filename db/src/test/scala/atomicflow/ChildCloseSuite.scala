@@ -390,7 +390,18 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
     def handle(generation: Long): rt.Lease = {
-      val instance = InstanceRecord(parentId, SerializedValue.of("in"), 1L, generation, None, None)
+      val instance = InstanceRecord(
+        parentId,
+        SerializedValue.of("in"),
+        1L,
+        generation,
+        None,
+        None,
+        None,
+        java.time.Instant.EPOCH,
+        None,
+        0
+      )
       new rt.PostgresCurrentExecution("test", 0L, parentId.workflowId, parentId.workflowInstanceKey, parentId.scope, generation, instance)
     }
 

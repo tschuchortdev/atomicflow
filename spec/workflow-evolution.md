@@ -78,7 +78,7 @@ Step.getExecutionState[Receipt]("charge")
   required `Cacheable[A]` instance.
 - Step versions evolve independently of workflow versions. Lookup is by one
   exact step version and does not mix the two version dimensions.
-- Steps that are currently retrying with the built-in step retry functionality are considered `Started`.
+- Steps that are currently retrying with the built-in step retry functionality are stored as a `RetryPending` row but reported as `Started` by `getExecutionState`.
 
 ## Evolving cached formats
 

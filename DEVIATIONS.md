@@ -59,6 +59,12 @@ adds detail to, the documents in `spec/`.
 
 - Input-change and expiry checks apply to pending `Started` records as well as
   completed records.
+- A durable step retry is represented on the step record itself: the row's
+  `state_kind` is `RetryPending` and carries the retry bookkeeping in
+  `state_payload` plus the deadline in `retry_deadline`. Core compares that
+  deadline against its clock to decide due-ness; the retry's timer subscription
+  is kept only to wake the instance at the deadline, and a fired retry
+  `TimerFired` event is never read by core.
 - `RetryPolicy.exponentialBackoff` is one method with both retry-count and
   cumulative-delay limits. Scala does not allow both proposed overloads to
   define default arguments.
@@ -72,7 +78,7 @@ adds detail to, the documents in `spec/`.
   decode its source outcome before mapping.
 - An empty race is rejected. When no event passes a signal filter, evaluation
   advances the signal cursor past the examined events before suspending.
-- `deleteStepOrAwait` deletes a step record and all its subscriptions in one
+- `deleteStep` deletes a step record and all its subscriptions in one
   ownership-checked transaction. Re-evaluation is a separate transaction. A
   replacement timer gets a fresh id, so its old firing event cannot satisfy it.
 - Timer firing commits before wait evaluation. Its event remains stored if
