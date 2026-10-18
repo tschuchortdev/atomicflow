@@ -211,9 +211,7 @@ final class PostgresJobRunner private[atomicflow] (
           workflow,
           c.instanceId,
           c.worker,
-          c.token,
-          settings.leaseDuration,
-          settings.leaseAcquireTimeout
+          c.token
         )(using settings.throwableCacheable)
         result match {
           case WorkflowRunResult.WorkflowSuspended =>

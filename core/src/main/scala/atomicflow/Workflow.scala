@@ -34,11 +34,11 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
     */
   @throws[WorkflowNotFoundException]
   @throws[java.util.concurrent.TimeoutException]
-  def awaitResult(timeout: FiniteDuration)(using
+  def blockUntilCompleted(timeout: FiniteDuration)(using
       runtime: WorkflowRuntime,
       cacheableThrowable: Cacheable[Throwable]
   ): WorkflowRunResult[Out] =
-    runtime.awaitResult(this, timeout)
+    runtime.blockUntilCompleted(this, timeout)
 
   /** The persisted data view of this instance, fresh from the database. */
   def getInfo()(using runtime: WorkflowRuntime): WorkflowInstance.Info =
@@ -105,10 +105,10 @@ final class Workflow[In, Out] private[atomicflow] (
     runtime.createWorkflowInstance(this, instanceKey, in)(using inputCacheable)
 
   /** Register the instance and schedule it for a job runner. */
-  def createAndSchedule(instanceKey: WorkflowInstanceKey, in: In)(using
+  def createAndScheduleForAsyncRun(instanceKey: WorkflowInstanceKey, in: In)(using
       runtime: WorkflowRuntime
   ): WorkflowInstance[In, Out] =
-    runtime.createAndSchedule(this, instanceKey, in)
+    runtime.createAndScheduleForAsyncRun(this, instanceKey, in)
 
   /** Start a child workflow from an executing parent. Create a
     * child under a scope derived from this parent's identity, generation, and
@@ -125,16 +125,15 @@ final class Workflow[In, Out] private[atomicflow] (
       inheritSignals: SignalInheritance = SignalInheritance.none,
       inheritPastEvents: Boolean = false
   )(using ctx: WorkflowContext): WorkflowInstance[In, Out] =
-    ctx.runtime.startChild(
+    ctx.internals.startChild(
       this,
       childKey,
       input,
       parentClosePolicy,
       inheritSignals,
       inheritPastEvents,
-      ctx.currentExecution,
       ctx.currentScope
-    )(using inputCacheable)
+    )(using inputCacheable, ctx.currentExecution)
 
   /** Run a previously created instance on the caller thread (no input param). */
   def run(instanceKey: WorkflowInstanceKey)(using
@@ -173,10 +172,10 @@ trait LoopScope[R] {
 
 object Workflow {
   /** Passive waiter for an instance's terminal outcome, addressed by key; see
-    * `WorkflowInstance.awaitResult`.
+    * `WorkflowInstance.blockUntilCompleted`.
     */
   @throws[java.util.concurrent.TimeoutException]
-  def awaitResult[In, Out](
+  def blockUntilCompleted[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       timeout: FiniteDuration
@@ -184,7 +183,7 @@ object Workflow {
       runtime: WorkflowRuntime,
       cacheableThrowable: Cacheable[Throwable]
   ): WorkflowRunResult[Out] =
-    runtime.awaitResult(WorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey)), timeout)
+    runtime.blockUntilCompleted(WorkflowInstance(workflow, WorkflowInstanceId(workflow.id, instanceKey)), timeout)
 
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
@@ -198,7 +197,7 @@ object Workflow {
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
   def heartbeat()(using ctx: WorkflowContext): Unit =
-    ctx.runtime.heartbeat(ctx.currentExecution)
+    ctx.internals.renewLease()(using ctx.currentExecution)
 
   /** The `Workflow.version` recorded when the instance was created. The current
     * body may branch on it internally to adapt to the definition version that
@@ -294,18 +293,18 @@ object Workflow {
   )(using
       ctx: WorkflowContext
   ): R = {
-    val rt: ctx.runtime.type = ctx.runtime
-    val run = ctx.currentExecution
+    val internals: ctx.internals.type = ctx.internals
+    given ctx.internals.Lease = ctx.currentExecution
     val cacheable = summon[Cacheable[S]]
     val parentScopePath = ctx.scopePath
     val parentScope = ctx.currentScope
-    val row = rt.readRegionState(run, id, parentScope)
+    val row = internals.readRegionState(id, parentScope)
     val startCount = row.map(_.restartCount).getOrElse(0L)
     val firstState: S = row match {
       case Some(regionState) => cacheable.read(regionState.serializedState.raw)
       case None =>
         val seed = initialState
-        rt.upsertRegion(run, id, parentScope, RegionState(0L, SerializedValue.of(cacheable.write(seed))))
+        internals.upsertRegion(id, parentScope, RegionState(0L, SerializedValue.of(cacheable.write(seed))))
         seed
     }
 
@@ -325,7 +324,7 @@ object Workflow {
         done = true
       } catch {
         case e: RegionRestartException =>
-          rt.upsertRegion(run, id, parentScope, RegionState(count + 1, e.serializedState))
+          internals.upsertRegion(id, parentScope, RegionState(count + 1, e.serializedState))
           count += 1
           state = cacheable.read(e.serializedState.raw)
         case e: RegionBreakException[R] =>

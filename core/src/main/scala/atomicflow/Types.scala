@@ -68,7 +68,7 @@ enum SignalInheritance {
 }
 
 /** The public synchronous execution outcome of `run`/`createAndRun`/
-  * `awaitResult`. Failures still propagate as exceptions.
+  * `blockUntilCompleted`. Failures still propagate as exceptions.
   */
 enum WorkflowRunResult[+A] {
   case WorkflowSuspended

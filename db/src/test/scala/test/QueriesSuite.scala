@@ -142,15 +142,15 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(run(sql"SELECT count(*) FROM workflow_events WHERE workflow_id = ${w.id}".query[Int].unique), 0)
   }
 
-  test("awaitResult returns immediately for a terminal completed instance") {
+  test("blockUntilCompleted returns immediately for a terminal completed instance") {
     val rt = newRuntime
     val w = wf("wf-await-done")
     rt.createAndRun(w, "k", "a")
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
-    assertEquals(rt.awaitResult(h, 5.seconds), WorkflowRunResult.Result("out-a"))
+    assertEquals(rt.blockUntilCompleted(h, 5.seconds), WorkflowRunResult.Result("out-a"))
   }
 
-  test("awaitResult throws the decoded failure for a terminal failed instance") {
+  test("blockUntilCompleted throws the decoded failure for a terminal failed instance") {
     val rt = newRuntime
     val failing = Workflow[String, String](id = "wf-await-fail")(in => throw new RuntimeException("boom"))
     val original = intercept[StepFailed] {
@@ -158,12 +158,12 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     }
     val h = rt.getWorkflowInstance(failing, WorkflowInstanceId(failing.id, "k"))
     val second = intercept[StepFailed] {
-      rt.awaitResult(h, 5.seconds)
+      rt.blockUntilCompleted(h, 5.seconds)
     }
     assertEquals(second.getMessage, original.getMessage)
   }
 
-  test("awaitResult returns WorkflowCancelled for a cancelled terminal instance") {
+  test("blockUntilCompleted returns WorkflowCancelled for a cancelled terminal instance") {
     val rt = newRuntime
     val w = wf("wf-await-cancel")
     rt.createWorkflowInstance(w, "k", "a")
@@ -171,10 +171,10 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
              terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Cancelled)}
              WHERE workflow_id = ${w.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run)
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
-    assertEquals(rt.awaitResult(h, 5.seconds), WorkflowRunResult.WorkflowCancelled)
+    assertEquals(rt.blockUntilCompleted(h, 5.seconds), WorkflowRunResult.WorkflowCancelled)
   }
 
-  test("awaitResult on a non-terminal instance times out and never executes the body") {
+  test("blockUntilCompleted on a non-terminal instance times out and never executes the body") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     val w = Workflow[String, String](id = "wf-await-timeout") { in =>
@@ -185,21 +185,21 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     given WorkflowRuntime = rt
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
     intercept[TimeoutException] {
-      rt.awaitResult(h, 300.millis)
+      rt.blockUntilCompleted(h, 300.millis)
     }
     assertEquals(counter.get(), 0)
     assertEquals(h.getInfo().terminalState, None)
   }
 
-  test("awaitResult with a zero timeout still performs one immediate poll, so a terminal instance is observed") {
+  test("blockUntilCompleted with a zero timeout still performs one immediate poll, so a terminal instance is observed") {
     val rt = newRuntime
     val w = wf("wf-await-zero-terminal")
     rt.createAndRun(w, "k", "a")
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
-    assertEquals(rt.awaitResult(h, 0.millis), WorkflowRunResult.Result("out-a"))
+    assertEquals(rt.blockUntilCompleted(h, 0.millis), WorkflowRunResult.Result("out-a"))
   }
 
-  test("awaitResult on a non-terminal instance with zero timeout times out without executing the body") {
+  test("blockUntilCompleted on a non-terminal instance with zero timeout times out without executing the body") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     val w = Workflow[String, String](id = "wf-await-zero-nonterminal") { in =>
@@ -210,13 +210,13 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     given WorkflowRuntime = rt
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
     intercept[TimeoutException] {
-      rt.awaitResult(h, 0.millis)
+      rt.blockUntilCompleted(h, 0.millis)
     }
     assertEquals(counter.get(), 0, "a zero-timeout await must not execute the body")
     assertEquals(h.getInfo().terminalState, None)
   }
 
-  test("awaitResult on a missing instance throws WorkflowNotFoundException on the first poll") {
+  test("blockUntilCompleted on a missing instance throws WorkflowNotFoundException on the first poll") {
     val rt = newRuntime
     val w = wf("wf-await-missing")
     rt.createWorkflowInstance(w, "k", "a")
@@ -224,17 +224,17 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
     run(sql"""DELETE FROM workflow_instances WHERE workflow_id = ${w.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run)
     intercept[WorkflowNotFoundException] {
-      rt.awaitResult(h, 5.seconds)
+      rt.blockUntilCompleted(h, 5.seconds)
     }
   }
 
-  test("instance.awaitResult and Workflow.awaitResult forward to the runtime") {
+  test("instance.blockUntilCompleted and Workflow.blockUntilCompleted forward to the runtime") {
     val rt = newRuntime
     val w = wf("wf-forwarders")
     rt.createAndRun(w, "k", "a")
     val h = rt.getWorkflowInstance(w, WorkflowInstanceId(w.id, "k"))
     given WorkflowRuntime = rt
-    assertEquals(h.awaitResult(5.seconds), WorkflowRunResult.Result("out-a"))
-    assertEquals(Workflow.awaitResult(w, "k", 5.seconds), WorkflowRunResult.Result("out-a"))
+    assertEquals(h.blockUntilCompleted(5.seconds), WorkflowRunResult.Result("out-a"))
+    assertEquals(Workflow.blockUntilCompleted(w, "k", 5.seconds), WorkflowRunResult.Result("out-a"))
   }
 }

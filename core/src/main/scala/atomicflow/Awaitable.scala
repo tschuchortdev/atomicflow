@@ -57,6 +57,6 @@ object Awaitable {
       * a workflow body.
       */
     def apply(delay: FiniteDuration)(using ctx: WorkflowContext): Timer =
-      Timer(ctx.runtime.clock.instant().plusNanos(delay.toNanos))
+      Timer(ctx.internals.clock.instant().plusNanos(delay.toNanos))
   }
 }

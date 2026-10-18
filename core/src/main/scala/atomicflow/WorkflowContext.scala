@@ -21,17 +21,20 @@ final class WorkflowContext(
       * created the instance.
       */
     val versionAtCreation: Long,
-    /** The runtime executing this run. Declared as a `val` so that
-      * [[currentExecution]]'s dependent type can be prefixed by it.
+    /** The runtime executing this run, as application code sees it. */
+    val runtime: WorkflowRuntime,
+    /** The same runtime viewed through its storage/execution engine operations.
+      * Core code reaches engine operations through here; application code never
+      * sees it.
       */
-    val runtime: WorkflowRuntime
+    private[atomicflow] val internals: WorkflowRuntimeInternals
 )(
-    /** The runtime's per-run execution handle: an opaque value this runtime
+    /** The runtime's per-run execution handle: an opaque value the runtime
       * created when the run started, passed back to the runtime's engine
-      * operations (see [[WorkflowRuntime.CurrentExecution]]). Lives in a second,
-      * dependent parameter list so its type can be prefixed by [[runtime]].
+      * operations (see [[WorkflowRuntimeInternals.Lease]]). Lives in a second,
+      * dependent parameter list so its type can be prefixed by [[internals]].
       */
-    val currentExecution: runtime.CurrentExecution,
+    val currentExecution: internals.Lease,
     /** The path of enclosing `Workflow.scoped` (and region / parallel-branch)
       * segments at this context's lexical position; [[ScopePath.empty]] at the
       * top level. Transient per-run state carried immutably through derived
@@ -54,10 +57,10 @@ final class WorkflowContext(
     * scopes key on this array.
     */
   private[atomicflow] def currentScope: ScopePath = scopePath
-  
+
   private[atomicflow] def copy(
       scopePath: ScopePath = scopePath,
       uncancellableDepth: Int = uncancellableDepth
   ): WorkflowContext =
-    new WorkflowContext(instanceId, versionAtCreation, runtime)(currentExecution, scopePath, uncancellableDepth)
+    new WorkflowContext(instanceId, versionAtCreation, runtime, internals)(currentExecution, scopePath, uncancellableDepth)
 }

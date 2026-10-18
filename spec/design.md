@@ -55,7 +55,7 @@ effect if a crash occurs after recording the attempt but before the effect.
 
 An unresolved wait stores its subscriptions and suspends the workflow. A job
 runner schedules another run when a matching signal, timer, or completion is
-available. Explicit `run` calls can also resolve waits. `awaitResult` only
+available. Explicit `run` calls can also resolve waits. `blockUntilCompleted` only
 observes the stored terminal outcome.
 
 `Workflow.scoped` gives repeated work separate step namespaces. Ordinary Scala

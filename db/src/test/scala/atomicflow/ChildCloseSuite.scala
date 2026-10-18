@@ -389,18 +389,20 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
-    def handle(generation: Long): rt.CurrentExecution =
-      new rt.PostgresCurrentExecution("test", 0L, parentId.workflowId, parentId.workflowInstanceKey, parentId.scope, generation)
+    def handle(generation: Long): rt.Lease = {
+      val instance = InstanceRecord(parentId, SerializedValue.of("in"), 1L, generation, None, None)
+      new rt.PostgresCurrentExecution("test", 0L, parentId.workflowId, parentId.workflowInstanceKey, parentId.scope, generation, instance)
+    }
 
     // A stale run watches a generation the parent has moved past.
     intercept[LeaseLostException] {
       rt.startChild(childWf, "w-stale", "hi", ParentClosePolicy.Abandon, SignalInheritance.none, false,
-                    handle(999L), ScopePath.empty)
+                    ScopePath.empty)(using summon[Cacheable[String]], handle(999L))
     }
     // A run under a terminal parent is refused.
     intercept[LeaseLostException] {
       rt.startChild(childWf, "w-term", "hi", ParentClosePolicy.Abandon, SignalInheritance.none, false,
-                    handle(0L), ScopePath.empty)
+                    ScopePath.empty)(using summon[Cacheable[String]], handle(0L))
     }
   }
 

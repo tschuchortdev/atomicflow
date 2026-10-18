@@ -49,10 +49,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     dataSource: DataSource,
     override val clock: Clock,
     leaseDuration: FiniteDuration = 5.minutes,
-    leaseAcquireTimeout: FiniteDuration = 30.seconds,
+    leaseAcquireTimeoutSetting: FiniteDuration = 30.seconds,
     durableRetryThresholdSetting: FiniteDuration = 30.seconds
 )(using executionContext: ExecutionContext)
-    extends WorkflowRuntime {
+    extends WorkflowRuntime
+    with WorkflowRuntimeInternals {
 
   Flyway.configure().dataSource(dataSource).load().migrate()
 
@@ -65,8 +66,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** Well-known advisory-lock key for the global event-append protocol. */
   private val EventAppendLockKey: Long = 844810493715605001L
 
-  /** Poll cadence of the passive `awaitResult` waiter. */
-  private val AwaitResultPollIntervalMillis: Long = 50L
+  /** Poll cadence of the passive `blockUntilCompleted` waiter. */
+  private val BlockUntilCompletedPollIntervalMillis: Long = 50L
 
   private def clearInterrupt(): Unit = Thread.interrupted()
 
@@ -124,9 +125,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * run's lease is acquired. The alias targets the class projection so the
     * member type does not depend on a particular runtime instance.
     */
-  override type CurrentExecution = PostgresWorkflowRuntime#PostgresCurrentExecution
+  override type Lease = PostgresWorkflowRuntime#PostgresCurrentExecution
 
   def durableRetryThreshold: FiniteDuration = durableRetryThresholdSetting
+
+  def leaseAcquireTimeout: FiniteDuration = leaseAcquireTimeoutSetting
 
   override def createWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
@@ -389,14 +392,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * before it has suspended and written a subscription row (peek reads before
     * suspension).
     */
-  private def runningInstanceCandidate(run: CurrentExecution, signalKey: SignalKey): Fragment =
+  private def runningInstanceCandidate(lease: Lease, signalKey: SignalKey): Fragment =
     fr"""SELECT i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope, $signalKey,
                 i.workflow_id, i.workflow_instance_key, i.workflow_instance_scope,
                 i.inherited_signal_prefixes,
                 i.parent_workflow_id, i.parent_instance_key, i.parent_instance_scope,
                 i.inherited_events_start_sequence_id, i.inherit_past_events
          FROM workflow_instances i
-         WHERE i.workflow_id = ${run.workflowId} AND i.workflow_instance_key = ${run.instanceKey} AND i.workflow_instance_scope = ${run.instanceScope}"""
+         WHERE i.workflow_id = ${lease.workflowId} AND i.workflow_instance_key = ${lease.instanceKey} AND i.workflow_instance_scope = ${lease.instanceScope}"""
 
   /** Query shared by signal reads, the event dispatcher, and
     * the full subscription scan. Given `candidates` (subscriber rows produced by
@@ -493,11 +496,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
       parentClosePolicy: ParentClosePolicy,
       inheritSignals: SignalInheritance,
       inheritPastEvents: Boolean,
-      run: CurrentExecution,
       enclosingScopePath: ScopePath
-  )(using cacheable: Cacheable[In]): WorkflowInstance[In, Out] = {
-    val parentId = run.instanceId
-    val parentGeneration = run.generation
+  )(using cacheable: Cacheable[In], lease: Lease): WorkflowInstance[In, Out] = {
+    val parentId = lease.instanceId
+    val parentGeneration = lease.generation
     val childWorkflowId = workflow.id
     val serializedInput = cacheable.write(input)
     val derivedScope = ScopePath.deriveChildScope(
@@ -1302,204 +1304,213 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  override def runWorkflowInstance[In, Out](
-      workflow: Workflow[In, Out],
-      instanceId: WorkflowInstanceId
-  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] =
-    executeWorkflowWithLease(workflow, instanceId, leaseDuration, leaseAcquireTimeout, preAcquired = None)
-      .asInstanceOf[WorkflowRunResult[Out]]
+  /** Runs `body` while holding the instance's execution lease: acquires the
+    * lease, bumps `times_executed`, re-reads the instance row under the fence,
+    * applies the run-start parent-close self-check, and always releases the
+    * lease afterwards. Returns `AlreadyTerminal` without running `body` when the
+    * instance is already terminal (before acquisition, after acquisition, or
+    * when a pending parent close finalizes a never-started child).
+    */
+  override def withLease[A](instance: WorkflowInstanceId, acquireTimeout: FiniteDuration)(
+      body: Lease ?=> A
+  ): LeasedRunResult[A] = {
+    val workflowId = instance.workflowId
+    val key = instance.workflowInstanceKey
+    val scope = instance.scope
+
+    clearInterrupt()
+
+    val initial = readInstanceRecord(instance).getOrElse(
+      throw new WorkflowNotFoundException(s"Workflow instance not found: $instance")
+    )
+    initial.terminalState match {
+      case Some(_) => LeasedRunResult.AlreadyTerminal(initial)
+      case None =>
+        val worker = workerId
+        val token = acquireLease(workflowId, key, scope, worker, leaseDuration, acquireTimeout) match {
+          case Some(t) => t
+          case None    => throw LeaseUnavailableException(instance)
+        }
+        try {
+          leaseUnderAcquisition(instance, worker, token) match {
+            case Left(record) => LeasedRunResult.AlreadyTerminal(record)
+            case Right(lease) => LeasedRunResult.Ran(body(using lease))
+          }
+        } finally {
+          releaseLeaseIfStillOwned(instance, worker, token)
+        }
+    }
+  }
+
+  /** The shared lease-acquisition follow-on: bump `times_executed` (+
+    * `last_run_at`) fenced by `worker`/`token`, re-read the instance row under
+    * the same fence, and apply the run-start parent-close self-check. Returns
+    * `Left(record)` when the instance is terminal (an already-terminal row, or a
+    * never-started child finalized `CANCELLED` by the self-check), otherwise
+    * `Right(lease)` carrying the freshly read record. Throws
+    * [[LeaseLostException]] when the fenced bump or re-read affects no row.
+    */
+  private def leaseUnderAcquisition(
+      instance: WorkflowInstanceId,
+      worker: String,
+      token: Long
+  ): Either[InstanceRecord, PostgresCurrentExecution] = {
+    val workflowId = instance.workflowId
+    val key = instance.workflowInstanceKey
+    val scope = instance.scope
+    val now = clock.instant()
+    val bumped = runTransaction {
+      sql"""UPDATE workflow_instances
+            SET times_executed = times_executed + 1, last_run_at = $now
+            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+              AND lease_owner = $worker AND fencing_token = $token""".update.run
+    }
+    if (bumped != 1) throw LeaseLostException(instance)
+
+    // Re-read the instance row now that we hold the lease. A caller-thread run
+    // may have waited out a live lease, during which a concurrent
+    // continueAsNew/reset replaced the input and bumped the generation; the
+    // pre-acquisition read would then be stale. Reading fenced by our owner+token
+    // guarantees we observe the current row (or detect we lost the lease).
+    val fresh = readFencedInstanceRecord(instance, worker, token).getOrElse(
+      throw LeaseLostException(instance)
+    )
+    fresh._1.terminalState match {
+      case Some(_) => Left(fresh._1)
+      case None =>
+        val parentCloseAbort =
+          if (fresh._2.isDefined) {
+            val (aborted, unconsumed) = parentClosureSelfCheck(workflowId, key, scope)
+            logDroppedUnconsumedSignals(instance, unconsumed)
+            aborted
+          } else false
+        if (parentCloseAbort) {
+          log.info(s"Workflow instance $instance cancelled by pending parent close before first execution")
+          Left(readInstanceRecord(instance).getOrElse(throw LeaseLostException(instance)))
+        } else {
+          log.debug(s"Running workflow instance $instance (fencingToken=$token)")
+          Right(new PostgresCurrentExecution(worker, token, workflowId, key, scope, fresh._1.generation, fresh._1))
+        }
+    }
+  }
+
+  /** Reads the full persisted state of an instance as an [[InstanceRecord]]. */
+  private def readInstanceRecord(instanceId: WorkflowInstanceId): Option[InstanceRecord] =
+    runTransaction {
+      sql"""SELECT input, workflow_version_at_creation, generation, terminal_state, terminal_outcome
+            FROM workflow_instances
+            WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
+              AND workflow_instance_scope = ${instanceId.scope}""".query[
+          (String, Long, Long, Option[String], Option[String])
+        ].option
+    }.map(toInstanceRecord(instanceId, _))
+
+  /** Reads the full persisted state of an instance fenced by `worker`/`token`,
+    * together with its current parent pointer (used to skip the parent-close
+    * self-check for top-level instances).
+    */
+  private def readFencedInstanceRecord(
+      instanceId: WorkflowInstanceId,
+      worker: String,
+      token: Long
+  ): Option[(InstanceRecord, Option[String])] =
+    runTransaction {
+      sql"""SELECT input, workflow_version_at_creation, generation, terminal_state, terminal_outcome, parent_workflow_id
+            FROM workflow_instances
+            WHERE workflow_id = ${instanceId.workflowId} AND workflow_instance_key = ${instanceId.workflowInstanceKey}
+              AND workflow_instance_scope = ${instanceId.scope}
+              AND lease_owner = $worker AND fencing_token = $token""".query[
+          (String, Long, Long, Option[String], Option[String], Option[String])
+        ].option
+    }.map { case (input, version, generation, terminal, outcome, parent) =>
+      (toInstanceRecord(instanceId, (input, version, generation, terminal, outcome)), parent)
+    }
+
+  private def toInstanceRecord(
+      instanceId: WorkflowInstanceId,
+      row: (String, Long, Long, Option[String], Option[String])
+  ): InstanceRecord = {
+    val (input, version, generation, terminal, outcome) = row
+    InstanceRecord(
+      instanceId,
+      SerializedValue.of(input),
+      version,
+      generation,
+      terminal.map(decodeTerminalState),
+      outcome.map(SerializedValue.of)
+    )
+  }
 
   /** Runs an instance whose lease is already held by the job runner's claim
     * (worker + fencing token supplied), skipping acquisition. Uses the same
-    * body-execution code path as the public [[runWorkflowInstance]]; the runner's
-    * lease settings override the runtime's defaults for this run.
+    * body-execution code path as the public run API.
     */
   private[atomicflow] def runClaimedInstance(
       workflow: Workflow[?, ?],
       instanceId: WorkflowInstanceId,
       worker: String,
-      token: Long,
-      leaseDuration: FiniteDuration,
-      leaseAcquireTimeout: FiniteDuration
-  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[?] =
-    executeWorkflowWithLease(workflow, instanceId, leaseDuration, leaseAcquireTimeout, preAcquired = Some((worker, token)))
-
-  /** The shared body-execution code path behind the public run API and the job
-    * runner. Decodes the persisted input with the definition's `Cacheable[In]`,
-    * reads `workflowVersionAtCreation` into the context, and executes the body
-    * under the given lease (either freshly acquired or pre-acquired by a claim).
-    */
-  private def executeWorkflowWithLease(
-      workflow: Workflow[?, ?],
-      instanceId: WorkflowInstanceId,
-      runLeaseDuration: FiniteDuration,
-      runLeaseAcquireTimeout: FiniteDuration,
-      preAcquired: Option[(String, Long)]
+      token: Long
   )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[?] =
     workflow match {
       case wf: Workflow[i, o] =>
-        val outCacheable: Cacheable[o] = wf.outputCacheable
-        given Cacheable[o] = outCacheable
-        val completionCodec = summon[Cacheable[WorkflowCompletionResult[o]]]
-        val workflowId = instanceId.workflowId
-        val key = instanceId.workflowInstanceKey
-        val scope = instanceId.scope
-
         clearInterrupt()
-
-        val row = runTransaction {
-          sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation, generation
-                FROM workflow_instances
-                WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[
-              (Option[String], Option[String], String, Long, Long)
-            ].option
-        }
-
-        val (terminalState, terminalOutcome, _, _, _) = row match {
-          case Some(r) => r
+        val initial = readInstanceRecord(instanceId).getOrElse(
+          throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+        )
+        initial.terminalState match {
+          case Some(_) => decodeTerminal(wf, initial)
           case None =>
-            throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-        }
-
-        terminalState match {
-          case Some(state) =>
-            handleTerminalRead(state, terminalOutcome, outCacheable, completionCodec, instanceId)
-          case None =>
-            val (worker, token) = preAcquired.getOrElse {
-              val w = workerId
-              val t = acquireLease(workflowId, key, scope, w, runLeaseDuration, runLeaseAcquireTimeout) match {
-                case Some(t) => t
-                case None    => throw LeaseUnavailableException(instanceId)
-              }
-              (w, t)
-            }
-
             try {
-              val now = clock.instant()
-              val bumped = runTransaction {
-                sql"""UPDATE workflow_instances
-                      SET times_executed = times_executed + 1, last_run_at = $now
-                      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                        AND lease_owner = $worker AND fencing_token = $token""".update.run
-              }
-              if (bumped != 1) throw LeaseLostException(instanceId)
-
-              // Re-read the instance row now that we hold the lease. A caller-thread
-              // run may have waited out a live lease, during which a concurrent
-              // continueAsNew/reset replaced the input and bumped the generation; the
-              // pre-acquisition read above would then be stale. Reading fenced by our
-              // owner+token guarantees we observe the current row (or detect we lost
-              // the lease). The generation, input, version, and terminal state below
-              // all come from this fresh read.
-              val freshRow = runTransaction {
-                sql"""SELECT terminal_state, terminal_outcome, input, workflow_version_at_creation, generation, parent_workflow_id
-                      FROM workflow_instances
-                      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                        AND lease_owner = $worker AND fencing_token = $token""".query[
-                    (Option[String], Option[String], String, Long, Long, Option[String])
-                  ].option
-              }
-              val (freshTerminal, freshOutcome, freshInputSerialized, freshVersionAtCreation, freshGeneration, freshParent) =
-                freshRow match {
-                  case Some(r) => r
-                  case None    => throw LeaseLostException(instanceId)
-                }
-
-              freshTerminal match {
-                case Some(state) =>
-                  handleTerminalRead(state, freshOutcome, outCacheable, completionCodec, instanceId)
-                case None =>
-                  // Run-start self-check: a child whose parent has recorded a
-                  // pending close (or is gone) applies its own policy before the
-                  // body executes. Aborts the run only for a never-started child
-                  // finalized CANCELLED; otherwise the run proceeds and the
-                  // delivered Cancel flag makes the next checkpoint throw. The
-                  // fresh parent pointer is a cheap filter: it only ever goes
-                  // from set to cleared, so a top-level instance skips the extra
-                  // transaction.
-                  val parentCloseAbort =
-                    if (freshParent.isDefined) {
-                      val (aborted, unconsumed) = parentClosureSelfCheck(workflowId, key, scope)
-                      logDroppedUnconsumedSignals(instanceId, unconsumed)
-                      aborted
-                    } else false
-                  if (parentCloseAbort) {
-                    log.info(s"Workflow instance $instanceId cancelled by pending parent close before first execution")
-                    WorkflowRunResult.WorkflowCancelled
-                  } else {
-                    val input = wf.inputCacheable.read(freshInputSerialized)
-                    val ctxInstanceId = instanceId
-                    val ctxVersionAtCreation = freshVersionAtCreation
-                    val ctxExecution = new PostgresCurrentExecution(worker, token, workflowId, key, scope, freshGeneration)
-                    val ctx = new WorkflowContext(
-                      ctxInstanceId,
-                      ctxVersionAtCreation,
-                      PostgresWorkflowRuntime.this
-                    )(ctxExecution)
-
-                    log.debug(s"Running workflow instance $instanceId (fencingToken=$token)")
-
-                    var outValue: o = null.asInstanceOf[o]
-                    var suspended = false
-                    try {
-                      outValue = wf.body(input)(using ctx)
-                    } catch {
-                      case _: WorkflowSuspendedException =>
-                        suspended = true
-                      case _: LeaseLostException =>
-                        throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
-                      case e: ContinueAsNewException =>
-                        val newInput = wf.inputCacheable.read(e.encoded.raw)
-                        val newSerializedInput = wf.inputCacheable.write(newInput)
-                        val unconsumed = continueAsNewTransition(workflowId, key, scope, worker, token, newSerializedInput)
-                        invokeUnconsumedSignalsListener(wf, instanceId, unconsumed)
-                        log.info(s"Workflow instance $instanceId continued as new")
-                        return WorkflowRunResult.ContinueAsNew
-                      case _: WorkflowCancelledException =>
-                        val payload = Framing.write("cancelled")
-                        val (updated, unconsumed) = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "cancelled", payload)
-                        if (updated == 1) {
-                          invokeUnconsumedSignalsListener(wf, instanceId, unconsumed)
-                          log.info(s"Workflow instance $instanceId cancelled")
-                          return WorkflowRunResult.WorkflowCancelled
-                        } else {
-                          log.info(s"Workflow instance $instanceId cancelled; adopting the winner's terminal outcome")
-                          return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-                        }
-                      case WorkflowNonFatal(t) =>
-                        val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
-                        val (updated, unconsumed) = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "failed", payload)
-                        if (updated == 1) {
-                          invokeUnconsumedSignalsListener(wf, instanceId, unconsumed)
-                          log.info(s"Workflow instance $instanceId failed", t)
-                          throw cacheableThrowable.read(cacheableThrowable.write(t))
-                        } else {
-                          log.info(s"Workflow instance $instanceId failed; adopting the winner's terminal outcome", t)
-                          return readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-                        }
-                    }
-
-                    if (suspended) {
-                      log.debug(s"Workflow instance $instanceId suspended")
-                      WorkflowRunResult.WorkflowSuspended
-                    } else {
-                      val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
-                      val (updated, unconsumed) = terminalTransitionAndEvent(workflowId, key, scope, worker, token, "completed", payload)
-                      if (updated == 1) {
-                        invokeUnconsumedSignalsListener(wf, instanceId, unconsumed)
-                        log.debug(s"Workflow instance $instanceId completed")
-                        WorkflowRunResult.Result(outCacheable.read(outCacheable.write(outValue)))
-                      } else {
-                        readTerminalAndReturn(workflowId, key, scope, outCacheable, completionCodec, instanceId)
-                      }
-                    }
-                  }
+              leaseUnderAcquisition(instanceId, worker, token) match {
+                case Left(record) => decodeTerminal(wf, record)
+                case Right(lease) => executeUnderLease(wf)(using cacheableThrowable, lease)
               }
             } finally {
               releaseLeaseIfStillOwned(instanceId, worker, token)
             }
         }
     }
+
+  /** Records the run's terminal outcome under the lease. The guarded terminal
+    * transition wins only if the instance is still non-terminal and the lease is
+    * still ours; otherwise the already-terminal row is read back and returned.
+    */
+  override def completeInstance(outcome: TerminalOutcome)(using lease: Lease): CompletionResult = {
+    val (state, payload) = outcome match {
+      case TerminalOutcome.Completed(p) => ("completed", p.raw)
+      case TerminalOutcome.Failed(p)    => ("failed", p.raw)
+      case TerminalOutcome.Cancelled    => ("cancelled", Framing.write("cancelled"))
+      case TerminalOutcome.Terminated   => ("terminated", Framing.write("terminated"))
+    }
+    val (updated, unconsumed) = terminalTransitionAndEvent(
+      lease.workflowId,
+      lease.instanceKey,
+      lease.instanceScope,
+      lease.workerId,
+      lease.fencingToken,
+      state,
+      payload
+    )
+    if (updated == 1) CompletionResult.Applied(unconsumed)
+    else
+      CompletionResult.AlreadyTerminal(
+        readInstanceRecord(lease.instanceId).getOrElse(throw LeaseLostException(lease.instanceId))
+      )
+  }
+
+  /** Commits a continue-as-new transition with `nextInput` under the lease and
+    * returns the instance's unconsumed signals. Core invokes the
+    * `onUnconsumedSignals` listener with the returned map.
+    */
+  override def continueAsNew(nextInput: SerializedValue)(using lease: Lease): Map[SignalKey, Seq[String]] =
+    continueAsNewTransition(
+      lease.workflowId,
+      lease.instanceKey,
+      lease.instanceScope,
+      lease.workerId,
+      lease.fencingToken,
+      nextInput.raw
+    )
 
   /** One conditional lease-acquire attempt as a `ConnectionIO`, so a caller may
     * run it inside its own transaction (the job runner's claim). Returns the new
@@ -1630,24 +1641,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 AND signal_key = workflow_events.event_key
             )
           ORDER BY sequence_id""".query[(String, String)].to[Vector].map(_.groupMap(_._1)(_._2))
-
-  /** Invokes the completing/restarting instance's `onUnconsumedSignals` listener
-    * with the map gathered inside the already-committed transition transaction.
-    * A throwing listener must never mask the workflow outcome, so any
-    * [[WorkflowNonFatal]] it raises is logged and swallowed. At-most-once: a
-    * crash between the transition commit and this call loses the delivery
-    * (acceptable for a logging/debug aid).
-    */
-  private def invokeUnconsumedSignalsListener(
-      workflow: Workflow[?, ?],
-      instanceId: WorkflowInstanceId,
-      unconsumed: Map[SignalKey, Seq[String]]
-  ): Unit =
-    try workflow.onUnconsumedSignals(unconsumed)
-    catch {
-      case WorkflowNonFatal(t) =>
-        log.warn(s"onUnconsumedSignals listener failed for workflow instance $instanceId; the workflow outcome is unaffected", t)
-    }
 
   /** WARN-logs unconsumed signals gathered on a terminal path that has no
     * workflow definition available (terminate, cancellation escalation, and the
@@ -1832,21 +1825,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING""").update.run.map(_ => ())
   }
 
-  private def readTerminalAndReturn[Out](
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: ScopePath,
-      outCacheable: Cacheable[Out],
-      completionCodec: Cacheable[WorkflowCompletionResult[Out]],
-      instanceId: WorkflowInstanceId
-  ): WorkflowRunResult[Out] = {
-    val (state, outcome) = runTransaction {
-      sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".query[(String, Option[String])].unique
-    }
-    handleTerminalRead(state, outcome, outCacheable, completionCodec, instanceId)
-  }
-
   /** Decodes a terminal instance's stored outcome and returns/thrown it, without
     * executing the body.
     */
@@ -2016,7 +1994,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  override def awaitResult[Out](
+  override def blockUntilCompleted[Out](
       instance: WorkflowInstance[?, Out],
       timeout: FiniteDuration
   )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
@@ -2049,7 +2027,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       terminal = readTerminalOrThrowMissing()
       if (terminal.isEmpty) {
         if (System.nanoTime() >= deadlineNanos) expired = true
-        else Thread.sleep(AwaitResultPollIntervalMillis)
+        else Thread.sleep(BlockUntilCompletedPollIntervalMillis)
       }
     }
 
@@ -2090,14 +2068,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
     rows.map { case (wf, scope, r) => toInfo(wf, scope, r) }
   }
 
-  // ---- Engine operations of the public WorkflowRuntime SPI. Each takes this
+  // ---- Engine operations of the WorkflowRuntimeInternals SPI. Each uses this
   // ---- run's PostgresCurrentExecution handle carrying the run's fencing identity.
 
-  override def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep] =
-    readStepRow(run.workflowId, run.instanceKey, run.instanceScope, stepId.key, stepId.scope, stepVersion)
+  override def lookupStep(stepId: StepId, stepVersion: Long)(using lease: Lease): Option[StoredStep] =
+    readStepRow(lease.workflowId, lease.instanceKey, lease.instanceScope, stepId.key, stepId.scope, stepVersion)
 
   override def writeStepState(
-      run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
       stepKind: StepKind,
@@ -2105,27 +2082,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
       inputFingerprints: InputFingerprints,
       payload: SerializedValue,
       expiresAt: Option[Instant]
-  ): Unit =
-    runLeaseCheckedTransaction(run) {
+  )(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease) {
       for {
         _ <- upsertStepStateQ(
-          run, stepId, stepVersion, stepKind, state, inputFingerprints, payload, expiresAt
+          lease, stepId, stepVersion, stepKind, state, inputFingerprints, payload, expiresAt
         )
-        _ <- deleteTimerSubscriptionsQ(run, stepId, stepVersion)
+        _ <- deleteTimerSubscriptionsQ(lease, stepId, stepVersion)
       } yield ()
     }
 
-  override def deleteStepOrAwait(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit =
-    runLeaseCheckedTransaction(run) {
+  override def deleteStepOrAwait(stepId: StepId, stepVersion: Long)(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease) {
       for {
         _ <- sql"""DELETE FROM workflow_steps
-                   WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope} AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion""".update.run
-        _ <- deleteSiteSubscriptionsQ(run, stepId, stepVersion)
+                   WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope} AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion""".update.run
+        _ <- deleteSiteSubscriptionsQ(lease, stepId, stepVersion)
       } yield ()
     }
 
   override def suspendStepRetry(
-      run: CurrentExecution,
       stepId: StepId,
       stepVersion: Long,
       stepKind: StepKind,
@@ -2133,11 +2109,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
       retryPayload: SerializedValue,
       deadline: Instant,
       expiresAt: Option[Instant]
-  ): Unit =
-    runLeaseCheckedTransaction(run) {
+  )(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease) {
       for {
         _ <- upsertStepStateQ(
-          run,
+          lease,
           stepId,
           stepVersion,
           stepKind,
@@ -2146,25 +2122,25 @@ class PostgresWorkflowRuntime private[atomicflow] (
           retryPayload,
           expiresAt
         )
-        _ <- insertRetrySubscriptionQ(run, stepId, stepVersion, deadline)
+        _ <- insertRetrySubscriptionQ(lease, stepId, stepVersion, deadline)
       } yield ()
     }
 
-  override def fireStepRetryIfDue(run: CurrentExecution, stepId: StepId, stepVersion: Long): Boolean =
-    runLeaseCheckedTransaction(run) {
+  override def fireStepRetryIfDue(stepId: StepId, stepVersion: Long)(using lease: Lease): Boolean =
+    runLeaseCheckedTransaction(lease) {
       val now = clock.instant()
       for {
         subs <- sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
-                      WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                      WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                         AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey
                       ORDER BY deadline, timer_id
                       FOR UPDATE""".query[(java.util.UUID, Instant)].to[Vector]
         _ <- subs.collect { case (subId, deadline) if !deadline.isAfter(now) => subId }.traverse_ { subId =>
           for {
             exists <- sql"""SELECT 1 FROM workflow_events
-                            WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                               AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-            _ <- if (exists.isEmpty) appendEvent(run.workflowId, run.instanceKey, run.instanceScope, "TimerFired", subId.toString, "")
+            _ <- if (exists.isEmpty) appendEvent(lease.workflowId, lease.instanceKey, lease.instanceScope, "TimerFired", subId.toString, "")
                  else ().pure[ConnectionIO]
           } yield ()
         }
@@ -2172,45 +2148,44 @@ class PostgresWorkflowRuntime private[atomicflow] (
                  else {
                    val idStrings = subs.map(_._1.toString)
                    fr"""SELECT 1 FROM workflow_events
-                         WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                            AND event_kind = 'TimerFired' AND event_key = ANY($idStrings)
                          LIMIT 1""".query[Int].option.map(_.isDefined)
                  }
       } yield fired
     }
 
-  override def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[SubscriberMatch] =
+  override def readAwaitSignalCandidates(signalKey: SignalKey)(using lease: Lease): Vector[SubscriberMatch] =
     runTransaction {
       for {
         cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
-                        WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope} AND signal_key = $signalKey""".query[Long].unique
+                        WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope} AND signal_key = $signalKey""".query[Long].unique
         direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
-                        WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                        WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                           AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
                         ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-        inherited <- readInheritedCandidatesQ(run, signalKey, cursor)
+        inherited <- readInheritedCandidatesQ(lease, signalKey, cursor)
       } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
         SubscriberMatch("", seq, SerializedValue.of(payload), createdAt)
       }
     }
 
   override def evaluateWait(
-      run: CurrentExecution,
       site: WaitSite,
       subscribers: Vector[Subscriber]
-  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[SerializedValue] = {
-    runLeaseCheckedTransaction(run)(fireDueTimerSubscriptionsQ(run, site.stepId, site.stepVersion))
-    runLeaseCheckedTransaction(run) {
+  )(decide: Vector[SubscriberMatch] => Option[WaitResolution])(using lease: Lease): Option[SerializedValue] = {
+    runLeaseCheckedTransaction(lease)(fireDueTimerSubscriptionsQ(lease, site.stepId, site.stepVersion))
+    runLeaseCheckedTransaction(lease) {
       for {
-        _ <- subscribers.traverse_(registerSubscriberQ(run, site, _))
-        perSubscriber <- subscribers.traverse(subscriber => readSubscriberEventsQ(run, site, subscriber).map(subscriber -> _))
+        _ <- subscribers.traverse_(registerSubscriberQ(lease, site, _))
+        perSubscriber <- subscribers.traverse(subscriber => readSubscriberEventsQ(lease, site, subscriber).map(subscriber -> _))
         candidates = perSubscriber.flatMap(_._2).sortBy(_.sequenceId)
         resolution = decide(candidates)
         result <- resolution match {
           case Some(r) =>
             for {
               _ <- upsertStepStateQ(
-                     run,
+                     lease,
                      site.stepId,
                      site.stepVersion,
                      site.stepKind,
@@ -2219,8 +2194,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      r.payload,
                      site.expiresAt
                    )
-              _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorQ(run, k, seq) }
-              _ <- deleteSiteSubscriptionsQ(run, site.stepId, site.stepVersion)
+              _ <- r.advanceSignalCursor.traverse_ { case (k, seq) => advanceCursorQ(lease, k, seq) }
+              _ <- deleteSiteSubscriptionsQ(lease, site.stepId, site.stepVersion)
             } yield Some(r.payload)
           case None =>
             val advances: Map[SignalKey, Long] =
@@ -2231,59 +2206,55 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 case (acc, _) => acc
               }
             advances.toVector
-              .traverse_ { case (k, seq) => advanceCursorQ(run, k, seq) }
+              .traverse_ { case (k, seq) => advanceCursorQ(lease, k, seq) }
               .as(None)
         }
       } yield result
     }
   }
 
-  override def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[ScopePath]): Unit =
-    runLeaseCheckedTransaction(run)(deleteSubscriptionsUnderScopePathsQ(run, scopePaths))
+  override def deleteSubscriptionsUnderScopePaths(scopePaths: Seq[ScopePath])(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease)(deleteSubscriptionsUnderScopePathsQ(lease, scopePaths))
 
   override def readRegionState(
-      run: CurrentExecution,
       regionId: String,
       parentScopePath: ScopePath
-  ): Option[RegionState] =
+  )(using lease: Lease): Option[RegionState] =
     runTransaction {
       sql"""SELECT state_payload FROM workflow_steps
-            WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
               AND step_id = $regionId AND step_scope_within_instance = $parentScopePath
               AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(decodeRegionState))
     }
 
   override def upsertRegion(
-      run: CurrentExecution,
       regionId: String,
       parentScopePath: ScopePath,
       state: RegionState
-  ): Unit =
-    runLeaseCheckedTransaction(run) {
+  )(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease) {
       val restartCount = state.restartCount
       val base = regionIterationScope(regionId, parentScopePath, restartCount - 1)
       val now = clock.instant()
       for {
-        _ <- deleteRegionNestedStepsQ(run, base)
-        _ <- deleteRegionNestedSubscriptionsQ(run, base)
+        _ <- deleteRegionNestedStepsQ(lease, base)
+        _ <- deleteRegionNestedSubscriptionsQ(lease, base)
         // Only a restart discards a prior interior; the first creation
         // (restartCount 0) closes nothing and records no closure.
         _ <- if (restartCount > 0)
           insertChildCloseRequestQ(
-            run.workflowId,
-            run.instanceKey,
-            run.instanceScope,
-            run.instanceScope.segments ++ Vector(run.workflowId, s"${run.instanceKey}@${run.generation}") ++ base.segments
+            lease.workflowId,
+            lease.instanceKey,
+            lease.instanceScope,
+            lease.instanceScope.segments ++ Vector(lease.workflowId, s"${lease.instanceKey}@${lease.generation}") ++ base.segments
           )
         else ().pure[ConnectionIO]
         _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${encodeRegionState(restartCount, state.serializedState.raw)}, '', NULL, $now, $now)
+              VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${encodeRegionState(restartCount, state.serializedState.raw)}, '', NULL, $now, $now)
               ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance)
               DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
       } yield ()
     }
-
-  override def heartbeat(run: CurrentExecution): Unit = renewLease(run)
 
   override def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean = {
     val workflowId = instanceId.workflowId
@@ -2297,17 +2268,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }.isDefined
   }
 
-  private def renewLease(run: CurrentExecution): Unit = {
+  override def renewLease()(using lease: Lease): Unit = {
     val now = clock.instant()
     val expires = now.plus(java.time.Duration.ofNanos(leaseDuration.toNanos))
     val updated = runTransaction {
       sql"""UPDATE workflow_instances
             SET lease_expires_at = $expires
-            WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
-              AND lease_owner = ${run.workerId} AND fencing_token = ${run.fencingToken}
+            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
+              AND lease_owner = ${lease.workerId} AND fencing_token = ${lease.fencingToken}
               AND terminal_state IS NULL""".update.run
     }
-    if (updated != 1) throw LeaseLostException(run.instanceId)
+    if (updated != 1) throw LeaseLostException(lease.instanceId)
   }
 
   /** Runs `write` inside one transaction, guarded by an exclusive lock on the
@@ -2323,26 +2294,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * `fencing_token` are required: lease recovery clears the owner without
     * bumping the token.
     */
-  private def runLeaseCheckedTransaction[A](run: CurrentExecution)(write: ConnectionIO[A]): A = {
+  private def runLeaseCheckedTransaction[A](lease: Lease)(write: ConnectionIO[A]): A = {
     val res: Option[A] = runTransaction {
       for {
         fenceOk <- sql"""SELECT 1 FROM workflow_instances
-                         WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
-                           AND lease_owner = ${run.workerId} AND fencing_token = ${run.fencingToken}
+                         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
+                           AND lease_owner = ${lease.workerId} AND fencing_token = ${lease.fencingToken}
                          FOR UPDATE""".query[Int].option
         r <- if (fenceOk.isDefined) write.map(Some(_)) else None.pure[ConnectionIO]
       } yield r
     }
     res match {
       case Some(a) => a
-      case None    => throw LeaseLostException(run.instanceId)
+      case None    => throw LeaseLostException(lease.instanceId)
     }
   }
 
   private val RetrySubscriberKey: String = "__retry__"
 
   private def upsertStepStateQ(
-      run: CurrentExecution,
+      lease: Lease,
       stepId: StepId,
       stepVersion: Long,
       stepKind: StepKind,
@@ -2357,7 +2328,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val fingerprintText = inputFingerprints.raw
     val payloadText = payload.raw
     sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $fingerprintText, $expiresAt, $now, $now)
+          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $fingerprintText, $expiresAt, $now, $now)
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance) DO UPDATE
           SET state_kind = $kind, state_payload = EXCLUDED.state_payload, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
       _ => ()
@@ -2365,26 +2336,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   private def insertRetrySubscriptionQ(
-      run: CurrentExecution,
+      lease: Lease,
       stepId: StepId,
       stepVersion: Long,
       deadline: java.time.Instant
   ): ConnectionIO[Unit] =
     for {
       _ <- sql"""DELETE FROM workflow_timer_subscriptions
-                 WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                 WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                    AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion AND subscriber_key = $RetrySubscriberKey""".update.run
       _ <- sql"""INSERT INTO workflow_timer_subscriptions
                   (timer_id, workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, deadline)
-                VALUES (gen_random_uuid(), ${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetrySubscriberKey, $deadline)
+                VALUES (gen_random_uuid(), ${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $RetrySubscriberKey, $deadline)
                 ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance) DO NOTHING""".update.run
     } yield ()
 
-  private def fireDueTimerSubscriptionsQ(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] = {
+  private def fireDueTimerSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] = {
     val now = clock.instant()
     for {
       due <- sql"""SELECT timer_id FROM workflow_timer_subscriptions
-                   WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                   WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                      AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion
                      AND deadline <= $now
                    ORDER BY deadline, timer_id
@@ -2392,57 +2363,57 @@ class PostgresWorkflowRuntime private[atomicflow] (
       _ <- due.traverse_ { subId =>
         for {
           exists <- sql"""SELECT 1 FROM workflow_events
-                          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                             AND event_kind = 'TimerFired' AND event_key = ${subId.toString}""".query[Int].option
-          _ <- if (exists.isEmpty) appendEvent(run.workflowId, run.instanceKey, run.instanceScope, "TimerFired", subId.toString, "")
+          _ <- if (exists.isEmpty) appendEvent(lease.workflowId, lease.instanceKey, lease.instanceScope, "TimerFired", subId.toString, "")
                else ().pure[ConnectionIO]
         } yield ()
       }
     } yield ()
   }
 
-  private def registerSubscriberQ(run: CurrentExecution, site: WaitSite, subscriber: Subscriber): ConnectionIO[Unit] =
+  private def registerSubscriberQ(lease: Lease, site: WaitSite, subscriber: Subscriber): ConnectionIO[Unit] =
     subscriber match {
       case Subscriber.Signal(subscriberKey, signalKey) =>
         sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
-              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $signalKey)
+              VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $signalKey)
               ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key) DO NOTHING""".update.run.map(_ => ())
       case Subscriber.Timer(subscriberKey, deadline) =>
         sql"""INSERT INTO workflow_timer_subscriptions
                 (timer_id, workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, deadline)
-              VALUES (gen_random_uuid(), ${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $deadline)
+              VALUES (gen_random_uuid(), ${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $deadline)
               ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance) DO NOTHING""".update.run.map(_ => ())
       case Subscriber.Completion(subscriberKey, completedWorkflowId, completedWorkflowInstanceKey, completedScope) =>
         sql"""INSERT INTO workflow_completion_subscriptions
                 (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope)
-              VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $completedWorkflowId, $completedWorkflowInstanceKey, $completedScope)
+              VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${site.stepId.key}, ${site.stepId.scope}, ${site.stepVersion}, $subscriberKey, $completedWorkflowId, $completedWorkflowInstanceKey, $completedScope)
               ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope) DO NOTHING""".update.run.map(_ => ())
     }
 
-  private def readSubscriberEventsQ(run: CurrentExecution, site: WaitSite, subscriber: Subscriber): ConnectionIO[Vector[SubscriberMatch]] =
+  private def readSubscriberEventsQ(lease: Lease, site: WaitSite, subscriber: Subscriber): ConnectionIO[Vector[SubscriberMatch]] =
     subscriber match {
       case Subscriber.Signal(subscriberKey, signalKey) =>
         for {
           cursor <- sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
-                          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope} AND signal_key = $signalKey""".query[Long].unique
+                          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope} AND signal_key = $signalKey""".query[Long].unique
           direct <- sql"""SELECT sequence_id, payload, created_at FROM workflow_events
-                          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                             AND event_kind = 'Signal' AND event_key = $signalKey AND sequence_id > $cursor
                           ORDER BY sequence_id""".query[(Long, String, java.time.Instant)].to[Vector]
-          inherited <- readInheritedCandidatesQ(run, signalKey, cursor)
+          inherited <- readInheritedCandidatesQ(lease, signalKey, cursor)
         } yield (direct ++ inherited).sortBy(_._1).map { case (seq, payload, createdAt) =>
           SubscriberMatch(subscriberKey, seq, SerializedValue.of(payload), createdAt)
         }
       case Subscriber.Timer(subscriberKey, _) =>
         for {
           subId <- sql"""SELECT timer_id FROM workflow_timer_subscriptions
-                         WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                         WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                            AND step_id = ${site.stepId.key} AND step_scope_within_instance = ${site.stepId.scope} AND step_version = ${site.stepVersion} AND subscriber_key = $subscriberKey""".query[java.util.UUID].option
           events <- subId match {
             case None => Vector.empty[SubscriberMatch].pure[ConnectionIO]
             case Some(id) =>
               sql"""SELECT sequence_id, created_at FROM workflow_events
-                    WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+                    WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
                       AND event_kind = 'TimerFired' AND event_key = ${id.toString}
                     ORDER BY sequence_id""".query[(Long, java.time.Instant)].to[Vector]
                 .map(_.map { case (seq, createdAt) => SubscriberMatch(subscriberKey, seq, SerializedValue.of(""), createdAt) })
@@ -2486,11 +2457,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
   }
 
-  private def deleteSiteSubscriptionsQ(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+  private def deleteSiteSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
     deleteAllSubscriptionsQ(
-      run.workflowId,
-      run.instanceKey,
-      run.instanceScope,
+      lease.workflowId,
+      lease.instanceKey,
+      lease.instanceScope,
       fr"step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion"
     )
 
@@ -2499,25 +2470,25 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * a prefix), across all three subscription tables. `scopePaths` are always
     * non-empty, so the array-prefix equality is a valid slice predicate.
     */
-  private def deleteSubscriptionsUnderScopePathsQ(run: CurrentExecution, scopePaths: Seq[ScopePath]): ConnectionIO[Unit] =
+  private def deleteSubscriptionsUnderScopePathsQ(lease: Lease, scopePaths: Seq[ScopePath]): ConnectionIO[Unit] =
     scopePaths.traverse_ { path =>
       require(path.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every row")
       deleteAllSubscriptionsQ(
-        run.workflowId,
-        run.instanceKey,
-        run.instanceScope,
+        lease.workflowId,
+        lease.instanceKey,
+        lease.instanceScope,
         fr"step_scope_within_instance[1:${path.segments.length}] = $path"
       )
     }
 
-  private def deleteTimerSubscriptionsQ(run: CurrentExecution, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
+  private def deleteTimerSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] =
     sql"""DELETE FROM workflow_timer_subscriptions
-          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
             AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion""".update.run.map(_ => ())
 
-  private def advanceCursorQ(run: CurrentExecution, signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
+  private def advanceCursorQ(lease: Lease, signalKey: SignalKey, sequenceId: Long): ConnectionIO[Unit] =
     sql"""INSERT INTO signal_cursor (workflow_id, workflow_instance_key, workflow_instance_scope, signal_key, sequence_id)
-          VALUES (${run.workflowId}, ${run.instanceKey}, ${run.instanceScope}, $signalKey, $sequenceId)
+          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, $signalKey, $sequenceId)
           ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, signal_key) DO UPDATE
           SET sequence_id = GREATEST(signal_cursor.sequence_id, EXCLUDED.sequence_id)""".update.run.map(_ => ())
 
@@ -2531,12 +2502,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * full scan agree on eligibility by construction.
     */
   private def readInheritedCandidatesQ(
-      run: CurrentExecution,
+      lease: Lease,
       signalKey: SignalKey,
       cursor: Long
   ): ConnectionIO[Vector[(Long, String, java.time.Instant)]] =
     (fr"""SELECT e.sequence_id, e.payload, e.created_at
-          FROM (""" ++ inheritedSignalSources(runningInstanceCandidate(run, signalKey)) ++ fr""") a
+          FROM (""" ++ inheritedSignalSources(runningInstanceCandidate(lease, signalKey)) ++ fr""") a
           JOIN workflow_events e
             ON e.workflow_id = a.source_wf AND e.workflow_instance_key = a.source_key AND e.workflow_instance_scope = a.source_scope
            AND e.event_kind = 'Signal' AND e.event_key = a.signal_key
@@ -2572,9 +2543,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * `child_close_requests` table, never in `workflow_steps`, so they are never
     * caught by this delete.
     */
-  private def deleteRegionNestedStepsQ(run: CurrentExecution, base: ScopePath): ConnectionIO[Unit] =
+  private def deleteRegionNestedStepsQ(lease: Lease, base: ScopePath): ConnectionIO[Unit] =
     sql"""DELETE FROM workflow_steps
-          WHERE workflow_id = ${run.workflowId} AND workflow_instance_key = ${run.instanceKey} AND workflow_instance_scope = ${run.instanceScope}
+          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
             AND step_scope_within_instance[1:${base.segments.length}] = $base""".update.run.map(_ => ())
 
   /** Deletes the nested subscription rows under the region's interior subtree:
@@ -2583,19 +2554,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * interior base (always non-empty), so the array-prefix equality is a valid
     * slice predicate.
     */
-  private def deleteRegionNestedSubscriptionsQ(run: CurrentExecution, base: ScopePath): ConnectionIO[Unit] =
+  private def deleteRegionNestedSubscriptionsQ(lease: Lease, base: ScopePath): ConnectionIO[Unit] =
     deleteAllSubscriptionsQ(
-      run.workflowId,
-      run.instanceKey,
-      run.instanceScope,
+      lease.workflowId,
+      lease.instanceKey,
+      lease.instanceScope,
       fr"step_scope_within_instance[1:${base.segments.length}] = $base"
     )
 
   /** The per-run execution handle of this runtime: the fencing identity of one
-    * run (worker, fencing token, generation) plus the instance identity. The
-    * runtime creates it when a run's lease is acquired; workflow code only
-    * passes it back to this runtime's engine operations, which are direct
-    * members of the runtime taking the handle as their first parameter.
+    * run (worker, fencing token, generation) plus the instance identity and the
+    * instance row re-read under the lease. The runtime creates it when a run's
+    * lease is acquired; core only threads it back to this runtime's engine
+    * operations and reads [[instance]] to build the run's context.
     */
   final class PostgresCurrentExecution(
       val workerId: String,
@@ -2603,8 +2574,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       val workflowId: WorkflowId,
       val instanceKey: WorkflowInstanceKey,
       val instanceScope: ScopePath,
-      val generation: Long
-  ) {
+      val generation: Long,
+      private[atomicflow] val instance: InstanceRecord
+  ) extends LeaseHandle {
 
     private[PostgresWorkflowRuntime] val instanceId = WorkflowInstanceId(workflowId, instanceKey, instanceScope)
   }

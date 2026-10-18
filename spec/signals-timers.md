@@ -104,7 +104,7 @@ enum Awaitable[R : Cacheable as resultCacheable] {
   `core-types.md`. A bare `WorkflowInstanceId` carries no output type — upgrade
   it to a typed handle from the workflow definition to await a completion.
 - `Timer.apply(delay)` resolves its clock through the `WorkflowContext` of the
-  calling workflow body (`ctx.runtime.clock`), so workflow code computes
+  calling workflow body (the context's library view, `ctx.internals.clock`), so workflow code computes
   deadlines from the executing runtime's single time source — an ambient
   `given Clock` is neither needed nor possible — and tests substitute a virtual
   clock on the runtime, advancing it between runs. Building a timer outside a

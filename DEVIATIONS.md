@@ -37,9 +37,13 @@ adds detail to, the documents in `spec/`.
 
 ## Runtime API and execution context
 
-- `WorkflowRuntime` exposes storage and execution operations directly. Backends
-  define `CurrentExecution`, an opaque handle created for one run and passed to
-  runtime operations through `WorkflowContext.currentExecution`.
+- The runtime is exposed as two views of one object. `WorkflowRuntime` is the
+  application view (create, run, cancel, query); `WorkflowRuntimeInternals` is
+  the library-core view (storage and execution primitives). A backend implements
+  both. Core reaches the engine view through `WorkflowContext.internals`.
+- Backends define `Lease`, an opaque per-run handle created when the run's lease
+  is acquired and taken implicitly by engine operations. A backend returns it
+  through `withLease`, which guarantees the lease is released.
 - The handle's identity is stable during a run. A backend that mutates its
   contents must support concurrent access from parallel branches.
 - `WorkflowContext` holds the enclosing step scope and cancellation-suppression

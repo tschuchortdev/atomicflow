@@ -1,202 +1,22 @@
 package atomicflow
 
+import org.slf4j.LoggerFactory
+
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.{Duration, FiniteDuration}
-import java.time.Clock
-import java.time.Instant
 
-/** Creates, runs, and stores workflow instances. Storage backends implement the
-  * abstract operations; final methods combine them into convenience operations.
+/** The application-facing view of a workflow runtime: creates, runs, and
+  * manages workflow instances. Some methods are final and composed here from
+  * the storage/execution engine operations; the rest are abstract and
+  * implemented by the storage backend. The engine operations themselves live on
+  * [[WorkflowRuntimeInternals]], which this trait requires as a self-type (a
+  * backend implements both), so application code holding a `WorkflowRuntime`
+  * cannot reach them.
   */
 @implicitNotFound("No WorkflowRuntime available. Add a using clause (using WorkflowRuntime).")
-trait WorkflowRuntime {
+trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
 
-  /** Clock used for timer deadlines, retry delays, leases, and stored timestamps.
-    * Workflow code and background jobs use this clock rather than database time.
-    */
-  def clock: Clock
-
-  /** The runtime's per-run execution handle. The runtime creates a value of this
-    * type when a run starts and hands it to workflow code through
-    * [[WorkflowContext.currentExecution]]; the type is opaque to callers — a
-    * value is only ever passed back to this runtime's own engine operations.
-    *
-    * Contract:
-    *   - The runtime creates the handle at run start, and its identity is stable
-    *     for the run's lifetime.
-    *   - Its contents are owned and updatable by the runtime (a lease protocol
-    *     may rotate fencing values during the run, for example).
-    *   - The same handle may be shared across the parallel-branch threads of one
-    *     run, so any internal mutation must be thread-safe.
-    *   - It should carry only what the runtime cannot derive from its own
-    *     configuration.
-    */
-  type CurrentExecution
-
-  /** The durable-retry threshold of this runtime: a step retry whose computed
-    * delay is at or below this sleeps inline inside the run; one whose delay is
-    * above it becomes a durable suspension (an ordinary timer subscription).
-    */
-  def durableRetryThreshold: FiniteDuration
-
-  /** Renews the lock on the workflow instance. */
-  def heartbeat(run: CurrentExecution): Unit
-
-  /** Reads whether cancellation has been requested. [[cancel]] sets the stored
-    * flag once and never clears it. Steps and waits check it before new work;
-    * cached results replay without checking it. No execution lease is required.
-    */
-  def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
-
-  /** Read a stored step without checking lease ownership, or `None` if absent.
-    * Reports the stored row even if it has expired.
-    */
-  def lookupStep(run: CurrentExecution, stepId: StepId, stepVersion: Long): Option[StoredStep]
-
-  /** Replace (or create) the step row, fenced: `state` is `Started` (an
-    * unresolved row, its `payload` empty or carrying retry bookkeeping), or the
-    * terminal `Succeeded`/`Failed`. The site's retry timer subscription is
-    * retired in the same transaction, so a resolved or superseded retry can
-    * never be re-fired.
-    */
-  def writeStepState(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: StepKind,
-      state: StoredStep.State,
-      inputFingerprints: InputFingerprints,
-      payload: SerializedValue,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Delete a step record and all its signal, timer, and completion subscriptions
-    * in one transaction, checking execution ownership. Used when inputs change
-    * or cached results expire, including pending retries.
-    *
-    * The caller evaluates the operation again after deletion. A new timer gets
-    * a new id, so old firing events cannot satisfy it. If the process crashes
-    * between deletion and evaluation, lease recovery or the next manual run
-    * evaluates the operation and registers its subscriptions again.
-    */
-  def deleteStepOrAwait(run: CurrentExecution, stepId: StepId, stepVersion: Long): Unit
-
-  /** Durably suspend an at-least-once step for a retry, fenced, in one
-    * transaction: persist (or refresh) the `started` step row carrying the
-    * runtime-owned retry bookkeeping in `retryPayload` and its `expiresAt`, and
-    * register the retry's timer subscription (deadline = `now + delay`) under
-    * the reserved `"__retry__"` subscriber key, which cannot collide with user
-    * awaits of the same site. The step body is NOT executed until the
-    * subscription is due.
-    */
-  def suspendStepRetry(
-      run: CurrentExecution,
-      stepId: StepId,
-      stepVersion: Long,
-      stepKind: StepKind,
-      inputFingerprints: InputFingerprints,
-      retryPayload: SerializedValue,
-      deadline: Instant,
-      expiresAt: Option[Instant]
-  ): Unit
-
-  /** Fire this step's due retry timers in one transaction after checking execution
-    * ownership. For each subscription with `deadline <= now`, lock it, check that
-    * no `TimerFired` event exists yet, and append one. The subscription row
-    * survives firing; only resolution retires it. Returns whether a `TimerFired`
-    * event now exists for the site, distinguishing a due retry (resume the body)
-    * from one still waiting (suspend).
-    */
-  def fireStepRetryIfDue(run: CurrentExecution, stepId: StepId, stepVersion: Long): Boolean
-
-  /** Read stored signals visible to this instance for `signalKey`, after its
-    * cursor and in sequence order. No lease check is required and the cursor is not
-    * advanced. Serves `Step.peekSignal`, so `subscriberKey` is always `""` on the
-    * returned candidates.
-    */
-  def readAwaitSignalCandidates(run: CurrentExecution, signalKey: SignalKey): Vector[SubscriberMatch]
-
-  /** Evaluate a wait-site, fenced, in two committed transactions. First, in its
-    * own transaction, fire the site's own due timer subscriptions
-    * (`deadline <= now`), row-locked in deadline order
-    * (`ORDER BY deadline, timer_id`), appending a `TimerFired` event per
-    * due subscription that has none yet under the global append protocol (no
-    * wakeup upsert); this commits immediately, so a fired event persists even if
-    * the evaluation that follows rolls back (a re-fire on a later evaluation is
-    * an idempotent event-exists no-op). Then, in a second transaction, register
-    * every subscriber idempotently (`ON CONFLICT DO NOTHING`), preserving an
-    * existing timer subscription's timer id and stored deadline; read all
-    * subscribers' candidates and apply `decide` to the candidates merged across
-    * subscribers and sorted by global `sequenceId`. `decide` runs inside this
-    * second transaction while the instance row lock is held, so it must be fast
-    * and pure (no I/O, no blocking). If `decide` returns `Some(resolution)`,
-    * persist the `succeeded` step row (`site.stepKind`), advance the winning
-    * signal key's cursor when the resolution requests it, and delete the site's
-    * rows in all three subscription tables — all atomically with the registration
-    * and candidate read. If it returns `None`, commit the registrations and
-    * advance each signal cursor past its examined, rejected events. Returns the
-    * persisted payload when resolved, `None` when suspended. A `decide`
-    * exception rolls the evaluation transaction back entirely; the earlier fire
-    * transaction already committed.
-    */
-  def evaluateWait(
-      run: CurrentExecution,
-      site: WaitSite,
-      subscribers: Vector[Subscriber]
-  )(decide: Vector[SubscriberMatch] => Option[WaitResolution]): Option[SerializedValue]
-
-  /** Delete every subscription row whose `step_scope_within_instance` equals one
-    * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
-    * as a prefix), across all three subscription tables (signal, timer,
-    * completion), fenced. Used by
-    * `Step.firstToRunWithoutSuspension` to retire every branch's pending
-    * subscriptions — including nested subscopes — before the winner's step row
-    * is written. The winner row is the stored
-    * first-wins marker, so deleting first means a crash in between leaves no
-    * marker, and the construct's next run re-evaluates from scratch and
-    * re-deletes; a committed winner row therefore never coexists with branch
-    * subscriptions.
-    */
-  def deleteSubscriptionsUnderScopePaths(run: CurrentExecution, scopePaths: Seq[ScopePath]): Unit
-
-  /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
-    * located at `regionId` under `parentScopePath`: its encoded state and its
-    * committed `restartCount`. `None` when the region has never been created
-    * (first creation, so the by-name seed must be evaluated).
-    */
-  def readRegionState(run: CurrentExecution, regionId: String, parentScopePath: ScopePath): Option[RegionState]
-
-  /** The single writer of a `Workflow.restartable`/`Workflow.loop` region's row:
-    * persist exactly `restartCount` and `serializedState`, creating the row if
-    * it does not exist (UPSERT, last writer wins). Before writing, discard the
-    * nested Step rows and subscriptions owned by generation `restartCount - 1`'s
-    * scope subtree (a construct-isolated prefix delete; a no-op when that
-    * generation left nothing behind, which is always the case at
-    * `restartCount == 0`) and close children created in that generation per
-    * their `ParentClosePolicy`. Signal cursors are preserved. Fenced. The caller
-    * invokes this only on first creation (`restartCount` 0, with the seed) or
-    * on a restart (with the next count); replays read the persisted row instead.
-    */
-  def upsertRegion(
-      run: CurrentExecution,
-      regionId: String,
-      parentScopePath: ScopePath,
-      state: RegionState
-  ): Unit
-
-  /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
-    * briefly row-locks the instance and rejects the append with
-    * [[SignalSendResult.InstanceAlreadyCompleted]] when it has already reached a
-    * terminal state, otherwise appends the event (with the signal's
-    * `Cacheable`). The sender only appends; wakeups are produced asynchronously
-    * by the job runner. Does not acquire the execution lease.
-    */
-  @throws[WorkflowNotFoundException]
-  def sendSignal[A: Cacheable](
-      workflowInstanceId: WorkflowInstanceId,
-      key: SignalKey,
-      value: A
-  ): SignalSendResult
+  private val log = LoggerFactory.getLogger(getClass)
 
   /** Register an instance, idempotent for equal (serialized) input; throws
     * [[WorkflowInputConflictException]] if the input differs.
@@ -275,6 +95,20 @@ trait WorkflowRuntime {
       restartFromStep: StepId
   )(using workflow: Workflow[In, Out]): Unit
 
+  /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
+    * briefly row-locks the instance and rejects the append with
+    * [[SignalSendResult.InstanceAlreadyCompleted]] when it has already reached a
+    * terminal state, otherwise appends the event (with the signal's
+    * `Cacheable`). The sender only appends; wakeups are produced asynchronously
+    * by the job runner. Does not acquire the execution lease.
+    */
+  @throws[WorkflowNotFoundException]
+  def sendSignal[A: Cacheable](
+      workflowInstanceId: WorkflowInstanceId,
+      key: SignalKey,
+      value: A
+  ): SignalSendResult
+
   /** Request cooperative cancellation of an instance. Durably sets
     * `cancel_requested_at` once and never resets it. If the instance has never
     * started and has no execution state, it is finalized `CANCELLED` immediately
@@ -309,53 +143,150 @@ trait WorkflowRuntime {
 
   /** Execute a created instance on the caller thread. */
   @throws[WorkflowNotFoundException]
-  def runWorkflowInstance[In, Out](
+  final def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
       instanceId: WorkflowInstanceId
-  )(using Cacheable[Throwable]): WorkflowRunResult[Out]
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] =
+    withLease(instanceId, leaseAcquireTimeout) { executeUnderLease(workflow) } match
+      case LeasedRunResult.Ran(value)              => value
+      case LeasedRunResult.AlreadyTerminal(record) => decodeTerminal(workflow, record)
 
-  /** Upsert a coalesced wakeup row for an instance, `ON CONFLICT DO NOTHING` so an
-    * existing row's timestamps are never reset. The backend derives `scheduled_at`
-    * from its own clock (`clock.now + delay`).
+  /** The shared body-execution path: decode the persisted input with the
+    * definition's `Cacheable[In]`, build a [[WorkflowContext]] for the lease,
+    * run the body, and translate its outcome into a terminal transition (or a
+    * control-flow result). Called by final [[runWorkflowInstance]] and by
+    * backends that already hold a lease for a claimed job.
     */
-  def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
+  final private[atomicflow] def executeUnderLease[In, Out](workflow: Workflow[In, Out])(using
+      cacheableThrowable: Cacheable[Throwable],
+      lease: Lease
+  ): WorkflowRunResult[Out] = {
+    given Cacheable[Out] = workflow.outputCacheable
+    val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
+    val record = lease.instance
+    val instanceId = record.instanceId
+    val input = workflow.inputCacheable.read(record.input.raw)
+    val ctx = new WorkflowContext(
+      instanceId,
+      record.versionAtCreation,
+      this,
+      this
+    )(lease)
 
-  /** Read a stored step without acquiring an execution lease.
-    * Used by `Step.getExecutionState`.
-    */
-  def readStep(
-      instanceId: WorkflowInstanceId,
-      stepId: StepId,
-      stepVersion: Long
-  ): Option[StoredStep]
+    var outValue: Out = null.asInstanceOf[Out]
+    var suspended = false
+    try {
+      outValue = workflow.body(input)(using ctx)
+    } catch {
+      case _: WorkflowSuspendedException =>
+        log.debug(s"Workflow instance $instanceId suspended")
+        suspended = true
+      case _: LeaseLostException =>
+        throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+      case e: ContinueAsNewException =>
+        val newInput = workflow.inputCacheable.read(e.encoded.raw)
+        val newSerializedInput = workflow.inputCacheable.write(newInput)
+        val unconsumed = continueAsNew(SerializedValue.of(newSerializedInput))
+        invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+        log.info(s"Workflow instance $instanceId continued as new")
+        return WorkflowRunResult.ContinueAsNew
+      case _: WorkflowCancelledException =>
+        completeInstance(TerminalOutcome.Cancelled) match {
+          case CompletionResult.Applied(unconsumed) =>
+            invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+            log.info(s"Workflow instance $instanceId cancelled")
+            return WorkflowRunResult.WorkflowCancelled
+          case CompletionResult.AlreadyTerminal(record) =>
+            return decodeTerminal(workflow, record)
+        }
+      case WorkflowNonFatal(t) =>
+        val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
+        completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload))) match {
+          case CompletionResult.Applied(unconsumed) =>
+            invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+            log.info(s"Workflow instance $instanceId failed", t)
+            throw cacheableThrowable.read(cacheableThrowable.write(t))
+          case CompletionResult.AlreadyTerminal(record) =>
+            return decodeTerminal(workflow, record)
+        }
+    }
 
-  /** Start a child workflow of an executing parent: create-if-absent a child
-    * instance under a scope derived from the parent's identity, generation, and
-    * enclosing `Workflow.scoped` path; record the parent relationship and
-    * inheritance configuration; and schedule the child's first wakeup. Never
-    * executes the child body on the parent's thread. Idempotent on parent
-    * replay (`startAsChild` returns the existing handle). The parent's identity
-    * and generation come from `run`.
+    if (suspended) WorkflowRunResult.WorkflowSuspended
+    else {
+      val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
+      completeInstance(TerminalOutcome.Completed(SerializedValue.of(payload))) match {
+        case CompletionResult.Applied(unconsumed) =>
+          invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+          log.debug(s"Workflow instance $instanceId completed")
+          WorkflowRunResult.Result(workflow.outputCacheable.read(workflow.outputCacheable.write(outValue)))
+        case CompletionResult.AlreadyTerminal(record) =>
+          decodeTerminal(workflow, record)
+      }
+    }
+  }
+
+  /** Decodes a terminal instance's persisted outcome and returns or throws it,
+    * without executing the body. Used when a run finds the instance already
+    * terminal, or when a concurrent writer won the terminal transition.
     */
-  def startChild[In, Out](
+  final private[atomicflow] def decodeTerminal[In, Out](
       workflow: Workflow[In, Out],
-      childKey: WorkflowInstanceKey,
-      input: In,
-      parentClosePolicy: ParentClosePolicy,
-      inheritSignals: SignalInheritance,
-      inheritPastEvents: Boolean,
-      run: CurrentExecution,
-      enclosingScopePath: ScopePath
-  )(using Cacheable[In]): WorkflowInstance[In, Out]
+      record: InstanceRecord
+  )(using cacheableThrowable: Cacheable[Throwable]): WorkflowRunResult[Out] = {
+    given Cacheable[Out] = workflow.outputCacheable
+    val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
 
-  /** The active children of `parentId`: instances whose parent relationship
-    * still points at `parentId` (not yet cleared by a parent terminal
-    * transition).
+    def decode(): WorkflowCompletionResult[Out] = {
+      val payload = record.terminalOutcome.getOrElse(
+        throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} has no terminal outcome")
+      )
+      try completionCodec.read(payload.raw)
+      catch {
+        case _: Throwable =>
+          throw new StepSerializationFailed(s"Terminal outcome of ${record.instanceId} could not be decoded")
+      }
+    }
+
+    record.terminalState match {
+      case Some(WorkflowTerminalState.Completed) =>
+        decode() match {
+          case WorkflowCompletionResult.Completed(v) => WorkflowRunResult.Result(v)
+          case _ =>
+            throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} stored a non-completed outcome as completed")
+        }
+      case Some(WorkflowTerminalState.Failed) =>
+        decode() match {
+          case WorkflowCompletionResult.Failed(t) => throw t
+          case _ =>
+            throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} stored a non-failed outcome as failed")
+        }
+      case Some(WorkflowTerminalState.Cancelled)  => WorkflowRunResult.WorkflowCancelled
+      case Some(WorkflowTerminalState.Terminated) => WorkflowRunResult.WorkflowTerminated
+      case None =>
+        throw new LeaseLostException(s"Workflow instance ${record.instanceId} is not terminal after a terminal transition")
+    }
+  }
+
+  /** Invokes the completing/restarting instance's `onUnconsumedSignals` listener
+    * with the map gathered inside the already-committed transition transaction.
+    * A throwing listener must never mask the workflow outcome, so any
+    * [[WorkflowNonFatal]] it raises is logged and swallowed. At-most-once: a
+    * crash between the transition commit and this call loses the delivery
+    * (acceptable for a logging/debug aid).
     */
-  def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info]
+  private def invokeUnconsumedSignalsListener(
+      workflow: Workflow[?, ?],
+      instanceId: WorkflowInstanceId,
+      unconsumed: Map[SignalKey, Seq[String]]
+  ): Unit =
+    try workflow.onUnconsumedSignals(unconsumed)
+    catch {
+      case WorkflowNonFatal(t) =>
+        log.warn(s"onUnconsumedSignals listener failed for workflow instance $instanceId; the workflow outcome is unaffected", t)
+    }
 
   /** Register and schedule the instance's first wakeup (due immediately). */
-  final def createAndSchedule[In, Out](
+  final def createAndScheduleForAsyncRun[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       in: In
@@ -424,6 +355,12 @@ trait WorkflowRuntime {
       scope: ScopePath = ScopePath.empty
   ): Long
 
+  /** The active children of `parentId`: instances whose parent relationship
+    * still points at `parentId` (not yet cleared by a parent terminal
+    * transition).
+    */
+  def getChildWorkflowInstances(parentId: WorkflowInstanceId): Vector[WorkflowInstance.Info]
+
   /** Passive waiter for an instance's terminal outcome: polls the stored
     * terminal projection until a terminal state is reached or `timeout`
     * elapses, then throws [[java.util.concurrent.TimeoutException]]. Never
@@ -431,7 +368,7 @@ trait WorkflowRuntime {
     * terminal instance.
     */
   @throws[java.util.concurrent.TimeoutException]
-  def awaitResult[Out](
+  def blockUntilCompleted[Out](
       instance: WorkflowInstance[?, Out],
       timeout: FiniteDuration
   )(using Cacheable[Throwable]): WorkflowRunResult[Out]

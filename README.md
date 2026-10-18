@@ -96,15 +96,15 @@ import scala.concurrent.duration.*
 
 val runner = WorkflowRuntime.startJobRunner(Seq(normalizeAddress, approveOrder))
 try {
-  val order = approveOrder.createAndSchedule("order-456", "456")
+  val order = approveOrder.createAndScheduleForAsyncRun("order-456", "456")
   order.sendSignal(approval, "manager")
-  val result = order.awaitResult(30.seconds)
+  val result = order.blockUntilCompleted(30.seconds)
 } finally runner.stop(5.seconds)
 ```
 
 The runner executes registered workflow definitions, fires due timers, finds
 signal and completion events, and recovers expired execution leases. Manual
-`run` calls can also resolve waits without a runner. `awaitResult` only polls
+`run` calls can also resolve waits without a runner. `blockUntilCompleted` only polls
 for completion; it does not execute the workflow.
 
 ## Other operations
