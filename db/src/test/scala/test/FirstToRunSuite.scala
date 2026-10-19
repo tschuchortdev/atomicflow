@@ -82,7 +82,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("42"))
     val Some((kind, state, payload)) = winnerRow(wf.id, "k"): @unchecked
-    assertEquals(kind, "FirstToRunWithoutSuspension")
+    assertEquals(kind, "FirstToRun")
     assertEquals(state, "Succeeded")
     assertEquals(payload, "42", "the winner row persists only the winning branch's result")
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
@@ -208,7 +208,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 1, "an unchanged input replays the cached winner without re-running")
     holder.set(2)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assertEquals(counter.get(), 2, "a changed invalidateOn input re-runs the construct from scratch")
+    assertEquals(counter.get(), 2, "a changed invalidateOn input re-runs the first-to-run from scratch")
   }
 
   test("firstToRunWithoutSuspension with zero branches throws IllegalArgumentException") {
@@ -244,7 +244,7 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("invalid-invalid-invalid"))
   }
 
-  test("sibling constructs in parallel branches sharing a scope keep each other's branch subscriptions (no over-deletion)") {
+  test("sibling first-to-run races in parallel branches sharing a scope keep each other's branch subscriptions (no over-deletion)") {
     val rt = newRuntime
     val sA = Signal[String]("sA")
     val sB = Signal[String]("sB")
@@ -264,19 +264,19 @@ val empty = attempt("" -> { () => 1 })
       results.mkString(",")
     }
     val id = rt.createWorkflowInstance(wf, "k", "in").id
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "both constructs suspend on the first run")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "both races suspend on the first run")
     assertEquals(
       signalSubscriptions(wf.id, "k").map(_._1).distinct.size,
       4,
-      "each of the two constructs' branches registers a distinct (construct-qualified) subscription path"
+      "each of the two races' branches registers a distinct (race-qualified) subscription path"
     )
     sA.send(id, "x")(using rt)
-    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "construct A completes, construct B stays suspended")
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended, "race A completes, race B stays suspended")
     sD.send(id, "y")(using rt)
     assertEquals(
       rt.runWorkflowInstance(wf, id),
       WorkflowRunResult.Result("1,20"),
-      "construct B's branch (b1) is still woken by its signal even after construct A's loser cleanup ran"
+      "race B's branch (b1) is still woken by its signal even after race A's loser cleanup ran"
     )
   }
 
@@ -323,7 +323,7 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(
       signalSubscriptions(wf.id, "k"),
       Vector((Vector("race/loser", "inner"), "deep"), (Vector("race/winner"), "winner")),
-      "the nested await registers under race/loser/inner while the construct is suspended"
+      "the nested await registers under race/loser/inner while the race is suspended"
     )
     sWinner.send(id, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))

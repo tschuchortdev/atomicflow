@@ -356,8 +356,9 @@ workflow_event_dispatch   -- single-row watermark for async wakeup materializati
 child_close_requests      -- asynchronous parent-close delivery
 ```
 
-Design notes: one `workflow_steps` table for **all** durable constructs
-(`step_kind` selects interpretation); `input_fingerprints` is comparison data,
+Design notes: one `workflow_steps` table for **all** durable step kinds
+(`step_kind` records which step kind wrote the row and selects interpretation);
+`input_fingerprints` is comparison data,
 not part of the key; the event log uses a `SEQUENCE ... CACHE 1` plus a global
 advisory lock; every execution-state write is fenced.
 

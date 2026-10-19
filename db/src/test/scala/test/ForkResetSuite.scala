@@ -368,4 +368,46 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     }
     assertEquals(stepIds(wf.id, "k"), Set("A", "B", "C"), "the failed reset left the terminal source untouched")
   }
+
+  test("fork excludes a step suspended on its retry timer; the fork re-executes it from scratch") {
+    val rt = newRuntime
+    val attempts = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "frk-retry-pending") { in =>
+      Step.atLeastOnce[String]("flaky") { attempts.incrementAndGet().toString }
+      Step.atLeastOnce[String]("gate") { TestControlFlow.suspend(); "never" }
+      "unreachable"
+    }
+    val sourceId = rt.createWorkflowInstance(wf, "k", "a").id
+    assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(attempts.get(), 1)
+
+    // Rewrite "flaky" as suspended on a durable retry, stored strictly before
+    // "gate" so a fork from "gate" would copy it.
+    setUpdatedAt(wf.id, "k", "flaky", t1)
+    setUpdatedAt(wf.id, "k", "gate", t2)
+    run(
+      sql"""UPDATE workflow_steps SET state_kind = 'RetryPending', state_payload = '1:0:-1', retry_deadline = $t3
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'flaky'""".update.run
+    )
+
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("gate"))(using wf)
+    assertEquals(
+      stepIds(wf.id, "fork"),
+      Set.empty,
+      "the retry-suspended step's row is not copied: its retry timer subscription does not travel with the fork"
+    )
+
+    // The fork re-executes the step from scratch instead of suspending on a
+    // deadline nothing would ever wake it for.
+    assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(attempts.get(), 2, "the fork re-executed the retry-suspended step")
+    assertEquals(
+      run(
+        sql"""SELECT state_kind FROM workflow_steps
+              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'fork' AND workflow_instance_scope = '{}' AND step_id = 'flaky'""".query[String].option
+      ),
+      Some("Succeeded"),
+      "the re-executed step completed in the fork"
+    )
+  }
 }

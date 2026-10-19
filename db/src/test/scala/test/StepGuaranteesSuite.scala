@@ -185,7 +185,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.Started)
   }
 
-  test("atMostOnce rows use step_version 0 and step_kind AtMostOnce") {
+  test("atMostOnce rows use step_version 0 and step_kind Step") {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "mo-kind") { in =>
       Step.atMostOnce[String]("step") {
@@ -202,7 +202,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
           (String, Long, String)
         ].option
     )
-    assertEquals(row, Some(("AtMostOnce", 0L, "Succeeded")))
+    assertEquals(row, Some(("Step", 0L, "Succeeded")))
   }
 
   test("atMostOnce: no named inputs — instance id is the sole cache key") {
@@ -224,5 +224,33 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.createAndRun(wf, "k2", "a")
     assertEquals(counter.get(), 2, "a different instance re-executes")
+  }
+
+  test("a step key stored for a different step kind fails the run with StepKeyConflictException") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "key-conflict") { in =>
+      Step.atLeastOnce[String]("shared") { "value" }
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    // Craft a foreign row at the step's key: an await result whose cache has
+    // already expired, so the step's replay path would discard and re-execute.
+    run(
+      sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at)
+            VALUES (${wf.id}, 'k', '{}', 'shared', 1, 'Await', 'Succeeded', 'go', '', '2020-01-01T00:00:00Z')""".update.run
+    )
+
+    // The run engine replays body-level failures through the throwable codec,
+    // so the conflict surfaces as a StepFailed carrying the conflict message.
+    val failure = intercept[StepFailed](rt.runWorkflowInstance(wf, id))
+    assert(failure.getMessage.contains("StepKeyConflictException"))
+    assertEquals(
+      run(
+        sql"""SELECT step_kind FROM workflow_steps
+              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'shared'""".query[String].option
+      ),
+      Some("Await"),
+      "the foreign row is preserved, not deleted by the invalidation path"
+    )
   }
 }

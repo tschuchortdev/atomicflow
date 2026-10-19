@@ -458,7 +458,7 @@ another retention boundary removes it.
 
 ## Invalidation and await stability
 
-When an upstream step is invalidated (TTL expired, `invalidateOn` dependency changed), downstream constructs are invalidated **only if they explicitly list the changed value in their `invalidateOn` cache-key**. No automatic cascade.
+When an upstream step is invalidated (TTL expired, `invalidateOn` dependency changed), downstream steps are invalidated **only if they explicitly list the changed value in their `invalidateOn` cache-key**. No automatic cascade.
 
 **Awaits inherit this rule:** an await can declare `invalidateOn` dependencies just as steps do:
 
@@ -556,9 +556,11 @@ workflow_event_dispatch (id, dispatched_through)
   `inheritedEventsStartSequenceId`: events appended after the relationship
   commits have a greater `sequenceId`.
 - `workflow_steps` is the shared durable record for user Steps, awaits,
-  `firstToRunWithoutSuspension`, and restartable regions. `stepKind` and
-  `stateKind` select the runtime interpretation of the always-present
-  `statePayload`; see `steps.md` and `restartable-regions-loops.md`.
+  `firstToRunWithoutSuspension`, and restartable regions. `stepKind` records
+  which step kind wrote the row (a step key belongs to exactly one
+  step kind) and `stateKind` selects the runtime interpretation of the
+  always-present `statePayload`; see `steps.md` and
+  `restartable-regions-loops.md`.
 - Awaits and `firstToRunWithoutSuspension` persist only their public returned
   value. Await event selection and the winning branch are transaction-local:
   they are used to advance signal cursors and clean up subscriptions, then are
@@ -569,7 +571,7 @@ workflow_event_dispatch (id, dispatched_through)
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded
   by the partial unique index on `(workflowInstanceId, eventKey) WHERE
   eventKind = 'TimerFired'`. The subscription row survives firing and is
-  deleted only when its await resolves. A first-to-run construct additionally
+  deleted only when its await resolves. A first-to-run race additionally
   retires every branch's subscriptions — including nested subscopes, via
   `deleteSubscriptionsUnderScopePaths` — BEFORE the winner's step row is
   written, so a committed winner row never coexists with branch subscriptions.
