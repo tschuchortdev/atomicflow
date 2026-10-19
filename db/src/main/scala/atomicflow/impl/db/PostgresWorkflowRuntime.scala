@@ -182,12 +182,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
     deleted > 0
   }
 
-  /** Reads the boundary timestamp of `stepId` on the instance: the last-updated
-    * timestamp of the step row with the highest version (used to decide which
-    * cached history is "before" vs. "after" the selected step). `None` means the
-    * step has no cached row (unknown or never executed).
+  /** The updated_at timestamp of the row with the highest step_version stored
+    * for one step id, or `None` when the step has no stored row. The timestamp
+    * marks the last durable write to the step's most recent row.
     */
-  private def readRestartBoundaryQ(
+  private def getStepLastUpdatedAtTime(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
@@ -214,15 +213,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
       for {
         sourceInput <- sql"""SELECT input FROM workflow_instances
                              WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
-                             FOR UPDATE""".query[
-            String
-          ].option
+                             FOR UPDATE""".query[String].option
         _ <- sourceInput match {
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
           case _ => ().pure[ConnectionIO]
         }
-        boundary <- readRestartBoundaryQ(sourceWf, sourceKey, sourceScope, restartFromStep)
+        boundary <- getStepLastUpdatedAtTime(sourceWf, sourceKey, sourceScope, restartFromStep)
         _ <- boundary match {
           case None =>
             throw new InvalidRestartStepException(
@@ -238,19 +235,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
             s"Workflow instance already exists under the fork key: $newId"
           )
         else ().pure[ConnectionIO]
-        // Copied rows keep their persisted state, except an unresolved retry
-        // (`RetryPending`): its timer subscription is not copied, so rewriting
-        // the row to a plain `Started` makes the fork re-execute the step body
-        // instead of suspending on a deadline nothing would ever wake it for.
+        // Copied rows keep their persisted state. Rows carrying a retry
+        // deadline are excluded: they are suspended on their site's retry
+        // timer, and timer subscriptions do not travel with the copy, so the
+        // destination would otherwise suspend on a deadline nothing would ever
+        // wake it for. The destination simply re-executes such steps from
+        // scratch.
         _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
                    SELECT $newWorkflowId, $newInstanceKey, '{}', step_id, step_scope_within_instance, step_version, step_kind,
-                     CASE WHEN state_kind = 'RetryPending' THEN 'Started' ELSE state_kind END,
-                     CASE WHEN state_kind = 'RetryPending' THEN '' ELSE state_payload END,
-                     CASE WHEN state_kind = 'RetryPending' THEN NULL ELSE retry_deadline END,
-                     input_fingerprints, expires_at, created_at, updated_at
+                     state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at
                    FROM workflow_steps
                    WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
-                     AND updated_at < $boundary""".update.run
+                     AND updated_at < $boundary
+                     AND retry_deadline IS NULL""".update.run
         _ <- upsertWakeupQ(newId.workflowId, newInstanceKey, ScopePath.empty, clock.instant())
       } yield ()
     }
@@ -278,7 +275,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
             throw new IllegalStateException(s"Cannot reset a terminal workflow instance: $sourceInstanceId")
           case Some((None, _)) => ().pure[ConnectionIO]
         }
-        boundary <- readRestartBoundaryQ(wf, key, scope, restartFromStep)
+        boundary <- getStepLastUpdatedAtTime(wf, key, scope, restartFromStep)
         _ <- boundary match {
           case None =>
             throw new InvalidRestartStepException(
@@ -291,9 +288,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
                key,
                scope,
                fr"""EXISTS (SELECT 1 FROM workflow_steps st
-                           WHERE st.workflow_id = $wf AND st.workflow_instance_key = $key AND st.workflow_instance_scope = $scope
-                             AND st.updated_at >= $boundary
-                             AND st.step_id = s.step_id AND st.step_scope_within_instance = s.step_scope_within_instance AND st.step_version = s.step_version)"""
+                            WHERE st.workflow_id = $wf AND st.workflow_instance_key = $key AND st.workflow_instance_scope = $scope
+                              AND st.updated_at >= $boundary
+                              AND st.step_id = s.step_id AND st.step_scope_within_instance = s.step_scope_within_instance AND st.step_version = s.step_version)"""
              )
         _ <- sql"""DELETE FROM workflow_steps
                    WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -1847,7 +1844,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
-  ): Option[StoredStep] =
+  ): Option[StepRow] =
     readStepRow(
       instanceId.workflowId,
       instanceId.workflowInstanceKey,
@@ -1864,16 +1861,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepId: String,
       stepScopePath: ScopePath,
       stepVersion: Long
-  ): Option[StoredStep] =
+  ): Option[StepRow] =
     runTransaction {
-      sql"""SELECT state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
+      sql"""SELECT step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
             WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
               AND step_id = $stepId AND step_scope_within_instance = $stepScopePath AND step_version = $stepVersion""".query[
-          (String, String, Option[java.time.Instant], String, Option[java.time.Instant])
+          (String, String, String, Option[java.time.Instant], String, Option[java.time.Instant])
         ].option
-    }.map { case (kind, payload, retryDeadline, fingerprints, expiresAt) =>
-      StoredStep(
-        StoredStep.State.fromString(kind, SerializedValue.of(payload), retryDeadline),
+    }.map { case (rowKind, stateKind, payload, retryDeadline, fingerprints, expiresAt) =>
+      StepRow(
+        StepState.fromPersisted(rowKind, stateKind, payload, retryDeadline),
         InputFingerprints.of(fingerprints),
         expiresAt
       )
@@ -1994,16 +1991,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def writeStep(
       stepId: StepId,
       stepVersion: Long,
-      stepKind: StepKind,
-      step: StoredStep
+      row: StepRow
   )(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease) {
       for {
-        _ <- upsertStepStateQ(lease, stepId, stepVersion, stepKind, step)
-        _ <- step.state match {
-          case StoredStep.State.RetryPending(_, deadline) =>
+        _ <- upsertStepStateQ(lease, stepId, stepVersion, row)
+        _ <- row.state.pendingRetryDeadline match {
+          case Some(deadline) =>
             insertRetrySubscriptionQ(lease, stepId, stepVersion, deadline)
-          case _ =>
+          case None =>
             deleteTimerSubscriptionsQ(lease, stepId, stepVersion)
         }
       } yield ()
@@ -2051,9 +2047,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      lease,
                      site.stepId,
                      site.stepVersion,
-                     site.stepKind,
-                     StoredStep(
-                       StoredStep.State.Succeeded(r.payload),
+                     StepRow(
+                       StepState.Await(r.payload),
                        site.inputFingerprints,
                        site.expiresAt
                      )
@@ -2080,44 +2075,26 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def deleteSubscriptionsUnderScopePaths(scopePaths: Seq[ScopePath])(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease)(deleteSubscriptionsUnderScopePathsQ(lease, scopePaths))
 
-  override def readRegionState(
-      regionId: String,
-      parentScopePath: ScopePath
-  )(using lease: Lease): Option[RegionState] =
-    runTransaction {
-      sql"""SELECT state_payload FROM workflow_steps
-            WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-              AND step_id = $regionId AND step_scope_within_instance = $parentScopePath
-              AND step_kind = 'RestartableRegion'""".query[String].option.map(_.map(decodeRegionState))
+  override def deleteStepsUnderScopePaths(scopePaths: Seq[ScopePath])(using lease: Lease): Unit =
+    runLeaseCheckedTransaction(lease) {
+      scopePaths.traverse_ { path =>
+        require(path.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every row")
+        sql"""DELETE FROM workflow_steps
+              WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
+                AND step_scope_within_instance[1:${path.segments.length}] = $path""".update.run.map(_ => ())
+      }
     }
 
-  override def upsertRegion(
-      regionId: String,
-      parentScopePath: ScopePath,
-      state: RegionState
-  )(using lease: Lease): Unit =
+  override def requestChildCloseUnderScopePath(scopePathPrefix: ScopePath)(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease) {
-      val restartCount = state.restartCount
-      val base = regionIterationScope(regionId, parentScopePath, restartCount - 1)
-      val now = clock.instant()
-      for {
-        _ <- deleteRegionNestedStepsQ(lease, base)
-        _ <- deleteRegionNestedSubscriptionsQ(lease, base)
-        // Only a restart discards a prior interior; the first creation
-        // (restartCount 0) closes nothing and records no closure.
-        _ <- if (restartCount > 0)
-          insertChildCloseRequestQ(
-            lease.workflowId,
-            lease.instanceKey,
-            lease.instanceScope,
-            lease.instanceScope.segments ++ Vector(lease.workflowId, s"${lease.instanceKey}@${lease.generation}") ++ base.segments
-          )
-        else ().pure[ConnectionIO]
-        _ <- sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at, created_at, updated_at)
-              VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, $regionId, $parentScopePath, 0, 'RestartableRegion', 'Started', ${encodeRegionState(restartCount, state.serializedState.raw)}, '', NULL, $now, $now)
-              ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance)
-              DO UPDATE SET state_payload = EXCLUDED.state_payload, updated_at = EXCLUDED.updated_at""".update.run
-      } yield ()
+      require(scopePathPrefix.segments.nonEmpty, "a step scope path must never be empty; an empty prefix would match every child")
+      // Child instances store their creation scope as the parent's instance
+      // scope, the parent's workflow id and `key@generation` marker, and then
+      // the parent's step scope path; translate the prefix accordingly.
+      val target = lease.instanceScope.segments ++
+        Vector(lease.workflowId, s"${lease.instanceKey}@${lease.generation}") ++
+        scopePathPrefix.segments
+      insertChildCloseRequestQ(lease.workflowId, lease.instanceKey, lease.instanceScope, target)
     }
 
   override def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean = {
@@ -2180,29 +2157,35 @@ class PostgresWorkflowRuntime private[atomicflow] (
       lease: Lease,
       stepId: StepId,
       stepVersion: Long,
-      stepKind: StepKind,
-      step: StoredStep
+      row: StepRow
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
-    val stepKindName = stepKind.persistedName
-    val fingerprintText = step.inputFingerprints.raw
-    val (kind, payloadText, retryDeadline): (String, String, Option[java.time.Instant]) =
-      step.state match {
-        case StoredStep.State.Started =>
-          ("Started", "", None)
-        case StoredStep.State.RetryPending(bookkeeping, deadline) =>
-          ("RetryPending", bookkeeping.raw, Some(deadline))
-        case StoredStep.State.Succeeded(payload) =>
-          ("Succeeded", payload.raw, None)
-        case StoredStep.State.Failed(payload) =>
-          ("Failed", payload.raw, None)
+    val fingerprintText = row.inputFingerprints.raw
+    val rowKind = row.state.rowKindText
+    val (stateKind, payloadText, retryDeadline) = row.state.persistedColumns
+    val site =
+      fr"workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}" ++
+        fr" AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion"
+    for {
+      // A step key belongs to exactly one step kind. The stored row's kind must
+      // match the written row's kind; a mismatch is a definition error, not an
+      // overwrite. The lease fencing serializes runs of one instance, so the
+      // check and the write cannot race.
+      existingKind <- (sql"SELECT step_kind FROM workflow_steps WHERE " ++ site).query[String].option
+      _ <- existingKind match {
+        case None =>
+          sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
+                VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $rowKind, $stateKind, $payloadText, $retryDeadline, $fingerprintText, ${row.expiresAt}, $now, $now)""".update.run
+        case Some(`rowKind`) =>
+          (sql"""UPDATE workflow_steps
+                 SET state_kind = $stateKind, state_payload = $payloadText, retry_deadline = $retryDeadline, input_fingerprints = $fingerprintText, expires_at = ${row.expiresAt}, updated_at = $now
+                 WHERE """ ++ site).update.run
+        case Some(storedKind) =>
+          throw new StepKeyConflictException(
+            s"Step key '${stepId.key}' at version $stepVersion is already stored as a '$storedKind' row and cannot be rewritten as a '$rowKind' row; a step key belongs to exactly one step kind"
+          )
       }
-    sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
-          VALUES (${lease.workflowId}, ${lease.instanceKey}, ${lease.instanceScope}, ${stepId.key}, ${stepId.scope}, $stepVersion, $stepKindName, $kind, $payloadText, $retryDeadline, $fingerprintText, ${step.expiresAt}, $now, $now)
-          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_scope_within_instance) DO UPDATE
-          SET state_kind = $kind, state_payload = EXCLUDED.state_payload, retry_deadline = EXCLUDED.retry_deadline, input_fingerprints = EXCLUDED.input_fingerprints, expires_at = EXCLUDED.expires_at, updated_at = $now""".update.run.map(
-      _ => ()
-    )
+    } yield ()
   }
 
   private def insertRetrySubscriptionQ(
@@ -2221,7 +2204,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, step_scope_within_instance) DO NOTHING""".update.run
     } yield ()
 
-  private def fireDueTimerSubscriptionsQ(lease: Lease, stepId: StepId, stepVersion: Long): ConnectionIO[Unit] = {
+  private def fireDueTimerSubscriptionsQ(
+      lease: Lease,
+      stepId: StepId,
+      stepVersion: Long
+  ): ConnectionIO[Unit] = {
     val now = clock.instant()
     for {
       due <- sql"""SELECT timer_id FROM workflow_timer_subscriptions
@@ -2384,53 +2371,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
           WHERE e.sequence_id > $cursor
             AND (a.past OR a.start_seq IS NULL OR e.sequence_id > a.start_seq)
           ORDER BY e.sequence_id""").query[(Long, String, java.time.Instant)].to[Vector]
-
-  /** The step-scope subtree prefix of a region's interior at a given
-    * `restartCount`: the parent scope path followed by the raw `regionId@count`
-    * segment. Nested Step/Await rows and children of the iteration live under this
-    * prefix; the region's own row lives at the parent scope path (one level up).
-    */
-  private def regionIterationScope(regionId: String, parentScopePath: ScopePath, restartCount: Long): ScopePath =
-    parentScopePath.appended(s"$regionId@$restartCount")
-
-  /** The wrapped payload of a region row: its committed `restartCount` and the
-    * encoded user state, stored in the step row's `state_payload`.
-    */
-  private case class RegionPayload(count: Long, state: String) derives upickle.default.ReadWriter
-
-  private def encodeRegionState(restartCount: Long, serializedState: String): String =
-    upickle.default.write(RegionPayload(restartCount, serializedState))
-
-  private def decodeRegionState(payload: String): RegionState = {
-    val storedState = upickle.default.read[RegionPayload](payload)
-    RegionState(storedState.count, SerializedValue.of(storedState.state))
-  }
-
-  /** Deletes the nested Step rows under the region's interior subtree: rows whose
-    * `step_scope_within_instance` is `base` or lies beneath it. `base` is the
-    * region interior base (always non-empty), so the array-prefix equality is a
-    * valid slice predicate. Pending child-close requests live in the dedicated
-    * `child_close_requests` table, never in `workflow_steps`, so they are never
-    * caught by this delete.
-    */
-  private def deleteRegionNestedStepsQ(lease: Lease, base: ScopePath): ConnectionIO[Unit] =
-    sql"""DELETE FROM workflow_steps
-          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope}
-            AND step_scope_within_instance[1:${base.segments.length}] = $base""".update.run.map(_ => ())
-
-  /** Deletes the nested subscription rows under the region's interior subtree:
-    * rows whose `step_scope_within_instance` is `base` or lies beneath it, in
-    * the signal, timer, and completion subscription tables. `base` is the region
-    * interior base (always non-empty), so the array-prefix equality is a valid
-    * slice predicate.
-    */
-  private def deleteRegionNestedSubscriptionsQ(lease: Lease, base: ScopePath): ConnectionIO[Unit] =
-    deleteAllSubscriptionsQ(
-      lease.workflowId,
-      lease.instanceKey,
-      lease.instanceScope,
-      fr"step_scope_within_instance[1:${base.segments.length}] = $base"
-    )
 
   /** The per-run execution handle of this runtime: the fencing identity of one
     * run (worker, fencing token, generation) plus the instance identity and the

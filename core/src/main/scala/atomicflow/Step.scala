@@ -7,6 +7,7 @@ import java.nio.charset.StandardCharsets
 import scala.annotation.experimental
 import scala.annotation.targetName
 import scala.concurrent.duration.*
+import scala.reflect.TypeTest
 
 /** Durable operations with stored results and named-input cache policies.
   */
@@ -153,7 +154,7 @@ object Step {
       invalidateAfter: Duration = Duration.Inf,
       retry: Step.RetryPolicy = Step.RetryPolicy.never
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    runStep(StepKind.AtLeastOnce, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
+    runStep(false, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
   /** An at-most-once step: the body executes, its result is persisted after
     * completion, and on replay an unresolved `Started` record yields `None`
@@ -179,7 +180,7 @@ object Step {
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runStep(StepKind.AtMostOnce, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
+    runStep(true, key, 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** The cancellation checkpoint for new work (a Step body about to execute, or
     * an await about to be evaluated): unless the `Workflow.uncancellable` depth
@@ -206,7 +207,7 @@ object Step {
     * resumes once that deadline is due.
     */
   private def runStep[A: Cacheable as valueCodec](
-      kind: StepKind,
+      atMostOnce: Boolean,
       stepKey: String,
       stepVersion: Long,
       ensureUnchanged: Seq[StepInput[?]],
@@ -270,9 +271,8 @@ object Step {
         internals.writeStep(
           stepId,
           stepVersion,
-          kind,
-          StoredStep(
-            StoredStep.State.Started,
+          StepRow(
+            StepState.SimpleStep.Started,
             InputFingerprints.of(fingerprints),
             None
           )
@@ -283,9 +283,9 @@ object Step {
         try {
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(body)
           internals.writeStep(
-            stepId, stepVersion, kind,
-            StoredStep(
-              StoredStep.State.Succeeded(SerializedValue.of(serialized)),
+            stepId, stepVersion,
+            StepRow(
+              StepState.SimpleStep.Succeeded(SerializedValue.of(serialized)),
               InputFingerprints.of(fingerprints),
               expiresAt
             )
@@ -303,9 +303,9 @@ object Step {
               case None =>
                 val (payload, toThrow) = serializeFailure(t)
                 internals.writeStep(
-                  stepId, stepVersion, kind,
-                  StoredStep(
-                    StoredStep.State.Failed(SerializedValue.of(payload)),
+                  stepId, stepVersion,
+                  StepRow(
+                    StepState.SimpleStep.Failed(SerializedValue.of(payload)),
                     InputFingerprints.of(fingerprints),
                     expiresAt
                   )
@@ -320,9 +320,8 @@ object Step {
                   internals.writeStep(
                     stepId,
                     stepVersion,
-                    kind,
-                    StoredStep(
-                      StoredStep.State.RetryPending(SerializedValue.of(RetryState.encode(bookkeeping)), deadline),
+                    StepRow(
+                      StepState.SimpleStep.RetryPending(SerializedValue.of(RetryState.encode(bookkeeping)), deadline),
                       InputFingerprints.of(fingerprints),
                       expiresAt
                     )
@@ -336,6 +335,8 @@ object Step {
     }
 
     val rawExisting = internals.readStep(ctx.instanceId, stepId, stepVersion)
+    // Reject a row of a different step kind before invalidation logic could delete it.
+    rawExisting.foreach(expectStepState[StepState.SimpleStep](stepKey, _))
     val replayable =
       rawExisting.filterNot(row =>
         isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)
@@ -346,16 +347,16 @@ object Step {
       case None => Some(runBody(None))
 
       case Some(row) =>
-        row.state match {
-          case StoredStep.State.Succeeded(payload) =>
+        expectStepState[StepState.SimpleStep](stepKey, row) match {
+          case StepState.SimpleStep.Succeeded(payload) =>
             Some(decodeStored(valueCodec, stepKey)(payload.raw))
-          case StoredStep.State.Failed(payload) =>
+          case StepState.SimpleStep.Failed(payload) =>
             throw decodeStoredFailure(throwableCodec, stepKey)(payload.raw)
-          case StoredStep.State.Started if kind == StepKind.AtMostOnce =>
+          case StepState.SimpleStep.Started if atMostOnce =>
             None
-          case StoredStep.State.Started =>
+          case StepState.SimpleStep.Started =>
             Some(runBody(None))
-          case StoredStep.State.RetryPending(bookkeeping, deadline) =>
+          case StepState.SimpleStep.RetryPending(bookkeeping, deadline) =>
             // A fresh instant, not the `now` read at the top of runStep: the
             // wakeup that resumed this run is produced against the sweeper's
             // clock, which can be ahead of this JVM's, and a stale comparison
@@ -374,7 +375,7 @@ object Step {
     *   the step's stable identity within the workflow
     * @param stepVersion
     *   the exact step version to inspect (`0` is the internal version for
-    *   unversioned constructs)
+    *   unversioned step kinds)
     */
   def getExecutionState[A: Cacheable](key: String, stepVersion: Long = 0)(using
       ctx: WorkflowContext,
@@ -385,12 +386,12 @@ object Step {
     ctx.internals.readStep(ctx.instanceId, stepId, stepVersion) match {
       case None => StepExecutionState.NeverStarted
       case Some(row) =>
-        row.state match {
-          case StoredStep.State.Succeeded(payload) =>
+        expectStepState[StepState.SimpleStep](key, row) match {
+          case StepState.SimpleStep.Succeeded(payload) =>
             StepExecutionState.Completed(decodeStored(valueCodec, key)(payload.raw))
-          case StoredStep.State.Failed(payload) =>
+          case StepState.SimpleStep.Failed(payload) =>
             StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(payload.raw))
-          case StoredStep.State.Started | StoredStep.State.RetryPending(_, _) =>
+          case StepState.SimpleStep.Started | StepState.SimpleStep.RetryPending(_, _) =>
             StepExecutionState.Started
         }
     }
@@ -536,7 +537,7 @@ object Step {
     * when the earliest stored event must win.
     *
     * @param stepId
-    *   the construct's stable identity within the workflow
+    *   the step's stable identity within the workflow
     * @param invalidateOn
     *   named inputs that invalidate the cached result when they change
     * @param ensureUnchanged
@@ -547,7 +548,7 @@ object Step {
     *   subscribers); the first branch to complete normally wins. Each branch
     *   body is wrapped in a `() => WorkflowContext ?=> R` lambda
     *   (`"key" -> { () => ... }`) so it stays lazy: constructing the lambda has
-    *   no side effects and the body runs only when the construct applies it with
+    *   no side effects and the body runs only when the race applies it with
     *   the branch's own context. A bare `("key", { ... })` context function
     *   would be typed eagerly and evaluated at the call site.
     */
@@ -604,9 +605,9 @@ object Step {
         // run re-evaluates from scratch and re-deletes.
         internals.deleteSubscriptionsUnderScopePaths(branchPaths)
         internals.writeStep(
-          scopedStepId, 0L, StepKind.FirstToRun,
-          StoredStep(
-            StoredStep.State.Succeeded(SerializedValue.of(serialized)),
+          scopedStepId, 0L,
+          StepRow(
+            StepState.FirstToRun(SerializedValue.of(serialized)),
             InputFingerprints.of(fingerprints),
             None
           )
@@ -616,6 +617,8 @@ object Step {
     }
 
     val rawExisting = internals.readStep(ctx.instanceId, scopedStepId, 0L)
+    // Reject a row of a different step kind before invalidation logic could delete it.
+    rawExisting.foreach(expectStepState[StepState.FirstToRun](stepId, _))
     val replayable =
       rawExisting.filterNot(row =>
         isExpired(row, now) || haveInputsChanged(stepId, row, ensureUnchanged, invalidateOn)
@@ -624,22 +627,22 @@ object Step {
 
     replayable match {
       case Some(row) =>
-        row.state match {
-          case StoredStep.State.Succeeded(payload) => decodeStored(valueCodec, stepId)(payload.raw)
-          case _                                   => evaluate()
+        expectStepState[StepState.FirstToRun](stepId, row) match {
+          case StepState.FirstToRun(result) => decodeStored(valueCodec, stepId)(result.raw)
         }
       case None => evaluate()
     }
   }
 
-  /** The shared cached-await replay for every await kind: a stored
-    * non-expired `succeeded` row replays via `decode`, an `ensureUnchanged`
-    * fingerprint conflict throws, and an existing row that has drifted
-    * (`invalidateOn` fingerprint change) or expired (its TTL elapsed) triggers
-    * the site's single `onDiscard` policy. `onDiscard` discards the site
-    * (`deleteStep`) and then evaluates it afresh; an unresolved
-    * (`started`) site also just evaluates. The stored-failure
-    * `StepSerializationFailed` message uses the `"Await"` prefix.
+  /** The shared cached-await replay for every await kind: a stored non-expired
+    * result row replays via `decode`, an `ensureUnchanged` fingerprint conflict
+    * throws, and an existing row that has drifted (`invalidateOn` fingerprint
+    * change) or expired (its TTL elapsed) triggers the site's single `onDiscard`
+    * policy. `onDiscard` discards the site (`deleteStep`) and then evaluates it
+    * afresh. A suspended await persists no row at all — its subscriptions carry
+    * the waiting — so an absent row evaluates afresh, and a row stored for a
+    * different step kind at the same key fails the run with
+    * [[StepKeyConflictException]] instead of being discarded.
     */
   private def replayCachedAwait[A](
       stepKey: String,
@@ -655,6 +658,8 @@ object Step {
     val stepId = StepId(stepKey, ctx.currentScope)
     val now = internals.clock.instant()
     val rawExisting = internals.readStep(ctx.instanceId, stepId, 0L)
+    // Reject a row of a different step kind before the discard policy could delete it.
+    rawExisting.foreach(expectStepState[StepState.Await](stepKey, _))
     val existing = rawExisting.filterNot(isExpired(_, now))
 
     existing match {
@@ -664,11 +669,8 @@ object Step {
       case Some(row) =>
         if (haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn)) onDiscard()
         else
-          row.state match {
-            case StoredStep.State.Succeeded(payload) => decode(payload.raw)
-            case StoredStep.State.Failed(_) =>
-              throw new StepSerializationFailed(s"Await '$stepKey' stored a failure without a failed await")
-            case StoredStep.State.Started | StoredStep.State.RetryPending(_, _) => evaluate()
+          expectStepState[StepState.Await](stepKey, row) match {
+            case StepState.Await(payload) => decode(payload.raw)
           }
     }
   }
@@ -711,7 +713,7 @@ object Step {
 
     def evaluate(): A = {
       throwIfCancelled
-      val site = WaitSite(stepId, 0L, StepKind.Await, InputFingerprints.of(fingerprints), expiresAt)
+      val site = WaitSite(stepId, 0L, InputFingerprints.of(fingerprints), expiresAt)
       internals.evaluateWait(site, subscribers.map(_._1))(pickRaceWinner(subscribers)) match {
         case Some(payload) => decode(payload.raw)
         case None          => throw new WorkflowSuspendedException
@@ -911,11 +913,11 @@ object Step {
   /** Enforces the `ensureUnchanged` pin (throwing [[StepInputConflictException]]
     * when a pinned input changed) and reports whether any `invalidateOn` input
     * differs from what the stored row recorded. Shared by steps, first-to-run
-    * constructs, and cached awaits.
+    * races, and cached awaits.
     */
   private def haveInputsChanged(
       key: String,
-      row: StoredStep,
+      row: StepRow,
       ensureUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]]
   ): Boolean = {
@@ -929,8 +931,22 @@ object Step {
     invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
   }
 
-  private def isExpired(row: StoredStep, now: java.time.Instant): Boolean =
+  private def isExpired(row: StepRow, now: java.time.Instant): Boolean =
     row.expiresAt.exists(!_.isAfter(now))
+  
+  /** A step key belongs to exactly one step kind: the row stored at a
+    * step's key must have been written by the step kind that reads it. Anything
+    * else means the key was reused for a different step kind (a definition
+    * change across workflow versions), which fails the run instead of reading,
+    * deleting, or overwriting the foreign row.
+    */
+  private def expectStepState[S <: StepState](stepKey: String, row: StepRow)(using TypeTest[StepState, S]): S = {
+    row.state match
+      case s: S => s
+      case _ => throw new StepKeyConflictException(
+        s"Step key '$stepKey' is already stored as a '${row.state.rowKindText}' row and cannot be reused for a different step kind; a step key belongs to exactly one step kind"
+      )
+  }
 
   private def expiryOf(invalidateAfter: Duration, now: java.time.Instant): Option[java.time.Instant] =
     invalidateAfter match {

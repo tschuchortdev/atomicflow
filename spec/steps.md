@@ -234,13 +234,26 @@ workflow_steps (
 )
 ```
 
-- The natural key is `(workflowInstanceId, stepId, stepVersion)`. Unversioned
-  constructs use internal `stepVersion = 0`; public at-least-once versions are
-  positive. Reusing an ID with an incompatible `stepKind` is a conflict.
-- `stepKind` distinguishes `AtLeastOnce`, `AtMostOnce`, `Await`,
-  `FirstToRunWithoutSuspension`, and `RestartableRegion`.
-- `stateKind` distinguishes `Started`, `RetryPending`, `Succeeded`, `Failed`.
-- `RestartableRegion` is permanently in state `Started` after the record was created.
+- The natural key is `(workflowInstanceId, stepId, stepVersion, stepScopeWithinInstance)`. Unversioned
+  step kinds use internal `stepVersion = 0`; public at-least-once versions are
+  positive. A step key belongs to exactly one step kind: declaring the same key
+  for two different step kinds — e.g. an await and a step — is a definition
+  error; the runtime fails the run with a `StepKeyConflictException` instead of
+  overwriting the stored row.
+- `stepKind` records which step kind wrote the row: `Step` (both
+  `atLeastOnce` and `atMostOnce` rows), `Await`, `FirstToRun` (a
+  `firstToRunWithoutSuspension` winner row), or `RestartableRegion` (a
+  `Workflow.restartable`/`Workflow.loop` region row).
+- `stateKind` is legal only for the step kinds that actually write it, and
+  a state kind that is not legal for its row's kind is a parse error:
+  - kind `Step`: `Started`, `RetryPending`, `Succeeded`, `Failed`
+  - kind `Await`: `Succeeded` only (a suspended await persists no row at all;
+    its subscriptions carry the waiting)
+  - kind `FirstToRun`: `Succeeded` only (the winner marker)
+  - kind `RestartableRegion`: `RestartableRegion` only
+- `RestartableRegion` state rows carry the region's committed `restartCount`
+  and its encoded user state; the runtime replaces them in place on each
+  generation boundary.
 - `retryDeadline` is non-null only for `RetryPending`: the clock instant at which
   the step body may run again. Core compares it against its clock to decide
   due-ness; the retry's timer subscription is kept only to wake the instance at
@@ -251,9 +264,11 @@ workflow_steps (
 - Awaits and `firstToRunWithoutSuspension` persist only their public returned
   value. Their selected event and winning branch are used while committing the
   result, cursor movement, and subscription cleanup but are not retained.
-- A restartable region updates its own row on each iteration and deletes
-  nested Step rows and subscriptions from the previous iteration. It never caches
-  the region's final return value.
+- A restartable region replaces its own row on each generation boundary
+  (`Workflow.restartable`/`Workflow.loop`), and discards the previous
+  generation's nested Step rows and subscriptions idempotently after the new
+  row is committed, closing that generation's children per their
+  `ParentClosePolicy`. It never caches the region's final return value.
 - `inputFingerprints` is comparison data, not part of the natural key. An
   `ensureUnchanged` difference finds the existing row and raises
   `StepInputConflictException`; an `invalidateOn` difference replaces the

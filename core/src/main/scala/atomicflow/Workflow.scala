@@ -306,14 +306,52 @@ object Workflow {
     val cacheable = summon[Cacheable[S]]
     val parentScopePath = ctx.scopePath
     val parentScope = ctx.currentScope
-    val row = internals.readRegionState(id, parentScope)
-    val startCount = row.map(_.restartCount).getOrElse(0L)
-    val firstState: S = row match {
-      case Some(regionState) => cacheable.read(regionState.serializedState.raw)
+    val regionId = StepId(id, parentScope)
+
+    /** Writes the region row: the restart count and the encoded state of the
+      * current generation. The row commit is the generation boundary — the
+      * previous generation's leftovers are discarded only after this write.
+      */
+    def writeRegionRow(count: Long, encodedState: SerializedValue): Unit =
+      internals.writeStep(
+        regionId, 0L,
+        StepRow(
+          StepState.Region(RegionState(count, encodedState)),
+          InputFingerprints.of(""),
+          None
+        )
+      )
+
+    /** Discards everything a finished region generation left behind: its nested
+      * step rows and subscriptions, and its child workflows (closed per their
+      * stored parent-close policy). Every effect is idempotent, so a crash
+      * between the region row write and this cleanup is repaired by re-running
+      * it on the next replay.
+      */
+    def discardGeneration(count: Long): Unit = {
+      val base = parentScopePath.appended(regionSegment(id, count))
+      internals.deleteStepsUnderScopePaths(Seq(base))
+      internals.deleteSubscriptionsUnderScopePaths(Seq(base))
+      internals.requestChildCloseUnderScopePath(base)
+    }
+
+    val stored = internals.readStep(ctx.instanceId, regionId, 0L)
+    val (startCount: Long, firstState: S) = stored match {
+      case Some(row) =>
+        row.state match {
+          case StepState.Region(RegionState(count, encodedState)) =>
+            (count, cacheable.read(encodedState.raw))
+          case other =>
+            // A step key belongs to exactly one step kind; a foreign row at the
+            // region's key means the key was reused for a different step kind.
+            throw new StepKeyConflictException(
+              s"Step key '$id' is already stored as a '${other.rowKindText}' row and cannot be redefined as a restartable region; a step key belongs to exactly one step kind"
+            )
+        }
       case None =>
         val seed = initialState
-        internals.upsertRegion(id, parentScope, RegionState(0L, SerializedValue.of(cacheable.write(seed))))
-        seed
+        writeRegionRow(0L, SerializedValue.of(cacheable.write(seed)))
+        (0L, seed)
     }
 
     var state: S = firstState
@@ -321,6 +359,7 @@ object Workflow {
     var result: R = null.asInstanceOf[R]
     var done = false
     while (!done) {
+      if (count > 0) discardGeneration(count - 1)
       val regionCtx = ctx.copy(scopePath = parentScopePath.appended(regionSegment(id, count)))
       val scope = new RestartableScope[S] {
         override def restartCount: Long = count
@@ -332,7 +371,11 @@ object Workflow {
         done = true
       } catch {
         case e: RegionRestartException =>
-          internals.upsertRegion(id, parentScope, RegionState(count + 1, e.serializedState))
+          // Commit the next generation's row first. The previous generation's
+          // rows, subscriptions, and children are discarded at the top of the
+          // next iteration, and re-discarded idempotently on replay, so a
+          // crash in between delays but never skips the cleanup.
+          writeRegionRow(count + 1, e.serializedState)
           count += 1
           state = cacheable.read(e.serializedState.raw)
         case e: RegionBreakException[R] =>

@@ -60,31 +60,38 @@ trait WorkflowRuntimeInternals {
     */
   def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 
-  /** Read a stored step without checking lease ownership, or `None` if absent.
-    * Reports the stored row even if it has expired. This is the single read path
-    * for steps; it is used both by `Step.runStep` and by `Step.getExecutionState`.
+  /** Read a stored step row, or `None` when absent. A step key (step id, scope,
+    * and version) belongs to exactly one step kind, so the returned row is the
+    * only row at that key, whichever step kind wrote it. The row is
+    * reported even if it has expired. This is the single read path for step
+    * rows; it is used by `Step.runStep`, `Step.getExecutionState`, and the
+    * restartable-region machinery. No execution lease is required.
     */
   def readStep(
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
-  ): Option[StoredStep]
+  ): Option[StepRow]
 
-  /** Replace (or create) the step row, fenced. The state, payload, input
-    * fingerprints, and expiry all travel inside `step`: `Started` is an
-    * unresolved row with an empty payload, `RetryPending` carries the retry
-    * bookkeeping and the deadline at which the body may run again, and
-    * `Succeeded`/`Failed` carry the terminal outcome. When `step.state` is
-    * `RetryPending`, the site's internal retry timer subscription is replaced
-    * with one at the new deadline; for every other state, the site's timer
-    * subscriptions are deleted. The step row and its retry subscription are
-    * written atomically, so a resolved or superseded retry can never re-fire.
+  /** Replace (or create) the step row, fenced. The row's [[StepState]] selects
+    * the stored `step_kind` (its subgroup) and carries the `state_kind`,
+    * payload, and retry deadline; the row additionally carries the input
+    * fingerprints and the expiry. When the state arms a retry
+    * ([[StepState.pendingRetryDeadline]]), the site's internal retry timer
+    * subscription is replaced with one at the new deadline; otherwise the
+    * site's own timer subscriptions are deleted. The step row and its retry
+    * subscription are written atomically, so a resolved or superseded retry can
+    * never re-fire.
+    *
+    * A step key belongs to exactly one step kind: writing a row whose kind
+    * differs from the kind of the row already stored at the same key fails with
+    * [[StepKeyConflictException]] instead of overwriting it.
     */
-  def writeStep(stepId: StepId, stepVersion: Long, stepKind: StepKind, step: StoredStep)(using Lease): Unit
+  def writeStep(stepId: StepId, stepVersion: Long, row: StepRow)(using Lease): Unit
 
-  /** Delete a step record and all its signal, timer, and completion subscriptions
-    * in one transaction, checking execution ownership. Used when inputs change
-    * or cached results expire, including pending retries.
+  /** Delete the step row stored at the key and the subscriptions registered at
+    * its site, in one transaction, fenced. Used when inputs change or cached
+    * results expire, including pending retries.
     *
     * The caller evaluates the operation again after deletion. A new timer gets
     * a new id, so old firing events cannot satisfy it. If the process crashes
@@ -120,7 +127,8 @@ trait WorkflowRuntimeInternals {
     * subscribers and sorted by global `sequenceId`. `decide` runs inside this
     * second transaction while the instance row lock is held, so it must be fast
     * and pure (no I/O, no blocking). If `decide` returns `Some(resolution)`,
-    * persist the `succeeded` step row (`site.stepKind`), advance the winning
+    * persist the site's step row with state [[StepState.Await]] carrying the
+    * winner, advance the winning
     * signal key's cursor when the resolution requests it, and delete the site's
     * rows in all three subscription tables — all atomically with the registration
     * and candidate read. If it returns `None`, commit the registrations and
@@ -142,35 +150,28 @@ trait WorkflowRuntimeInternals {
     * subscriptions — including nested subscopes — before the winner's step row
     * is written. The winner row is the stored
     * first-wins marker, so deleting first means a crash in between leaves no
-    * marker, and the construct's next run re-evaluates from scratch and
+    * marker, and the step's next run re-evaluates from scratch and
     * re-deletes; a committed winner row therefore never coexists with branch
     * subscriptions.
     */
   def deleteSubscriptionsUnderScopePaths(scopePaths: Seq[ScopePath])(using Lease): Unit
 
-  /** Read the persisted state of a `Workflow.restartable`/`Workflow.loop` region
-    * located at `regionId` under `parentScopePath`: its encoded state and its
-    * committed `restartCount`. `None` when the region has never been created
-    * (first creation, so the by-name seed must be evaluated).
+  /** Delete every step row whose `step_scope_within_instance` equals one of
+    * `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
+    * as a prefix), fenced. Subscriptions are not touched; combine with
+    * [[deleteSubscriptionsUnderScopePaths]] to discard a whole scope subtree.
+    * Every scope path must be non-empty: an empty prefix would match every row.
     */
-  def readRegionState(regionId: String, parentScopePath: ScopePath)(using Lease): Option[RegionState]
+  def deleteStepsUnderScopePaths(scopePaths: Seq[ScopePath])(using Lease): Unit
 
-  /** The single writer of a `Workflow.restartable`/`Workflow.loop` region's row:
-    * persist exactly `restartCount` and `serializedState`, creating the row if
-    * it does not exist (UPSERT, last writer wins). Before writing, discard the
-    * nested Step rows and subscriptions owned by generation `restartCount - 1`'s
-    * scope subtree (a construct-isolated prefix delete; a no-op when that
-    * generation left nothing behind, which is always the case at
-    * `restartCount == 0`) and close children created in that generation per
-    * their `ParentClosePolicy`. Signal cursors are preserved. Fenced. The caller
-    * invokes this only on first creation (`restartCount` 0, with the seed) or
-    * on a restart (with the next count); replays read the persisted row instead.
+  /** Request closure of every child workflow whose creation scope lies beneath
+    * `scopePathPrefix`, a scope path of the parent's step coordinates, fenced.
+    * The request is recorded idempotently; each covered child is then closed per
+    * its stored `ParentClosePolicy` when the runtime applies pending closures.
+    * Used by the `Workflow.restartable`/`Workflow.loop` machinery to close the
+    * children of a discarded region generation.
     */
-  def upsertRegion(
-      regionId: String,
-      parentScopePath: ScopePath,
-      state: RegionState
-  )(using Lease): Unit
+  def requestChildCloseUnderScopePath(scopePathPrefix: ScopePath)(using Lease): Unit
 
   /** Start a child workflow of an executing parent: create-if-absent a child
     * instance under a scope derived from the parent's identity, generation, and

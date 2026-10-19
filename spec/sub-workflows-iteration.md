@@ -85,11 +85,11 @@ object Step {
 
 Like `Step.awaitRace` members, branches carry an explicit key: a stable, non-empty, unique identity (the `"__"` prefix is reserved) that names the branch's scope segment (`stepId/key`). Reordering branches never changes their identity.
 
-Note the `() => WorkflowContext ?=> R` branch type. The extra `() =>` layer is required: a bare `("key", { ... })` tuple whose element is a context function is typed eagerly in this Scala version, so the body would run at the call site (with the enclosing scope) instead of inside the branch. Wrapping the body in a lambda (`"key" -> { () => ... }`) makes the tuple element an ordinary function value — constructing a lambda has no side effects, and the body only runs when the construct applies it with the branch's own `WorkflowContext`. The same deferral also applies to `Workflow.parallel`'s branch blocks.
+Note the `() => WorkflowContext ?=> R` branch type. The extra `() =>` layer is required: a bare `("key", { ... })` tuple whose element is a context function is typed eagerly in this Scala version, so the body would run at the call site (with the enclosing scope) instead of inside the branch. Wrapping the body in a lambda (`"key" -> { () => ... }`) makes the tuple element an ordinary function value — constructing a lambda has no side effects, and the body only runs when the race applies it with the branch's own `WorkflowContext`. The same deferral also applies to `Workflow.parallel`'s branch blocks.
 
 Because it is edge-triggered (not level-triggered like `Workflow.parallel`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
 
-The winner row persists only the winning branch's public returned value (the winning branch's identity is transaction-local and not retained, like an await's event selection). When the construct resolves, every branch's pending subscriptions — including those of nested subscopes — are deleted BEFORE the winner row is written, so a committed winner row never coexists with branch subscriptions. The ordering is deliberate: the winner row is the durable first-wins marker, so a crash in between leaves no marker and the construct's next run re-evaluates from scratch and re-deletes (the deletion runs at most twice).
+The winner row persists only the winning branch's public returned value (the winning branch's identity is transaction-local and not retained, like an await's event selection). When the race resolves, every branch's pending subscriptions — including those of nested subscopes — are deleted BEFORE the winner row is written, so a committed winner row never coexists with branch subscriptions. The ordering is deliberate: the winner row is the durable first-wins marker, so a crash in between leaves no marker and the step's next run re-evaluates from scratch and re-deletes (the deletion runs at most twice).
 
 This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
 
@@ -416,7 +416,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstToRunWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
 3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
-   construct resolves, every branch's pending subscriptions — including those
+   race resolves, every branch's pending subscriptions — including those
    of nested subscopes — are deleted (a subtree delete over all three
    subscription tables) BEFORE the winner's step row is written, so a losing
    await can never wake the workflow later and a committed winner row never
