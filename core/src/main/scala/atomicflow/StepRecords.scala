@@ -69,11 +69,11 @@ object StepState {
     * by name; [[fromPersisted]] and [[StepState.persistedColumns]] defer to the
     * same texts.
     */
-  val StartedText: String        = "Started"
-  val RetryPendingText: String   = "RetryPending"
-  val SucceededText: String      = "Succeeded"
-  val FailedText: String         = "Failed"
-  val RegionStateText: String    = "RestartableRegion"
+  private val StartedText: String        = "Started"
+  private val RetryPendingText: String   = "RetryPending"
+  private val SucceededText: String      = "Succeeded"
+  private val FailedText: String         = "Failed"
+  private val RegionStateText: String    = "RestartableRegion"
 
   /** Rejects a stored state whose kind is not legal for its row's kind. */
   private def illegalRowState(rowKindText: String, stateKindText: String): Nothing =
@@ -198,6 +198,13 @@ enum Subscriber {
       completedWorkflowInstanceKey: WorkflowInstanceKey,
       completedScope: ScopePath
   )
+
+  /** The subscriber's key within its wait-site. */
+  def key: String = this match {
+    case Signal(subscriberKey, _)           => subscriberKey
+    case Timer(subscriberKey, _)            => subscriberKey
+    case Completion(subscriberKey, _, _, _) => subscriberKey
+  }
 }
 
 /** A stored event available to a wait's subscriber. Events from all subscribers

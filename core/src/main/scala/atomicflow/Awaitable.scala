@@ -37,8 +37,7 @@ enum Awaitable[R] {
   case Mapped[A, B](underlying: Awaitable[A], f: A => B) extends Awaitable[B]
 
   /** Transform the awaited result onto another type. No `Cacheable[B]` is needed
-    * here; `Step.awaitRace` requires the mapped result's codec. Direct
-    * `Step.await` does not currently support mapped awaitables.
+    * here; `Step.await` and `Step.awaitRace` require the mapped result's codec.
     */
   def map[B](f: R => B): Awaitable[B] = this match {
     case Mapped(u, g) => Mapped(u, g.andThen(f))
