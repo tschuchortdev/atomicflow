@@ -109,10 +109,8 @@ class CacheableSuite extends FunSuite:
 
     val unmatched: Throwable = new IllegalStateException("nope")
     val decoded = summon[Cacheable[Throwable]].read(summon[Cacheable[Throwable]].write(unmatched))
-    decoded match
-      case _: StepFailed => // expected: fallback stores portable diagnostics
-      case other => fail(s"expected StepFailed from fallback, got $other")
-    assert(clue(decoded.getMessage).contains("IllegalStateException"))
+    // the fallback stores portable diagnostics, rendered as the original exception
+    assertEquals(decoded.toString, "java.lang.IllegalStateException: nope")
     assert(clue(decoded.getMessage).contains("nope"))
   }
 
@@ -150,20 +148,32 @@ class CacheableSuite extends FunSuite:
     }
   }
 
-  test("forThrowable.genericStringMessageSerializer replays StepFailed with original diagnostics") {
+  test("forThrowable.genericStringMessageSerializer replays the original exception's diagnostics") {
     val c = Cacheable.forThrowable.genericStringMessageSerializer
     assertEquals(c.stableSerializedTypeId, "throwable-generic")
     val decoded = c.read(c.write(new IllegalArgumentException("boom")))
-    decoded match
-      case _: StepFailed => // expected
-      case other => fail(s"expected StepFailed, got $other")
-    assert(clue(decoded.getMessage).contains("IllegalArgumentException"))
+    // decoded failures render as the original exception, never naming the portable form
+    assertEquals(decoded.toString, "java.lang.IllegalArgumentException: boom")
     assert(clue(decoded.getMessage).contains("boom"))
     // nested causes are preserved as portable diagnostics
     val withCause = new RuntimeException("outer", new IllegalArgumentException("inner"))
     val decodedWithCause = c.read(c.write(withCause))
     assert(clue(decodedWithCause.getMessage).contains("outer"))
     assert(clue(decodedWithCause.getCause).getMessage.contains("inner"))
+  }
+
+  test("re-serializing a decoded failure preserves the original exception's diagnostics") {
+    val c = Cacheable.forThrowable.genericStringMessageSerializer
+    // a workflow-terminal failure round-trips the already-decoded form again
+    val once = c.read(c.write(new IllegalStateException("boom")))
+    val twice = c.read(c.write(once))
+    assertEquals(twice.toString, "java.lang.IllegalStateException: boom")
+    assertEquals(twice.getMessage, "boom")
+    // nested causes keep their original class names too
+    val outer = c.read(c.write(new RuntimeException("outer", new IllegalArgumentException("inner"))))
+    val outerAgain = c.read(c.write(outer))
+    assertEquals(outerAgain.getMessage, "outer")
+    assertEquals(outerAgain.getCause.getMessage, "inner")
   }
 
   test("forThrowable.javaSerializable round-trips concrete exception classes") {

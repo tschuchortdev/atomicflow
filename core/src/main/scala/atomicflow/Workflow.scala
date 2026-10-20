@@ -296,17 +296,16 @@ object Workflow {
     * becomes a restart, `break` throws [[RegionBreakException]]). Both control
     * exceptions are caught here and unwound to the region boundary.
     */
-  private def runRestartableRegion[S: Cacheable, R](id: String, initialState: => S)(
+  private def runRestartableRegion[S, R](id: String, initialState: => S)(
       body: (S, RestartableScope[S]) => WorkflowContext ?=> R
   )(using
-      ctx: WorkflowContext
+      ctx: WorkflowContext,
+      cacheable: Cacheable[S]
   ): R = {
+    ScopePath.requireValidKey("region id", id)
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
-    val cacheable = summon[Cacheable[S]]
-    val parentScopePath = ctx.scopePath
-    val parentScope = ctx.currentScope
-    val regionId = StepId(id, parentScope)
+    val regionId = StepId(id, ctx.currentScope)
 
     /** Writes the region row: the restart count and the encoded state of the
       * current generation. The row commit is the generation boundary — the
@@ -406,8 +405,10 @@ object Workflow {
     * the same step definitions can execute independently per element. Scopes
     * nest arbitrarily; the full scope is the array of enclosing segment keys.
     */
-  def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
+  def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
+    ScopePath.requireValidKey("scope key", scopeKey)
     withScope(scopeKey)(body)
+  }
 
   /** Like [[scoped]] but the scope key is derived deterministically from the
     * element's fingerprint, so equal elements share the same scope (reusing
@@ -416,10 +417,8 @@ object Workflow {
   def scoped[A: Fingerprintable, R](elem: A)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
     withScope(Fingerprintable[A].fingerprint(elem, Sha256Fingerprinter).toString)(body)
 
-  private def withScope[R](segment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
-    require(segment.nonEmpty, "Workflow.scoped requires a non-empty scope")
+  private def withScope[R](segment: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
     body(using ctx.copy(scopePath = ctx.scopePath.appended(segment)))
-  }
 
   /** Runs one by-name block, catches its suspension instead of propagating it,
     * and returns `Either[WorkflowSuspendedException, R]`. The opt-in primitive

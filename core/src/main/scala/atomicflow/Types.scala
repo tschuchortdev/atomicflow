@@ -35,7 +35,12 @@ enum SignalSendResult {
 /** Identity of a step (or await-site) within a workflow instance. `scope` is the
   * enclosing `Workflow.scoped` path.
   */
-final case class StepId(key: String, scope: ScopePath = ScopePath.empty)
+final case class StepId(key: String, scope: ScopePath = ScopePath.empty) {
+
+  /** The `/`-joined scope and key, for diagnostics and selector rendering. */
+  def pathStr: String =
+    if (scope.segments.isEmpty) key else s"${scope.encoded}/$key"
+}
 
 /** The only durable, user-visible lifecycle states of an instance. `None` means
   * not terminal yet; CREATED/RUNNING/SUSPENDED are transient bookkeeping, and

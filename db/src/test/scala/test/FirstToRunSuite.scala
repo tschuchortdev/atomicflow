@@ -68,7 +68,7 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(winnerRow(wf.id, "k"), None, "no winner row while every branch is suspended")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
-      Vector((Vector("race/a"), "s1"), (Vector("race/b"), "s2")),
+      Vector((Vector("race", "a"), "s1"), (Vector("race", "b"), "s2")),
       "each branch's await subscription remains registered while the workflow is suspended"
     )
   }
@@ -302,12 +302,14 @@ val empty = attempt("" -> { () => 1 })
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val paths = run(
-      sql"""SELECT DISTINCT step_scope_within_instance FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_within_instance""".query[Vector[String]].to[Vector]
+      sql"""
+        SELECT DISTINCT step_scope_within_instance FROM workflow_steps
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' ORDER BY step_scope_within_instance
+      """.query[Vector[String]].to[Vector]
     )
-    assert(paths.contains(Vector("outer", "race/one")), s"the winner branch's step must persist under the enclosing scope, got: $paths")
-    assert(!paths.contains(Vector("race/one")), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
-    assert(paths.contains(Vector("outer", "race/two")), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
+    assert(paths.contains(Vector("outer", "race", "one")), s"the winner branch's step must persist under the enclosing scope, got: $paths")
+    assert(!paths.contains(Vector("race", "one")), s"no branch step may be persisted without the enclosing scope prefix, got: $paths")
+    assert(paths.contains(Vector("outer", "race", "two")), s"the completing loser branch's step also carries the enclosing prefix, got: $paths")
   }
 
   test("loser cleanup deletes subscriptions of nested subscopes, not just the branch's immediate scope") {
@@ -330,8 +332,8 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(
       signalSubscriptions(wf.id, "k"),
-      Vector((Vector("race/loser", "inner"), "deep"), (Vector("race/winner"), "winner")),
-      "the nested await registers under race/loser/inner while the race is suspended"
+      Vector((Vector("race", "loser", "inner"), "deep"), (Vector("race", "winner"), "winner")),
+      "the nested await registers under race/loser/inner (three segments) while the race is suspended"
     )
     sWinner.send(id, "go")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))

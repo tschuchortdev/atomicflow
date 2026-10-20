@@ -80,22 +80,30 @@ Forking is a recovery and manual-intervention operation, distinct from
 continue-as-new:
 
 ```scala
-runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFromStep = stepId)
+runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFrom = stepId"/orders/charge")
 ```
 
 - A fork always receives a completely new instance ID.
 - The fork has generation = 0 and starts with the same input as the source instance.
 - A fork is an independent top-level workflow. It does not inherit the source
   workflow's parent relationship or inherited signals.
-- `restartFromStep` is an exclusive boundary: cached history strictly before
-  the selected step is copied, while the selected step and subsequent history
-  are omitted so that the selected step executes again.
+- `restartFrom` is a step selector (the `stepId` interpolator, see
+  `steps.md`). It is an exclusive boundary: cached history strictly before the
+  boundary is copied, while the matched steps and subsequent history are
+  omitted so that they execute again.
+- The boundary is the earliest matched row's last-updated timestamp: rows
+  strictly before the boundary are copied, everything with an equal or later
+  timestamp is omitted. A selector that matches several rows therefore resets
+  every match.
 - The workflow function still executes from its beginning. Copied history is
   replayed until execution reaches the first uncopied operation; the runtime
   does not jump directly into the workflow body.
-- `restartFromStep` must identify a step already executed by the source.
+- A selector matching no executed step of the source throws
+  `NoMatchingStepException`. `runtime.listSteps(instanceId, selector)` lists
+  the matched steps for previewing.
 - TODO: define a causal boundary for parallel branches, where executed steps do
-  not necessarily have one total order. A single step ID may be insufficient.
+  not necessarily have one total order. A single boundary timestamp may be
+  insufficient.
 - Forking does not require old generations to remain as separate workflow
   instances; it only operates on the source state that currently exists.
 
@@ -105,13 +113,14 @@ Reset keeps the same instance identity but erases history from a selected step
 onward. It is the in-place counterpart of a fork.
 
 ```scala
-runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
+runtime.resetWorkflow(sourceInstanceId, restartFrom = stepId"orders/charge")
 ```
 
 - Generation is incremented in place; no old generation is retained.
-- History strictly before `restartFromStep` remains cached. The selected step
-  and subsequent history are erased, and the workflow replays from the top.
-- Runtime determines which steps are "after" or "before" by looking at the timestamp where the step row was last updated.
+- History strictly before the boundary remains cached. The matched steps and
+  subsequent history are erased, and the workflow replays from the top.
+- The boundary is determined exactly as for forking: the earliest matched row's
+  last-updated timestamp, rows with an equal or later timestamp are erased.
 - **Reset closes all children of the old generation.** Like `continueAsNew`, the
   reset transaction records a `child_close_requests` row targeting exactly the
   pre-increment generation's children (`parent identity + key@generation`),
@@ -132,6 +141,6 @@ runtime.resetWorkflow(sourceInstanceId, restartFromStep = stepId)
 the operation explicit and avoids inventing a second iteration abstraction.
 - Forking uses a new identity and copied cached steps, so it does not need to
   address or preserve an old continue-as-new generation.
-- An exclusive `restartFromStep` boundary reruns the selected operation, which
+- An exclusive `restartFrom` boundary reruns the selected operation, which
   matches the primary recovery case. An inclusive boundary would preserve the
   operation most likely to require correction.

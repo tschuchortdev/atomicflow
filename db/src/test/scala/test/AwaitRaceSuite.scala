@@ -453,17 +453,17 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     }
     val sig = Signal[String]("s")
 
-    val empty = intercept[StepFailed] {
+    val empty = intercept[RuntimeException] {
       runBody("race-invalid-empty", Seq("" -> Awaitable.SignalEvent(sig)))
     }
     assert(empty.getMessage.contains("non-empty"), empty.getMessage)
 
-    val duplicate = intercept[StepFailed] {
+    val duplicate = intercept[RuntimeException] {
       runBody("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     }
     assert(duplicate.getMessage.contains("unique"), duplicate.getMessage)
 
-    val reserved = intercept[StepFailed] {
+    val reserved = intercept[RuntimeException] {
       runBody("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     }
     assert(reserved.getMessage.contains("reserved"), reserved.getMessage)

@@ -240,18 +240,22 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     // Craft a foreign row at the step's key: an await result whose cache has
     // already expired, so the step's replay path would discard and re-execute.
     run(
-      sql"""INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at)
-            VALUES (${wf.id}, 'k', '{}', 'shared', 1, 'Await', 'Succeeded', 'go', '', '2020-01-01T00:00:00Z')""".update.run
+      sql"""
+        INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints, expires_at)
+        VALUES (${wf.id}, 'k', '{}', 'shared', 1, 'Await', 'Succeeded', 'go', '', '2020-01-01T00:00:00Z')
+      """.update.run
     )
 
     // The run engine replays body-level failures through the throwable codec,
-    // so the conflict surfaces as a StepFailed carrying the conflict message.
-    val failure = intercept[StepFailed](rt.runWorkflowInstance(wf, id))
-    assert(failure.getMessage.contains("StepKeyConflictException"))
+    // so the conflict surfaces as the decoded failure carrying the conflict message.
+    val failure = intercept[RuntimeException](rt.runWorkflowInstance(wf, id))
+    assert(failure.toString.contains("StepKeyConflictException"))
     assertEquals(
       run(
-        sql"""SELECT step_kind FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'shared'""".query[String].option
+        sql"""
+          SELECT step_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'shared'
+        """.query[String].option
       ),
       Some("Await"),
       "the foreign row is preserved, not deleted by the invalidation path"

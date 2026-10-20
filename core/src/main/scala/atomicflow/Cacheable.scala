@@ -198,42 +198,69 @@ object Cacheable {
     }
   }
 
+  /** Capability of a `Cacheable[Throwable]`: how the runtime rethrows a failure
+    * decoded from a step's persisted failure row. Codecs mixing this in make
+    * step failures catchable as [[StepFailed]], so catches can address the
+    * failing step with the `stepId` interpolator. Codecs without it rethrow
+    * the decoded exception unchanged, preserving its original class.
+    */
+  trait StepFailurePresenter {
+    def presentStepFailure(step: StepId, decoded: Throwable): Throwable
+  }
+
   /** Application-wide `Cacheable[Throwable]` choices. One of
     * these (or a custom codec) must be selected explicitly; neither is an
     * automatic given.
     */
   object forThrowable {
-    /** Stores portable diagnostics (class name, message, cause chain) and replays a
+    /** Stores portable diagnostics (class name, message, cause chain), decodes
+      * them into a `SerializedException`, and presents step failures as
       * [[StepFailed]]. Recommended default for new workflows.
       */
-    def genericStringMessageSerializer: Cacheable[Throwable] = new Cacheable[Throwable] {
-      override def stableSerializedTypeId: String = "throwable-generic"
+    def genericStringMessageSerializer: Cacheable[Throwable] & StepFailurePresenter =
+      new Cacheable[Throwable] with StepFailurePresenter {
+        override def stableSerializedTypeId: String = "throwable-generic"
 
-      override def write(value: Throwable): String =
-        upickle.default.write(toJson(value))
+        override def write(value: Throwable): String =
+          upickle.default.write(toJson(value))
 
-      override def read(serialized: String): Throwable =
-        fromJson(ujson.read(serialized))
+        override def read(serialized: String): Throwable =
+          fromJson(ujson.read(serialized))
 
-      private def toJson(t: Throwable): ujson.Value = ujson.Obj(
-        "c" -> t.getClass.getName,
-        "m" -> (if (t.getMessage == null) ujson.Null else ujson.Str(t.getMessage)),
-        "cause" -> (if (t.getCause == null || t.getCause.eq(t)) ujson.Null else toJson(t.getCause))
-      )
+        override def presentStepFailure(step: StepId, decoded: Throwable): Throwable =
+          StepFailed(step, decoded)
 
-      private def fromJson(v: ujson.Value): StepFailed = {
-        val className = v("c").str
-        val message = v("m") match {
-          case ujson.Null => null
-          case m          => m.str
+        private def toJson(t: Throwable): ujson.Value = t match {
+          // an already-decoded failure keeps its original diagnostics instead
+          // of recording the portable form's own class name
+          case decoded: SerializedException =>
+            ujson.Obj(
+              "c" -> decoded.originalClassName,
+              "m" -> (if (decoded.originalMessage == null) ujson.Null else ujson.Str(decoded.originalMessage)),
+              "cause" -> (if (decoded.getCause == null || decoded.getCause.eq(decoded)) ujson.Null
+                          else toJson(decoded.getCause))
+            )
+          case _ =>
+            ujson.Obj(
+              "c" -> t.getClass.getName,
+              "m" -> (if (t.getMessage == null) ujson.Null else ujson.Str(t.getMessage)),
+              "cause" -> (if (t.getCause == null || t.getCause.eq(t)) ujson.Null else toJson(t.getCause))
+            )
         }
-        val cause = v("cause") match {
-          case ujson.Null => null
-          case c          => fromJson(c)
+
+        private def fromJson(v: ujson.Value): SerializedException = {
+          val className = v("c").str
+          val message = v("m") match {
+            case ujson.Null => null
+            case m          => m.str
+          }
+          val cause = v("cause") match {
+            case ujson.Null => null
+            case c          => fromJson(c)
+          }
+          SerializedException(className, message, cause)
         }
-        new StepFailed(if (message == null) className else s"$className: $message", cause)
       }
-    }
 
     /** Uses Java serialization; preserves concrete exception classes, but persisted
       * data is coupled to those classes and their serializable object graphs.

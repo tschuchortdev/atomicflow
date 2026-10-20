@@ -63,9 +63,11 @@ class TypesSuite extends FunSuite:
       c.stableSerializedTypeId,
       s"workflow-completion-result(${summon[Cacheable[Int]].stableSerializedTypeId},throwable-generic)"
     )
-    // a Failed payload written with the generic codec decodes to StepFailed
+    // a Failed payload written with the generic codec decodes to the portable
+    // form, rendered as the original exception
     c.read(c.write(WorkflowCompletionResult.Failed(new IllegalStateException("x")))) match
-      case WorkflowCompletionResult.Failed(_: StepFailed) => // expected
-      case other => fail(s"expected Failed(StepFailed), got $other")
+      case WorkflowCompletionResult.Failed(failure) =>
+        assertEquals(failure.toString, "java.lang.IllegalStateException: x")
+      case other => fail(s"expected Failed(original diagnostics), got $other")
   }
 

@@ -83,7 +83,7 @@ object Step {
 }
 ```
 
-Like `Step.awaitRace` members, branches carry an explicit key: a stable, non-empty, unique identity (the `"__"` prefix is reserved) that names the branch's scope segment (`stepId/key`). Reordering branches never changes their identity.
+Like `Step.awaitRace` members, branches carry an explicit key: a stable, non-empty, unique identity (the `"_"`-leading form is reserved) that names the branch's scope. The branch runs one scope level below the race's key, so its scope path is the enclosing scope plus the race key plus the branch key (`.../stepId/branchKey`). Branch keys obey the scope-key rules of `ScopePath.requireValidKey` (see `steps.md`). Reordering branches never changes their identity.
 
 Note the `() => WorkflowContext ?=> R` branch type. The extra `() =>` layer is required: a bare `("key", { ... })` tuple whose element is a context function is typed eagerly in this Scala version, so the body would run at the call site (with the enclosing scope) instead of inside the branch. Wrapping the body in a lambda (`"key" -> { () => ... }`) makes the tuple element an ordinary function value — constructing a lambda has no side effects, and the body only runs when the race applies it with the branch's own `WorkflowContext`. The same deferral also applies to `Workflow.parallel`'s branch blocks.
 
@@ -302,10 +302,11 @@ Application rules:
 - **Representation.** The scope is a structured **segment array** (a
   `TEXT[]` in Postgres, `Vector[String]` in Scala), not a joined string. The
   array positions — not any delimiter — are what separate segments, so **no
-  escaping or shortening is performed anywhere**. User-supplied segments
-  (workflow IDs, instance keys, `Workflow.scoped` keys, restartable / loop IDs,
-  `key@generation`, `id@restartCount` markers) are stored verbatim, including
-  any embedded `/`, `@`, or `\`. A single runtime function composes the array:
+  escaping or shortening is performed anywhere**. User-supplied scope keys
+  (`Workflow.scoped` keys, restartable / loop IDs, step keys, race branch keys)
+  are validated by `ScopePath.requireValidKey` and never contain `/`, `*`, `@`,
+  `[`, `]`, `{`, `}` or a leading `_`; workflow IDs and instance keys are stored
+  verbatim. A single runtime function composes the array:
   ```scala
   def deriveChildScope(parentInstanceScope, parentWorkflowId, parentKey,
                        parentGeneration, enclosingScopePath): Vector[String] =

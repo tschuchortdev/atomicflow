@@ -200,6 +200,7 @@ object Step {
       invalidateAfter: Duration,
       retry: Step.RetryPolicy
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] = {
+    ScopePath.requireValidKey("step key", stepKey)
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
@@ -295,7 +296,7 @@ object Step {
                     expiresAt
                   )
                 )
-                throw toThrow
+                throw presentStepFailure(stepId, toThrow)
               case Some(delay) =>
                 bookkeeping = bookkeeping.after(delay)
                 if (delay <= internals.durableRetryThreshold)
@@ -326,12 +327,16 @@ object Step {
         row match {
           case StepState.SimpleStep.Succeeded(payload) =>
             Some(decodeStored(valueCodec, stepKey)(payload.raw))
+
           case StepState.SimpleStep.Failed(payload) =>
-            throw decodeStoredFailure(throwableCodec, stepKey)(payload.raw)
+            throw presentStepFailure(stepId, decodeStoredFailure(throwableCodec, stepKey)(payload.raw))
+
           case StepState.SimpleStep.Started if atMostOnce =>
             None
+
           case StepState.SimpleStep.Started =>
             Some(runBody(None))
+
           case StepState.SimpleStep.RetryPending(bookkeeping, deadline) =>
             // A fresh instant, not the `now` read at the top of runSimpleStep: the
             // wakeup that resumed this run is produced against the sweeper's
@@ -465,14 +470,19 @@ object Step {
     * [[firstToRunWithoutSuspension]] branch key). The `""` key is reserved for
     * single-subscriber sites (plain awaits), and the `"__"` prefix for
     * engine-internal subscribers (such as step retries).
+    *
+    * A `firstToRun` branch key is also a scope-path segment (each branch runs
+    * one scope level below the race's key), so it must satisfy the key rules of
+    * [[ScopePath.requireValidKey]].
     */
-  private def validateBranchKeys(stepKey: String, branchKeys: Seq[String]): Unit = {
+  private def validateBranchKeys(stepKey: String, branchKeys: Seq[String], keysArePathSegments: Boolean = false): Unit = {
     branchKeys.foreach { branchKey =>
       require(branchKey.nonEmpty, s"'$stepKey' branch keys must be non-empty")
       require(
         !branchKey.startsWith("__"),
         s"'$stepKey' branch key '$branchKey' uses the reserved '__' prefix"
       )
+      if keysArePathSegments then ScopePath.requireValidKey(s"'$stepKey' branch key", branchKey)
     }
     val duplicateKeys = branchKeys.groupBy(identity).collect { case (k, ms) if ms.size > 1 => k }.toVector.sorted
     require(
@@ -530,33 +540,31 @@ object Step {
   )(branches: (String, () => WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
     evaluateFirstCompletedBranch(stepId, invalidateOn, ensureUnchanged, branches.toVector)
 
-  private def evaluateFirstCompletedBranch[R: Cacheable](
-      stepId: String,
+  private def evaluateFirstCompletedBranch[R](
+      stepKey: String,
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]],
       branches: Vector[(String, () => WorkflowContext ?=> R)]
-  )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R = {
-    require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepId') requires at least one branch")
-    validateBranchKeys(stepId, branches.map(_._1))
+  )(using ctx: WorkflowContext, valueCodec: Cacheable[R], throwableCodec: Cacheable[Throwable]): R = {
+    require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepKey') requires at least one branch")
+    validateBranchKeys(stepKey, branches.map(_._1), keysArePathSegments = true)
+    ScopePath.requireValidKey("step key", stepKey)
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
-    val scopedStepId = StepId(stepId, ctx.currentScope)
-    val valueCodec = summon[Cacheable[R]]
+    val scopedStepId = StepId(stepKey, ctx.currentScope)
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = internals.clock.instant()
 
-    def branchSegment(key: String): String =
-      s"$stepId/$key"
-
+    // Each race branch runs one scope level below the race's key, so sibling
+    // branches of the same race cannot collide.
     def branchPath(base: ScopePath, key: String): ScopePath =
-      base.appended(branchSegment(key))
+      base.appended(scopedStepId.key).appended(key)
 
     def evaluate(): R = {
       throwIfCancelled
-      val baseScope = ctx.currentScope
-      val baseScopePath = ctx.scopePath
-      val branchPaths = branches.map((key, _) => branchPath(baseScope, key))
-      val branchContexts = branches.map((key, _) => ctx.copy(scopePath = baseScopePath.appended(branchSegment(key))))
+      val branchPaths = branches.map((key, _) => branchPath(ctx.currentScope, key))
+      val branchContexts = branches.map((key, _) =>
+        ctx.copy(scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key)))
       val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
         ox.par(branches.indices.map { i =>
           () =>
@@ -568,7 +576,7 @@ object Step {
         throw new WorkflowSuspendedException(suspensions)
       } else {
         val winnerResult = outcomes.collect { case Right(r) => r }.head
-        val (serialized, decoded) = encodeAndDecode(valueCodec, stepId)(winnerResult)
+        val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(winnerResult)
         // Delete-first: retire every branch's subscriptions (including nested
         // subscopes) before persisting the winner. The winner row is the durable
         // first-wins marker, so a crash in between leaves no marker and the next
@@ -586,8 +594,8 @@ object Step {
       }
     }
 
-    loadStepStateOrDeleteIfInvalid[StepState.FirstToRun](stepId, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
-      case Some(StepState.FirstToRun(result)) => decodeStored(valueCodec, stepId)(result.raw)
+    loadStepStateOrDeleteIfInvalid[StepState.FirstToRun](stepKey, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
+      case Some(StepState.FirstToRun(result)) => decodeStored(valueCodec, stepKey)(result.raw)
       case None                               => evaluate()
     }
   }
@@ -630,17 +638,17 @@ object Step {
     * its step row plus every subscription) and re-evaluates from scratch, so no
     * stale registration can satisfy the new registration.
     */
-  private def awaitRaceImpl[A: Cacheable](
+  private def awaitRaceImpl[A](
       stepKey: String,
       branches: Seq[(String, Awaitable[A])],
       invalidateOn: Seq[StepInput[?]],
       ensureUnchanged: Seq[StepInput[?]],
       invalidateAfter: Duration
-  )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
+  )(using ctx: WorkflowContext, valueCodec: Cacheable[A], throwableCodec: Cacheable[Throwable]): A = {
+    ScopePath.requireValidKey("step key", stepKey)
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
-    val valueCodec = summon[Cacheable[A]]
     val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
     val now = internals.clock.instant()
     val expiresAt = expiryOf(invalidateAfter, now)
@@ -800,6 +808,17 @@ object Step {
 
   private def decodeStoredFailure(codec: Cacheable[Throwable], key: String)(payload: String): Throwable =
     tryOrThrowStepSerializationFailed(s"Step '$key' failure could not be decoded")(codec.read(payload))
+
+  /** How a decoded step failure is rethrown: codecs with the
+    * [[Cacheable.StepFailurePresenter]] capability wrap it into a
+    * [[StepFailed]] naming the failing step; other codecs rethrow it unchanged,
+    * preserving its original class.
+    */
+  private def presentStepFailure(stepId: StepId, decoded: Throwable)(using codec: Cacheable[Throwable]): Throwable =
+    codec match {
+      case presenter: Cacheable.StepFailurePresenter => presenter.presentStepFailure(stepId, decoded)
+      case _                                         => decoded
+    }
 
   /** Enforces the `ensureUnchanged` pin (throwing [[StepInputConflictException]]
     * when a pinned input changed) and reports whether any `invalidateOn` input

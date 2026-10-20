@@ -183,26 +183,62 @@ class PostgresWorkflowRuntime private[atomicflow] (
     deleted > 0
   }
 
-  /** The updated_at timestamp of the row with the highest step_version stored
-    * for one step id, or `None` when the step has no stored row. The timestamp
-    * marks the last durable write to the step's most recent row.
+  /** One stored step row of an instance: the step id's key and scope within the
+    * instance, and the newest row's last-update timestamp.
     */
-  private def getStepLastUpdatedAtTime(
+  private case class StoredStep(key: String, scope: ScopePath, updatedAt: java.time.Instant) {
+    def stepId: StepId = StepId(key, scope)
+  }
+
+  /** The instance's stored step rows, one per distinct step id, ordered by last
+    * update. Only the instance's own rows: rows of child instances live under
+    * their own workflow identities.
+    */
+  private def readStoredSteps(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: ScopePath
+  ): ConnectionIO[Vector[StoredStep]] =
+    sql"""
+      SELECT step_id, step_scope_within_instance, MAX(updated_at)
+      FROM workflow_steps
+      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+      GROUP BY step_id, step_scope_within_instance
+      ORDER BY MAX(updated_at), step_id, step_scope_within_instance
+    """.query[StoredStep].to[Vector]
+
+  /** Resolves a step selector against the instance's stored step rows: the
+    * restart boundary is the earliest matched row's timestamp, so every
+    * matching step is erased or omitted and re-executes. Fails with
+    * [[NoMatchingStepException]] when nothing matches, listing some existing
+    * steps for orientation.
+    */
+  private def resolveRestartBoundary(
+      sourceInstanceId: WorkflowInstanceId,
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
-      stepId: StepId
-  ): ConnectionIO[Option[java.time.Instant]] =
-    sql"""SELECT updated_at FROM workflow_steps
-          WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-            AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope}
-          ORDER BY step_version DESC
-          LIMIT 1""".query[java.time.Instant].option
+      restartFrom: StepIdSelector
+  ): ConnectionIO[java.time.Instant] =
+    readStoredSteps(workflowId, key, scope).map { stored =>
+      val matches = stored.filter(step => restartFrom.matches(step.stepId))
+      if matches.isEmpty then {
+        val existing =
+          if stored.isEmpty then "the instance has no stored steps"
+          else
+            s"existing steps: ${stored.take(10).map(step => s"'${step.stepId.pathStr}'").mkString(", ")}" +
+              (if stored.size > 10 then s" (and ${stored.size - 10} more)" else "")
+        throw new NoMatchingStepException(
+          s"restartFrom '${restartFrom}' matches no executed step of $sourceInstanceId; $existing"
+        )
+      }
+      matches.map(_.updatedAt).min
+    }
 
   override def forkWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
       newInstanceKey: WorkflowInstanceKey,
-      restartFromStep: StepId
+      restartFrom: StepIdSelector
   )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out] = {
     val sourceWf = sourceInstanceId.workflowId
     val sourceKey = sourceInstanceId.workflowInstanceKey
@@ -212,25 +248,22 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
     runTransaction {
       for {
-        sourceInput <- sql"""SELECT input FROM workflow_instances
-                             WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
-                             FOR UPDATE""".query[String].option
+        sourceInput <- sql"""
+          SELECT input FROM workflow_instances
+          WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
+          FOR UPDATE
+        """.query[String].option
         _ <- sourceInput match {
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
           case _ => ().pure[ConnectionIO]
         }
-        boundary <- getStepLastUpdatedAtTime(sourceWf, sourceKey, sourceScope, restartFromStep)
-        _ <- boundary match {
-          case None =>
-            throw new InvalidRestartStepException(
-              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.encoded}' does not identify an executed step of $sourceInstanceId"
-            )
-          case _ => ().pure[ConnectionIO]
-        }
-        inserted <- sql"""INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation)
-                          VALUES ($newWorkflowId, $newInstanceKey, '{}', $sourceInput, ${workflow.version})
-                          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING""".update.run
+        boundary <- resolveRestartBoundary(sourceInstanceId, sourceWf, sourceKey, sourceScope, restartFrom)
+        inserted <- sql"""
+          INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation)
+          VALUES ($newWorkflowId, $newInstanceKey, '{}', $sourceInput, ${workflow.version})
+          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
+        """.update.run
         _ <- if (inserted == 0)
           throw new WorkflowInputConflictException(
             s"Workflow instance already exists under the fork key: $newId"
@@ -259,7 +292,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   override def resetWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
-      restartFromStep: StepId
+      restartFrom: StepIdSelector
   )(using workflow: Workflow[In, Out]): Unit = {
     val wf = sourceInstanceId.workflowId
     val key = sourceInstanceId.workflowInstanceKey
@@ -280,40 +313,62 @@ class PostgresWorkflowRuntime private[atomicflow] (
             throw new IllegalStateException(s"Cannot reset a terminal workflow instance: $sourceInstanceId")
           case Some((None, _)) => ().pure[ConnectionIO]
         }
-        boundary <- getStepLastUpdatedAtTime(wf, key, scope, restartFromStep)
-        _ <- boundary match {
-          case None =>
-            throw new InvalidRestartStepException(
-              s"restartFromStep ${restartFromStep.key}@'${restartFromStep.scope.encoded}' does not identify an executed step of $sourceInstanceId"
-            )
-          case _ => ().pure[ConnectionIO]
-        }
+        boundary <- resolveRestartBoundary(sourceInstanceId, wf, key, scope, restartFrom)
         _ <- deleteAllSubscriptionsQ(
                wf,
                key,
                scope,
-               fr"""EXISTS (SELECT 1 FROM workflow_steps st
-                            WHERE st.workflow_id = $wf AND st.workflow_instance_key = $key AND st.workflow_instance_scope = $scope
-                              AND st.updated_at >= $boundary
-                              AND st.step_id = s.step_id AND st.step_scope_within_instance = s.step_scope_within_instance AND st.step_version = s.step_version)"""
+               fr"""
+                 EXISTS (SELECT 1 FROM workflow_steps st
+                 WHERE st.workflow_id = $wf AND st.workflow_instance_key = $key AND st.workflow_instance_scope = $scope
+                   AND st.updated_at >= $boundary
+                   AND st.step_id = s.step_id AND st.step_scope_within_instance = s.step_scope_within_instance AND st.step_version = s.step_version)
+               """
              )
-        _ <- sql"""DELETE FROM workflow_steps
-                   WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                     AND updated_at >= $boundary""".update.run
-        _ <- sql"""DELETE FROM workflow_wakeups
-                   WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run
+        _ <- sql"""
+          DELETE FROM workflow_steps
+          WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+            AND updated_at >= $boundary
+        """.update.run
+        _ <- sql"""
+          DELETE FROM workflow_wakeups
+          WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+        """.update.run
         // Reset closes exactly the children of the old generation (targeting
         // the pre-increment generation, same as continueAsNew): children
         // created before the reset boundary are closed; body replay recreates
         // what is needed. The successor generation's children carry the
         // incremented marker and never match this target.
         _ <- insertChildCloseRequestQ(wf, key, scope, scope.segments ++ Vector(wf, s"$key@$generation"))
-        _ <- sql"""UPDATE workflow_instances SET generation = generation + 1
-                   WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope""".update.run
+        _ <- sql"""
+          UPDATE workflow_instances SET generation = generation + 1
+          WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+        """.update.run
         _ <- upsertWakeupQ(wf, key, scope, now)
       } yield ()
     }
     ()
+  }
+
+  override def listSteps(
+      sourceInstanceId: WorkflowInstanceId,
+      selector: StepIdSelector
+  ): Vector[StepId] = {
+    val wf = sourceInstanceId.workflowId
+    val key = sourceInstanceId.workflowInstanceKey
+    val scope = sourceInstanceId.scope
+    runTransaction {
+      for {
+        exists <- sql"""
+          SELECT 1 FROM workflow_instances
+          WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+        """.query[Int].option
+        _ <- if exists.isEmpty then
+          throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
+        else ().pure[ConnectionIO]
+        stored <- readStoredSteps(wf, key, scope)
+      } yield stored.filter(step => selector.matches(step.stepId)).map(_.stepId).toVector
+    }
   }
 
   /** The storage form of a [[SignalInheritance]] configuration: the set of

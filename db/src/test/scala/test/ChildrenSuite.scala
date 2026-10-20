@@ -386,12 +386,15 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.Result("HI"))
     assert(!hasWakeup(childWf.id, "worker-1", scope), "terminal child wakeup is cleaned up")
 
-    run(sql"""UPDATE workflow_instances SET input = 'OTHER'
-              WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}""".update.run)
+    run(sql"""
+      UPDATE workflow_instances SET input = 'OTHER'
+      WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}
+    """.update.run)
 
-    intercept[StepFailed] {
+    val conflict = intercept[RuntimeException] {
       rt.runWorkflowInstance(parentWf, parentId)
     }
+    assert(conflict.toString.contains("WorkflowInputConflictException"), conflict.toString)
     assert(!hasWakeup(childWf.id, "worker-1", scope), "a conflicting replay must not commit a wakeup side effect")
   }
 

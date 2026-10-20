@@ -19,6 +19,32 @@ object ScopePath:
   /** Builds a scope from its segments. */
   def apply(segments: String*): ScopePath = segments.toVector
 
+  /** Characters forbidden in user-chosen keys. They are the pattern syntax of
+    * [[StepIdSelector]] (segment separator, wildcards, iteration marker,
+    * reserved brackets), so a key containing them could never be addressed by
+    * a selector.
+    */
+  private val ForbiddenKeyChars = "/*@[]{}"
+
+  /** Checks a user-chosen key that becomes a scope-path segment or a step key:
+    * step keys, `Workflow.scoped` keys, region ids, and race branch keys.
+    * Fails with [[IllegalArgumentException]] when the key is empty, contains a
+    * forbidden character, or starts with `_` (reserved for engine-internal
+    * keys).
+    */
+  def requireValidKey(what: String, key: String): Unit = {
+    require(key.nonEmpty, s"$what must not be empty")
+    val forbidden = key.find(ForbiddenKeyChars.contains)
+    require(
+      forbidden.isEmpty,
+      s"$what '$key' must not contain '${forbidden.get}'; the characters / * @ [ ] { } are reserved for step selectors"
+    )
+    require(
+      !key.startsWith("_"),
+      s"$what '$key' must not start with '_'; leading underscores are reserved for engine-internal keys"
+    )
+  }
+
   /** Wraps an existing segment array, e.g. one read from storage. */
   def fromVector(segments: Vector[String]): ScopePath = segments
 

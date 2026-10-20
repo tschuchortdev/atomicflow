@@ -82,14 +82,14 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
       throw new RuntimeException(s"boom-$in")
     }
 
-    val first = intercept[StepFailed] {
+    val first = intercept[RuntimeException] {
       rt.createAndRun(wf, "k", "x")
     }
     assert(first.getMessage.contains("boom-x"))
     assertEquals(counter.get(), 1)
     assertEquals(instanceRow(wf.id, "k").get._1, Some("failed"))
 
-    val second = intercept[StepFailed] {
+    val second = intercept[RuntimeException] {
       rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     }
     assertEquals(second.getMessage, first.getMessage)
