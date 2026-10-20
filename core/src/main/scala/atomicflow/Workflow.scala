@@ -329,7 +329,7 @@ object Workflow {
       * it on the next replay.
       */
     def discardGeneration(count: Long): Unit = {
-      val base = parentScopePath.appended(regionSegment(id, count))
+      val base = ctx.scopePath.appended(regionSegment(id, count))
       internals.deleteStepsUnderScopePaths(Seq(base))
       internals.deleteSubscriptionsUnderScopePaths(Seq(base))
       internals.requestChildCloseUnderScopePath(base)
@@ -360,7 +360,7 @@ object Workflow {
     var done = false
     while (!done) {
       if (count > 0) discardGeneration(count - 1)
-      val regionCtx = ctx.copy(scopePath = parentScopePath.appended(regionSegment(id, count)))
+      val regionCtx = ctx.copy(scopePath = ctx.scopePath.appended(regionSegment(id, count)))
       val scope = new RestartableScope[S] {
         override def restartCount: Long = count
         override def restart(nextState: S): Nothing =

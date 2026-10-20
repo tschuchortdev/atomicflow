@@ -17,9 +17,11 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(Long, String, String, String, Instant)] =
     run(
-      sql"""SELECT sequence_id, event_kind, event_key, payload, created_at
-            FROM workflow_events WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-            ORDER BY sequence_id""".query[(Long, String, String, String, Instant)].to[Vector]
+      sql"""
+        SELECT sequence_id, event_kind, event_key, payload, created_at
+        FROM workflow_events WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        ORDER BY sequence_id
+      """.query[(Long, String, String, String, Instant)].to[Vector]
     )
 
   test("send appends exactly one Signal event with the correct envelope and clock created_at") {
@@ -82,9 +84,11 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(wf, "k", "in")
     val leaseExpiry = Instant.now().plusSeconds(3600)
     run(
-      sql"""UPDATE workflow_instances
-            SET lease_owner = 'worker', fencing_token = fencing_token + 1, lease_expires_at = $leaseExpiry
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances
+        SET lease_owner = 'worker', fencing_token = fencing_token + 1, lease_expires_at = $leaseExpiry
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
 
     val signal = Signal[String]("greet")
@@ -97,15 +101,19 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "sig-wakeup") { in => in }
     rt.createWorkflowInstance(wf, "k", "in")
     run(
-      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, signal_key)
-            VALUES (${wf.id}, 'k', '{}', 'step', 1, 0, 'greet')""".update.run
+      sql"""
+        INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, subscriber_key, signal_key)
+        VALUES (${wf.id}, 'k', '{}', 'step', 1, 0, 'greet')
+      """.update.run
     )
 
     val signal = Signal[String]("greet")
     assertEquals(signal.send(WorkflowInstanceId(wf.id, "k"), "x")(using rt), SignalSendResult.Success)
 
     val wake = run(
-      sql"""SELECT scheduled_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT scheduled_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.query[
           Instant
         ].option
     )
@@ -121,7 +129,9 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     signal.send(WorkflowInstanceId(wf.id, "k"), "x")(using rt)
 
     val wake = run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".query[Int].option
+      sql"""
+        SELECT 1 FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.query[Int].option
     )
     assertEquals(wake, None)
   }

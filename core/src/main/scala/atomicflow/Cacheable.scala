@@ -316,6 +316,7 @@ object Cacheable {
       codecs
         .find(_.stableSerializedTypeId == memberId) match {
         case Some(codec) => readWith(codec, payload)
+
         case None =>
           if (memberId == fallback.stableSerializedTypeId) fallback.read(payload)
           else throw new IllegalArgumentException(s"unionMostSpecific: unknown member codec id: $memberId")

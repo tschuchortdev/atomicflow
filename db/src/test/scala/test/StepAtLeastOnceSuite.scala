@@ -30,8 +30,10 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       stepVersion: Long
   ): Option[(String, String, Option[Instant])] =
     run(
-      sql"""SELECT state_kind, state_payload, expires_at FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion""".query[
+      sql"""
+        SELECT state_kind, state_payload, expires_at FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion
+      """.query[
           (String, String, Option[Instant])
         ].option
     )
@@ -41,8 +43,10 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Option[String], Option[String], Long)] =
     run(
-      sql"""SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[String], Long)
         ].option
     )
@@ -85,8 +89,10 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "started-before") { in =>
       Step.atLeastOnce[String]("step") {
         observed = run(
-          sql"""SELECT state_kind FROM workflow_steps
-                WHERE workflow_id = 'started-before' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 1""".query[
+          sql"""
+            SELECT state_kind FROM workflow_steps
+            WHERE workflow_id = 'started-before' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 1
+          """.query[
               String
             ].option
         )
@@ -113,6 +119,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       case WorkflowRunResult.Result(v) =>
         assertEquals(v, StepResult("x"))
         assert(v.ne(captured), "the decoded value must be a distinct instance")
+
       case other => fail(s"unexpected result: $other")
     }
   }
@@ -257,8 +264,10 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "fenced") { in =>
       Step.atLeastOnce[String]("step") {
         run(
-          sql"""UPDATE workflow_instances SET fencing_token = fencing_token + 1
-                WHERE workflow_id = 'fenced' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+          sql"""
+            UPDATE workflow_instances SET fencing_token = fencing_token + 1
+            WHERE workflow_id = 'fenced' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+          """.update.run
         )
         "result"
       }

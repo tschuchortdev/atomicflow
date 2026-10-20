@@ -14,9 +14,11 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
 
   private def stepScopePaths(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[Vector[String]] =
     run(
-      sql"""SELECT DISTINCT step_scope_within_instance FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key
-            ORDER BY step_scope_within_instance""".query[Vector[String]].to[Vector]
+      sql"""
+        SELECT DISTINCT step_scope_within_instance FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key
+        ORDER BY step_scope_within_instance
+      """.query[Vector[String]].to[Vector]
     )
 
   test("scoped runs the same step definition once per element with distinct rows") {
@@ -278,9 +280,11 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(shieldedCounter.get(), 1, "the shielded branch's body ran despite the pending cancel")
     assertEquals(exposedCounter.get(), 0, "the exposed branch's body never ran")
     val rows = run(
-      sql"""SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
-            ORDER BY step_id, step_scope_within_instance""".query[(String, Vector[String], String)].to[Vector]
+      sql"""
+        SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
+        ORDER BY step_id, step_scope_within_instance
+      """.query[(String, Vector[String], String)].to[Vector]
     )
     assert(rows.exists { case (stepId, _, _) => stepId == "shielded" }, "the shielded step row exists (its checkpoint suppressed delivery)")
     assert(!rows.exists { case (stepId, _, _) => stepId == "exposed" }, "the exposed step row is absent (its body never ran)")

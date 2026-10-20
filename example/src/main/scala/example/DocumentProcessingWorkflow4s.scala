@@ -213,7 +213,7 @@ class PerDocumentWorkflow(virusCheckService: VirusCheckService,
       signAndUploadWithRetry >>>
       checkUploadStatusLoop
   }
-  
+
   private lazy val doVirusChecksInParallel: WIO[DocumentFromInputFile, Error, State.AllVirusChecksPassed] =
     WIO.parallel.taking[DocumentFromInputFile]
       .withInterimState[State.WaitingForVirusChecks](initial =
@@ -291,7 +291,7 @@ class PerDocumentWorkflow(virusCheckService: VirusCheckService,
       )
       .retryIn { case NonFatal(e) => 15.minutes.toJava } // TODO: Only unlimited retries are possible >:O
   }
-  
+
   private lazy val signFile: WIO[State.AllVirusChecksPassed, Error.SigningFailed, State.DocumentSigned] =
     WIO.runIO { (state: State.AllVirusChecksPassed) =>
         encryptionService.signDocument(state.documentContent)

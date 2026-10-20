@@ -22,9 +22,9 @@ final class PostgresJobRunner private[atomicflow] (
     startLoop: Boolean = true
 ) extends JobRunner {
 
-  private val log = LoggerFactory.getLogger(getClass)
+  private val logger = LoggerFactory.getLogger(getClass)
 
-  private val registry: Map[WorkflowId, Workflow[?, ?]] = {
+  private val workflowDefinitionsRegistry: Map[WorkflowId, Workflow[?, ?]] = {
     val grouped = definitions.groupBy(_.id)
     grouped.collectFirst { case (id, ws) if ws.size > 1 => id } match {
       case Some(id) =>
@@ -41,7 +41,7 @@ final class PostgresJobRunner private[atomicflow] (
   private val runnerWorkerId: String =
     settings.workerId.getOrElse(s"jobrunner-${java.util.UUID.randomUUID()}")
 
-  private val stopped = new AtomicBoolean(false)
+  private val isStopped = new AtomicBoolean(false)
 
   private val RequeueBackoffBase: FiniteDuration = 1.second
   private val RequeueBackoffCap: FiniteDuration = 5.minutes
@@ -126,7 +126,7 @@ final class PostgresJobRunner private[atomicflow] (
     */
   private def claimDueWakeups(): Vector[ClaimedInstance] = {
     val now = runtime.clock.instant()
-    val ids: List[WorkflowId] = registry.keys.toList
+    val ids: List[WorkflowId] = workflowDefinitionsRegistry.keys.toList
     val query =
       fr"""
         WITH ranked AS (
@@ -156,12 +156,16 @@ final class PostgresJobRunner private[atomicflow] (
           else
             runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope, runnerWorkerId, settings.leaseDuration).flatMap {
               case Some(token) =>
-                sql"""DELETE FROM workflow_wakeups
+                sql"""
+                      DELETE FROM workflow_wakeups
                       WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
-                        AND scheduled_at = ${row.scheduledAt}""".update.run.map { _ =>
-                  acquirePermit(row.workflowId)
-                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorkerId, token, row.attempts, row.createdAt)
-                }
+                        AND scheduled_at = ${row.scheduledAt}
+                """
+                  .update.run
+                  .map { _ =>
+                    acquirePermit(row.workflowId)
+                    acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorkerId, token, row.attempts, row.createdAt)
+                  }
               case None => acc.pure[ConnectionIO]
             }
         }
@@ -176,10 +180,12 @@ final class PostgresJobRunner private[atomicflow] (
     */
   private def deferWakeupIO(row: DueWakeupRow, now: java.time.Instant): ConnectionIO[Unit] = {
     val deferred = now.plus(java.time.Duration.ofNanos(settings.capacityRetryDelay.toNanos))
-    sql"""UPDATE workflow_wakeups
+    sql"""
+          UPDATE workflow_wakeups
           SET scheduled_at = $deferred
           WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
-            AND scheduled_at = ${row.scheduledAt}""".update.run.map(_ => ())
+            AND scheduled_at = ${row.scheduledAt}
+    """.update.run.map(_ => ())
   }
 
   /** Requeues a claimed wakeup after a transient failure. One transaction: the
@@ -190,21 +196,22 @@ final class PostgresJobRunner private[atomicflow] (
     * (never earlier than an existing future time), and bumps `attempts` by one.
     */
   private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int, createdAt: java.time.Instant): Unit = {
-    val now = runtime.clock.instant()
-    val scheduled = now.plus(java.time.Duration.ofNanos(requeueDelay(attempts).toNanos))
+    val scheduledAt = runtime.clock.instant().plus(java.time.Duration.ofNanos(requeueDelay(attempts).toNanos))
     runtime.runTransaction {
-      sql"""INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, scheduled_at, attempts)
-            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduled, ${attempts + 1})
+      sql"""
+            INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, scheduled_at, attempts)
+            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduledAt, ${attempts + 1})
             ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO UPDATE
             SET created_at = workflow_wakeups.created_at,
                 scheduled_at = GREATEST(workflow_wakeups.scheduled_at, EXCLUDED.scheduled_at),
-                attempts = workflow_wakeups.attempts + 1""".update.run
+                attempts = workflow_wakeups.attempts + 1
+      """.update.run
     }
     ()
   }
 
   private def dispatchRun(c: ClaimedInstance): Unit = {
-    val workflow = registry(c.instanceId.workflowId)
+    val workflow = workflowDefinitionsRegistry(c.instanceId.workflowId)
     try {
       testRunWrapper(() => {
         val result = runtime.runClaimedInstance(
@@ -215,14 +222,14 @@ final class PostgresJobRunner private[atomicflow] (
         )(using settings.throwableCacheable)
         result match {
           case WorkflowRunResult.WorkflowSuspended =>
-            log.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
+            logger.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
           case other =>
-            log.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
+            logger.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
         }
       })
     } catch {
       case _: WorkflowNotFoundException =>
-        log.warn(s"Claimed workflow instance ${c.instanceId} was not found; wakeup already consumed")
+        logger.warn(s"Claimed workflow instance ${c.instanceId} was not found; wakeup already consumed")
       case e: Throwable =>
         classifyFailure(c, e)
     } finally {
@@ -239,32 +246,34 @@ final class PostgresJobRunner private[atomicflow] (
   private def classifyFailure(c: ClaimedInstance, e: Throwable): Unit =
     runtime.readTerminalState(c.instanceId) match {
       case Some("failed") =>
-        log.warn(s"Workflow instance ${c.instanceId} failed and will not be rescheduled", e)
+        logger.warn(s"Workflow instance ${c.instanceId} failed and will not be rescheduled", e)
+
       case Some(_) =>
-        log.debug(s"Workflow instance ${c.instanceId} reached a terminal state; adopting its outcome")
+        logger.debug(s"Workflow instance ${c.instanceId} reached a terminal state; adopting its outcome")
+
       case None =>
         if (runtime.isLeaseStillOwned(c.instanceId, c.worker, c.token)) {
-          log.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
+          logger.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
           requeueTransient(c.instanceId, c.attempts, c.createdAt)
         } else
-          log.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
+          logger.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
     }
 
   private def dispatchAndAwait(claimed: Vector[ClaimedInstance]): Unit = {
     if (claimed.isEmpty) return
-    log.info(s"Job runner claimed ${claimed.size} wakeups this cycle")
+    logger.info(s"Job runner claimed ${claimed.size} wakeups this cycle")
     val latch = new CountDownLatch(claimed.size)
     claimed.foreach { c =>
       try {
         workerExecutor.execute(() => {
           try dispatchRun(c)
           catch {
-            case e: Throwable => log.warn(s"Uncaught error dispatching ${c.instanceId}", e)
+            case e: Throwable => logger.warn(s"Uncaught error dispatching ${c.instanceId}", e)
           } finally latch.countDown()
         })
       } catch {
         case e: Throwable =>
-          log.warn(s"Executor rejected the dispatch of ${c.instanceId}; requeueing", e)
+          logger.warn(s"Executor rejected the dispatch of ${c.instanceId}; requeueing", e)
           runtime.releaseLeaseIfStillOwned(c.instanceId, c.worker, c.token)
           releasePermit(c.instanceId.workflowId)
           requeueTransient(c.instanceId, c.attempts, c.createdAt)
@@ -299,7 +308,7 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def runTimerSweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
-      (fr"""
+      fr"""
         SELECT s.timer_id, s.workflow_id, s.workflow_instance_key, s.workflow_instance_scope
         FROM workflow_timer_subscriptions s
         JOIN workflow_instances i
@@ -314,14 +323,15 @@ final class PostgresJobRunner private[atomicflow] (
         ORDER BY s.deadline
         LIMIT ${settings.timerBatchSize}
         FOR UPDATE OF s SKIP LOCKED
-      """).query[TimerSweepRow].to[Vector]
+      """
+        .query[TimerSweepRow].to[Vector]
     }
     var fired = 0
     rows.foreach { row =>
       if (runtime.runTransaction(runtime.fireTimerSubscriptionQ(row.timerId, row.workflowId, row.instanceKey, row.scope)))
         fired += 1
     }
-    if (fired > 0) log.debug(s"Timer sweep fired $fired due timers")
+    if (fired > 0) logger.debug(s"Timer sweep fired $fired due timers")
     fired
   }
 
@@ -334,10 +344,13 @@ final class PostgresJobRunner private[atomicflow] (
     val now = runtime.clock.instant()
     val cutoff = now.minus(java.time.Duration.ofNanos(settings.cancelTimeout.toNanos))
     val rows = runtime.runTransaction {
-      sql"""SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
+      sql"""
+            SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
             WHERE cancel_requested_at IS NOT NULL AND terminal_state IS NULL
               AND cancel_requested_at <= $cutoff
-            LIMIT 128""".query[InstanceRow].to[Vector]
+            LIMIT 128
+      """
+        .query[InstanceRow].to[Vector]
     }
     var escalated = 0
     rows.foreach { row =>
@@ -346,7 +359,7 @@ final class PostgresJobRunner private[atomicflow] (
       runtime.logDroppedUnconsumedSignals(id, unconsumed)
       if (terminated) escalated += 1
     }
-    if (escalated > 0) log.info(s"Escalation sweep escalated $escalated cancellations to TERMINATED")
+    if (escalated > 0) logger.info(s"Escalation sweep escalated $escalated cancellations to TERMINATED")
     escalated
   }
 
@@ -359,16 +372,19 @@ final class PostgresJobRunner private[atomicflow] (
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
-      sql"""SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
+      sql"""
+            SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
             WHERE lease_owner IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
-            LIMIT 128""".query[InstanceRow].to[Vector]
+            LIMIT 128
+      """
+        .query[InstanceRow].to[Vector]
     }
     var recovered = 0
     rows.foreach { row =>
       if (runtime.recoverLease(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope)))
         recovered += 1
     }
-    if (recovered > 0) log.info(s"Lease recovery sweep recovered $recovered expired leases")
+    if (recovered > 0) logger.info(s"Lease recovery sweep recovered $recovered expired leases")
     recovered
   }
 
@@ -429,7 +445,8 @@ final class PostgresJobRunner private[atomicflow] (
   }
 
   private[atomicflow] def runDriverCycle(): Unit = {
-    if (stopped.get) throw new IllegalStateException("Job runner is stopped")
+    if (isStopped.get)
+      throw new IllegalStateException("Job runner is stopped")
     runSweepsDue()
     val claimed = claimDueWakeups()
     lastClaimedBatch = claimed.map(_.instanceId)
@@ -452,7 +469,7 @@ final class PostgresJobRunner private[atomicflow] (
 
   private def driverLoop(): Unit = {
     var backoff = settings.pollInterval
-    while (!stopped.get) {
+    while (!isStopped.get) {
       try {
         runSweepsDue()
         val claimed = claimDueWakeups()
@@ -469,7 +486,7 @@ final class PostgresJobRunner private[atomicflow] (
           Thread.currentThread().interrupt()
           return
         case e: Throwable =>
-          log.warn("Job runner cycle failed", e)
+          logger.warn("Job runner cycle failed", e)
           Thread.sleep(backoff.toMillis)
           backoff = (backoff * 2) min (settings.pollInterval * 10)
       }
@@ -480,7 +497,7 @@ final class PostgresJobRunner private[atomicflow] (
   if (startLoop) loopThread.start()
 
   override def stop(gracePeriod: FiniteDuration): Unit = {
-    if (!stopped.getAndSet(true)) {
+    if (!isStopped.getAndSet(true)) {
       val deadline = System.nanoTime() + gracePeriod.toNanos
       loopThread.interrupt()
       try {

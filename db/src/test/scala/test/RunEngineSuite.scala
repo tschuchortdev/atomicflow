@@ -15,16 +15,20 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
 
   private def instanceRow(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Option[String], Option[String], Int, Option[java.time.Instant], Option[String], Long, Option[java.time.Instant])] =
     run(
-      sql"""SELECT terminal_state, terminal_outcome, times_executed, last_run_at, lease_owner, fencing_token, lease_expires_at
-            FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT terminal_state, terminal_outcome, times_executed, last_run_at, lease_owner, fencing_token, lease_expires_at
+        FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[String], Int, Option[java.time.Instant], Option[String], Long, Option[java.time.Instant])
         ].option
     )
 
   private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
     run(
-      sql"""SELECT event_kind, event_key, payload FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'""".query[
+      sql"""
+        SELECT event_kind, event_key, payload FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
+      """.query[
           (String, String, String)
         ].option
     )
@@ -97,8 +101,10 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "leased")(in => s"out-$in")
     rt.createWorkflowInstance(wf, "k", "a")
     run(
-      sql"""UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
     intercept[LeaseUnavailableException] {
       rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
@@ -115,8 +121,10 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(wf, "k", "a")
     val payload = Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Completed("from-sql"))
     run(
-      sql"""UPDATE workflow_instances SET terminal_state = 'completed', terminal_outcome = $payload
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET terminal_state = 'completed', terminal_outcome = $payload
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
 
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")),
@@ -129,16 +137,20 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "cancelled")(in => s"out-$in")
     rt.createWorkflowInstance(wf, "ck", "a")
     run(
-      sql"""UPDATE workflow_instances SET terminal_state = 'cancelled', terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Cancelled)}
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'ck' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET terminal_state = 'cancelled', terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Cancelled)}
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'ck' AND workflow_instance_scope = '{}'
+      """.update.run
     )
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "ck")), WorkflowRunResult.WorkflowCancelled)
 
     val wf2 = Workflow[String, String](id = "terminated")(in => s"out-$in")
     rt.createWorkflowInstance(wf2, "tk", "a")
     run(
-      sql"""UPDATE workflow_instances SET terminal_state = 'terminated', terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Terminated)}
-            WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 'tk' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET terminal_state = 'terminated', terminal_outcome = ${Cacheable[WorkflowCompletionResult[String]].write(WorkflowCompletionResult.Terminated)}
+        WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 'tk' AND workflow_instance_scope = '{}'
+      """.update.run
     )
     assertEquals(rt.runWorkflowInstance(wf2, WorkflowInstanceId(wf2.id, "tk")), WorkflowRunResult.WorkflowTerminated)
   }
@@ -148,8 +160,10 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "corrupt")(in => s"out-$in")
     rt.createWorkflowInstance(wf, "k", "a")
     run(
-      sql"""UPDATE workflow_instances SET terminal_state = 'completed', terminal_outcome = 'not-a-valid-payload'
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET terminal_state = 'completed', terminal_outcome = 'not-a-valid-payload'
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
     intercept[StepSerializationFailed] {
       rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))

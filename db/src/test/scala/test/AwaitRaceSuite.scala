@@ -32,16 +32,20 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
 
   private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, String)] =
     run(
-      sql"""SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-            ORDER BY step_id, subscriber_key""".query[(String, Long, String, String)].to[Vector]
+      sql"""
+        SELECT step_id, step_version, subscriber_key, signal_key FROM workflow_signal_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        ORDER BY step_id, subscriber_key
+      """.query[(String, Long, String, String)].to[Vector]
     )
 
   private def timerSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(String, Long, String, java.util.UUID, Instant)] =
     run(
-      sql"""SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-            ORDER BY step_id, subscriber_key""".query[(String, Long, String, java.util.UUID, Instant)].to[Vector]
+      sql"""
+        SELECT step_id, step_version, subscriber_key, timer_id, deadline FROM workflow_timer_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        ORDER BY step_id, subscriber_key
+      """.query[(String, Long, String, java.util.UUID, Instant)].to[Vector]
     )
 
   private def completionSubscriptions(
@@ -49,41 +53,53 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(String, Long, String, String, String, Vector[String])] =
     run(
-      sql"""SELECT step_id, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope
-            FROM workflow_completion_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-            ORDER BY step_id, subscriber_key""".query[(String, Long, String, String, String, Vector[String])].to[Vector]
+      sql"""
+        SELECT step_id, step_version, subscriber_key, completed_workflow_id, completed_workflow_instance_key, completed_workflow_instance_scope
+        FROM workflow_completion_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+        ORDER BY step_id, subscriber_key
+      """.query[(String, Long, String, String, String, Vector[String])].to[Vector]
     )
 
   private def cursor(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey): Option[Long] =
     run(
-      sql"""SELECT sequence_id FROM signal_cursor
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey""".query[Long].option
+      sql"""
+        SELECT sequence_id FROM signal_cursor
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey
+      """.query[Long].option
     )
 
   private def seqOf(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey, payload: String): Long =
     run(
-      sql"""SELECT sequence_id FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND event_kind = 'Signal' AND event_key = $signalKey AND payload = $payload""".query[Long].unique
+      sql"""
+        SELECT sequence_id FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND event_kind = 'Signal' AND event_key = $signalKey AND payload = $payload
+      """.query[Long].unique
     )
 
   private def timerFiredOrder(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
     run(
-      sql"""SELECT event_key FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND event_kind = 'TimerFired' ORDER BY sequence_id""".query[String].to[Vector]
+      sql"""
+        SELECT event_key FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND event_kind = 'TimerFired' ORDER BY sequence_id
+      """.query[String].to[Vector]
     )
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
-      sql"""SELECT EXISTS(SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}')""".query[Boolean].unique
+      sql"""
+        SELECT EXISTS(SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}')
+      """.query[Boolean].unique
     )
 
   private def stepRow(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String): Option[(String, String, String)] =
     run(
-      sql"""SELECT step_kind, state_kind, state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = 0""".query[
+      sql"""
+        SELECT step_kind, state_kind, state_payload FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = 0
+      """.query[
           (String, String, String)
         ].option
     )

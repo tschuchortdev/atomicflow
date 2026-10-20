@@ -35,7 +35,6 @@ class DocumentProcessingAtomicflow(
   import DocumentProcessingAtomicflow.*
   import DocumentProcessingAtomicflow.given
 
-
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
   private given Cacheable[Array[Byte]] = new Cacheable[Array[Byte]] {
@@ -152,8 +151,10 @@ class DocumentProcessingAtomicflow(
       outcome match {
         case UploadPollOutcome.ProcessedSuccessfully => loop.break(())
         case UploadPollOutcome.ProcessedWithErrors(msg) => throw Error.UploadProcessedWithErrors(msg)
+
         case UploadPollOutcome.NoInfo =>
-          if (attempts >= MaxPollAttempts) throw Error.UploadStatusTimeoutExceeded
+          if (attempts >= MaxPollAttempts)
+            throw Error.UploadStatusTimeoutExceeded
           else {
             Step.await[Unit]("poll-wait", Awaitable.Timer(PollInterval))
             attempts + 1
@@ -176,14 +177,14 @@ object DocumentProcessingAtomicflow {
   given Cacheable[UploadPollOutcome] = new Cacheable[UploadPollOutcome] {
     override def stableSerializedTypeId: String = "upload-poll-outcome"
     override def write(value: UploadPollOutcome): String = value match {
-      case UploadPollOutcome.ProcessedSuccessfully   => "success"
+      case UploadPollOutcome.ProcessedSuccessfully    => "success"
       case UploadPollOutcome.ProcessedWithErrors(msg) => s"error:$msg"
-      case UploadPollOutcome.NoInfo                    => "noinfo"
+      case UploadPollOutcome.NoInfo                   => "noinfo"
     }
     override def read(serialized: String): UploadPollOutcome = serialized match {
-      case "success"                            => UploadPollOutcome.ProcessedSuccessfully
-      case s if s.startsWith("error:")          => UploadPollOutcome.ProcessedWithErrors(s.drop("error:".length))
-      case _                                    => UploadPollOutcome.NoInfo
+      case "success"                   => UploadPollOutcome.ProcessedSuccessfully
+      case s if s.startsWith("error:") => UploadPollOutcome.ProcessedWithErrors(s.drop("error:".length))
+      case _                           => UploadPollOutcome.NoInfo
     }
   }
 

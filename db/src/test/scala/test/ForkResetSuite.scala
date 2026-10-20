@@ -19,14 +19,18 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
 
   private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath = ScopePath.empty): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[Int].unique
     )
 
   private def stepIds(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath = ScopePath.empty): Set[String] =
     run(
-      sql"""SELECT step_id FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[String].to[Set]
+      sql"""
+        SELECT step_id FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[String].to[Set]
     )
 
   private def setUpdatedAt(
@@ -403,8 +407,10 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(attempts.get(), 2, "the fork re-executed the retry-suspended step")
     assertEquals(
       run(
-        sql"""SELECT state_kind FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'fork' AND workflow_instance_scope = '{}' AND step_id = 'flaky'""".query[String].option
+        sql"""
+          SELECT state_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'fork' AND workflow_instance_scope = '{}' AND step_id = 'flaky'
+        """.query[String].option
       ),
       Some("Succeeded"),
       "the re-executed step completed in the fork"

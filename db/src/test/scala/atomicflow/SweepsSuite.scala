@@ -26,7 +26,9 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].option
+      sql"""
+        SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].option
     ).isDefined
 
   private def terminalRow(
@@ -34,8 +36,10 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Option[String], Option[String])] =
     run(
-      sql"""SELECT terminal_state, terminal_outcome FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT terminal_state, terminal_outcome FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[String])
         ].option
     )
@@ -45,31 +49,39 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Option[String], Option[Instant], Long)] =
     run(
-      sql"""SELECT lease_owner, lease_expires_at, fencing_token FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT lease_owner, lease_expires_at, fencing_token FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[Instant], Long)
         ].option
     )
 
   private def cancelRequestedAt(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
-      sql"""SELECT cancel_requested_at FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Option[Instant]].unique
+      sql"""
+        SELECT cancel_requested_at FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Option[Instant]].unique
     )
 
   private def completedEvent(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(String, String, String)] =
     run(
-      sql"""SELECT event_kind, event_key, payload FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'""".query[
+      sql"""
+        SELECT event_kind, event_key, payload FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
+      """.query[
           (String, String, String)
         ].option
     )
 
   private def timerFiredEvents(workflowId: WorkflowId): Vector[(String, Long)] =
     run(
-      sql"""SELECT event_key, sequence_id FROM workflow_events
-            WHERE workflow_id = $workflowId AND event_kind = 'TimerFired'
-            ORDER BY sequence_id""".query[(String, Long)].to[Vector]
+      sql"""
+        SELECT event_key, sequence_id FROM workflow_events
+        WHERE workflow_id = $workflowId AND event_kind = 'TimerFired'
+        ORDER BY sequence_id
+      """.query[(String, Long)].to[Vector]
     )
 
   private def timerSubscriptions(
@@ -77,16 +89,20 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(java.util.UUID, Instant)] =
     run(
-      sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT timer_id, deadline FROM workflow_timer_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (java.util.UUID, Instant)
         ].to[Vector]
     )
 
   private def timerFiredCount(timerId: java.util.UUID): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_events
+        WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}
+      """.query[Int].unique
     )
 
   test("timer sweep fires a due timer of an unattended instance and upserts a wakeup") {
@@ -234,8 +250,10 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-in"))
       run(
-        sql"""UPDATE workflow_instances SET cancel_requested_at = '2020-01-01T00:00:00Z'
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+        sql"""
+          UPDATE workflow_instances SET cancel_requested_at = '2020-01-01T00:00:00Z'
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
       )
 
       assertEquals(runner.runEscalationSweep(), 0)
@@ -267,8 +285,10 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(terminalRow(wf.id, "k").get._1, Some("terminated"))
       assertEquals(
         run(
-          sql"""SELECT COUNT(*) FROM workflow_events
-                WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'""".query[Int].unique
+          sql"""
+            SELECT COUNT(*) FROM workflow_events
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND event_kind = 'WorkflowCompleted'
+          """.query[Int].unique
         ),
         1,
         "only one WorkflowCompleted event may exist"
@@ -292,9 +312,11 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
 
       clock.advanceBy(1.hour)
       run(
-        sql"""UPDATE workflow_instances
-              SET lease_owner = 'orphaned-worker', lease_expires_at = '2026-01-02T00:30:00Z'
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+        sql"""
+          UPDATE workflow_instances
+          SET lease_owner = 'orphaned-worker', lease_expires_at = '2026-01-02T00:30:00Z'
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
       )
 
       assertEquals(runner.runRecoverySweep(), 1)
@@ -318,9 +340,11 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
       run(
-        sql"""UPDATE workflow_instances
-              SET lease_owner = 'live-worker', lease_expires_at = now() + interval '1 hour'
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+        sql"""
+          UPDATE workflow_instances
+          SET lease_owner = 'live-worker', lease_expires_at = now() + interval '1 hour'
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
       )
 
       assertEquals(runner.runRecoverySweep(), 0)
@@ -331,9 +355,11 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       val id2 = rt.createWorkflowInstance(wf2, "t", "in").id
       assertEquals(rt.runWorkflowInstance(wf2, id2), WorkflowRunResult.Result("out-in"))
       run(
-        sql"""UPDATE workflow_instances
-              SET lease_owner = 'orphan', lease_expires_at = now() - interval '1 hour'
-              WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 't' AND workflow_instance_scope = '{}'""".update.run
+        sql"""
+          UPDATE workflow_instances
+          SET lease_owner = 'orphan', lease_expires_at = now() - interval '1 hour'
+          WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 't' AND workflow_instance_scope = '{}'
+        """.update.run
       )
       assertEquals(runner.runRecoverySweep(), 0)
       assertEquals(leaseRow(wf2.id, "t").get._1, Some("orphan"), "a terminal instance's lease must be untouched")

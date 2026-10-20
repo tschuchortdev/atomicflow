@@ -95,6 +95,7 @@ object StepState {
         stateKindText match {
           case StartedText =>
             SimpleStep.Started
+
           case RetryPendingText =>
             SimpleStep.RetryPending(
               SerializedValue.of(payload),
@@ -102,27 +103,33 @@ object StepState {
                 throw new IllegalArgumentException("RetryPending step row is missing its retry_deadline")
               )
             )
+
           case SucceededText => SimpleStep.Succeeded(SerializedValue.of(payload))
           case FailedText    => SimpleStep.Failed(SerializedValue.of(payload))
           case other         => illegalRowState(rowKindText, other)
         }
+
       case StepKind.Await =>
         stateKindText match {
           case SucceededText => Await(SerializedValue.of(payload))
           case other         => illegalRowState(rowKindText, other)
         }
+
       case StepKind.FirstToRun =>
         stateKindText match {
           case SucceededText => FirstToRun(SerializedValue.of(payload))
           case other         => illegalRowState(rowKindText, other)
         }
+
       case StepKind.RestartableRegion =>
         stateKindText match {
           case RegionStateText =>
             Region(RegionState.decode(payload))
+
           case other =>
             illegalRowState(rowKindText, other)
         }
+
       case other =>
         throw new IllegalArgumentException(s"Unknown step_kind '$other'")
     }
@@ -143,16 +150,22 @@ object StepState {
     def persistedColumns: (String, String, Option[Instant]) = state match {
       case SimpleStep.Started =>
         (StartedText, "", None)
+
       case SimpleStep.RetryPending(bookkeeping, deadline) =>
         (RetryPendingText, bookkeeping.raw, Some(deadline))
+
       case SimpleStep.Succeeded(payload) =>
         (SucceededText, payload.raw, None)
+
       case SimpleStep.Failed(payload) =>
         (FailedText, payload.raw, None)
+
       case Await(payload) =>
         (SucceededText, payload.raw, None)
+
       case FirstToRun(result) =>
         (SucceededText, result.raw, None)
+
       case Region(snapshot) =>
         (RegionStateText, RegionState.encode(snapshot), None)
     }

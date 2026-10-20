@@ -19,15 +19,19 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(String, String, String)] =
     run(
-      sql"""SELECT step_kind, state_kind, state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND step_id = 'race'""".query[(String, String, String)].option
+      sql"""
+        SELECT step_kind, state_kind, state_payload FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND step_id = 'race'
+      """.query[(String, String, String)].option
     )
 
   private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(Vector[String], String)] =
     run(
-      sql"""SELECT step_scope_within_instance, signal_key FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key
-            ORDER BY step_scope_within_instance, signal_key""".query[(Vector[String], String)].to[Vector]
+      sql"""
+        SELECT step_scope_within_instance, signal_key FROM workflow_signal_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key
+        ORDER BY step_scope_within_instance, signal_key
+      """.query[(Vector[String], String)].to[Vector]
     )
 
   test("all branches suspend -> combined suspension with one cause per branch, no winner row, all subscriptions remain") {
@@ -134,8 +138,10 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     )
     assertEquals(
       run(
-        sql"""SELECT count(*) FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'race'""".query[Int].unique
+        sql"""
+          SELECT count(*) FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'race'
+        """.query[Int].unique
       ),
       1,
       "the winner row is written once"
@@ -182,10 +188,12 @@ class FirstToRunSuite extends PostgresWorkflowRuntimeSuite {
     )
     assertEquals(
       run(
-        sql"""SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
-              WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'""".query[(String, Vector[String], String)].to[Vector]
+        sql"""
+          SELECT step_id, step_scope_within_instance, state_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'fast'
+        """.query[(String, Vector[String], String)].to[Vector]
       ),
-      Vector(("fast", Vector("race/fast"), "Succeeded")),
+      Vector(("fast", Vector("race", "fast"), "Succeeded")),
       "the winner branch's own step row survives cleanup"
     )
   }

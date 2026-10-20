@@ -22,10 +22,11 @@ object WorkflowCompletionResult {
   /** Composite codec built from the result and throwable codecs; records the
     * selected member codec ids per the `Cacheable` composition scheme.
     */
-  given [R: Cacheable](using throwableCacheable: Cacheable[Throwable]): Cacheable[WorkflowCompletionResult[R]] =
+  given [R](using
+      resultCacheable: Cacheable[R],
+      throwableCacheable: Cacheable[Throwable]
+  ): Cacheable[WorkflowCompletionResult[R]] =
     new Cacheable[WorkflowCompletionResult[R]] {
-      private val resultCacheable = summon[Cacheable[R]]
-
       override def stableSerializedTypeId: String =
         s"workflow-completion-result(${resultCacheable.stableSerializedTypeId},${throwableCacheable.stableSerializedTypeId})"
 

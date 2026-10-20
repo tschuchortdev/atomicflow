@@ -54,8 +54,10 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(observed, Some("value"))
 
     run(
-      sql"""UPDATE workflow_steps SET state_kind = 'Started', state_payload = ''
-            WHERE workflow_id = 'mo-crash' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 0""".update.run
+      sql"""
+        UPDATE workflow_steps SET state_kind = 'Started', state_payload = ''
+        WHERE workflow_id = 'mo-crash' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 0
+      """.update.run
     )
 
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
@@ -197,8 +199,10 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.createAndRun(wf, "k", "a")
     val row = run(
-      sql"""SELECT step_kind, step_version, state_kind FROM workflow_steps
-            WHERE workflow_id = 'mo-kind' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step'""".query[
+      sql"""
+        SELECT step_kind, step_version, state_kind FROM workflow_steps
+        WHERE workflow_id = 'mo-kind' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step'
+      """.query[
           (String, Long, String)
         ].option
     )
