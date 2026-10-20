@@ -32,20 +32,26 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
   private def childRow(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Option[ChildRow] =
     run(
-      sql"""SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_instance_scope
-            FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
+      sql"""
+        SELECT terminal_state, times_executed, cancel_requested_at, parent_workflow_id, parent_instance_key, parent_instance_scope
+        FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[
           (Option[String], Int, Option[Instant], Option[String], Option[String], Option[Vector[String]])
         ].option
     ).map { case (t, te, c, pw, pk, ps) => ChildRow(t, te, c, pw, pk, ps) }
 
   private def childCloseRowCount(): Int =
-    run(sql"""SELECT COUNT(*) FROM child_close_requests""".query[Int].unique)
+    run(sql"""
+      SELECT COUNT(*) FROM child_close_requests
+    """.query[Int].unique)
 
   private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
+      sql"""
+        SELECT 1 FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[
           Int].option
     ).isDefined
 
@@ -297,8 +303,10 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
 
     // Hard-delete the suspended parent (its own rows cascade away).
-    run(sql"""DELETE FROM workflow_instances
-              WHERE workflow_id = 'orders' AND workflow_instance_key = 'order-42' AND workflow_instance_scope = '{}'""".update.run)
+    run(sql"""
+      DELETE FROM workflow_instances
+      WHERE workflow_id = 'orders' AND workflow_instance_key = 'order-42' AND workflow_instance_scope = '{}'
+    """.update.run)
 
     sweep(childWf)
 
@@ -517,8 +525,10 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
     val rows = run(
-      sql"""SELECT workflow_instance_scope FROM workflow_instances
-            WHERE workflow_id = 'worker' AND workflow_instance_key = 'c' ORDER BY workflow_instance_scope""".query[Vector[String]].to[Vector]
+      sql"""
+        SELECT workflow_instance_scope FROM workflow_instances
+        WHERE workflow_id = 'worker' AND workflow_instance_key = 'c' ORDER BY workflow_instance_scope
+      """.query[Vector[String]].to[Vector]
     )
     assertEquals(rows, Vector(Vector("orders", "order-42@0")),
                  "the closed child is not recreated: exactly one instance row, the cancelled one")

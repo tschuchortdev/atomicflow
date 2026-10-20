@@ -2,8 +2,7 @@ package atomicflow
 
 import org.slf4j.LoggerFactory
 
-import java.util.concurrent.TimeUnit
-
+import java.util.concurrent.{TimeUnit, TimeoutException}
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.*
 
@@ -165,7 +164,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
   ): WorkflowRunResult[Out] = {
     given Cacheable[Out] = workflow.outputCacheable
     val completionCodec = summon[Cacheable[WorkflowCompletionResult[Out]]]
-    val record = lease.instance
+    val record = lease.currentWfInstance
     val instanceId = record.instanceId
     val input = workflow.inputCacheable.read(record.input.raw)
     val ctx = new WorkflowContext(
@@ -254,17 +253,22 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       case Some(WorkflowTerminalState.Completed) =>
         decode() match {
           case WorkflowCompletionResult.Completed(v) => WorkflowRunResult.Result(v)
+
           case _ =>
             throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} stored a non-completed outcome as completed")
         }
+
       case Some(WorkflowTerminalState.Failed) =>
         decode() match {
           case WorkflowCompletionResult.Failed(t) => throw t
+
           case _ =>
             throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} stored a non-failed outcome as failed")
         }
+
       case Some(WorkflowTerminalState.Cancelled)  => WorkflowRunResult.WorkflowCancelled
       case Some(WorkflowTerminalState.Terminated) => WorkflowRunResult.WorkflowTerminated
+
       case None =>
         throw new LeaseLostException(s"Workflow instance ${record.instanceId} is not terminal after a terminal transition")
     }
@@ -377,7 +381,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     * sub-millisecond intervals are honored.
     */
   @throws[WorkflowNotFoundException]
-  @throws[java.util.concurrent.TimeoutException]
+  @throws[TimeoutException]
   final def blockUntilCompleted[Out](
       instance: WorkflowInstance[?, Out],
       timeout: FiniteDuration,
@@ -391,14 +395,17 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       val record = readInstance(instance.id).getOrElse(
         throw new WorkflowNotFoundException(s"Workflow instance not found: ${instance.id}")
       )
-      if (record.terminalState.isDefined) terminal = Some(record)
-      else if (System.nanoTime() >= deadlineNanos) expired = true
-      else TimeUnit.NANOSECONDS.sleep(pollInterval.toNanos)
+      if (record.terminalState.isDefined) 
+        terminal = Some(record)
+      else if (System.nanoTime() >= deadlineNanos) 
+        expired = true
+      else 
+        TimeUnit.NANOSECONDS.sleep(pollInterval.toNanos)
     }
     terminal match {
       case Some(record) => decodeTerminal(instance.workflow, record)
       case None =>
-        throw new java.util.concurrent.TimeoutException(
+        throw new TimeoutException(
           s"Workflow instance did not reach a terminal state within $timeout: ${instance.id}"
         )
     }

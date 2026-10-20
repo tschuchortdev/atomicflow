@@ -21,8 +21,10 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
       stepVersion: Long
   ): Option[(String, String, Option[Instant], Option[Instant])] =
     run(
-      sql"""SELECT state_kind, state_payload, retry_deadline, expires_at FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion""".query[
+      sql"""
+        SELECT state_kind, state_payload, retry_deadline, expires_at FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId AND step_version = $stepVersion
+      """.query[
           (String, String, Option[Instant], Option[Instant])
         ].option
     )
@@ -32,9 +34,11 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(java.util.UUID, Instant)] =
     run(
-      sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND step_id = 'step' AND step_version = 1""".query[
+      sql"""
+        SELECT timer_id, deadline FROM workflow_timer_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND step_id = 'step' AND step_version = 1
+      """.query[
           (java.util.UUID, Instant)
         ].to[Vector]
     )

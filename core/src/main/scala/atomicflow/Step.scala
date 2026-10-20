@@ -147,7 +147,7 @@ object Step {
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
     runSimpleStep(atMostOnce = false, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
-  /** An at-most-once step: A step that was started but did not persist a result is not re-executed and 
+  /** An at-most-once step: A step that was started but did not persist a result is not re-executed and
    * instead returns [[None]].
     *
     * @param key
@@ -339,7 +339,8 @@ object Step {
             // would re-suspend an already-due retry that will never be woken again.
             if (!deadline.isAfter(internals.clock.instant()))
               Some(runBody(Some(RetryState.decode(bookkeeping.raw))))
-            else throw new WorkflowSuspendedException
+            else
+              throw new WorkflowSuspendedException
         }
     }
   }
@@ -353,12 +354,12 @@ object Step {
     *   the exact step version to inspect (`0` is the internal version for
     *   unversioned step kinds)
     */
-  def getExecutionState[A: Cacheable](key: String, stepVersion: Long = 0)(using
+  def getExecutionState[A](key: String, stepVersion: Long = 0)(using
       ctx: WorkflowContext,
+      valueCodec: Cacheable[A],
       throwableCodec: Cacheable[Throwable]
   ): StepExecutionState[A] = {
     val stepId = StepId(key, ctx.currentScope)
-    val valueCodec = summon[Cacheable[A]]
     ctx.internals.readStep(ctx.instanceId, stepId, stepVersion) match {
       case None => StepExecutionState.NeverStarted
       case Some(row) =>
@@ -612,10 +613,10 @@ object Step {
     rawExisting.foreach(expectStepState[S](stepKey, _))
     val replayable =
       rawExisting.filterNot(row => isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn))
-    
-    if (rawExisting.isDefined && replayable.isEmpty) 
+
+    if (rawExisting.isDefined && replayable.isEmpty)
       internals.deleteStep(stepId, stepVersion)
-    
+
     replayable.map(expectStepState[S](stepKey, _))
   }
 
@@ -647,10 +648,10 @@ object Step {
     val raceBranches = branches.map((branchKey, a) => branchOf(branchKey, a, now)).toVector
 
     loadStepStateOrDeleteIfInvalid[StepState.Await](stepKey, stepId, 0L, now, ensureUnchanged, invalidateOn) match {
-      case Some(StepState.Await(payload)) => 
+      case Some(StepState.Await(payload)) =>
         decodeStored(valueCodec, stepKey)(payload.raw)
-      
-      case None => 
+
+      case None =>
         throwIfCancelled
         val waitSite = WaitSite(stepId, 0L, InputFingerprints.of(fingerprints), expiresAt)
         internals.evaluateWait(waitSite, raceBranches.map(_.subscriber))(pickRaceWinner(valueCodec, raceBranches)) match {
@@ -690,10 +691,10 @@ object Step {
                 signal.cacheable.read(c.payload.raw)
               )).filter(filter)
         )
-        
+
       case Awaitable.Timer(deadline) =>
         Branch(Subscriber.Timer(branchKey, deadline), _ => Some(()))
-        
+
       case wc @ Awaitable.WorkflowCompletion(instanceId) =>
         Branch(
           Subscriber.Completion(
@@ -707,7 +708,7 @@ object Step {
               wc.completionCacheable.read(c.payload.raw)
             ))
         )
-        
+
       case Awaitable.Mapped(underlying, f) =>
         branchOf(branchKey, underlying, now).map(f)
     }
@@ -721,17 +722,17 @@ object Step {
       valueCodec: Cacheable[A],
       branches: Vector[Branch[A]]
   ): Vector[SubscriberMatch] => Option[WaitResolution] = {
-    val byKey = branches.map(b => b.subscriber.key -> b).toMap
+    val branchesByKey = branches.map(b => b.subscriber.key -> b).toMap
     candidates =>
       candidates.iterator
-        .flatMap(c => byKey.get(c.subscriberKey).flatMap(_.accept(c)).map(c -> _))
+        .flatMap(c => branchesByKey.get(c.subscriberKey).flatMap(_.accept(c)).map(c -> _))
         .nextOption()
         .map { case (candidate, value) =>
           WaitResolution(
             SerializedValue.of(tryOrThrowStepSerializationFailed(s"Subscriber '${candidate.subscriberKey}' result could not be encoded")(
               valueCodec.write(value)
             )),
-            byKey(candidate.subscriberKey).subscriber match {
+            branchesByKey(candidate.subscriberKey).subscriber match {
               case Subscriber.Signal(_, key) => Some((key, candidate.sequenceId))
               case _                         => None
             }
@@ -823,7 +824,7 @@ object Step {
 
   private def isExpired(row: StepRow, now: java.time.Instant): Boolean =
     row.expiresAt.exists(!_.isAfter(now))
-  
+
   /** A step key belongs to exactly one step kind: the row stored at a
     * step's key must have been written by the step kind that reads it. Anything
     * else means the key was reused for a different step kind (a definition
@@ -833,9 +834,11 @@ object Step {
   private def expectStepState[S <: StepState](stepKey: String, row: StepRow)(using TypeTest[StepState, S]): S = {
     row.state match
       case s: S => s
-      case _ => throw new StepKeyConflictException(
-        s"Step key '$stepKey' is already stored as a '${row.state.rowKindText}' row and cannot be reused for a different step kind; a step key belongs to exactly one step kind"
-      )
+
+      case _ =>
+        throw new StepKeyConflictException(
+          s"Step key '$stepKey' is already stored as a '${row.state.rowKindText}' row and cannot be reused for a different step kind; a step key belongs to exactly one step kind"
+        )
   }
 
   private def expiryOf(invalidateAfter: Duration, now: java.time.Instant): Option[java.time.Instant] =

@@ -18,23 +18,29 @@ class AwaitTimerSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Vector[(java.util.UUID, Instant)] =
     run(
-      sql"""SELECT timer_id, deadline FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT timer_id, deadline FROM workflow_timer_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (java.util.UUID, Instant)
         ].to[Vector]
     )
 
   private def timerFiredEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[String] =
     run(
-      sql"""SELECT event_key FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND event_kind = 'TimerFired' ORDER BY sequence_id""".query[String].to[Vector]
+      sql"""
+        SELECT event_key FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND event_kind = 'TimerFired' ORDER BY sequence_id
+      """.query[String].to[Vector]
     )
 
   private def timerFiredCount(timerId: java.util.UUID): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_events
+        WHERE event_kind = 'TimerFired' AND event_key = ${timerId.toString}
+      """.query[Int].unique
     )
 
   test("a timer not yet due suspends and records an absolute-deadline subscription with no event") {

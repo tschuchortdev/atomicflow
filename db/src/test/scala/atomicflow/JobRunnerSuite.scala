@@ -30,13 +30,17 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].option
+      sql"""
+        SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].option
     ).isDefined
 
   private def subscriptionExists(workflowId: WorkflowId, key: WorkflowInstanceKey, signalKey: SignalKey): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_signal_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey""".query[Int].option
+      sql"""
+        SELECT 1 FROM workflow_signal_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND signal_key = $signalKey
+      """.query[Int].option
     ).isDefined
 
   private def instanceRow(
@@ -44,8 +48,10 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Option[String], Int)] =
     run(
-      sql"""SELECT terminal_state, times_executed FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[(Option[String], Int)].option
+      sql"""
+        SELECT terminal_state, times_executed FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[(Option[String], Int)].option
     )
 
   private def wakeupRow(
@@ -53,17 +59,23 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Instant, Instant, Int)] =
     run(
-      sql"""SELECT created_at, scheduled_at, attempts FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[(Instant, Instant, Int)].option
+      sql"""
+        SELECT created_at, scheduled_at, attempts FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[(Instant, Instant, Int)].option
     )
 
   private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Unit =
-    run(sql"""DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".update.run)
+    run(sql"""
+      DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+    """.update.run)
 
   private def leaseOwner(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
     run(
-      sql"""SELECT lease_owner FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Option[String]].unique
+      sql"""
+        SELECT lease_owner FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Option[String]].unique
     )
 
   test("started runner claims the createAndScheduleForAsyncRun wakeup and completes the instance autonomously") {
@@ -128,9 +140,11 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     val wf = simpleWf("atomic")
     wf.createAndScheduleForAsyncRun("k", "x")(using rt)
     run(
-      sql"""UPDATE workflow_instances
-            SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances
+        SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
@@ -320,9 +334,11 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.testRunWrapper = { _ =>
         run(
-          sql"""UPDATE workflow_instances SET lease_owner = 'other', fencing_token = fencing_token + 1,
-                lease_expires_at = now() + interval '1 hour'
-                WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+          sql"""
+            UPDATE workflow_instances SET lease_owner = 'other', fencing_token = fencing_token + 1,
+            lease_expires_at = now() + interval '1 hour'
+            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+          """.update.run
         )
         throw new RuntimeException("simulated infrastructure failure")
       }

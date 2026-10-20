@@ -15,7 +15,9 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
 
   private def hasWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[Int].option
+      sql"""
+        SELECT 1 FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[Int].option
     ).isDefined
 
   private def cursorAt(
@@ -25,8 +27,10 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       signalKey: SignalKey
   ): Option[Long] =
     run(
-      sql"""SELECT sequence_id FROM signal_cursor
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments} AND signal_key = $signalKey""".query[Long].option
+      sql"""
+        SELECT sequence_id FROM signal_cursor
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments} AND signal_key = $signalKey
+      """.query[Long].option
     )
 
   private def childInfo(rt: PostgresWorkflowRuntime, parentId: WorkflowInstanceId, childKey: WorkflowInstanceKey): WorkflowInstance.Info =
@@ -38,8 +42,10 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       scope: ScopePath
   ): (Vector[String], Boolean) =
     run(
-      sql"""SELECT inherited_signal_prefixes, inherit_past_events FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}"""
+      sql"""
+        SELECT inherited_signal_prefixes, inherit_past_events FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """
         .query[(Vector[String], Boolean)].unique
     )
 
@@ -340,8 +346,10 @@ class InheritanceSuite extends PostgresWorkflowRuntimeSuite {
       "under none the child does not see the parent event"
     )
 
-    run(sql"""DELETE FROM workflow_wakeups
-              WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${childId.scope.segments}""".update.run)
+    run(sql"""
+      DELETE FROM workflow_wakeups
+      WHERE workflow_id = ${childWf.id} AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${childId.scope.segments}
+    """.update.run)
     assert(!hasWakeup(childWf.id, "worker-1", childId.scope), "the child's stale creation wakeup is cleared")
 
     inherit = SignalInheritance.all

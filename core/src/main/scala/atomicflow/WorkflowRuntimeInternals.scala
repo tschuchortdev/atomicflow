@@ -11,7 +11,7 @@ import scala.concurrent.duration.FiniteDuration
 trait LeaseHandle {
 
   /** The instance row re-read under the lease. Visible only to the library. */
-  private[atomicflow] def instance: InstanceRecord
+  private[atomicflow] def currentWfInstance: InstanceRecord
 }
 
 /** The storage and execution operations a backend implements for the library
@@ -138,7 +138,7 @@ trait WorkflowRuntimeInternals {
     * transaction already committed.
     */
   def evaluateWait(
-      site: WaitSite,
+      waitSite: WaitSite,
       subscribers: Vector[Subscriber]
   )(decide: Vector[SubscriberMatch] => Option[WaitResolution])(using Lease): Option[SerializedValue]
 

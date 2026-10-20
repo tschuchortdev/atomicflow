@@ -16,22 +16,28 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
 
   private def countSteps(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].unique
     )
 
   private def countNonRegionSteps(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND step_kind <> 'RestartableRegion'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND step_kind <> 'RestartableRegion'
+      """.query[Int].unique
     )
 
   private def regionPayload(workflowId: WorkflowId, key: WorkflowInstanceKey, regionId: String): Option[(Long, String)] =
     run(
-      sql"""SELECT state_payload FROM workflow_steps
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-              AND step_id = $regionId AND step_kind = 'RestartableRegion'""".query[String].option
+      sql"""
+        SELECT state_payload FROM workflow_steps
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+          AND step_id = $regionId AND step_kind = 'RestartableRegion'
+      """.query[String].option
     ).map { p =>
       val o = upickle.default.read[ujson.Value](p)
       (o("count").num.toLong, o("state").str)
@@ -39,21 +45,27 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
 
   private def childRows(workflowId: WorkflowId, childKey: WorkflowInstanceKey): Vector[(Vector[String], Option[String])] =
     run(
-      sql"""SELECT workflow_instance_scope, terminal_state FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $childKey
-            ORDER BY workflow_instance_scope""".query[(Vector[String], Option[String])].to[Vector]
+      sql"""
+        SELECT workflow_instance_scope, terminal_state FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $childKey
+        ORDER BY workflow_instance_scope
+      """.query[(Vector[String], Option[String])].to[Vector]
     )
 
   private def countTimerSubs(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_timer_subscriptions
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_timer_subscriptions
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].unique
     )
 
   private def countTimerEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'TimerFired'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'TimerFired'
+      """.query[Int].unique
     )
 
   test("restartable restarts until finished, threads state, and exposes restartCount") {
@@ -385,8 +397,10 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("done"))
     val paths = run(
-      sql"""SELECT DISTINCT step_scope_within_instance FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'inner'""".query[Vector[String]].to[Vector]
+      sql"""
+        SELECT DISTINCT step_scope_within_instance FROM workflow_steps
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'inner'
+      """.query[Vector[String]].to[Vector]
     )
     assert(paths.contains(Vector("R@0")), s"the parallel step's scope carries the enclosing region segment: $paths")
   }
@@ -480,8 +494,10 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("all-done"))
     val bCount = run(
-      sql"""SELECT COUNT(*) FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'b'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_steps
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'b'
+      """.query[Int].unique
     )
     assertEquals(bCount, 1, "the sibling region's nested step survives the wildcard-meaning restart")
   }

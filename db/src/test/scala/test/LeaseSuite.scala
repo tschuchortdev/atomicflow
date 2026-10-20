@@ -15,8 +15,10 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
 
   private def leaseExpiry(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
     run(
-      sql"""SELECT lease_expires_at FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Option[Instant]].option
+      sql"""
+        SELECT lease_expires_at FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Option[Instant]].option
     ).flatten
 
   private def instanceRow(
@@ -24,8 +26,10 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
       key: WorkflowInstanceKey
   ): Option[(Option[String], Option[String], Long)] =
     run(
-      sql"""SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT terminal_state, terminal_outcome, fencing_token FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[String], Long)
         ].option
     )
@@ -57,8 +61,10 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "hb-fenced") { in =>
       Step.atLeastOnce[String]("step") {
         run(
-          sql"""UPDATE workflow_instances SET fencing_token = fencing_token + 1
-                WHERE workflow_id = 'hb-fenced' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+          sql"""
+            UPDATE workflow_instances SET fencing_token = fencing_token + 1
+            WHERE workflow_id = 'hb-fenced' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+          """.update.run
         )
         Workflow.heartbeat()
         "result"
@@ -77,8 +83,10 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "expired")(in => s"out-$in")
     rt.createWorkflowInstance(wf, "k", "a")
     run(
-      sql"""UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() - interval '1 hour'
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'""".update.run
+      sql"""
+        UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() - interval '1 hour'
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
     )
 
     val result = rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))

@@ -20,29 +20,39 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
 
   private def wakeupExists(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Boolean =
     run(
-      sql"""SELECT 1 FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
+      sql"""
+        SELECT 1 FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[
         Int].option
     ).isDefined
 
   private def wakeupCount(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".query[
+      sql"""
+        SELECT COUNT(*) FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.query[
         Int].unique
     )
 
   private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey, scope: ScopePath): Unit =
     run(
-      sql"""DELETE FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}""".update.run
+      sql"""
+        DELETE FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = ${scope.segments}
+      """.update.run
     )
 
   private def watermark(): Long =
-    run(sql"""SELECT dispatched_through FROM workflow_event_dispatch WHERE id = 1""".query[Long].unique)
+    run(sql"""
+      SELECT dispatched_through FROM workflow_event_dispatch WHERE id = 1
+    """.query[Long].unique)
 
   private def maxEventSeq(): Long =
-    run(sql"""SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events""".query[Long].unique)
+    run(sql"""
+      SELECT COALESCE(MAX(sequence_id), 0) FROM workflow_events
+    """.query[Long].unique)
 
 
   test("best-effort dispatch wakes a suspended direct-signal subscriber after a send") {
@@ -246,12 +256,16 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-in"))
     run(
-      sql"""INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
-            VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'greet')""".update.run
+      sql"""
+        INSERT INTO workflow_signal_subscriptions (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, subscriber_key, signal_key)
+        VALUES (${wf.id}, 'k', '{}', 'w', '{}', 0, '', 'greet')
+      """.update.run
     )
     run(
-      sql"""INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key, payload, created_at)
-            VALUES (nextval('workflow_event_sequence'), 'Signal', ${wf.id}, 'k', '{}', 'greet', 'hi', now())""".update.run
+      sql"""
+        INSERT INTO workflow_events (sequence_id, event_kind, workflow_id, workflow_instance_key, workflow_instance_scope, event_key, payload, created_at)
+        VALUES (nextval('workflow_event_sequence'), 'Signal', ${wf.id}, 'k', '{}', 'greet', 'hi', now())
+      """.update.run
     )
 
     rt.dispatchNewEvents(1000)
