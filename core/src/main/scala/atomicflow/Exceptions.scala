@@ -2,13 +2,43 @@ package atomicflow
 
 /** Public exceptions of the atomicflow runtime. */
 
-/** A durable step or workflow failure as replayed from persisted state.
+/** A durable step failure, thrown when a step's persisted failure row is
+  * reached: on the run that persisted it and on every replay. The `cause` is
+  * the decoded original failure.
   *
-  * `Cacheable.forThrowable.genericStringMessageSerializer` decodes failures into
-  * this class, carrying the original exception's class name and message as portable
-  * diagnostics.
+  * Thrown only by throwable codecs that present failures this way (the
+  * recommended `Cacheable.forThrowable.genericStringMessageSerializer` does);
+  * other codecs rethrow the decoded exception unchanged, preserving its
+  * original class.
   */
-class StepFailed(message: String, cause: Throwable = null) extends RuntimeException(message, cause)
+final class StepFailed(val step: StepId, cause: Throwable)
+    extends RuntimeException(if cause == null then null else cause.toString, cause)
+
+object StepFailed {
+
+  /** Matches a failing step and binds its message. The step is addressed with
+    * the `stepId` interpolator:
+    * `case StepFailed(stepId"orders/$id/charge", message) => ...`.
+    */
+  def unapply(t: Throwable): Option[(StepId, String)] = t match {
+    case failure: StepFailed => Some((failure.step, failure.getMessage))
+    case _                   => None
+  }
+}
+
+/** A failure decoded from its persisted portable form: the original exception's
+  * class name, message, and cause chain. Renders as the original exception, so
+  * stack traces read `Caused by: <original class>: <message>` and never name
+  * this class.
+  */
+private[atomicflow] final class SerializedException(
+    private[atomicflow] val originalClassName: String,
+    private[atomicflow] val originalMessage: String,
+    cause: SerializedException = null
+) extends RuntimeException(originalMessage, cause) {
+  override def toString: String =
+    if originalMessage == null then originalClassName else s"$originalClassName: $originalMessage"
+}
 
 /** Thrown before an uncached step or wait while `cancel_requested_at` is
   * set. A plain public [[RuntimeException]] so ordinary cleanup (`NonFatal`, broad
@@ -35,11 +65,11 @@ object WorkflowInputConflictException {
 /** Thrown by operations that address a workflow instance that does not exist. */
 class WorkflowNotFoundException(message: String) extends RuntimeException(message)
 
-/** Thrown by `forkWorkflow`/`resetWorkflow` when `restartFromStep` does not
-  * identify an already-executed step of the source instance (an unknown step id,
-  * or a step that has no cached row because it never executed).
+/** Thrown by `forkWorkflow`/`resetWorkflow` when the step selector matches no
+  * already-executed step of the source instance (an empty match, or a selector
+  * that does not fit the workflow's current shape).
   */
-class InvalidRestartStepException(message: String) extends RuntimeException(message)
+class NoMatchingStepException(message: String) extends RuntimeException(message)
 
 /** Thrown by an external `run` on an instance whose execution lease is held by
   * another worker and does not become available within the runtime's
@@ -81,4 +111,4 @@ class StepKeyConflictException(message: String) extends RuntimeException(message
 /** Thrown when a step, signal, or terminal outcome cannot be encoded or decoded
   * with the configured codec.
   */
-class StepSerializationFailed(message: String) extends StepFailed(message)
+class StepSerializationFailed(message: String) extends RuntimeException(message)

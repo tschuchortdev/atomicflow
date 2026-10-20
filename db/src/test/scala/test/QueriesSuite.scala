@@ -161,11 +161,11 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
   test("blockUntilCompleted throws the decoded failure for a terminal failed instance") {
     val rt = newRuntime
     val failing = Workflow[String, String](id = "wf-await-fail")(in => throw new RuntimeException("boom"))
-    val original = intercept[StepFailed] {
+    val original = intercept[RuntimeException] {
       rt.createAndRun(failing, "k", "a")
     }
     val h = rt.getWorkflowInstance(failing, WorkflowInstanceId(failing.id, "k"))
-    val second = intercept[StepFailed] {
+    val second = intercept[RuntimeException] {
       rt.blockUntilCompleted(h, 5.seconds)
     }
     assertEquals(second.getMessage, original.getMessage)

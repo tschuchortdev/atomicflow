@@ -171,11 +171,11 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("10,20,30|6"))
   }
 
-  test("injectivity: StepId('a/b','') and StepId('b','a') are distinct rows; step_id is the bare key and the path lives in step_scope_within_instance") {
+  test("injectivity: StepId('ab','') and StepId('b','a') are distinct rows; step_id is the bare key and the path lives in step_scope_within_instance") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "scope-injective") { in =>
-      Step.atLeastOnce[Int]("a/b") { counter.incrementAndGet(); 1 }
+      Step.atLeastOnce[Int]("ab") { counter.incrementAndGet(); 1 }
       Workflow.scoped("a") { Step.atLeastOnce[Int]("b") { counter.incrementAndGet(); 2 } }
       "done"
     }
@@ -183,11 +183,27 @@ class ScopedParallelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("done"))
     assertEquals(counter.get(), 2, "the two distinct step identities execute independently")
     val rows = run(
-      sql"""SELECT step_id, step_scope_within_instance FROM workflow_steps
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
-            ORDER BY step_id, step_scope_within_instance""".query[(String, Vector[String])].to[Vector]
+      sql"""
+        SELECT step_id, step_scope_within_instance FROM workflow_steps
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k'
+        ORDER BY step_id, step_scope_within_instance
+      """.query[(String, Vector[String])].to[Vector]
     )
-    assertEquals(rows, Vector(("a/b", Vector.empty), ("b", Vector("a"))))
+    assertEquals(rows, Vector(("ab", Vector.empty), ("b", Vector("a"))))
+  }
+
+  test("step keys must not contain characters reserved for step selectors") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "key-forbidden") { in =>
+      try {
+        Step.atLeastOnce[Int]("a/b") { 1 }
+        "no-require"
+      } catch {
+        case _: IllegalArgumentException => "required"
+      }
+    }
+    rt.createWorkflowInstance(wf, "k", "in")
+    assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("required"))
   }
 
   test("scoped requires a non-empty scope key") {

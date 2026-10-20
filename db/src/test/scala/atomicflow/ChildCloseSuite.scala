@@ -63,8 +63,10 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
   private def setUpdatedAt(workflowId: WorkflowId, key: WorkflowInstanceKey, stepId: String, ts: Instant): Unit =
     run(
-      sql"""UPDATE workflow_steps SET updated_at = $ts
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId""".update.run
+      sql"""
+        UPDATE workflow_steps SET updated_at = $ts
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId
+      """.update.run
     )
 
   test("terminal close of a suspended Cancel child is asynchronous and delivered by the sweep") {
@@ -468,7 +470,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
 
     // Reset from the executed `pre` step: the old generation's child must be closed.
-    rt.resetWorkflow[String, String](parentId, StepId("pre"))(using parentWf)
+    rt.resetWorkflow[String, String](parentId, stepId"/pre")(using parentWf)
     assertEquals(childCloseRowCount(), 1, "reset records one closure request for the old generation")
 
     sweep(childWf)
@@ -515,7 +517,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     // on replay the cached step's body (startAsChild) is never re-executed.
     setUpdatedAt("orders", "order-42", "start-child", Instant.parse("2026-01-01T00:00:00Z"))
 
-    rt.resetWorkflow[String, String](parentId, StepId("post"))(using parentWf)
+    rt.resetWorkflow[String, String](parentId, stepId"/post")(using parentWf)
 
     sweep(childWf)
     assertEquals(childRow("worker", "c", child0.scope).get.terminalState, Some("cancelled"),

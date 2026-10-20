@@ -151,8 +151,8 @@ given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializ
 // given Cacheable[Throwable] = Cacheable.forThrowable.javaSerializable
 ```
 
-- `genericStringMessageSerializer` stores portable diagnostics and replays a library `StepFailed` exception. It is the recommended default for new workflows.
-- `javaSerializable` uses Java serialization and can preserve concrete exception classes, but persisted data is coupled to those classes and their serializable object graphs.
+- `genericStringMessageSerializer` stores portable diagnostics (class name, message, cause chain) and presents step failures as the library `StepFailed` exception, so catches can address the failing step (see "Step selectors and key rules" below). It is the recommended default for new workflows.
+- `javaSerializable` uses Java serialization and can preserve concrete exception classes, but persisted data is coupled to those classes and their serializable object graphs; step failures are rethrown unchanged and cannot be matched by step selector.
 - Custom codecs decide which concrete exception types remain catchable after replay. Workflow code must not assume more than the selected codec promises.
 - Neither codec is an automatic given. Choosing the throwable codec is part of workflow behavior and must be explicit at application setup.
 
@@ -169,8 +169,50 @@ body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded 
 - The initial run also exposes the decoded representation, so it takes the same downstream pattern-match or `catch` branch as replay.
 - A Step result's object identity is not preserved, even during its initial execution. Code after a Step may rely on its value, but not on reference equality with an object created inside the Step.
 - Fatal JVM errors and the internal library control-flow exceptions for suspension, reset, and continue-as-new are never cached as Step failures. Lease loss raised inside a Step body — for example by an explicit `Workflow.heartbeat` call — likewise aborts the run without durable effect and is never a Step outcome. The public `WorkflowCancelledException` delivered at checkpoints is likewise never a Step outcome: delivery happens before a Step body executes, so a cancellation surfacing through a Step boundary cannot poison the Step cache.
-- If result or exception serialization fails, the step attempts to store `StepSerializationFailed`, a subtype of `StepFailed`, with the configured throwable codec. If that codec also fails, the original failure propagates without a stored step failure.
-- A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic `StepFailed` representation is preferable to failing serialization.
+- If result or exception serialization fails, the step attempts to store `StepSerializationFailed` with the configured throwable codec. If that codec also fails, the original failure propagates without a stored step failure. `StepSerializationFailed` is independent of `StepFailed`.
+- A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic portable representation is preferable to failing serialization.
+
+### StepFailed and step selectors
+
+With `genericStringMessageSerializer`, a step failure is thrown as
+`StepFailed(step, cause)` — on the run that persisted the failure and on every
+replay, so catches see the same type both times. `cause` is the decoded original
+failure in its portable form (rendering as the original exception, e.g.
+`Caused by: java.lang.RuntimeException: boom`); the retry policy still sees the
+raw body exception. Failures decoded by other codecs are rethrown unchanged.
+
+`StepFailed` is matched with the `stepId` string interpolator, whose pattern
+addresses the failing step by its scope path and key — the same path
+`Workflow.scoped`, `Workflow.loop`, and `firstToRun` branches build:
+
+```scala
+try {
+  Workflow.scoped("orders") { Step.atLeastOnce("charge")(...) }
+} catch {
+  case StepFailed(stepId"charge", msg)              => // key "charge", any depth
+  case StepFailed(stepId"orders/charge", msg)       => // suffix match: charge directly inside orders
+  case StepFailed(stepId"/orders/charge", msg)      => // anchored: the full path from the instance root
+  case StepFailed(stepId"poll/**/fetch", msg)       => // ** matches zero or more scope segments
+  case StepFailed(stepId"item-*/fetch", msg)        => // * matches text within one segment
+  case StepFailed(stepId"orders/$id/charge", msg)   => // $id binds the matched segment text
+}
+```
+
+- Matching is a pure function of the pattern and the step id: the first run and every replay agree.
+- Iteration markers (`name@3`, written by `Workflow.loop`) are ignored on both sides, so `orders` also matches `orders@3`; iteration counts cannot be pinned.
+- The same interpolator builds `StepSelector` values for `resetWorkflow`/`forkWorkflow` (`restartFrom = stepId"orders/charge"`) and is inspectable via `StepSelector.parse`/`render` for tooling.
+- In expression position, an interpolated `String` hole is a literal segment and any other `Fingerprintable` value becomes its fingerprint segment — the same segment `Workflow.scoped(elem)` derives.
+
+### Step keys and scope keys
+
+Keys that become scope-path segments or step keys — step keys, `Workflow.scoped`
+keys, region ids (`loop`/`restartable`), and `firstToRun` branch keys — must not
+be empty, must not start with `_`, and must not contain `/`, `*`, `@`, `[`, `]`,
+`{`, `}`. These characters are the selector pattern syntax, so a key containing
+them could never be addressed by a selector. Violations throw
+`IllegalArgumentException` when workflow execution reaches the operation.
+Fingerprint segments (derived by `scoped(elem)`) are encoded as unpadded
+Base64url and never contain the pattern-syntax characters.
 
 ### Workflow-level failures use the same codec
 

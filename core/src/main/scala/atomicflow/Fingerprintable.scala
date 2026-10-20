@@ -26,10 +26,13 @@ object Fingerprintable {
       fa.fingerprintRep(f(value), fp)
   }
 
-  /** Hash bytes, encoded as Base64 by `toString`. */
+  /** Hash bytes, encoded as unpadded Base64url by `toString`. The url-safe
+    * alphabet keeps fingerprint segments free of `/`, so scope paths stay
+    * printable and addressable by step selectors.
+    */
   case class Fingerprint(bytes: IArray[Byte]) {
     override lazy val toString: String =
-      Base64.getEncoder.encodeToString(bytes.asInstanceOf[Array[Byte]])
+      Base64.getUrlEncoder.withoutPadding.encodeToString(bytes.asInstanceOf[Array[Byte]])
 
     override def equals(obj: Any): Boolean = obj match {
       case other: Fingerprint if util.Arrays.equals(
@@ -42,7 +45,7 @@ object Fingerprintable {
 
   object Fingerprint {
     def fromString(string: String): Fingerprint =
-      Fingerprint(Base64.getDecoder().decode(string).asInstanceOf[IArray[Byte]])
+      Fingerprint(Base64.getUrlDecoder.decode(string).asInstanceOf[IArray[Byte]])
   }
 
   /** Builds type-specific representations and combines them into a hash. */

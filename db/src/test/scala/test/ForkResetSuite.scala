@@ -40,40 +40,52 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
       ts: Instant
   ): Unit =
     run(
-      sql"""UPDATE workflow_steps SET updated_at = $ts
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId""".update.run
+      sql"""
+        UPDATE workflow_steps SET updated_at = $ts
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND step_id = $stepId
+      """.update.run
     )
 
   private def storedInput(workflowId: WorkflowId, key: WorkflowInstanceKey): String =
     run(
-      sql"""SELECT input FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[String].unique
+      sql"""
+        SELECT input FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[String].unique
     )
 
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_wakeups
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_wakeups
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].unique
     )
 
   private def parentCols(workflowId: WorkflowId, key: WorkflowInstanceKey): (Option[String], Option[String], Option[Vector[String]]) =
     run(
-      sql"""SELECT parent_workflow_id, parent_instance_key, parent_instance_scope FROM workflow_instances
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[
+      sql"""
+        SELECT parent_workflow_id, parent_instance_key, parent_instance_scope FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[
           (Option[String], Option[String], Option[Vector[String]])
         ].unique
     )
 
   private def countCursor(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM signal_cursor
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM signal_cursor
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Int].unique
     )
 
   private def countSignalEvents(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
-      sql"""SELECT COUNT(*) FROM workflow_events
-            WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'Signal'""".query[Int].unique
+      sql"""
+        SELECT COUNT(*) FROM workflow_events
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}' AND event_kind = 'Signal'
+      """.query[Int].unique
     )
 
   private def counterWf(
@@ -103,7 +115,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(fork.id.workflowInstanceKey, "fork")
     assertEquals(fork.id.scope, ScopePath.empty)
     assertEquals(stepIds(wf.id, "fork"), Set("A"), "only the strictly-before step A is copied")
@@ -127,7 +139,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(fork.getInfo()(using rt).generation, 0L, "fork starts at generation 0")
     assertEquals(storedInput(wf.id, "fork"), storedInput(wf.id, "k"), "fork carries the same input as the source")
     val (pw, pk, ps) = parentCols(wf.id, "fork")
@@ -141,7 +153,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     )
   }
 
-  test("fork errors when restartFromStep does not identify an already-executed step") {
+  test("fork errors when restartFrom does not match an already-executed step") {
     val rt = newRuntime
     val cA = new AtomicInteger(0)
     val cB = new AtomicInteger(0)
@@ -150,8 +162,8 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     val sourceId = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.Result("done"))
 
-    intercept[InvalidRestartStepException] {
-      rt.forkWorkflow[String, String](sourceId, "fork", StepId("ZZZ"))(using wf)
+    intercept[NoMatchingStepException] {
+      rt.forkWorkflow[String, String](sourceId, "fork", stepId"/ZZZ")(using wf)
     }
 
     val never = Workflow[String, String]("frk-never") { in =>
@@ -160,8 +172,8 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     }
     val nid = rt.createWorkflowInstance(never, "nk", "noop").id
     assertEquals(rt.runWorkflowInstance(never, nid), WorkflowRunResult.Result("noop"))
-    intercept[InvalidRestartStepException] {
-      rt.forkWorkflow[String, String](nid, "nfork", StepId("A"))(using never)
+    intercept[NoMatchingStepException] {
+      rt.forkWorkflow[String, String](nid, "nfork", stepId"/A")(using never)
     }
   }
 
@@ -178,11 +190,11 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(stepIds(wf.id, "fork"), Set("A"), "first fork succeeds")
 
     intercept[WorkflowInputConflictException] {
-      rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+      rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     }
   }
 
@@ -208,7 +220,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
-    rt.resetWorkflow[String, String](id, StepId("B"))(using wf)
+    rt.resetWorkflow[String, String](id, stepId"/B")(using wf)
     assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
     assertEquals(stepIds(wf.id, "k"), Set("A"), "the selected step B and later step C are erased; A is kept")
     assertEquals(countWakeups(wf.id, "k"), 1, "a wakeup is scheduled so the instance re-runs")
@@ -246,7 +258,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "wait1", t1)
     setUpdatedAt(wf.id, "k", "B", t2)
 
-    rt.resetWorkflow[String, String](id, StepId("B"))(using wf)
+    rt.resetWorkflow[String, String](id, stepId"/B")(using wf)
     assertEquals(countCursor(wf.id, "k"), 1, "the signal cursor survives reset")
     assertEquals(countSignalEvents(wf.id, "k"), 2, "signal events are not deleted by reset")
     assertEquals(stepIds(wf.id, "k"), Set("wait1"), "the before-boundary wait1 is kept; B is erased")
@@ -272,7 +284,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "C", t2)
     setUpdatedAt(wf.id, "k", "B", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(stepIds(wf.id, "fork"), Set("A", "C"), "C is backdated below the B boundary, so it is copied too")
 
     assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.Result("done"))
@@ -303,7 +315,7 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "C", t2)
     setUpdatedAt(wf.id, "k", "B", t3)
 
-    rt.resetWorkflow[String, String](id, StepId("B"))(using wf)
+    rt.resetWorkflow[String, String](id, stepId"/B")(using wf)
     assertEquals(
       stepIds(wf.id, "k"),
       Set("A", "C"),
@@ -338,13 +350,13 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "A", t1)
     setUpdatedAt(wf.id, "k", "B", t2)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(stepIds(wf.id, "fork"), Set("A"))
     assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(cA.get(), 1, "fork replays the copied A")
     assertEquals(cB.get(), 2, "fork re-executes B")
 
-    rt.resetWorkflow[String, String](sourceId, StepId("B"))(using wf)
+    rt.resetWorkflow[String, String](sourceId, stepId"/B")(using wf)
     assertEquals(stepIds(wf.id, "k"), Set("A"), "reset on the suspended source keeps A")
     assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.WorkflowSuspended)
     assertEquals(cA.get(), 1, "the reset source replays A")
@@ -364,11 +376,11 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "B", t2)
     setUpdatedAt(wf.id, "k", "C", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("B"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/B")(using wf)
     assertEquals(stepIds(wf.id, "fork"), Set("A"), "fork works on a terminal source")
 
     intercept[IllegalStateException] {
-      rt.resetWorkflow[String, String](sourceId, StepId("B"))(using wf)
+      rt.resetWorkflow[String, String](sourceId, stepId"/B")(using wf)
     }
     assertEquals(stepIds(wf.id, "k"), Set("A", "B", "C"), "the failed reset left the terminal source untouched")
   }
@@ -390,11 +402,13 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "flaky", t1)
     setUpdatedAt(wf.id, "k", "gate", t2)
     run(
-      sql"""UPDATE workflow_steps SET state_kind = 'RetryPending', state_payload = '1:0:-1', retry_deadline = $t3
-            WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'flaky'""".update.run
+      sql"""
+        UPDATE workflow_steps SET state_kind = 'RetryPending', state_payload = '1:0:-1', retry_deadline = $t3
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'flaky'
+      """.update.run
     )
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", StepId("gate"))(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/gate")(using wf)
     assertEquals(
       stepIds(wf.id, "fork"),
       Set.empty,

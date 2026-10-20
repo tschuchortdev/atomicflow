@@ -42,7 +42,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     *
     * The fork receives a completely new instance ID, generation 0, and the same
     * input as the source; it is an independent top-level workflow (no parent
-    * relationship, no inherited signals). `restartFromStep` is an exclusive
+    * relationship, no inherited signals). `restartFrom` is an exclusive
     * boundary: the cached history strictly before the selected step is copied
     * (rewritten to the new identity), while the selected step and subsequent
     * history are omitted so they re-execute in the fork. The workflow function
@@ -50,51 +50,64 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     * first uncopied operation.
     *
     * The boundary is ordered by the step rows' last-updated timestamp: rows
-    * strictly before the selected row are kept, the selected row and everything
-    * with an equal or later timestamp are omitted. `restartFromStep` must
-    * identify an already-executed step of the source or
-    * [[InvalidRestartStepException]] is thrown. Forking is allowed on any source
-    * state (suspended or terminal) and does not modify the source.
+    * strictly before the boundary are kept, everything with an equal or later
+    * timestamp is omitted. `restartFrom` must match at least one already-executed
+    * step of the source; the boundary is the earliest matched row, so every
+    * matching step re-executes. A selector matching nothing throws
+    * [[NoMatchingStepException]]. Forking is allowed on any source state
+    * (suspended or terminal) and does not modify the source.
     *
-    * LIMITATION: a single step id is used as the causal boundary, which is
-    * insufficient to describe a cut through parallel branches that have no one
-    * total order; rows sharing the boundary timestamp are conservatively
-    * omitted.
+    * LIMITATION: a single boundary timestamp is used as the causal boundary,
+    * which is insufficient to describe a cut through parallel branches that
+    * have no one total order; rows sharing the boundary timestamp are
+    * conservatively omitted.
     */
   @throws[WorkflowNotFoundException]
-  @throws[InvalidRestartStepException]
+  @throws[NoMatchingStepException]
   def forkWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
       newInstanceKey: WorkflowInstanceKey,
-      restartFromStep: StepId
+      restartFrom: StepIdSelector
   )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out]
 
-  /** Reset an instance in place from `restartFromStep`: keep the same instance
+  /** Reset an instance in place from `restartFrom`: keep the same instance
     * identity, increment the generation, erase the selected step and subsequent
     * history (Step rows and their subscriptions/wakeups), and schedule the
-    * instance to re-run from the top. History strictly before the selected step
+    * instance to re-run from the top. History strictly before the boundary
     * remains cached and is replayed, so the workflow function still executes
     * from its beginning. The instance's input, signal cursors, and directly
     * addressed events are untouched.
     *
     * The boundary is ordered by the step rows' last-updated timestamp: rows
-    * strictly before the selected row are kept, the selected row and everything
-    * with an equal or later timestamp are erased. `restartFromStep` must
-    * identify an already-executed step or [[InvalidRestartStepException]] is
-    * thrown. Resetting a terminal instance throws [[IllegalStateException]].
+    * strictly before the boundary are kept, everything with an equal or later
+    * timestamp is erased. `restartFrom` must match at least one already-executed
+    * step; the boundary is the earliest matched row, so every matching step is
+    * erased and re-executes. A selector matching nothing throws
+    * [[NoMatchingStepException]]. Resetting a terminal instance throws
+    * [[IllegalStateException]].
     *
-    * LIMITATION: a single step id is used as the causal boundary, which is
-    * insufficient to describe a cut through parallel branches that have no one
-    * total order; rows sharing the boundary timestamp are conservatively
-    * erased.
+    * LIMITATION: a single boundary timestamp is used as the causal boundary,
+    * which is insufficient to describe a cut through parallel branches that
+    * have no one total order; rows sharing the boundary timestamp are
+    * conservatively erased.
     */
   @throws[WorkflowNotFoundException]
-  @throws[InvalidRestartStepException]
+  @throws[NoMatchingStepException]
   @throws[IllegalStateException]
   def resetWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
-      restartFromStep: StepId
+      restartFrom: StepIdSelector
   )(using workflow: Workflow[In, Out]): Unit
+
+  /** The step ids of the source instance's stored step rows whose identity the
+    * selector matches, ordered by their last update. A dry-run view of what
+    * `resetWorkflow`/`forkWorkflow` would select with the same selector: the
+    * reset boundary is the earliest listed row.
+    */
+  def listSteps(
+      sourceInstanceId: WorkflowInstanceId,
+      selector: StepIdSelector
+  ): Vector[StepId]
 
   /** Append a `Signal` event addressed to `workflowInstanceId`. The sender
     * briefly row-locks the instance and rejects the append with
