@@ -142,6 +142,13 @@ Testcontainers.
 sbt test
 ```
 
+For repeated invocations, connect to a persistent sbt server instead of
+starting a new JVM each time — this skips the JVM startup on every run:
+
+```sh
+sbt --client test
+```
+
 The `example` module contains equivalent document-processing workflows using
 AtomicFlow and workflows4s. API and storage details are in [`spec/`](spec/).
 Runtime design notes are in [`docs/design/`](docs/design/).
