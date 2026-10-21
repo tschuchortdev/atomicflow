@@ -150,7 +150,7 @@ sbt --client test
 ```
 
 The `example` module contains equivalent document-processing workflows using
-AtomicFlow and workflows4s. API and storage details are in [`spec/`](spec/).
+AtomicFlow, workflows4s, and dbos4s (DBOS Transact). API and storage details are in [`spec/`](spec/).
 Runtime design notes are in [`docs/design/`](docs/design/).
 [`DEVIATIONS.md`](DEVIATIONS.md) records implementation decisions and differences
 from the design. System comparisons are in [`docs/comparison/`](docs/comparison/).
