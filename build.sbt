@@ -52,7 +52,7 @@ lazy val db = project
   )
 
 lazy val example = project
-  .dependsOn(core, db)
+  .dependsOn(core, db % "compile->compile;test->test")
   .settings(
     name := "atomicflow-examples",
     libraryDependencies ++= Seq(

@@ -7,44 +7,27 @@ import cats.effect.IO
 import cats.effect.unsafe.IORuntime
 import io.circe.syntax.*
 import munit.FunSuite
-import org.flywaydb.core.Flyway
 import org.postgresql.ds.PGSimpleDataSource
-import org.testcontainers.containers.PostgreSQLContainer
+import test.SharedPostgres
 
 import java.nio.file.{Files, Path}
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import scala.concurrent.ExecutionContext
 
-/** End-to-end smoke test for the document-processing example: one Postgres 16
-  * container, a single Flyway migration, and a small in-memory collaborator
-  * setup that processes a two-document batch to completion.
+/** End-to-end smoke test for the document-processing example: the shared
+  * Postgres container, a single Flyway migration, and a small in-memory
+  * collaborator setup that processes a two-document batch to completion.
   */
 class DocumentProcessingAtomicflowSuite extends FunSuite {
 
-  private final class Pg extends PostgreSQLContainer[Pg]("postgres:16")
+  private lazy val dataSource: PGSimpleDataSource = SharedPostgres.newDatabase()
 
-  private val container: Pg =
-    new Pg().withDatabaseName("testdb").withUsername("postgres").withPassword("postgres")
-
-  private def newDataSource: PGSimpleDataSource = {
-    val ds = new PGSimpleDataSource()
-    ds.setUrl(container.getJdbcUrl)
-    ds.setUser(container.getUsername)
-    ds.setPassword(container.getPassword)
-    ds
-  }
-
-  private lazy val flyway: Flyway =
-    Flyway.configure().dataSource(newDataSource).cleanDisabled(false).load()
-
-  override def beforeAll(): Unit = container.start()
-  override def afterAll(): Unit = container.close()
+  private def newDataSource: PGSimpleDataSource = dataSource
 
   override def beforeEach(context: BeforeEach): Unit = {
     super.beforeEach(context)
-    flyway.clean()
-    flyway.migrate()
+    SharedPostgres.truncateAll(dataSource)
   }
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer

@@ -6,9 +6,7 @@ import doobie.ConnectionIO
 import doobie.Transactor
 import doobie.implicits.*
 import munit.FunSuite
-import org.flywaydb.core.Flyway
 import org.postgresql.ds.PGSimpleDataSource
-import org.testcontainers.containers.PostgreSQLContainer
 
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
@@ -16,36 +14,20 @@ import java.time.Clock
 
 /** Shared database setup for PostgreSQL runtime tests.
   *
-  * Starts one PostgreSQL 16 container per suite and recreates the schema between
-  * tests with Flyway clean and migrate. `newRuntime` uses the same container.
+  * Hands out a suite-specific database from the JVM-wide container in
+  * [[SharedPostgres]] and empties all tables before each test; the schema
+  * itself is never recreated. `newRuntime` uses the same database.
   */
 abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 
-  private final class Pg extends PostgreSQLContainer[Pg]("postgres:16")
-
-  private val container: Pg =
-    new Pg().withDatabaseName("testdb").withUsername("postgres").withPassword("postgres")
-
-  override def beforeAll(): Unit = container.start()
-
-  override def afterAll(): Unit = container.close()
-
-  private def newDataSource: PGSimpleDataSource = {
-    val ds = new PGSimpleDataSource()
-    ds.setUrl(container.getJdbcUrl)
-    ds.setUser(container.getUsername)
-    ds.setPassword(container.getPassword)
-    ds
-  }
-
-  private lazy val flyway: Flyway =
-    Flyway.configure().dataSource(newDataSource).cleanDisabled(false).load()
+  private lazy val dataSource: PGSimpleDataSource = SharedPostgres.newDatabase()
 
   override def beforeEach(context: BeforeEach): Unit = {
     super.beforeEach(context)
-    flyway.clean()
-    flyway.migrate()
+    SharedPostgres.truncateAll(dataSource)
   }
+
+  private def newDataSource: PGSimpleDataSource = dataSource
 
   private lazy val xa: Transactor[IO] =
     Transactor.fromDataSource[IO](newDataSource, ExecutionContext.global)
