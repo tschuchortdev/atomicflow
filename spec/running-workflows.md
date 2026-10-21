@@ -569,10 +569,8 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
   outcome), revoke the lease, and never schedule the instance again. No resume
   is scheduled and no `WorkflowCancelledException` is delivered — the body gets no
   chance to run.
-- Directly addressed `Signal` events are gathered and deleted in the same
-  transition. No workflow definition is available on this path, so the
-  `onUnconsumedSignals` listener cannot run; any gathered unconsumed signals are
-  logged at WARN level instead of being silently dropped.
+- Directly addressed `Signal` events are deleted in the same transition. There
+  is no user-facing handler for unconsumed signals; they are ignored.
 - If currently running: the orphan thread may continue briefly but can never
   commit — all lease-checked writes are rejected, and its next checkpoint
   re-check observes the stored terminal state and discards the execution.
@@ -650,10 +648,9 @@ The public operation is available only inside an executing workflow through the 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
 2. One atomic transaction erases the current execution state (including old
    subscriptions and wakeups but not cursors), closes old child relationships,
-   gathers the directly addressed `Signal` events (per signal key, after
-   cursors) and then deletes them, increments the generation counter, and
-   persists `newInput`. The `onUnconsumedSignals` handler runs after this
-   transaction commits. Older generations are not retained separately.
+   deletes the directly addressed `Signal` events, increments the generation
+   counter, and persists `newInput`. Older generations are not retained
+   separately.
 3. The new generation therefore starts with a **completely empty** set of Step
    rows, subscriptions, and directly addressed event rows. Exact-key signal
    cursors survive the transition.
@@ -667,11 +664,10 @@ The public operation is available only inside an executing workflow through the 
 
 ### Unconsumed signals at the reset boundary
 
-Inside the transition transaction the currently visible signals after the old
-generation's exact-key cursors are gathered, and the directly addressed
-`Signal` events are physically deleted as part of that same transaction; the
-workflow's `onUnconsumedSignals` handler then receives the gathered map after
-commit. Cached child Step results remain
+Inside the transition transaction the directly addressed
+`Signal` events after the old generation's exact-key cursors are physically
+deleted as part of that same transaction; unconsumed signals are ignored
+(there is no user-facing handler for them). Cached child Step results remain
 replayable without their source event. Events belonging to other workflow
 instances are not owned by this transition and are not deleted. A continuing
 child remains attached to its own parent and can inherit retained parent events

@@ -41,7 +41,7 @@ enum TerminalOutcome:
   * transition applied, or a concurrent writer had already made the instance
   * terminal. */
 enum CompletionResult:
-  case Applied(unconsumedSignals: Map[SignalKey, Seq[String]])
+  case WorkflowInstanceTerminated
   case AlreadyTerminal(record: InstanceRecord)
 
 /** The result of running a body under an execution lease. */

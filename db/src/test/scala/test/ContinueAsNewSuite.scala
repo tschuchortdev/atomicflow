@@ -158,25 +158,18 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     )
   }
 
-  test("unconsumed directly-addressed Signal events from gen 0 are deleted and onUnconsumedSignals runs") {
+  test("unconsumed directly-addressed Signal events from gen 0 are deleted at the continue-as-new transition") {
     val rt = newRuntime
     val sig = Signal[String]("S")
-    var handlerCalled = false
-    var handlerMap: Map[SignalKey, Seq[String]] = Map.empty
-    val wf = Workflow[String, String](id = "can-events")(
-      in => {
-        if (in == "start") Workflow.continueAsNew("next")
-        "done"
-      },
-      onUnconsumedSignals = m => { handlerCalled = true; handlerMap = m }
-    )
+    val wf = Workflow[String, String](id = "can-events") { in =>
+      if (in == "start") Workflow.continueAsNew("next")
+      "done"
+    }
     val id = rt.createWorkflowInstance(wf, "k", "start").id
     sig.send(id, "u1")(using rt)
     sig.send(id, "u2")(using rt)
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.ContinueAsNew)
-    assert(handlerCalled, "onUnconsumedSignals must run after the transition commits")
-    assertEquals(handlerMap.get("S"), Some(Seq("u1", "u2")))
     assertEquals(countSignalEvents(wf.id, "k"), 0, "directly addressed Signal events are deleted")
   }
 
@@ -339,7 +332,6 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
   test("a continueAsNew whose new-input codec fails to decode does not consume pending signals and leaves the instance runnable") {
     val rt = newRuntime
     val sig = Signal[String]("S")
-    var handlerCalled = false
     val (wf, id) = {
       val identity = {
         import atomicflow.Cacheable.Simple.given
@@ -353,13 +345,10 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
             throw new IllegalStateException("input codec mismatch: boom")
           else identity.read(serialized)
       }
-      val w = Workflow[String, String]("can-mismatch")(
-        in => {
-          if (in == "start") Workflow.continueAsNew("boom")(using identity)
-          "done"
-        },
-        onUnconsumedSignals = _ => handlerCalled = true
-      )
+      val w = Workflow[String, String]("can-mismatch") { in =>
+        if (in == "start") Workflow.continueAsNew("boom")(using identity)
+        "done"
+      }
       (w, rt.createWorkflowInstance(w, "k", "start").id)
     }
     sig.send(id, "pending")(using rt)
@@ -367,7 +356,6 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
 
     intercept[IllegalStateException](rt.runWorkflowInstance(wf, id))
 
-    assertEquals(handlerCalled, false, "onUnconsumedSignals must not run when the new input fails to decode")
     assertEquals(countSignalEvents(wf.id, "k"), 1, "pending signals are not consumed when the new input fails to decode")
 
     val repaired = Workflow[String, String]("can-mismatch") { in => "recovered:" + in }

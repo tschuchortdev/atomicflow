@@ -104,13 +104,11 @@ adds detail to, the documents in `spec/`.
   before the next uncached step or wait.
 - Internal test helpers allow manual driver cycles, sweeps, and injected run
   failures without starting a background loop.
-- Unconsumed directly addressed signals are gathered and deleted in the same
-  transaction as completion or continue-as-new. The listener receives raw
-  serialized payloads grouped by key, in event order, after commit. Delivery is
-  at-most-once; listener failures are logged. Transitions without a workflow
-  definition log the discarded signals instead.
+- Unconsumed directly addressed signals are deleted in the same
+  transaction as completion or continue-as-new. There is no user-facing
+  handler for them; they are ignored (matching Temporal and DBOS).
 - `sendSignal` rejects terminal instances by checking `terminal_state` under
-  the same instance-row lock used by completion. There is no separate
+  the same instance-row-lock used by completion. There is no separate
   `is_accepting_signals` flag.
 
 ## Child workflows and history changes

@@ -233,14 +233,12 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       case e: ContinueAsNewException =>
         val newInput = workflow.inputCacheable.read(e.encoded.raw)
         val newSerializedInput = workflow.inputCacheable.write(newInput)
-        val unconsumed = continueAsNew(SerializedValue.of(newSerializedInput))
-        invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+        continueAsNew(SerializedValue.of(newSerializedInput))
         log.info(s"Workflow instance $instanceId continued as new")
         return WorkflowRunResult.ContinueAsNew
       case _: WorkflowCancelledException =>
         completeInstance(TerminalOutcome.Cancelled) match {
-          case CompletionResult.Applied(unconsumed) =>
-            invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+          case CompletionResult.WorkflowInstanceTerminated =>
             log.info(s"Workflow instance $instanceId cancelled")
             return WorkflowRunResult.WorkflowCancelled
           case CompletionResult.AlreadyTerminal(record) =>
@@ -249,8 +247,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       case WorkflowNonFatal(t) =>
         val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
         completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload))) match {
-          case CompletionResult.Applied(unconsumed) =>
-            invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+          case CompletionResult.WorkflowInstanceTerminated =>
             log.info(s"Workflow instance $instanceId failed", t)
             throw cacheableThrowable.read(cacheableThrowable.write(t))
           case CompletionResult.AlreadyTerminal(record) =>
@@ -262,8 +259,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     else {
       val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
       completeInstance(TerminalOutcome.Completed(SerializedValue.of(payload))) match {
-        case CompletionResult.Applied(unconsumed) =>
-          invokeUnconsumedSignalsListener(workflow, instanceId, unconsumed)
+        case CompletionResult.WorkflowInstanceTerminated =>
           log.debug(s"Workflow instance $instanceId completed")
           WorkflowRunResult.Result(workflow.outputCacheable.read(workflow.outputCacheable.write(outValue)))
         case CompletionResult.AlreadyTerminal(record) =>
@@ -319,24 +315,6 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
         throw new LeaseLostException(s"Workflow instance ${record.instanceId} is not terminal after a terminal transition")
     }
   }
-
-  /** Invokes the completing/restarting instance's `onUnconsumedSignals` listener
-    * with the map gathered inside the already-committed transition transaction.
-    * A throwing listener must never mask the workflow outcome, so any
-    * [[WorkflowNonFatal]] it raises is logged and swallowed. At-most-once: a
-    * crash between the transition commit and this call loses the delivery
-    * (acceptable for a logging/debug aid).
-    */
-  private def invokeUnconsumedSignalsListener(
-      workflow: Workflow[?, ?],
-      instanceId: WorkflowInstanceId,
-      unconsumed: Map[SignalKey, Seq[String]]
-  ): Unit =
-    try workflow.onUnconsumedSignals(unconsumed)
-    catch {
-      case WorkflowNonFatal(t) =>
-        log.warn(s"onUnconsumedSignals listener failed for workflow instance $instanceId; the workflow outcome is unaffected", t)
-    }
 
   /** Register and schedule the instance's first wakeup (due immediately). */
   final def createAndScheduleForAsyncRun[In, Out](
