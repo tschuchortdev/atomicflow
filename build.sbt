@@ -4,6 +4,12 @@ ThisBuild / version := "0.1.0-SNAPSHOT"
 
 ThisBuild / scalaVersion := "3.7.3"
 
+// Sbt runs test suites in parallel; unbounded concurrency oversubscribes the
+// CPU (all suites share one Postgres container and one JVM), which slows every
+// test body down. Six concurrent suites keeps the wall time of full parallelism
+// with far less contention.
+ThisBuild / concurrentRestrictions += Tags.limit(Tags.Test, 6)
+
 val dependencyVersions = new {
   val circe = "0.14.14"
   val doobie = "1.0.0-RC9"
