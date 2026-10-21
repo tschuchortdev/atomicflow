@@ -314,7 +314,7 @@ object Workflow {
     def writeRegionRow(count: Long, encodedState: SerializedValue): Unit =
       internals.writeStep(
         regionId, 0L,
-        StepRow(
+        StoredStep(
           StepState.Region(RegionState(count, encodedState)),
           InputFingerprints.of(""),
           None

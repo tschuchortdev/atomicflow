@@ -200,7 +200,7 @@ try {
 
 - Matching is a pure function of the pattern and the step id: the first run and every replay agree.
 - Iteration markers (`name@3`, written by `Workflow.loop`) are ignored on both sides, so `orders` also matches `orders@3`; iteration counts cannot be pinned.
-- The same interpolator builds `StepSelector` values for `resetWorkflow`/`forkWorkflow` (`restartFrom = stepId"orders/charge"`) and is inspectable via `StepSelector.parse`/`render` for tooling.
+- The same interpolator builds `StepSelector` values for `resetWorkflow`/`forkWorkflow` (`invalidateAllExecutedAfter = Seq(stepId"orders/charge")`) and is inspectable via `StepSelector.parse`/`render` for tooling.
 - In expression position, an interpolated `String` hole is a literal segment and any other `Fingerprintable` value becomes its fingerprint segment — the same segment `Workflow.scoped(elem)` derives.
 
 ### Step keys and scope keys

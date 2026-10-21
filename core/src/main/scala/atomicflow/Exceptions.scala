@@ -65,9 +65,10 @@ object WorkflowInputConflictException {
 /** Thrown by operations that address a workflow instance that does not exist. */
 class WorkflowNotFoundException(message: String) extends RuntimeException(message)
 
-/** Thrown by `forkWorkflow`/`resetWorkflow` when the step selector matches no
-  * already-executed step of the source instance (an empty match, or a selector
-  * that does not fit the workflow's current shape).
+/** Thrown by `forkWorkflow`/`resetWorkflow` when no invalidation selector
+  * matches an already-executed step of the source instance, so the operation
+  * would invalidate nothing (a miss on an individual selector is tolerated as
+  * long as some other selector matches).
   */
 class NoMatchingStepException(message: String) extends RuntimeException(message)
 

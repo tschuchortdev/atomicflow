@@ -71,7 +71,7 @@ trait WorkflowRuntimeInternals {
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
-  ): Option[StepRow]
+  ): Option[StoredStep]
 
   /** Replace (or create) the step row, fenced. The row's [[StepState]] selects
     * the stored `step_kind` (its subgroup) and carries the `state_kind`,
@@ -87,18 +87,19 @@ trait WorkflowRuntimeInternals {
     * differs from the kind of the row already stored at the same key fails with
     * [[StepKeyConflictException]] instead of overwriting it.
     */
-  def writeStep(stepId: StepId, stepVersion: Long, row: StepRow)(using Lease): Unit
+  def writeStep(stepId: StepId, stepVersion: Long, row: StoredStep)(using Lease): Unit
 
-  /** Delete the step row stored at the key and the subscriptions registered at
-    * its site, in one transaction, fenced. Used when inputs change or cached
-    * results expire, including pending retries.
+  /** Bulk-delete the step rows stored at the given `(step id, version)`
+    * identities and the subscriptions registered at their sites, in one
+    * transaction, fenced. Used when inputs change or cached results expire,
+    * including pending retries.
     *
     * The caller evaluates the operation again after deletion. A new timer gets
     * a new id, so old firing events cannot satisfy it. If the process crashes
     * between deletion and evaluation, lease recovery or the next manual run
     * evaluates the operation and registers its subscriptions again.
     */
-  def deleteStep(stepId: StepId, stepVersion: Long)(using Lease): Unit
+  def deleteSteps(steps: Seq[(stepId: StepId, version: Long)])(using Lease): Unit
 
   /** Reads the full persisted state of an instance, or `None` when absent. No
     * lease is required; serves both the run path and `getInfo`, and backs the

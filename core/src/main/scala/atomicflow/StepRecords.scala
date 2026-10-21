@@ -8,7 +8,7 @@ import java.time.Instant
   * the comparison data shared by every row: the encoded fingerprints of the
   * step's named inputs, and the expiry of the cached result.
   */
-final case class StepRow(
+final case class StoredStep(
     state: StepState,
     inputFingerprints: InputFingerprints,
     expiresAt: Option[Instant]

@@ -42,67 +42,100 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
     *
     * The fork receives a completely new instance ID, generation 0, and the same
     * input as the source; it is an independent top-level workflow (no parent
-    * relationship, no inherited signals). `restartFrom` is an exclusive
-    * boundary: the cached history strictly before the selected step is copied
-    * (rewritten to the new identity), while the selected step and subsequent
-    * history are omitted so they re-execute in the fork. The workflow function
-    * still executes from its beginning, replaying the copied rows until the
-    * first uncopied operation.
+    * relationship, no inherited signals). The invalidated steps — and, for
+    * `invalidateAllExecutedAfter`, all executed steps at or after their
+    * boundary — are omitted from the copied history so they re-execute in the
+    * fork; all other cached rows are copied (rewritten to the new identity).
+    * The workflow function still executes from its beginning, replaying the
+    * copied rows until the first uncopied operation.
     *
-    * The boundary is ordered by the step rows' last-updated timestamp: rows
-    * strictly before the boundary are kept, everything with an equal or later
-    * timestamp is omitted. `restartFrom` must match at least one already-executed
-    * step of the source; the boundary is the earliest matched row, so every
-    * matching step re-executes. A selector matching nothing throws
-    * [[NoMatchingStepException]]. Forking is allowed on any source state
-    * (suspended or terminal) and does not modify the source.
+    * At least one of `invalidateIndividualSteps` and `invalidateAllExecutedAfter`
+    * must be non-empty (an [[IllegalArgumentException]] is thrown otherwise);
+    * when both are non-empty their effects compound (the union is invalidated).
     *
-    * LIMITATION: a single boundary timestamp is used as the causal boundary,
-    * which is insufficient to describe a cut through parallel branches that
-    * have no one total order; rows sharing the boundary timestamp are
-    * conservatively omitted.
+    * `invalidateIndividualSteps` invalidates exactly the executed steps matching
+    * any of the selectors, leaving all other history in place. It is meant to be
+    * used in conjunction with the `invalidateOn` parameter on Step definitions:
+    * you invalidate one or a few steps and the invalidation propagates according
+    * to the dependency graph the steps specify — downstream steps whose
+    * `invalidateOn` inputs have changed re-execute on replay, all others reuse
+    * their cached results.
+    *
+    * `invalidateAllExecutedAfter` treats each selector as an exclusive boundary,
+    * ordered by the step rows' last-updated timestamp: the boundary is the
+    * earliest matched row, and everything with an equal or later timestamp is
+    * omitted. Multiple selectors compound: the earliest of their boundaries
+    * applies.
+    *
+    * Selectors matching no executed step are tolerated; only when no selector
+    * of either list matches any executed step — the operation would invalidate
+    * nothing at all — is [[NoMatchingStepException]] thrown. Forking is allowed
+    * on any source state (suspended or terminal) and does not modify the
+    * source.
+    *
+    * LIMITATION: for `invalidateAllExecutedAfter` a single boundary timestamp is
+    * used as the causal boundary, which is insufficient to describe a cut
+    * through parallel branches that have no one total order; rows sharing the
+    * boundary timestamp are conservatively omitted.
     */
   @throws[WorkflowNotFoundException]
   @throws[NoMatchingStepException]
   def forkWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
       newInstanceKey: WorkflowInstanceKey,
-      restartFrom: StepIdSelector
+      invalidateIndividualSteps: Seq[StepIdSelector],
+      invalidateAllExecutedAfter: Seq[StepIdSelector]
   )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out]
 
-  /** Reset an instance in place from `restartFrom`: keep the same instance
-    * identity, increment the generation, erase the selected step and subsequent
-    * history (Step rows and their subscriptions/wakeups), and schedule the
-    * instance to re-run from the top. History strictly before the boundary
-    * remains cached and is replayed, so the workflow function still executes
-    * from its beginning. The instance's input, signal cursors, and directly
-    * addressed events are untouched.
+  /** Reset an instance in place: keep the same instance identity, increment the
+    * generation, erase the invalidated steps (Step rows and their
+    * subscriptions/wakeups), and schedule the instance to re-run from the top.
+    * All other history remains cached and is replayed, so the workflow function
+    * still executes from its beginning. The instance's input, signal cursors,
+    * and directly addressed events are untouched.
     *
-    * The boundary is ordered by the step rows' last-updated timestamp: rows
-    * strictly before the boundary are kept, everything with an equal or later
-    * timestamp is erased. `restartFrom` must match at least one already-executed
-    * step; the boundary is the earliest matched row, so every matching step is
-    * erased and re-executes. A selector matching nothing throws
-    * [[NoMatchingStepException]]. Resetting a terminal instance throws
-    * [[IllegalStateException]].
+    * At least one of `invalidateIndividualSteps` and `invalidateAllExecutedAfter`
+    * must be non-empty (an [[IllegalArgumentException]] is thrown otherwise);
+    * when both are non-empty their effects compound (the union is erased).
     *
-    * LIMITATION: a single boundary timestamp is used as the causal boundary,
-    * which is insufficient to describe a cut through parallel branches that
-    * have no one total order; rows sharing the boundary timestamp are
-    * conservatively erased.
+    * `invalidateIndividualSteps` erases exactly the executed steps matching any
+    * of the selectors, leaving all other history in place. It is meant to be
+    * used in conjunction with the `invalidateOn` parameter on Step definitions:
+    * you invalidate one or a few steps and the invalidation propagates according
+    * to the dependency graph the steps specify — downstream steps whose
+    * `invalidateOn` inputs have changed re-execute on replay, all others reuse
+    * their cached results.
+    *
+    * `invalidateAllExecutedAfter` treats each selector as an exclusive boundary,
+    * ordered by the step rows' last-updated timestamp: the boundary is the
+    * earliest matched row, and everything with an equal or later timestamp is
+    * erased. Multiple selectors compound: the earliest of their boundaries
+    * applies.
+    *
+    * Selectors matching no executed step are tolerated; only when no selector
+    * of either list matches any executed step — the operation would erase
+    * nothing at all — is [[NoMatchingStepException]] thrown. Resetting a
+    * terminal instance throws [[IllegalStateException]].
+    *
+    * LIMITATION: for `invalidateAllExecutedAfter` a single boundary timestamp is
+    * used as the causal boundary, which is insufficient to describe a cut
+    * through parallel branches that have no one total order; rows sharing the
+    * boundary timestamp are conservatively erased.
     */
   @throws[WorkflowNotFoundException]
   @throws[NoMatchingStepException]
   @throws[IllegalStateException]
   def resetWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
-      restartFrom: StepIdSelector
+      invalidateIndividualSteps: Seq[StepIdSelector],
+      invalidateAllExecutedAfter: Seq[StepIdSelector]
   )(using workflow: Workflow[In, Out]): Unit
 
   /** The step ids of the source instance's stored step rows whose identity the
     * selector matches, ordered by their last update. A dry-run view of what
-    * `resetWorkflow`/`forkWorkflow` would select with the same selector: the
-    * reset boundary is the earliest listed row.
+    * `resetWorkflow`/`forkWorkflow` would invalidate with the same selector:
+    * as `invalidateIndividualSteps` these are the steps invalidated exactly, as
+    * `invalidateAllExecutedAfter` the boundary is the earliest listed row.
     */
   def listSteps(
       sourceInstanceId: WorkflowInstanceId,

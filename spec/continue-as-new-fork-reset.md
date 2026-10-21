@@ -80,17 +80,31 @@ Forking is a recovery and manual-intervention operation, distinct from
 continue-as-new:
 
 ```scala
-runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFrom = stepId"/orders/charge")
+runtime.forkWorkflow(
+  sourceInstanceId,
+  newInstanceKey,
+  invalidateIndividualSteps = Seq.empty,
+  invalidateAllExecutedAfter = Seq(stepId"/orders/charge")
+)
 ```
 
 - A fork always receives a completely new instance ID.
 - The fork has generation = 0 and starts with the same input as the source instance.
 - A fork is an independent top-level workflow. It does not inherit the source
   workflow's parent relationship or inherited signals.
-- `restartFrom` is a step selector (the `stepId` interpolator, see
-  `steps.md`). It is an exclusive boundary: cached history strictly before the
-  boundary is copied, while the matched steps and subsequent history are
-  omitted so that they execute again.
+- The fork takes two invalidation lists, both selectors (the `stepId`
+  interpolator, see `steps.md`). At least one must be non-empty; when both are,
+  their effects compound (the union is omitted from the copied history).
+- `invalidateIndividualSteps` omits exactly the executed steps matching any of
+  the selectors; all other history is copied. It is meant to be used together
+  with the `invalidateOn` parameter on Step definitions: you invalidate one or a
+  few steps and the invalidation propagates according to the dependency graph
+  the steps specify — downstream steps whose `invalidateOn` inputs changed
+  re-execute, all others reuse their cached results.
+- `invalidateAllExecutedAfter` is an exclusive boundary: cached history strictly
+  before the boundary is copied, while the matched steps and subsequent history
+  are omitted so that they execute again. Multiple selectors compound: the
+  earliest of their boundaries applies.
 - The boundary is the earliest matched row's last-updated timestamp: rows
   strictly before the boundary are copied, everything with an equal or later
   timestamp is omitted. A selector that matches several rows therefore resets
@@ -98,29 +112,43 @@ runtime.forkWorkflow(sourceInstanceId, newInstanceKey, restartFrom = stepId"/ord
 - The workflow function still executes from its beginning. Copied history is
   replayed until execution reaches the first uncopied operation; the runtime
   does not jump directly into the workflow body.
-- A selector matching no executed step of the source throws
-  `NoMatchingStepException`. `runtime.listSteps(instanceId, selector)` lists
-  the matched steps for previewing.
+- A selector matching no executed step is tolerated (it simply invalidates
+  nothing); only when no selector matches any executed step — the fork would
+  invalidate nothing at all — does it throw `NoMatchingStepException`.
+  `runtime.listSteps(instanceId, selector)` lists the matched steps for
+  previewing.
 - TODO: define a causal boundary for parallel branches, where executed steps do
   not necessarily have one total order. A single boundary timestamp may be
-  insufficient.
+  insufficient (for `invalidateAllExecutedAfter`).
 - Forking does not require old generations to remain as separate workflow
   instances; it only operates on the source state that currently exists.
 
 ## Resetting
 
-Reset keeps the same instance identity but erases history from a selected step
-onward. It is the in-place counterpart of a fork.
+Reset keeps the same instance identity but erases selected history. It is the
+in-place counterpart of a fork.
 
 ```scala
-runtime.resetWorkflow(sourceInstanceId, restartFrom = stepId"orders/charge")
+runtime.resetWorkflow(
+  sourceInstanceId,
+  invalidateIndividualSteps = Seq.empty,
+  invalidateAllExecutedAfter = Seq(stepId"orders/charge")
+)
 ```
 
 - Generation is incremented in place; no old generation is retained.
-- History strictly before the boundary remains cached. The matched steps and
-  subsequent history are erased, and the workflow replays from the top.
-- The boundary is determined exactly as for forking: the earliest matched row's
-  last-updated timestamp, rows with an equal or later timestamp are erased.
+- The two invalidation lists follow the same rules as forking (at least one
+  non-empty, both compound, selectors matching nothing are tolerated as long as
+  some selector matches).
+- All history except the invalidated steps remains cached and is replayed; the
+  workflow replays from the top.
+- `invalidateIndividualSteps` erases exactly the matched steps and is meant to
+  be used with the `invalidateOn` parameter on Step definitions: invalidate one
+  or a few steps, and the invalidation propagates according to the specified
+  dependency graph.
+- `invalidateAllExecutedAfter` determines the boundary exactly as for forking:
+  the earliest matched row's last-updated timestamp, rows with an equal or later
+  timestamp are erased.
 - **Reset closes all children of the old generation.** Like `continueAsNew`, the
   reset transaction records a `child_close_requests` row targeting exactly the
   pre-increment generation's children (`parent identity + key@generation`),
@@ -141,6 +169,8 @@ runtime.resetWorkflow(sourceInstanceId, restartFrom = stepId"orders/charge")
 the operation explicit and avoids inventing a second iteration abstraction.
 - Forking uses a new identity and copied cached steps, so it does not need to
   address or preserve an old continue-as-new generation.
-- An exclusive `restartFrom` boundary reruns the selected operation, which
-  matches the primary recovery case. An inclusive boundary would preserve the
-  operation most likely to require correction.
+- An exclusive `invalidateAllExecutedAfter` boundary reruns the selected
+  operation and everything executed after it, which matches the primary
+  recovery case. An inclusive boundary would preserve the operation most likely
+  to require correction. `invalidateIndividualSteps` covers the finer-grained
+  case of rerunning one or a few steps with `invalidateOn`-driven propagation.
