@@ -78,7 +78,7 @@ adds detail to, the documents in `spec/`.
   decode its source outcome before mapping.
 - An empty race is rejected. When no event passes a signal filter, evaluation
   advances the signal cursor past the examined events before suspending.
-- `deleteStep` deletes a step record and all its subscriptions in one
+- `deleteSteps` deletes step records and all their subscriptions in one
   ownership-checked transaction. Re-evaluation is a separate transaction. A
   replacement timer gets a fresh id, so its old firing event cannot satisfy it.
 - Timer firing commits before wait evaluation. Its event remains stored if

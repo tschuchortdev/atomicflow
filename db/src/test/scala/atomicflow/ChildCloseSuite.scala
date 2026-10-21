@@ -470,7 +470,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowSuspended)
 
     // Reset from the executed `pre` step: the old generation's child must be closed.
-    rt.resetWorkflow[String, String](parentId, stepId"/pre")(using parentWf)
+    rt.resetWorkflow[String, String](parentId, Seq.empty, Seq(stepId"/pre"))(using parentWf)
     assertEquals(childCloseRowCount(), 1, "reset records one closure request for the old generation")
 
     sweep(childWf)
@@ -517,7 +517,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     // on replay the cached step's body (startAsChild) is never re-executed.
     setUpdatedAt("orders", "order-42", "start-child", Instant.parse("2026-01-01T00:00:00Z"))
 
-    rt.resetWorkflow[String, String](parentId, stepId"/post")(using parentWf)
+    rt.resetWorkflow[String, String](parentId, Seq.empty, Seq(stepId"/post"))(using parentWf)
 
     sweep(childWf)
     assertEquals(childRow("worker", "c", child0.scope).get.terminalState, Some("cancelled"),

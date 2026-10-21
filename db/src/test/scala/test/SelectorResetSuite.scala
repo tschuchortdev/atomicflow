@@ -109,7 +109,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "b", t2)
     setUpdatedAt(wf.id, "k", "c", t3)
 
-    rt.resetWorkflow[String, String](id, stepId"/b")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/b"))(using wf)
     assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
     assertEquals(stepIds(wf.id, "k"), Set("a"), "b and c are erased; a is kept")
 
@@ -141,7 +141,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "after", t2)
     setUpdatedAt(wf.id, "k", "wait", t3)
 
-    rt.resetWorkflow[String, String](id, stepId"orders/charge")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"orders/charge"))(using wf)
     assertEquals(stepRows(wf.id, "k"), Set.empty, "charge and everything after it are erased")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
@@ -173,7 +173,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAtInScope(wf.id, "k", Vector("s2"), "x", t3)
     setUpdatedAt(wf.id, "k", "wait", t4)
 
-    rt.resetWorkflow[String, String](id, stepId"*/x")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"*/x"))(using wf)
     assertEquals(
       stepRows(wf.id, "k"),
       Set.empty[(Vector[String], String)],
@@ -225,7 +225,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "c", t4)
     setUpdatedAt(wf.id, "k", "w", t5)
 
-    rt.resetWorkflow[String, String](id, stepId"/b")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/b"))(using wf)
     assertEquals(handle.getInfo()(using rt).generation, 1L, "generation increments in place")
     assertEquals(
       stepIds(wf.id, "k"),
@@ -274,7 +274,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAtInScope(wf.id, "k", Vector("loopid@1"), "innerstep", t1)
     setUpdatedAtInScope(wf.id, "k", Vector("loopid@1"), "wait", t2)
 
-    rt.resetWorkflow[String, String](id, stepId"loopid/innerstep")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"loopid/innerstep"))(using wf)
     assertEquals(
       stepRows(wf.id, "k"),
       Set((Vector.empty[String], "loopid")),
@@ -304,7 +304,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     setUpdatedAt(wf.id, "k", "b", t2)
     setUpdatedAt(wf.id, "k", "c", t3)
 
-    val fork = rt.forkWorkflow[String, String](sourceId, "fork", stepId"/a")(using wf)
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", Seq.empty, Seq(stepId"/a"))(using wf)
     assertEquals(fork.id.workflowInstanceKey, "fork")
     assertEquals(fork.id.scope, ScopePath.empty)
     assertEquals(stepIds(wf.id, "fork"), Set.empty, "nothing is strictly before a; a and later are omitted")
@@ -325,7 +325,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
 
     val resetError = intercept[NoMatchingStepException] {
-      rt.resetWorkflow[String, String](id, stepId"/zzz")(using wf)
+      rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/zzz"))(using wf)
     }
     assert(resetError.getMessage.contains("/zzz"), s"unexpected message: ${resetError.getMessage}")
     assert(
@@ -338,7 +338,7 @@ class SelectorResetSuite extends PostgresWorkflowRuntimeSuite {
     )
 
     val forkError = intercept[NoMatchingStepException] {
-      rt.forkWorkflow[String, String](id, "fork", stepId"/zzz")(using wf)
+      rt.forkWorkflow[String, String](id, "fork", Seq.empty, Seq(stepId"/zzz"))(using wf)
     }
     assert(forkError.getMessage.contains("/zzz"), s"unexpected message: ${forkError.getMessage}")
     assert(

@@ -183,62 +183,138 @@ class PostgresWorkflowRuntime private[atomicflow] (
     deleted > 0
   }
 
-  /** One stored step row of an instance: the step id's key and scope within the
-    * instance, and the newest row's last-update timestamp.
+  /** The identifying columns of one stored step row: the step id's key and
+    * scope within the instance, the row's step version, and the row's
+    * last-update timestamp. Not the whole row — just enough to address the row
+    * and to order it in time.
     */
-  private case class StoredStep(key: String, scope: ScopePath, updatedAt: java.time.Instant) {
-    def stepId: StepId = StepId(key, scope)
-  }
+  private case class StepUpdatedAt(stepId: StepId, version: Long, updatedAt: java.time.Instant)
 
-  /** The instance's stored step rows, one per distinct step id, ordered by last
-    * update. Only the instance's own rows: rows of child instances live under
-    * their own workflow identities.
+  /** The instance's stored step rows, one entry per physical row. Only the
+    * instance's own rows: rows of child instances live under their own
+    * workflow identities.
     */
-  private def readStoredSteps(
+  private def readAllSteps(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath
-  ): ConnectionIO[Vector[StoredStep]] =
+  ): ConnectionIO[Vector[StepUpdatedAt]] =
     sql"""
-      SELECT step_id, step_scope_within_instance, MAX(updated_at)
+      SELECT step_id, step_scope_within_instance, step_version, updated_at
       FROM workflow_steps
       WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-      GROUP BY step_id, step_scope_within_instance
-      ORDER BY MAX(updated_at), step_id, step_scope_within_instance
-    """.query[StoredStep].to[Vector]
+    """.query[StepUpdatedAt].to[Vector]
 
-  /** Resolves a step selector against the instance's stored step rows: the
-    * restart boundary is the earliest matched row's timestamp, so every
-    * matching step is erased or omitted and re-executes. Fails with
-    * [[NoMatchingStepException]] when nothing matches, listing some existing
-    * steps for orientation.
+  /** The stored steps of `rows`, one entry per distinct step id, ordered by
+    * the step's newest last-update timestamp (then key and path).
     */
-  private def resolveRestartBoundary(
+  private def distinctSteps(rows: Vector[StepUpdatedAt]): Vector[StepUpdatedAt] =
+    rows
+      .groupBy(_.stepId)
+      .values
+      .map(_.maxBy(_.updatedAt))
+      .toVector
+      .sortBy(step => (step.updatedAt, step.stepId.key, step.stepId.pathStr))
+
+  /** Computes the stored step rows a reset or fork invalidates, from the two
+    * invalidation parameter lists and the instance's stored step rows. Pure
+    * bookkeeping: selector matching is Scala-side ([[StepIdSelector]] cannot
+    * be expressed in SQL), so the SQL of both operations only ever sees
+    * concrete `(step id, version)` identities.
+    *
+    * `invalidateIndividualSteps` selects all rows (all versions) of the steps
+    * matching any of its selectors. `invalidateAllExecutedAfter` selects
+    * every row whose last-update timestamp is at or after the boundary: the
+    * earliest of the matched steps' newest timestamps (a step may have several
+    * version rows; the boundary is per step, so every matching step is
+    * invalidated). Both lists compound; a selector matching no stored step is
+    * tolerated.
+    *
+    * Throws [[NoMatchingStepException]] when no selector of either list
+    * matches any stored step (the operation would invalidate nothing),
+    * listing the given selectors and some existing steps for orientation.
+    */
+  private def computeInvalidatedStepRowsForReset(
       sourceInstanceId: WorkflowInstanceId,
+      rows: Vector[StepUpdatedAt],
+      invalidateIndividualSteps: Seq[StepIdSelector],
+      invalidateAllExecutedAfter: Seq[StepIdSelector]
+  ): Vector[StepUpdatedAt] = {
+    require(
+      invalidateIndividualSteps.nonEmpty || invalidateAllExecutedAfter.nonEmpty,
+      s"reset/fork of $sourceInstanceId needs at least one of invalidateIndividualSteps and invalidateAllExecutedAfter to be non-empty"
+    )
+
+    def matching(selector: StepIdSelector): Vector[StepUpdatedAt] =
+      rows.filter(row => selector.matches(row.stepId))
+
+    val individual = invalidateIndividualSteps.flatMap(matching).toVector
+    val boundary = invalidateAllExecutedAfter
+      .flatMap(matching)
+      .groupBy(_.stepId)
+      .values
+      .map(_.map(_.updatedAt).max)
+      .minOption
+    val after = boundary.map(b => rows.filter(row => !row.updatedAt.isBefore(b))).getOrElse(Vector.empty)
+
+    val invalidated = (individual ++ after).distinct
+    if invalidated.isEmpty then {
+      val selectors =
+        (invalidateIndividualSteps.map(("invalidateIndividualSteps", _)) ++
+          invalidateAllExecutedAfter.map(("invalidateAllExecutedAfter", _)))
+          .map((kind, sel) => s"$kind='${sel}'")
+          .mkString(", ")
+      val existingSteps = distinctSteps(rows)
+      val existing =
+        if existingSteps.isEmpty then "the instance has no stored steps"
+        else
+          s"existing steps: ${existingSteps.take(10).map(step => s"'${step.stepId.pathStr}'").mkString(", ")}" +
+            (if existingSteps.size > 10 then s" (and ${existingSteps.size - 10} more)" else "")
+      throw new NoMatchingStepException(
+        s"no selector of the reset/fork of $sourceInstanceId matches an executed step (selectors: $selectors); $existing"
+      )
+    }
+    invalidated
+  }
+
+  /** A SQL predicate selecting the step rows with the given
+    * `(step id, version)` identities: an OR chain of equality conjunctions
+    * over the row's own columns, wrapped in one pair of parentheses so it
+    * composes safely under `NOT` or next to further `AND` conjuncts. Every
+    * statement this appears in touches exactly one table, so the columns are
+    * never ambiguous and need no qualifier.
+    */
+  private def oneOfStepIds(steps: Seq[(StepId, Long)]): Fragment =
+    if steps.isEmpty then fr"FALSE"
+    else
+      fr"(" ++ steps
+        .map((stepId, version) =>
+          fr"step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $version"
+        )
+        .reduceLeft((a, b) => a ++ fr" OR " ++ b) ++ fr")"
+
+  /** Bulk-deletes the step rows with the given `(step id, version)` identities
+    * of one instance. No lease is required: the reset/fork path calls it for
+    * the instance it operates on, and the lease-fenced `deleteSteps` wraps it
+    * for the replay path.
+    */
+  private def deleteStepRowsQ(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
-      restartFrom: StepIdSelector
-  ): ConnectionIO[java.time.Instant] =
-    readStoredSteps(workflowId, key, scope).map { stored =>
-      val matches = stored.filter(step => restartFrom.matches(step.stepId))
-      if matches.isEmpty then {
-        val existing =
-          if stored.isEmpty then "the instance has no stored steps"
-          else
-            s"existing steps: ${stored.take(10).map(step => s"'${step.stepId.pathStr}'").mkString(", ")}" +
-              (if stored.size > 10 then s" (and ${stored.size - 10} more)" else "")
-        throw new NoMatchingStepException(
-          s"restartFrom '${restartFrom}' matches no executed step of $sourceInstanceId; $existing"
-        )
-      }
-      matches.map(_.updatedAt).min
-    }
+      steps: Seq[(StepId, Long)]
+  ): ConnectionIO[Unit] =
+    sql"""
+      DELETE FROM workflow_steps
+      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+        AND ${oneOfStepIds(steps)}
+    """.update.run.map(_ => ())
 
   override def forkWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
       newInstanceKey: WorkflowInstanceKey,
-      restartFrom: StepIdSelector
+      invalidateIndividualSteps: Seq[StepIdSelector],
+      invalidateAllExecutedAfter: Seq[StepIdSelector]
   )(using workflow: Workflow[In, Out]): WorkflowInstance[In, Out] = {
     val sourceWf = sourceInstanceId.workflowId
     val sourceKey = sourceInstanceId.workflowInstanceKey
@@ -258,7 +334,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
             throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
           case _ => ().pure[ConnectionIO]
         }
-        boundary <- resolveRestartBoundary(sourceInstanceId, sourceWf, sourceKey, sourceScope, restartFrom)
+        invalidated <- readAllSteps(sourceWf, sourceKey, sourceScope).map(rows =>
+          computeInvalidatedStepRowsForReset(
+            sourceInstanceId,
+            rows,
+            invalidateIndividualSteps,
+            invalidateAllExecutedAfter
+          )
+        )
         inserted <- sql"""
           INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation)
           VALUES ($newWorkflowId, $newInstanceKey, '{}', $sourceInput, ${workflow.version})
@@ -269,19 +352,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
             s"Workflow instance already exists under the fork key: $newId"
           )
         else ().pure[ConnectionIO]
-        // Copied rows keep their persisted state. Rows carrying a retry
-        // deadline are excluded: they are suspended on their site's retry
-        // timer, and timer subscriptions do not travel with the copy, so the
-        // destination would otherwise suspend on a deadline nothing would ever
-        // wake it for. The destination simply re-executes such steps from
-        // scratch.
+        // Copied rows keep their persisted state. Invalidated rows are omitted
+        // so they re-execute in the fork. Rows carrying a retry deadline are
+        // also excluded: they are suspended on their site's retry timer, and
+        // timer subscriptions do not travel with the copy, so the destination
+        // would otherwise suspend on a deadline nothing would ever wake it for.
+        // The destination simply re-executes such steps from scratch.
         _ <- sql"""
           INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_scope_within_instance, step_version, step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at)
           SELECT $newWorkflowId, $newInstanceKey, '{}', step_id, step_scope_within_instance, step_version, step_kind,
             state_kind, state_payload, retry_deadline, input_fingerprints, expires_at, created_at, updated_at
           FROM workflow_steps
           WHERE workflow_id = $sourceWf AND workflow_instance_key = $sourceKey AND workflow_instance_scope = $sourceScope
-            AND updated_at < $boundary
+            AND NOT ${oneOfStepIds(invalidated.map(row => (row.stepId, row.version)))}
             AND retry_deadline IS NULL
         """.update.run
         _ <- upsertWakeupQ(newId.workflowId, newInstanceKey, ScopePath.empty, clock.instant())
@@ -292,7 +375,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   override def resetWorkflow[In, Out](
       sourceInstanceId: WorkflowInstanceId,
-      restartFrom: StepIdSelector
+      invalidateIndividualSteps: Seq[StepIdSelector],
+      invalidateAllExecutedAfter: Seq[StepIdSelector]
   )(using workflow: Workflow[In, Out]): Unit = {
     val wf = sourceInstanceId.workflowId
     val key = sourceInstanceId.workflowInstanceKey
@@ -313,23 +397,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
             throw new IllegalStateException(s"Cannot reset a terminal workflow instance: $sourceInstanceId")
           case Some((None, _)) => ().pure[ConnectionIO]
         }
-        boundary <- resolveRestartBoundary(sourceInstanceId, wf, key, scope, restartFrom)
-        _ <- deleteAllSubscriptionsQ(
-               wf,
-               key,
-               scope,
-               fr"""
-                 EXISTS (SELECT 1 FROM workflow_steps st
-                 WHERE st.workflow_id = $wf AND st.workflow_instance_key = $key AND st.workflow_instance_scope = $scope
-                   AND st.updated_at >= $boundary
-                   AND st.step_id = s.step_id AND st.step_scope_within_instance = s.step_scope_within_instance AND st.step_version = s.step_version)
-               """
-             )
-        _ <- sql"""
-          DELETE FROM workflow_steps
-          WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-            AND updated_at >= $boundary
-        """.update.run
+        invalidated <- readAllSteps(wf, key, scope).map(rows =>
+          computeInvalidatedStepRowsForReset(
+            sourceInstanceId,
+            rows,
+            invalidateIndividualSteps,
+            invalidateAllExecutedAfter
+          )
+        )
+        invalidatedIds = invalidated.map(row => (row.stepId, row.version))
+        _ <- deleteAllSubscriptionsQ(wf, key, scope, oneOfStepIds(invalidatedIds))
+        _ <- deleteStepRowsQ(wf, key, scope, invalidatedIds)
         _ <- sql"""
           DELETE FROM workflow_wakeups
           WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -366,8 +444,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
         _ <- if exists.isEmpty then
           throw new WorkflowNotFoundException(s"Workflow instance not found: $sourceInstanceId")
         else ().pure[ConnectionIO]
-        stored <- readStoredSteps(wf, key, scope)
-      } yield stored.filter(step => selector.matches(step.stepId)).map(_.stepId).toVector
+        rows <- readAllSteps(wf, key, scope)
+      } yield distinctSteps(rows).filter(step => selector.matches(step.stepId)).map(_.stepId).toVector
     }
   }
 
@@ -2095,8 +2173,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
-  ): Option[StepRow] =
-    readStepRow(
+  ): Option[StoredStep] =
+    readStoredStep(
       instanceId.workflowId,
       instanceId.workflowInstanceKey,
       instanceId.scope,
@@ -2105,14 +2183,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
       stepVersion
     )
 
-  private def readStepRow(
+  private def readStoredStep(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
       stepId: String,
       stepScopePath: ScopePath,
       stepVersion: Long
-  ): Option[StepRow] =
+  ): Option[StoredStep] =
     runTransaction {
       sql"""
         SELECT step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
@@ -2121,7 +2199,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       """.query[(String, String, String, Option[java.time.Instant], String, Option[java.time.Instant])]
         .option
     }.map { case (rowKind, stateKind, payload, retryDeadline, fingerprints, expiresAt) =>
-      StepRow(
+      StoredStep(
         StepState.fromPersisted(rowKind, stateKind, payload, retryDeadline),
         InputFingerprints.of(fingerprints),
         expiresAt
@@ -2252,7 +2330,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
   override def writeStep(
       stepId: StepId,
       stepVersion: Long,
-      row: StepRow
+      row: StoredStep
   )(using lease: Lease): Unit =
     runLeaseCheckedTransaction(lease) {
       for {
@@ -2267,16 +2345,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
       } yield ()
     }
 
-  override def deleteStep(stepId: StepId, stepVersion: Long)(using lease: Lease): Unit =
+  override def deleteSteps(steps: Seq[(stepId: StepId, version: Long)])(using lease: Lease): Unit = {
+    val identities = steps.map(s => (s.stepId, s.version))
     runLeaseCheckedTransaction(lease) {
       for {
-        _ <- sql"""
-          DELETE FROM workflow_steps
-          WHERE workflow_id = ${lease.workflowId} AND workflow_instance_key = ${lease.instanceKey} AND workflow_instance_scope = ${lease.instanceScope} AND step_id = ${stepId.key} AND step_scope_within_instance = ${stepId.scope} AND step_version = $stepVersion
-        """.update.run
-        _ <- deleteSiteSubscriptionsQ(lease, stepId, stepVersion)
+        _ <- deleteStepRowsQ(lease.workflowId, lease.instanceKey, lease.instanceScope, identities)
+        _ <- deleteAllSubscriptionsQ(lease.workflowId, lease.instanceKey, lease.instanceScope, oneOfStepIds(identities))
       } yield ()
     }
+  }
 
   override def readAwaitSignalCandidates(signalKey: SignalKey)(using lease: Lease): Vector[SubscriberMatch] =
     runTransaction {
@@ -2318,7 +2395,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                      lease,
                      waitSite.stepId,
                      waitSite.stepVersion,
-                     StepRow(
+                     StoredStep(
                        StepState.Await(r.payload),
                        waitSite.inputFingerprints,
                        waitSite.expiresAt
@@ -2437,7 +2514,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       lease: Lease,
       stepId: StepId,
       stepVersion: Long,
-      row: StepRow
+      row: StoredStep
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
     val fingerprintText = row.inputFingerprints.raw

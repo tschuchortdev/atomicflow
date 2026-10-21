@@ -11,7 +11,10 @@ import scala.collection.mutable
   *
   *   - In a `StepFailed` pattern, to react to a specific step's failure:
   *     `case StepFailed(stepId"orders/$id/charge", message) => ...`
-  *   - As the `restartFrom` boundary of `resetWorkflow`/`forkWorkflow`.
+  *   - As the `invalidateIndividualSteps` selectors (individual step
+ *     invalidation) or `invalidateAllExecutedAfter` boundaries (erase/omit
+ *     everything from the earliest matched row onward) of
+ *     `resetWorkflow`/`forkWorkflow`.
   *
   * A selector describes a path of scope segments ending in the step key, the
   * same shape `Workflow.scoped`, `Workflow.loop`, and races build at run time:

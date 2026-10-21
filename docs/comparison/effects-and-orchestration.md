@@ -348,8 +348,8 @@ analogue elsewhere.
 
 **AtomicFlow**
 ```scala
-runtime.forkWorkflow(sourceId, newInstanceKey, restartFrom = stepId"/orders/charge")  // new identity
-runtime.resetWorkflow(sourceId, restartFrom = stepId"orders/charge")                  // in place
+runtime.forkWorkflow(sourceId, newInstanceKey, Seq.empty, Seq(stepId"/orders/charge"))  // new identity
+runtime.resetWorkflow(sourceId, Seq.empty, Seq(stepId"orders/charge"))                  // in place
 ```
 **DBOS**
 ```python
@@ -361,7 +361,7 @@ DBOS.fork_workflow(workflow_id, start_step)   # programmatic + UI
 |---|---|---|---|
 | Fork to new instance | ✅ | ❌ | ✅ |
 | In-place reset | ✅ | ✅ (new Run from an event) | ❌ |
-| Boundary | exclusive `restartFrom` step selector, ordered by row `updated_at` | target event id | start step |
+| Boundary | `invalidateIndividualSteps` (exact step selectors) and/or `invalidateAllExecutedAfter` (exclusive selector boundary, ordered by row `updated_at`) | target event id | start step |
 | Purpose | recover from a buggy step; branch a corrected copy | replay from earlier point | restart many failed workflows from a step after an outage |
 
 **Implementation.** AtomicFlow's fork copies cached rows **strictly before** the

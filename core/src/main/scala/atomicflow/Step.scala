@@ -257,7 +257,7 @@ object Step {
         internals.writeStep(
           stepId,
           stepVersion,
-          StepRow(
+          StoredStep(
             StepState.SimpleStep.Started,
             InputFingerprints.of(fingerprints),
             None
@@ -270,7 +270,7 @@ object Step {
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(body)
           internals.writeStep(
             stepId, stepVersion,
-            StepRow(
+            StoredStep(
               StepState.SimpleStep.Succeeded(SerializedValue.of(serialized)),
               InputFingerprints.of(fingerprints),
               expiresAt
@@ -290,7 +290,7 @@ object Step {
                 val (payload, toThrow) = serializeFailure(t)
                 internals.writeStep(
                   stepId, stepVersion,
-                  StepRow(
+                  StoredStep(
                     StepState.SimpleStep.Failed(SerializedValue.of(payload)),
                     InputFingerprints.of(fingerprints),
                     expiresAt
@@ -306,7 +306,7 @@ object Step {
                   internals.writeStep(
                     stepId,
                     stepVersion,
-                    StepRow(
+                    StoredStep(
                       StepState.SimpleStep.RetryPending(SerializedValue.of(RetryState.encode(bookkeeping)), deadline),
                       InputFingerprints.of(fingerprints),
                       expiresAt
@@ -584,7 +584,7 @@ object Step {
         internals.deleteSubscriptionsUnderScopePaths(branchPaths)
         internals.writeStep(
           scopedStepId, 0L,
-          StepRow(
+          StoredStep(
             StepState.FirstToRun(SerializedValue.of(serialized)),
             InputFingerprints.of(fingerprints),
             None
@@ -623,7 +623,7 @@ object Step {
       rawExisting.filterNot(row => isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn))
 
     if (rawExisting.isDefined && replayable.isEmpty)
-      internals.deleteStep(stepId, stepVersion)
+      internals.deleteSteps(Seq((stepId = stepId, version = stepVersion)))
 
     replayable.map(expectStepState[S](stepKey, _))
   }
@@ -827,7 +827,7 @@ object Step {
     */
   private def haveInputsChanged(
       key: String,
-      row: StepRow,
+      row: StoredStep,
       ensureUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]]
   ): Boolean = {
@@ -841,7 +841,7 @@ object Step {
     invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
   }
 
-  private def isExpired(row: StepRow, now: java.time.Instant): Boolean =
+  private def isExpired(row: StoredStep, now: java.time.Instant): Boolean =
     row.expiresAt.exists(!_.isAfter(now))
 
   /** A step key belongs to exactly one step kind: the row stored at a
@@ -850,7 +850,7 @@ object Step {
     * change across workflow versions), which fails the run instead of reading,
     * deleting, or overwriting the foreign row.
     */
-  private def expectStepState[S <: StepState](stepKey: String, row: StepRow)(using TypeTest[StepState, S]): S = {
+  private def expectStepState[S <: StepState](stepKey: String, row: StoredStep)(using TypeTest[StepState, S]): S = {
     row.state match
       case s: S => s
 

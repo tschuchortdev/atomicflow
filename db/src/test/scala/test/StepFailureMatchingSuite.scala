@@ -46,7 +46,7 @@ class StepFailureMatchingSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(aExecs.get(), 1, "replay must not re-execute the failed step body")
     assert(caughtMsg.contains("boom-a"), s"unexpected message: $caughtMsg")
 
-    rt.resetWorkflow[String, String](id, stepId"/a")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/a"))(using wf)
     caughtBy = "none"
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(caughtBy, "a", "after reset the re-executed step fails again and the same branch fires")
@@ -214,7 +214,7 @@ class StepFailureMatchingSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(execs.get(), 1, "the replay must not re-execute the failed body")
-    rt.resetWorkflow[String, String](id, stepId"/flaky")(using wf)
+    rt.resetWorkflow[String, String](id, Seq.empty, Seq(stepId"/flaky"))(using wf)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
     assertEquals(execs.get(), 2, "only the reset re-executed the body")
 
