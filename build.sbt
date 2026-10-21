@@ -64,6 +64,8 @@ lazy val example = project
     libraryDependencies ++= Seq(
       // dbos4s pins (and pulls in) the dev.dbos:transact Java library
       "xyz.matthieucourt" %% "dbos4s-transact0.9" % "0.1.0",
+      // The official Temporal Java SDK, used from Scala
+      "io.temporal" % "temporal-sdk" % "1.40.0",
       "org.business4s" %% "workflows4s-core" % "0.4.0",
       "org.business4s" %% "workflows4s-bpmn" % "0.4.0",
       "org.typelevel" %% "cats-effect" % "3.6.1",
@@ -82,6 +84,7 @@ lazy val example = project
     // Test dependencies
     libraryDependencies ++= Seq(
       "xyz.matthieucourt" %% "dbos4s-testkit-transact0.9" % "0.1.0",
+      "io.temporal" % "temporal-testing" % "1.40.0",
       "org.scalameta" %% "munit" % dependencyVersions.munit,
       "org.testcontainers" % "testcontainers" % "1.21.3",
       "org.testcontainers" % "postgresql" % "1.21.3",
