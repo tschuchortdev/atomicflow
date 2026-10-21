@@ -5,6 +5,7 @@ import org.postgresql.ds.PGSimpleDataSource
 import org.testcontainers.containers.PostgreSQLContainer
 
 import java.sql.Connection
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 /** One PostgreSQL 16 container shared by every suite in this JVM, with one
@@ -14,9 +15,11 @@ import java.util.concurrent.atomic.AtomicInteger
   * instance instead of starting one each. Each suite gets its own database so
   * pooled connections and background workers from one suite can never touch
   * another suite's data. Suites isolate their tests by emptying all tables
-  * between tests; the schema is static (one Flyway migration), so truncation
-  * is equivalent to a full clean and migrate. The container is closed by a
-  * JVM shutdown hook, which fires when sbt's test JVM exits.
+  * between tests and restoring the rows the migrations seed into a fresh
+  * schema; the rest of the schema is never recreated. Because every database
+  * is created and migrated from scratch, migration changes are picked up on
+  * the next test run automatically. The container is closed by a JVM shutdown
+  * hook, which fires when sbt's test JVM exits.
   */
 object SharedPostgres {
 
@@ -40,6 +43,8 @@ object SharedPostgres {
 
   private val databaseCounter = new AtomicInteger(0)
 
+  private val seedInsertsByDatabase = new ConcurrentHashMap[PGSimpleDataSource, Vector[String]]()
+
   /** Starts the container if needed and hands out a fresh, migrated database. */
   def newDatabase(): PGSimpleDataSource = synchronized {
     container
@@ -52,47 +57,70 @@ object SharedPostgres {
     } finally admin.getConnection.close()
     val ds = newDataSource(name)
     Flyway.configure().dataSource(ds).cleanDisabled(false).load().migrate()
+    seedInsertsByDatabase.put(ds, snapshotSeedInserts(ds))
     ds
   }
 
-  /** Empties all tables and restarts identity sequences, keeping the schema in place.
-    *
-    * Tables that the migration seeds with singleton rows are not truncated;
-    * their mutable columns are reset instead, so the seed data stays intact.
+  /** Empties all tables and restarts identity sequences, keeping the schema in
+    * place, then restores the migration-seeded rows captured at creation time.
     */
   def truncateAll(ds: PGSimpleDataSource): Unit = {
+    val seeds = seedInsertsByDatabase.get(ds)
     val conn: Connection = ds.getConnection
     try {
-      val (seeded, plain) = {
-        val rs = conn
-          .createStatement()
-          .executeQuery(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'flyway_schema_history'"
-          )
-        try {
-          val seededBuilder = Vector.newBuilder[String]
-          val plainBuilder  = Vector.newBuilder[String]
-          while rs.next() do {
-            val t = rs.getString(1)
-            if seededTables.contains(t) then seededBuilder += t else plainBuilder += t
-          }
-          (seededBuilder.result(), plainBuilder.result())
-        } finally rs.getStatement.close()
-      }
-      if plain.nonEmpty then {
-        val ddl = plain.map(t => s"\"$t\"").mkString("TRUNCATE TABLE ", ", ", " RESTART IDENTITY CASCADE")
+      val tables = userTables(conn)
+      if tables.nonEmpty then {
+        val ddl = tables.map(t => s"\"$t\"").mkString("TRUNCATE TABLE ", ", ", " RESTART IDENTITY CASCADE")
         val st = conn.createStatement()
         try st.execute(ddl)
         finally st.close()
       }
-      for t <- seeded do {
+      if seeds.nonEmpty then {
         val st = conn.createStatement()
-        try st.executeUpdate(s"UPDATE \"$t\" SET dispatched_through = 0")
+        try seeds.foreach(st.execute)
         finally st.close()
       }
     } finally conn.close()
   }
 
-  /** Migration-seeded tables whose singleton rows must survive a reset. */
-  private val seededTables = Set("workflow_event_dispatch")
+  /** The contents of all user tables right after migration; on a fresh schema
+    * these are exactly the rows seeded by the migrations.
+    */
+  private def snapshotSeedInserts(ds: PGSimpleDataSource): Vector[String] = {
+    val conn: Connection = ds.getConnection
+    try {
+      userTables(conn).toVector.flatMap { table =>
+        val st = conn.createStatement()
+        try {
+          val rs = st.executeQuery(s"""SELECT * FROM "$table"""")
+          try {
+            val meta = rs.getMetaData
+            val columns = (1 to meta.getColumnCount).map(i => s""""${meta.getColumnName(i)}"""")
+            val inserts = Vector.newBuilder[String]
+            while rs.next() do {
+              val values = (1 to meta.getColumnCount).map { i =>
+                val v = rs.getString(i)
+                if v == null then "NULL" else "'" + v.replace("'", "''") + "'"
+              }
+              inserts += s"""INSERT INTO "$table" (${columns.mkString(", ")}) VALUES (${values.mkString(", ")})"""
+            }
+            inserts.result()
+          } finally rs.close()
+        } finally st.close()
+      }
+    } finally conn.close()
+  }
+
+  private def userTables(conn: Connection): Vector[String] = {
+    val rs = conn
+      .createStatement()
+      .executeQuery(
+        "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename <> 'flyway_schema_history'"
+      )
+    try {
+      val b = Vector.newBuilder[String]
+      while rs.next() do b += rs.getString(1)
+      b.result()
+    } finally rs.getStatement.close()
+  }
 }
