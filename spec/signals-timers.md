@@ -404,57 +404,25 @@ The library provides a function to await completion of other workflows.
 
 ## Unconsumed signals at completion
 
-Every workflow can have an `onUnconsumedSignals` handler, mainly for logging.
+A signal arriving after execution passed its await-site is not lost immediately:
+the immutable fact remains available until workflow completion, continue-as-new,
+or another retention boundary removes it.
 
-A signal arriving after execution passed its await-site is not lost: the
-immutable fact remains available until workflow completion, continue-as-new, or
-another retention boundary removes it.
-
-- **Default: ignore.** Unless a handler is declared, unconsumed signals are
-  ignored. The gathering and deletion of directly addressed `Signal` events, the
-  closing of child relationships, and the terminal transition commit together;
-  children retain cached Step results for
+- **Unconsumed signals are ignored.** There is no user-facing handler for
+  signals left unconsumed at a terminal boundary; matching the behavior of
+  Temporal and DBOS, they are dropped. The deletion of directly addressed
+  `Signal` events, the closing of child relationships, and the terminal
+  transition commit together; children retain cached Step results for
   inherited signals they already consumed, so replay does not require the
   source rows.
-- Optional `onUnconsumedSignals` handler can be passed to the `Workflow` constructor in the same parameter group as the body. It runs after the instance has been marked complete (or has continued as new) and receives a map of all unconsumed signals:
-  ```scala
-  val wf = Workflow("order")(
-    (order: Order) => {
-      val orderEvents = Step.await("read-orders", Awaitable.SignalEvent(orders))
-      ...
-    },
-    onUnconsumedSignals = { unconsumed =>
-      unconsumed.foreach { case (signalId, events) =>
-        ...
-      }
-    }
-  )
-  ```
-  When only the body is needed, the handler defaults to ignoring unconsumed signals:
-  ```scala
-  val wf = Workflow("order") { (order: Order) => 
-    ...
-  }
-  ```
-  The handler receives `Map[SignalKey, Seq[String]]` where the values are
-  currently visible, raw serialized event payloads after this workflow
-  instance's cursor for each exact signal key (see DEVIATIONS entry 19 for why
-  the payloads are not decoded).
-- The `onUnconsumedSignals` handler is a regular function (may not contain `Step`s). It is invoked **after** the terminal (or continue-as-new) transaction commits, so it is **at-most-once**: a crash between the commit and the invocation loses the delivery, which is acceptable for a logging/debug aid. A handler that throws cannot mask the workflow outcome.
-- Directly addressed `Signal` events are gathered (per key, after cursors) and
-  deleted inside the same terminal/continue-as-new transaction that sets the
-  instance terminal, under that transaction's instance row lock. A signal
-  therefore either commits before the transition — and is included in the
-  handler's map — or arrives after and is rejected as
+- Directly addressed `Signal` events are deleted inside the same
+  terminal/continue-as-new transaction that sets the instance terminal, under
+  that transaction's instance row lock. A signal therefore either commits
+  before the transition — and is deleted with the other unconsumed events —
+  or arrives after and is rejected as
   `InstanceAlreadyCompleted` because the instance is already terminal
   (`terminal_state IS NOT NULL`). This resolves the "completion delivery
-  boundary" question below: a signal can never be reported as delivered and
-  then omitted.
-- On paths with no workflow definition available — force-stop/termination,
-  cancellation escalation, and cancellation of a never-started instance
-  (including a never-started child closed by its parent) — the gathered map
-  cannot be handed to a listener; the runtime logs it at WARN level instead of
-  silently dropping it.
+  boundary" question below: a signal can never be observed half-delivered.
 
 ## Invalidation and await stability
 
@@ -669,14 +637,13 @@ key. Decide whether a typed prefix-group API has a concrete use case before
 introducing cursor interaction between overlapping prefixes and exact keys.
 
 4. **Completion delivery boundary** — **Resolved**: the unconsumed `Signal`
-   events are gathered and deleted inside the terminal/continue-as-new
-   transaction that sets the instance terminal, under that transaction's
-   instance row lock, and the `onUnconsumedSignals` handler is invoked after the
-   commit. A concurrent `send` first row-locks the same instance: if it commits
-   before the transition it is included in the handler's batch; if it arrives
-   after, the committed `terminal_state` makes `send` reject it as
-   `InstanceAlreadyCompleted`. It is therefore never reported as delivered and
-   then omitted from handling.
+   events are deleted inside the terminal/continue-as-new transaction that
+   sets the instance terminal, under that transaction's instance row lock.
+   A concurrent `send` first row-locks the same instance: if it commits
+   before the transition its event is deleted with the other unconsumed
+   events; if it arrives after, the committed `terminal_state` makes `send`
+   reject it as `InstanceAlreadyCompleted`. A signal is therefore never
+   observable as delivered and then silently kept.
 
 5. **Broadcast by key prefix** — **TODO**: Define snapshot and aggregate-result
 semantics for the derived bulk operation described above.

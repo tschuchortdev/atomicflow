@@ -763,7 +763,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
     val now = clock.instant()
-    val unconsumed = runTransaction {
+    runTransaction {
       for {
         row <- sql"""
           SELECT terminal_state, times_executed, lease_owner, lease_expires_at
@@ -771,35 +771,34 @@ class PostgresWorkflowRuntime private[atomicflow] (
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
         """.query[(Option[String], Int, Option[String], Option[java.time.Instant])].option
-        gathered <- row match {
+        _ <- row match {
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-            
+
           case Some((Some(_), _, _, _)) =>
-            Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
+            ().pure[ConnectionIO]
 
           case Some((None, timesExecuted, leaseOwner, leaseExpiresAt)) =>
             for {
               hasExecutionState <- hasExecutionStateQ(workflowId, key, scope)
-              m <- if (timesExecuted == 0 && !hasExecutionState)
-                finalizeCancelledWithoutLease(workflowId, key, scope)
-              else
-                for {
-                  _ <- sql"""
-                    UPDATE workflow_instances SET cancel_requested_at = $now
-                    WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                      AND cancel_requested_at IS NULL
-                  """.update.run
-                  _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
-                      upsertWakeupQ(workflowId, key, scope, now)
-                    else 
-                      ().pure[ConnectionIO]
-                } yield Map.empty[SignalKey, Seq[String]]
-            } yield m
+              _ <- if (timesExecuted == 0 && !hasExecutionState)
+                  finalizeCancelledWithoutLease(workflowId, key, scope)
+                else
+                  for {
+                    _ <- sql"""
+                      UPDATE workflow_instances SET cancel_requested_at = $now
+                      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+                        AND cancel_requested_at IS NULL
+                    """.update.run
+                    _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
+                        upsertWakeupQ(workflowId, key, scope, now)
+                      else
+                        ().pure[ConnectionIO]
+                  } yield ()
+            } yield ()
         }
-      } yield gathered
+      } yield ()
     }
-    logDroppedUnconsumedSignals(instanceId, unconsumed)
     ()
   }
 
@@ -867,10 +866,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
   /** The guarded `CANCELLED` terminal transition for an instance that has no
     * execution lease (finalized from a cancel request before first start): the
     * guarded status update plus the `WorkflowCompleted(Cancelled)` event, in one
-    * transaction. The directly addressed `Signal` events are gathered (per key,
-    * after cursors) and then deleted in the same transaction; because no
-    * workflow definition is available on this path, the caller WARN-logs the
-    * gathered map. Completion wakeups are produced asynchronously by the job
+    * transaction. The directly addressed `Signal` events are deleted in the same
+    * transaction. Completion wakeups are produced asynchronously by the job
     * runner. The `Cancelled` outcome carries no user code, so it is encoded
     * directly with the runtime's framing.
     */
@@ -878,7 +875,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath
-  ): ConnectionIO[Map[SignalKey, Seq[String]]] = {
+  ): ConnectionIO[Unit] = {
     val payload = Framing.write("cancelled")
     for {
       updated <- sql"""
@@ -888,17 +885,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
           AND terminal_state IS NULL
       """.update.run
       
-      unconsumed <- if (updated == 1)
+      _ <- if (updated == 1)
           for {
-            gathered <- gatherUnconsumedSignalsQ(workflowId, key, scope)
             _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
             _ <- appendCompletedEvent(workflowId, key, scope, payload)
             _ <- terminalCleanupIO(workflowId, key, scope)
             _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
-          } yield gathered
+          } yield ()
         else 
-          Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
-    } yield unconsumed
+          ().pure[ConnectionIO]
+    } yield ()
   }
 
   /** Terminal cleanup of an instance's own scheduling and subscription rows:
@@ -998,21 +994,21 @@ class PostgresWorkflowRuntime private[atomicflow] (
     */
   private def closeOneChildQ(
       child: (WorkflowId, WorkflowInstanceKey, ScopePath, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
-  ): ConnectionIO[Map[SignalKey, Seq[String]]] = {
+  ): ConnectionIO[Unit] = {
     val now = clock.instant()
     val (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) = child
-    
+
     val clearPointer = sql"""
       UPDATE workflow_instances
       SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_instance_scope = NULL
       WHERE workflow_id = $cwf AND workflow_instance_key = $ckey AND workflow_instance_scope = $cscope
     """.update.run.map(_ => ())
-    
+
     val deliver = policy match {
-      case Some("abandon") => Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
-      
+      case Some("abandon") => ().pure[ConnectionIO]
+
       case _ => terminal match {
-        case Some(_) => Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
+        case Some(_) => ().pure[ConnectionIO]
 
         case None =>
           if (timesExecuted == 0)
@@ -1025,16 +1021,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
             """.update.run
             _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
                 upsertWakeupQ(cwf, ckey, cscope, now)
-              else 
+              else
                 ().pure[ConnectionIO]
-          } yield Map.empty[SignalKey, Seq[String]]
+          } yield ()
       }
     }
-    
+
     for {
       _ <- clearPointer
-      unconsumed <- deliver
-    } yield unconsumed
+      _ <- deliver
+    } yield ()
   }
 
   /** The child-close delivery sweep (the asynchronous half of
@@ -1084,13 +1080,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
     var closed = 0
     candidates.foreach { case (kind, (wf, k, s)) =>
-      val (done, unconsumed) =
+      val done =
         withDeadlockRetry(runTransaction(closeOnePendingChildQ(wf, k, s, orphan = kind == "orphan")))
-      
-      if (unconsumed.nonEmpty) 
-        logDroppedUnconsumedSignals(WorkflowInstanceId(wf, k, s), unconsumed)
-      
-      if (done) 
+
+      if (done)
         closed += 1
     }
     val removed = withDeadlockRetry {
@@ -1125,7 +1118,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       key: WorkflowInstanceKey,
       scope: ScopePath,
       orphan: Boolean
-  ): ConnectionIO[(Boolean, Map[SignalKey, Seq[String]])] =
+  ): ConnectionIO[Boolean] =
     for {
       row <- sql"""
         SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state, times_executed, lease_owner, lease_expires_at
@@ -1151,7 +1144,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                 """.update.run
               else ().pure[ConnectionIO]
-            } yield (stillGone.isEmpty, Map.empty[SignalKey, Seq[String]])
+            } yield stillGone.isEmpty
           } else {
             for {
               matched <- sql"""
@@ -1160,13 +1153,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
                   AND $scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
                 LIMIT 1
               """.query[Int].option
-              unconsumed <- if (matched.isDefined)
-                closeOneChildQ((workflowId, key, scope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt))
-              else Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
-            } yield (matched.isDefined, unconsumed)
+              _ <- if (matched.isDefined)
+                  closeOneChildQ((workflowId, key, scope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt))
+                else ().pure[ConnectionIO]
+            } yield matched.isDefined
           }
           
-        case _ => (false, Map.empty[SignalKey, Seq[String]]).pure[ConnectionIO]
+        case _ => false.pure[ConnectionIO]
       }
     } yield done
 
@@ -1187,7 +1180,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath
-  ): (Boolean, Map[SignalKey, Seq[String]]) = {
+  ): Boolean = {
     val now = clock.instant()
     runTransaction {
       for {
@@ -1217,7 +1210,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               
               result <- parentUsable match {
                 // A hard-deleted parent detaches its child; it never cancels.
-                case None => clearPointer.as((false, Map.empty[SignalKey, Seq[String]]))
+                case None => clearPointer.as(false)
 
                 case Some(_) =>
                   for {
@@ -1229,11 +1222,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
                     """.query[Int].option
                     
                     r <- matched match {
-                      case None => (false, Map.empty[SignalKey, Seq[String]]).pure[ConnectionIO]
+                      case None => false.pure[ConnectionIO]
 
                       case Some(_) =>
                         policy match {
-                          case Some("abandon") => clearPointer.as((false, Map.empty[SignalKey, Seq[String]]))
+                          case Some("abandon") => clearPointer.as(false)
 
                           case _ =>
                             if (timesExecuted == 1) {
@@ -1241,8 +1234,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
                               // body never runs; finalize CANCELLED and abort.
                               for {
                                 _ <- clearPointer
-                                m <- finalizeCancelledWithoutLease(workflowId, key, scope)
-                              } yield (true, m)
+                                _ <- finalizeCancelledWithoutLease(workflowId, key, scope)
+                              } yield true
                             } else {
                               // A started child: deliver the cooperative flag;
                               // the next cancellation checkpoint throws.
@@ -1253,7 +1246,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                                   WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                                     AND cancel_requested_at IS NULL
                                 """.update.run
-                              } yield (false, Map.empty[SignalKey, Seq[String]])
+                              } yield false
                             }
                         }
                     }
@@ -1261,7 +1254,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               }
             } yield result
             
-          case _ => (false, Map.empty[SignalKey, Seq[String]]).pure[ConnectionIO]
+          case _ => false.pure[ConnectionIO]
         }
       } yield abort
     }
@@ -1289,25 +1282,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
     if (exists.isEmpty)
       throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
-    val (_, unconsumed) = escalateTerminated(instanceId)
-    logDroppedUnconsumedSignals(instanceId, unconsumed)
+    escalateTerminated(instanceId)
     ()
   }
 
   /** The guarded `continueAsNew` in-place transition, committed in ONE
-    * transaction under the run's lease: gather the directly addressed `Signal`
-    * events (per key, after cursors), erase the old generation's execution
+    * transaction under the run's lease: erase the old generation's execution
     * records (Step rows, subscriptions, and wakeup), keep the exact-key signal
     * cursors, record a `child_close_requests` row targeting exactly the
     * children of the closing generation (delivery is asynchronous; see
-    * [[insertChildCloseRequestQ]]), delete the gathered `Signal` events,
-    * increment the generation, install the new input, and upsert the successor's
-    * wakeup. Fenced: if the lease no longer belongs to this run, no rows are
-    * affected and [[LeaseLostException]] is thrown.
-    *
-    * Returns the gathered unconsumed-signal map (empty when nothing was
-    * visible); the caller invokes the `onUnconsumedSignals` listener with it
-    * after this transaction commits.
+    * [[insertChildCloseRequestQ]]), delete the directly addressed `Signal`
+    * events, increment the generation, install the new input, and upsert the
+    * successor's wakeup. Fenced: if the lease no longer belongs to this run,
+    * no rows are affected and [[LeaseLostException]] is thrown.
     */
   private def continueAsNewTransition(
       workflowId: WorkflowId,
@@ -1316,9 +1303,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       worker: String,
       token: Long,
       newSerializedInput: String
-  ): Map[SignalKey, Seq[String]] = {
+  ): Unit = {
     val now = clock.instant()
-    val res = runTransaction {
+    val done = runTransaction {
       for {
         locked <- sql"""
           SELECT generation FROM workflow_instances
@@ -1328,11 +1315,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
         """.query[Long].option
         
         done <- locked match {
-          case None => Option.empty[Map[SignalKey, Seq[String]]].pure[ConnectionIO]
+          case None => false.pure[ConnectionIO]
 
           case Some(generation) =>
             for {
-              unconsumed <- gatherUnconsumedSignalsQ(workflowId, key, scope)
               _ <- sql"""
                 DELETE FROM workflow_steps
                 WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -1347,32 +1333,28 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
               """.update.run
               _ <- upsertWakeupQ(workflowId, key, scope, now)
-            } yield Some(unconsumed)
+            } yield true
         }
       } yield done
     }
     
-    res match {
-      case Some(unconsumed) => unconsumed
-      case None             => throw LeaseLostException(WorkflowInstanceId(workflowId, key, scope))
-    }
+    if (!done)
+      throw LeaseLostException(WorkflowInstanceId(workflowId, key, scope))
   }
 
   /** The guarded `TERMINATED` terminal transition, shared by the public
     * [[terminate]] and the cancellation-escalation sweep. Row-locks the
     * instance; a missing or already-terminal instance is a no-op (returns
-    * `(false, Map.empty)`); otherwise the guarded status update plus the
+    * `false`); otherwise the guarded status update plus the
     * `WorkflowCompleted(Terminated)` event, lease revocation (fencing-token
     * bump and clearing owner/expiry), and terminal cleanup commit in one
-    * transaction. The directly addressed `Signal` events are gathered (per key,
-    * after cursors) and then deleted in the same transaction; because no
-    * workflow definition is available on this path, the caller WARN-logs the
-    * gathered map. Completion wakeups are produced asynchronously by the job
-    * runner. Idempotent: a concurrent winner makes a later caller a no-op.
+    * transaction. The directly addressed `Signal` events are deleted in the
+    * same transaction. Completion wakeups are produced asynchronously by the
+    * job runner. Idempotent: a concurrent winner makes a later caller a no-op.
     */
   private[atomicflow] def escalateTerminated(
       instanceId: WorkflowInstanceId
-  ): (Boolean, Map[SignalKey, Seq[String]]) = {
+  ): Boolean = {
     val workflowId = instanceId.workflowId
     val key = instanceId.workflowInstanceKey
     val scope = instanceId.scope
@@ -1387,9 +1369,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
         """.query[Option[String]].option
         
         updated <- terminal match {
-          case None => (false, Map.empty[SignalKey, Seq[String]]).pure[ConnectionIO]
+          case None => false.pure[ConnectionIO]
           
-          case Some(Some(_)) => (false, Map.empty[SignalKey, Seq[String]]).pure[ConnectionIO]
+          case Some(Some(_)) => false.pure[ConnectionIO]
 
           case Some(None) =>
             for {
@@ -1401,17 +1383,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                   AND terminal_state IS NULL
               """.update.run
-              unconsumed <- if (u == 1)
+              _ <- if (u == 1)
                   for {
-                    gathered <- gatherUnconsumedSignalsQ(workflowId, key, scope)
                     _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
                     _ <- appendCompletedEvent(workflowId, key, scope, payload)
                     _ <- terminalCleanupIO(workflowId, key, scope)
                     _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
-                  } yield gathered
-                else 
-                  Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
-            } yield (u == 1, unconsumed)
+                  } yield ()
+                else
+                  ().pure[ConnectionIO]
+            } yield u == 1
         }
       } yield updated
     }
@@ -1678,11 +1659,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
       case Some(_) => Left(fresh)
       case None =>
         val parentCloseAbort =
-          if (fresh.parentId.isDefined) {
-            val (aborted, unconsumed) = parentClosureSelfCheck(workflowId, key, scope)
-            logDroppedUnconsumedSignals(instance, unconsumed)
-            aborted
-          } 
+          if (fresh.parentId.isDefined)
+            parentClosureSelfCheck(workflowId, key, scope)
           else false
         
         if (parentCloseAbort) {
@@ -1803,7 +1781,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       case TerminalOutcome.Cancelled    => ("cancelled", Framing.write("cancelled"))
       case TerminalOutcome.Terminated   => ("terminated", Framing.write("terminated"))
     }
-    val (updated, unconsumed) = terminalTransitionAndEvent(
+    val updated = terminalTransitionAndEvent(
       lease.workflowId,
       lease.instanceKey,
       lease.instanceScope,
@@ -1812,18 +1790,15 @@ class PostgresWorkflowRuntime private[atomicflow] (
       state,
       payload
     )
-    if (updated == 1) CompletionResult.Applied(unconsumed)
+    if (updated == 1) CompletionResult.WorkflowInstanceTerminated
     else
       CompletionResult.AlreadyTerminal(
         readInstance(lease.instanceId).getOrElse(throw LeaseLostException(lease.instanceId))
       )
   }
 
-  /** Commits a continue-as-new transition with `nextInput` under the lease and
-    * returns the instance's unconsumed signals. Core invokes the
-    * `onUnconsumedSignals` listener with the returned map.
-    */
-  override def continueAsNew(nextInput: SerializedValue)(using lease: Lease): Map[SignalKey, Seq[String]] =
+  /** Commits a continue-as-new transition with `nextInput` under the lease. */
+  override def continueAsNew(nextInput: SerializedValue)(using lease: Lease): Unit =
     continueAsNewTransition(
       lease.workflowId,
       lease.instanceKey,
@@ -1904,20 +1879,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
-    * append, the gather of this instance's unconsumed directly addressed
-    * `Signal` events, and their deletion: the guarded
-    * `terminal_state`/`terminal_outcome` update, the gather, the event append,
-    * and the `Signal` deletion commit together in one transaction. Completion
-    * wakeups are produced asynchronously by the job runner. Wins only if the
-    * instance is not already terminal and the lease is still ours. `TimerFired`
-    * and `WorkflowCompleted` events are retained (subscribers and replays need
-    * them); consumers of the deleted `Signal` events already hold cached Step
-    * results.
+    * append and the deletion of this instance's directly addressed `Signal`
+    * events: the guarded `terminal_state`/`terminal_outcome` update, the event
+    * append, and the `Signal` deletion commit together in one transaction.
+    * Completion wakeups are produced asynchronously by the job runner. Wins
+    * only if the instance is not already terminal and the lease is still ours.
+    * `TimerFired` and `WorkflowCompleted` events are retained (subscribers and
+    * replays need them); consumers of the deleted `Signal` events already hold
+    * cached Step results.
     *
-    * Returns `(rowsUpdated, unconsumed)` where `rowsUpdated` is 1 if this writer
-    * won the transition and 0 if another writer already made it terminal; the
-    * unconsumed map is only meaningful when `rowsUpdated == 1`. The caller
-    * invokes the `onUnconsumedSignals` listener with it after commit.
+    * Returns `rowsUpdated` where it is 1 if this writer won the transition and
+    * 0 if another writer already made it terminal.
     */
   private def terminalTransitionAndEvent(
       workflowId: WorkflowId,
@@ -1927,7 +1899,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       token: Long,
       state: String,
       payload: String
-  ): (Int, Map[SignalKey, Seq[String]]) =
+  ): Int =
     runTransaction {
       for {
         updated <- sql"""
@@ -1937,56 +1909,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
             AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token
         """.update.run
         
-        unconsumed <- if (updated == 1)
+        _ <- if (updated == 1)
             for {
-              gathered <- gatherUnconsumedSignalsQ(workflowId, key, scope)
               _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
               _ <- appendCompletedEvent(workflowId, key, scope, payload)
               _ <- terminalCleanupIO(workflowId, key, scope)
               _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
-            } yield gathered
+            } yield ()
           else 
-            Map.empty[SignalKey, Seq[String]].pure[ConnectionIO]
-      } yield (updated, unconsumed)
+            ().pure[ConnectionIO]
+      } yield updated
     }
-
-  /** Gathers the currently visible unconsumed `Signal` events of the instance,
-    * as a `ConnectionIO` so it runs inside the caller's terminal/continue-as-new
-    * transaction (which holds the instance row lock): for every key, the events
-    * after that key's shared cursor (cursor absent means from the first event),
-    * in `sequenceId` order, as their raw serialized payloads. Keys with no
-    * events after their cursor are absent from the result.
-    */
-  private def gatherUnconsumedSignalsQ(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: ScopePath
-  ): ConnectionIO[Map[SignalKey, Seq[String]]] =
-    sql"""
-      SELECT event_key, payload FROM workflow_events
-      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-        AND event_kind = 'Signal'
-        AND sequence_id > (
-          SELECT COALESCE(MAX(sequence_id), 0) FROM signal_cursor
-          WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-            AND signal_key = workflow_events.event_key
-        )
-      ORDER BY sequence_id
-    """.query[(String, String)].to[Vector].map(_.groupMap(_._1)(_._2))
-
-  /** WARN-logs unconsumed signals gathered on a terminal path that has no
-    * workflow definition available (terminate, cancellation escalation, and the
-    * cancel-before-first-start finalization), so they are not silently dropped;
-    * the `onUnconsumedSignals` listener could not run.
-    */
-  private[atomicflow] def logDroppedUnconsumedSignals(
-      instanceId: WorkflowInstanceId,
-      unconsumed: Map[SignalKey, Seq[String]]
-  ): Unit = {
-    if (unconsumed.nonEmpty)
-      log.warn(s"Workflow instance $instanceId reached a terminal transition with unconsumed signals, " +
-          s"but no workflow definition is available on this path to run the onUnconsumedSignals listener; dropped: $unconsumed")
-  }
 
   /** Upserts the wakeup of every non-terminal instance holding a pending
     * completion subscription on the instance that just completed, `ON CONFLICT
@@ -2072,10 +2005,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * if it is already terminal (`terminal_state IS NOT NULL`), else append the
     * event (payload from the signal's [[Cacheable]]). The terminal transition
     * that deletes the addressed events commits under the same row lock, so a
-    * signal either commits first — and is thereby included in the gathered
-    * unconsumed map — or is rejected as already-completed. The sender only
-    * appends; wakeups are produced asynchronously by the job runner. Does not
-    * acquire the execution lease.
+    * signal either commits before the transition — or is rejected as
+    * already-completed. The sender only appends; wakeups are produced
+    * asynchronously by the job runner. Does not acquire the execution lease.
     */
   override def sendSignal[A: Cacheable as cacheable](
       workflowInstanceId: WorkflowInstanceId,

@@ -96,7 +96,6 @@ final class Workflow[In, Out] private[atomicflow] (
     val name: String,
     val description: Option[String],
     val body: In => WorkflowContext ?=> Out,
-    val onUnconsumedSignals: Map[SignalKey, Seq[String]] => Unit,
     val inputCacheable: Cacheable[In],
     val outputCacheable: Cacheable[Out]
 ) {
@@ -487,8 +486,7 @@ object Workflow {
       name: String = "",
       description: Option[String] = None
   )(
-      body: In => WorkflowContext ?=> Out,
-      onUnconsumedSignals: Map[SignalKey, Seq[String]] => Unit = _ => ()
+      body: In => WorkflowContext ?=> Out
   ): Workflow[In, Out] =
     new Workflow[In, Out](
       id,
@@ -496,7 +494,6 @@ object Workflow {
       name,
       description,
       body,
-      onUnconsumedSignals,
       summon[Cacheable[In]],
       summon[Cacheable[Out]]
     )

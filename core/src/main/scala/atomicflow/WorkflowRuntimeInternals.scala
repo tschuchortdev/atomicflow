@@ -198,14 +198,12 @@ trait WorkflowRuntimeInternals {
     */
   def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
-  /** Records the run's terminal outcome under the lease. Returns `Applied` with
-    * the instance's unconsumed signals when this run made the transition, or
-    * `AlreadyTerminal` when another writer already did.
+  /** Records the run's terminal outcome under the lease. Returns `Applied` when
+    * this run made the transition, or `AlreadyTerminal` when another writer
+    * already did.
     */
   def completeInstance(outcome: TerminalOutcome)(using Lease): CompletionResult
 
-  /** Commits a continue-as-new transition with `nextInput` and returns the
-    * instance's unconsumed signals.
-    */
-  def continueAsNew(nextInput: SerializedValue)(using Lease): Map[SignalKey, Seq[String]]
+  /** Commits a continue-as-new transition with `nextInput`. */
+  def continueAsNew(nextInput: SerializedValue)(using Lease): Unit
 }
