@@ -430,4 +430,74 @@ class ForkResetSuite extends PostgresWorkflowRuntimeSuite {
       "the re-executed step completed in the fork"
     )
   }
+
+  test("fork and reset of a missing source instance raise WorkflowNotFoundException") {
+    val rt = newRuntime
+    val wf = counterWf("frk-missing-source", new AtomicInteger(0), new AtomicInteger(0), new AtomicInteger(0))
+    val missing = WorkflowInstanceId(wf.id, "missing")
+
+    intercept[WorkflowNotFoundException] {
+      rt.forkWorkflow[String, String](missing, "fork", Seq.empty, Seq(stepId"/A"))(using wf)
+    }
+    intercept[WorkflowNotFoundException] {
+      rt.resetWorkflow[String, String](missing, Seq.empty, Seq(stepId"/A"))(using wf)
+    }
+  }
+
+  test("fork and reset reject an operation that would invalidate nothing") {
+    val rt = newRuntime
+    val wf = Workflow[String, String]("frk-empty-selectors") { _ =>
+      Step.atLeastOnce[String]("A") { "a" }
+      TestControlFlow.suspend()
+    }
+    val sourceId = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.WorkflowSuspended)
+
+    val forkError = intercept[IllegalArgumentException] {
+      rt.forkWorkflow[String, String](sourceId, "fork", Seq.empty, Seq.empty)(using wf)
+    }
+    assert(forkError.getMessage.contains("needs at least one"), forkError.getMessage)
+
+    val resetError = intercept[IllegalArgumentException] {
+      rt.resetWorkflow[String, String](sourceId, Seq.empty, Seq.empty)(using wf)
+    }
+    assert(resetError.getMessage.contains("needs at least one"), resetError.getMessage)
+  }
+
+  test("fork with invalidateIndividualSteps invalidates the matching step and copies the rest") {
+    val rt = newRuntime
+    val cA = new AtomicInteger(0)
+    val cB = new AtomicInteger(0)
+    val cC = new AtomicInteger(0)
+    val wf = counterWf("frk-individual", cA, cB, cC)
+    val sourceId = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.Result("done"))
+
+    setUpdatedAt(wf.id, "k", "A", t1)
+    setUpdatedAt(wf.id, "k", "B", t2)
+    setUpdatedAt(wf.id, "k", "C", t3)
+
+    val fork = rt.forkWorkflow[String, String](sourceId, "fork", Seq(stepId"/B"), Seq.empty)(using wf)
+    assertEquals(stepIds(wf.id, "fork"), Set("A", "C"), "only the individually selected step B is invalidated")
+
+    assertEquals(rt.runWorkflowInstance(wf, fork.id), WorkflowRunResult.Result("done"))
+    assertEquals((cA.get(), cB.get(), cC.get()), (1, 2, 1), "only B re-executes in the fork")
+  }
+
+  test("the no-match error lists ten existing steps and summarizes the rest") {
+    val rt = newRuntime
+    val wf = Workflow[String, String]("frk-many-steps") { _ =>
+      (1 to 12).foreach { i =>
+        Step.atLeastOnce[Int](s"s$i") { i }
+      }
+      "done"
+    }
+    val sourceId = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, sourceId), WorkflowRunResult.Result("done"))
+
+    val e = intercept[NoMatchingStepException] {
+      rt.forkWorkflow[String, String](sourceId, "fork", Seq.empty, Seq(stepId"/nope"))(using wf)
+    }
+    assert(e.getMessage.contains("(and 2 more)"), e.getMessage)
+  }
 }

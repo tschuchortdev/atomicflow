@@ -91,6 +91,16 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(percent.map(_.id.workflowInstanceKey), Vector("a%1"))
   }
 
+  test("getWorkflowInstancesByPrefix treats a backslash in the prefix as a literal") {
+    val rt = newRuntime
+    val w = wf("wf-escape-backslash")
+    rt.createWorkflowInstance(w, "a\\b", "a")
+    rt.createWorkflowInstance(w, "axb", "b")
+
+    val res = rt.getWorkflowInstancesByPrefix(w.id, "a\\")
+    assertEquals(res.map(_.id.workflowInstanceKey), Vector("a\\b"))
+  }
+
   test("getUnfinishedWorkflowInstances default excludes started instances; includeWaiting includes them") {
     val rt = newRuntime
     val w = wf("wf-unfinished")

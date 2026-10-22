@@ -501,4 +501,23 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
     )
     assertEquals(bCount, 1, "the sibling region's nested step survives the wildcard-meaning restart")
   }
+
+  test("reusing a step key as a restartable region is rejected") {
+    val rt = newRuntime
+    val v1 = Workflow[String, String](id = "region-key-conflict") { _ =>
+      Step.atMostOnce[String]("key") { "step" }
+      TestControlFlow.suspend()
+    }
+    val id = rt.createWorkflowInstance(v1, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(v1, id), WorkflowRunResult.WorkflowSuspended)
+
+    val v2 = Workflow[String, String](id = "region-key-conflict") { _ =>
+      Workflow.restartable[Int, String]("key", 0) { (_, _) => "region" }
+    }
+    val e = intercept[RuntimeException] {
+      rt.runWorkflowInstance(v2, id)
+    }
+    assert(e.toString.contains("StepKeyConflictException"), e.toString)
+    assert(e.getMessage.contains("cannot be redefined as a restartable region"), e.getMessage)
+  }
 }
