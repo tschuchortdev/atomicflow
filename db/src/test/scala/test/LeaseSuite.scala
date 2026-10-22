@@ -103,6 +103,25 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     assert(WorkflowNonFatal.unapply(LeaseUnavailableException.apply(id)).isDefined)
   }
 
+  test("continueAsNew after a SQL fencing-token bump throws LeaseLostException") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "can-fenced") { in =>
+      run(
+        sql"""
+          UPDATE workflow_instances SET fencing_token = fencing_token + 1
+          WHERE workflow_id = 'can-fenced' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
+      )
+      Workflow.continueAsNew(in + "!")
+    }
+
+    intercept[LeaseLostException] {
+      rt.createAndRun(wf, "k", "a")
+    }
+    val row = instanceRow(wf.id, "k").get
+    assertEquals(row._1, None, "the run must not become terminal after lease loss")
+  }
+
   test("Workflow.versionAtCreation exposes the version recorded at creation") {
     val rt = newRuntime
     var v: Long = -1L
