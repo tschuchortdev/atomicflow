@@ -1770,18 +1770,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
         }
     }
 
-  /** Records the run's terminal outcome under the lease. The guarded terminal
-    * transition wins only if the instance is still non-terminal and the lease is
-    * still ours; otherwise the already-terminal row is read back and returned.
+  /** Records the run's terminal outcome under the lease. A fenced write: throws
+    * [[LeaseLostException]] when the guarded terminal transition affects no row
+    * (the lease was taken over or the instance is already terminal), so this
+    * run's outcome was not recorded.
     */
-  override def completeInstance(outcome: TerminalOutcome)(using lease: Lease): CompletionResult = {
+  override def completeInstance(outcome: TerminalOutcome)(using lease: Lease): Unit = {
     val (state, payload) = outcome match {
       case TerminalOutcome.Completed(p) => ("completed", p.raw)
       case TerminalOutcome.Failed(p)    => ("failed", p.raw)
       case TerminalOutcome.Cancelled    => ("cancelled", Framing.write("cancelled"))
       case TerminalOutcome.Terminated   => ("terminated", Framing.write("terminated"))
     }
-    val updated = terminalTransitionAndEvent(
+    terminalTransitionAndEvent(
       lease.workflowId,
       lease.instanceKey,
       lease.instanceScope,
@@ -1790,11 +1791,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
       state,
       payload
     )
-    if (updated == 1) CompletionResult.WorkflowInstanceTerminated
-    else
-      CompletionResult.AlreadyTerminal(
-        readInstance(lease.instanceId).getOrElse(throw LeaseLostException(lease.instanceId))
-      )
   }
 
   /** Commits a continue-as-new transition with `nextInput` under the lease. */
@@ -1882,14 +1878,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * append and the deletion of this instance's directly addressed `Signal`
     * events: the guarded `terminal_state`/`terminal_outcome` update, the event
     * append, and the `Signal` deletion commit together in one transaction.
-    * Completion wakeups are produced asynchronously by the job runner. Wins
-    * only if the instance is not already terminal and the lease is still ours.
-    * `TimerFired` and `WorkflowCompleted` events are retained (subscribers and
-    * replays need them); consumers of the deleted `Signal` events already hold
-    * cached Step results.
-    *
-    * Returns `rowsUpdated` where it is 1 if this writer won the transition and
-    * 0 if another writer already made it terminal.
+    * Completion wakeups are produced asynchronously by the job runner. A fenced
+    * write: wins only if the instance is not already terminal and the lease is
+    * still ours; otherwise it throws [[LeaseLostException]] and this run's
+    * outcome is not recorded. `TimerFired` and `WorkflowCompleted` events are
+    * retained (subscribers and replays need them); consumers of the deleted
+    * `Signal` events already hold cached Step results.
     */
   private def terminalTransitionAndEvent(
       workflowId: WorkflowId,
@@ -1899,8 +1893,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
       token: Long,
       state: String,
       payload: String
-  ): Int =
-    runTransaction {
+  ): Unit = {
+    val updated = runTransaction {
       for {
         updated <- sql"""
           UPDATE workflow_instances
@@ -1920,6 +1914,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
             ().pure[ConnectionIO]
       } yield updated
     }
+    if (updated != 1)
+      throw LeaseLostException(WorkflowInstanceId(workflowId, key, scope))
+  }
 
   /** Upserts the wakeup of every non-terminal instance holding a pending
     * completion subscription on the instance that just completed, `ON CONFLICT

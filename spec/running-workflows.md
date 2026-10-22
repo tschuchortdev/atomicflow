@@ -430,8 +430,10 @@ Rules:
   (`WHERE terminal_state IS NULL`) and runs in the same transaction that
   appends the `WorkflowCompleted` event, setting `terminal_state` and
   `terminal_outcome` together. Concurrent attempts are serialized by the
-  guarded update: exactly one wins; the loser re-reads and adopts the winner's
-  outcome. **The first terminal event wins.** In particular, a workflow that
+  guarded update: exactly one wins; the loser's fenced write affects zero rows
+  and the run aborts with `LeaseLostException` without recording its outcome —
+  a later read or `run` adopts the winner's outcome. **The first terminal
+  event wins.** In particular, a workflow that
   catches a delivered cancellation and finishes normally is `COMPLETED` (with
   `cancel_requested_at` set) if its completion event lands first.
 - **Every resume path re-checks `terminal_state` before running user code** and

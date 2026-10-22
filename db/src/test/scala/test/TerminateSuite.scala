@@ -358,6 +358,39 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(terminalRow(wf.id, "k").get._1, Some("terminated"))
   }
 
+  test("a run whose terminal transition loses to a concurrent terminate throws LeaseLostException and its outcome is not recorded") {
+    val rt = newRuntime
+    val wfId = "term-race"
+    val latch = new java.util.concurrent.CountDownLatch(1)
+    val wf = Workflow[String, String](id = wfId) { in =>
+      latch.await()
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "a").id
+
+    val errors = new Array[Throwable](1)
+    val t = new Thread(() =>
+      try { val _ = rt.runWorkflowInstance(wf, id) }
+      catch { case e: Throwable => errors(0) = e }
+    )
+    t.start()
+    Thread.sleep(700)
+    rt.terminate(id)
+    latch.countDown()
+    t.join(10000)
+    assert(!t.isAlive, "the run must finish after the terminal transition loses the race")
+    assert(errors(0).isInstanceOf[LeaseLostException], s"expected LeaseLostException, got: ${errors(0)}")
+
+    assertEquals(terminalRow(wfId, "k").get._1, Some("terminated"))
+    val event = completedEvent(wfId, "k").get
+    assertEquals(
+      Cacheable[WorkflowCompletionResult[String]].read(event._3),
+      WorkflowCompletionResult.Terminated,
+      "the only WorkflowCompleted event is the terminator's; the losing run recorded no outcome"
+    )
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowTerminated)
+  }
+
   test("terminate on an unknown instance throws WorkflowNotFoundException") {
     val rt = newRuntime
     intercept[WorkflowNotFoundException] {

@@ -37,13 +37,6 @@ enum TerminalOutcome:
   case Cancelled
   case Terminated
 
-/** The result of reporting a terminal outcome: either the guarded terminal
-  * transition applied, or a concurrent writer had already made the instance
-  * terminal. */
-enum CompletionResult:
-  case WorkflowInstanceTerminated
-  case AlreadyTerminal(record: InstanceRecord)
-
 /** The result of running a body under an execution lease. */
 enum LeasedRunResult[+A]:
   case AlreadyTerminal(record: InstanceRecord)

@@ -228,50 +228,43 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       case _: WorkflowSuspendedException =>
         log.debug(s"Workflow instance $instanceId suspended")
         suspended = true
+        
       case _: LeaseLostException =>
         throw new LeaseLostException(s"Workflow instance lease lost during run: $instanceId")
+        
       case e: ContinueAsNewException =>
         val newInput = workflow.inputCacheable.read(e.encoded.raw)
         val newSerializedInput = workflow.inputCacheable.write(newInput)
         continueAsNew(SerializedValue.of(newSerializedInput))
         log.info(s"Workflow instance $instanceId continued as new")
         return WorkflowRunResult.ContinueAsNew
+        
       case _: WorkflowCancelledException =>
-        completeInstance(TerminalOutcome.Cancelled) match {
-          case CompletionResult.WorkflowInstanceTerminated =>
-            log.info(s"Workflow instance $instanceId cancelled")
-            return WorkflowRunResult.WorkflowCancelled
-          case CompletionResult.AlreadyTerminal(record) =>
-            return decodeTerminal(workflow, record)
-        }
+        completeInstance(TerminalOutcome.Cancelled)
+        log.info(s"Workflow instance $instanceId cancelled")
+        return WorkflowRunResult.WorkflowCancelled
+        
       case WorkflowNonFatal(t) =>
         val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
-        completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload))) match {
-          case CompletionResult.WorkflowInstanceTerminated =>
-            log.info(s"Workflow instance $instanceId failed", t)
-            throw cacheableThrowable.read(cacheableThrowable.write(t))
-          case CompletionResult.AlreadyTerminal(record) =>
-            return decodeTerminal(workflow, record)
-        }
+        completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload)))
+        log.info(s"Workflow instance $instanceId failed", t)
+        throw cacheableThrowable.read(cacheableThrowable.write(t))
     }
 
-    if (suspended) WorkflowRunResult.WorkflowSuspended
+    if (suspended)
+      WorkflowRunResult.WorkflowSuspended
     else {
       val payload = completionCodec.write(WorkflowCompletionResult.Completed(outValue))
-      completeInstance(TerminalOutcome.Completed(SerializedValue.of(payload))) match {
-        case CompletionResult.WorkflowInstanceTerminated =>
-          log.debug(s"Workflow instance $instanceId completed")
-          WorkflowRunResult.Result(workflow.outputCacheable.read(workflow.outputCacheable.write(outValue)))
-        case CompletionResult.AlreadyTerminal(record) =>
-          decodeTerminal(workflow, record)
-      }
+      completeInstance(TerminalOutcome.Completed(SerializedValue.of(payload)))
+      log.debug(s"Workflow instance $instanceId completed")
+      WorkflowRunResult.Result(workflow.outputCacheable.read(workflow.outputCacheable.write(outValue)))
     }
   }
 
   /** Decodes a terminal instance's persisted outcome and returns or throws it,
     * without executing the body. Used when a run finds the instance already
-    * terminal, or when a concurrent writer won the terminal transition. Only the
-    * definition's output codec is needed, so any `Workflow[?, Out]` suffices.
+    * terminal at claim or lease acquisition. Only the definition's output codec
+    * is needed, so any `Workflow[?, Out]` suffices.
     */
   final private[atomicflow] def decodeTerminal[Out](
       workflow: Workflow[?, Out],
@@ -427,7 +420,9 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
         TimeUnit.NANOSECONDS.sleep(pollInterval.toNanos)
     }
     terminal match {
-      case Some(record) => decodeTerminal(instance.workflow, record)
+      case Some(record) => 
+        decodeTerminal(instance.workflow, record)
+        
       case None =>
         throw new TimeoutException(
           s"Workflow instance did not reach a terminal state within $timeout: ${instance.id}"
