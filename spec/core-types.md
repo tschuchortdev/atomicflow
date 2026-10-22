@@ -28,10 +28,10 @@ type SignalKey = String
 case class WorkflowInstanceId(
   workflowId: WorkflowId,
   workflowInstanceKey: WorkflowInstanceKey,
-  scope: String = ""
+  scope: Vector[String] = Vector.empty
 )
 
-case class StepId(key: String, scope: String = "")
+case class StepId(key: String, scope: Vector[String] = Vector.empty)
 
 
 // Definition objects: the code + its descriptive fields. No separate Meta wrapper.
@@ -49,11 +49,19 @@ final class Signal[A](
 
 
 // Runtime contexts: materialized only during execution; compose stable ids, not Meta wrappers.
-trait WorkflowContext {
-  def instanceId: WorkflowInstanceId
-  def versionAtCreation: Long
-  def runtime: WorkflowRuntime
-}
+final class WorkflowContext(
+  val instanceId: WorkflowInstanceId,
+  val versionAtCreation: Long,
+  val runtime: WorkflowRuntime,
+  // The same runtime viewed through its library-core operations. Library-only;
+  // application code never sees it.
+  internals: WorkflowRuntimeInternals
+)(
+  // The backend's opaque per-run execution handle: created when the run's lease
+  // is acquired, identity-stable for the run, contents backend-owned. Dependent
+  // second parameter list so the type can be prefixed by internals.
+  val currentExecution: internals.Lease
+)
 
 trait StepContext[Out] {
   def stepId: StepId
@@ -71,7 +79,7 @@ trait StepContext[Out] {
 final class WorkflowInstance[In, Out](workflow: Workflow[In, Out], instanceId: WorkflowInstanceId) {
   def id: WorkflowInstanceId
   def run()(using WorkflowRuntime): WorkflowRunResult[Out]
-  def awaitResult(timeout: FiniteDuration)(using WorkflowRuntime): WorkflowRunResult[Out]
+  def blockUntilCompleted(timeout: FiniteDuration, pollInterval: FiniteDuration = 50.milliseconds)(using WorkflowRuntime): WorkflowRunResult[Out]
   def getInfo()(using WorkflowRuntime): WorkflowInstance.Info   // fresh from DB
   // Awaitable of this instance's completion; yields a WorkflowCompletionResult[Out]
   // (see running-workflows.md). Codecs resolve at the await call site.
@@ -108,7 +116,8 @@ enum WorkflowTerminalState {
 - **Definition objects own their fields directly.** `Workflow` and `Signal[A]` are the definition objects; they carry their identifying fields directly. No separate `*Meta` wrapper is needed because there is no metadata-only catalog or introspection API: every consumer that needs the definition also has the executable `Workflow` or typed `Signal` object. The single exception is the job runner's executor, which starts from a claimed instance id alone and resolves code through the runner's definition registry — an execution prerequisite supplied when the runner is started (`runtime.startJobRunner`), not a metadata catalog (see `running-workflows.md`, "Job runner and scheduling"). A separate descriptor would only introduce indirection (`workflow.meta.workflowId` instead of `workflow.id`). `Workflow` carries `version`, `name`, and `description`; `Signal[A]` carries only its `key` (plus its contextual `Cacheable[A]`).
 - **Runtime contexts, not execution-scoped metadata.** `WorkflowContext` and `StepContext` are runtime contexts materialized only during execution. They compose stable IDs (`WorkflowInstanceId`, `StepId`) rather than extending or wrapping metadata classes. Steps are inline lambdas, so step identity fields only exist while a workflow instance executes — `StepContext` carries `stepId`, `stepVersion`, and descriptive fields for logging and diagnostics. **Step identity is never used as a lookup key.** Lookups use `WorkflowInstanceId` + `StepId` + `stepVersion`; since this triple appears only rarely in internal implementation code, a plain tuple suffices. Descriptive fields (`stepName`, `stepDescription`) never affect any lookup, so editing a description never orphans cached results.
 - **`scope` field**: Child workflows need some sort of prefix to prevent collision between themselves. This is not a prefix of the regular key, but a separate field, to prevent collision between this derived key and the arbitrary user-specified key of top-level instances. Creation
-  APIs never accept a scope; top-level instances always have `scope = ""`, while
+  APIs never accept a scope; top-level instances always have the empty scope
+  (an empty segment array), while
   `startAsChild` derives a non-empty scope. Query APIs have a scope parameter with the same empty default, so omitting it means an exact top-level lookup rather than a
   lookup across all scopes. The database uniqueness key is `(workflowId,
   workflowInstanceKey, scope)`. See `sub-workflows-iteration.md` for derivation.

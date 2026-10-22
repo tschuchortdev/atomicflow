@@ -1,28 +1,28 @@
 # Restartable Regions and Loops
 
-`Workflow.restartable` and `Workflow.loop` are primitives to implement infinite-loop-like behavior (such as polling) where it is undesirable to use regular loops with index-keyed subworkflows/steps because those would accumulate a huge history of useless step caches, timer awaits, etc.
+`Workflow.restartable` and `Workflow.loop` store loop state while removing the previous iteration's nested step records and subscriptions. Use them for polling or other repeated work that should not accumulate execution history.
 
-The goal of this feature was to have a region of steps and timers that can be easily reset:
+Each restart resets the region's steps and timers:
 ```scala 
 while (true) {
   Step.atLeastOnce(...) { ... }
-  Step.await(..., Awaitable.Timer(...)) { ... }
+  Step.await(..., Awaitable.Timer(...))
   // both Step and Timer await must be reset in every iteration to make sense
 }
 ```
 Alternatively, polling could also be implemented through a Step with built-in unlimited retries:
 ```scala
-Step.atLeastOnce("polling_step", retryPolicy = RetryPolicy.fixedDelay(1.minute)) { // built-in retry functionality for Steps in library
+Step.atLeastOnce("poll-status", retry = Step.RetryPolicy.fixedDelay(Long.MaxValue, 1.minute)) {
   val r = poll()
   if (r == NoResult)
     throw RuntimeException("poll again")
 }
 ```
-but this is not as flexible (cannot wait for signals, only timer-based retry) and somewhat of a hack.
+Retry-based polling cannot wait for signals and represents a pending result as a failure.
 
 ## Equivalent APIs
 
-`Workflow.restartable` and `Workflow.loop` are two equivalent views of the same region primitive (document this in scaladoc). Which one to use is a matter of taste:
+`Workflow.restartable` and `Workflow.loop` use the same stored state and restart transitions:
 
 Use `restartable` when continuing is exceptional control flow and returning
 the result is the normal path:
@@ -52,19 +52,19 @@ The two forms have exactly the same durable transitions:
   completes the region.
 - `restart` and `break` return `Nothing` and use library control-flow
   exceptions internally.
-- `RestartableScope` and `LoopScope` are dual public views over the same
+- `RestartableScope` and `LoopScope` are public interfaces to the same
   internal region scope and expose the same `restartCount` metadata.
 
-Conceptual API shapes:
+API signatures:
 
 ```scala
 def restartable[S: Cacheable, R](id: String, initialState: => S)(
-  body: (S, RestartableScope[S]) => R
-): R
+  body: (S, RestartableScope[S]) => WorkflowContext ?=> R
+)(using WorkflowContext): R
 
 def loop[S: Cacheable, R](id: String, initialState: => S)(
-  body: (S, LoopScope[R]) => S
-): R
+  body: (S, LoopScope[R]) => WorkflowContext ?=> S
+)(using WorkflowContext): R
 
 trait RestartableScope[S]:
   def restartCount: Long
@@ -75,7 +75,7 @@ trait LoopScope[R]:
   def break(result: R): Nothing
 ```
 
-The implementation uses internal control-flow exceptions to implement the `restart`/`break` (which _must_ be considered in the library's `NonFatal`-like extractor!). The two functions share the same implementation by internally converting one into the other.
+`restart` and `break` throw internal control-flow exceptions. `WorkflowNonFatal` excludes them, allowing them to reach the enclosing region's handler.
 
 ## Region semantics
 
@@ -91,12 +91,12 @@ The implementation uses internal control-flow exceptions to implement the `resta
 - `restartCount` starts at zero and counts committed restart transitions. It
   does not count body executions caused by crashes or outer replay.
 - Restart atomically replaces the region's Step row with its next state and
-  discards nested Step rows and subscriptions owned by the previous looping.
+  discards nested Step rows and subscriptions owned by the previous iteration.
 - Execution re-enters the region locally after restart; outer workflow code is
-  not replayed merely to begin the next looping.
+  not replayed merely to begin the next iteration.
 - Only the current state and current-generation execution records are retained,
   so thousands of iterations do not create unbounded workflow state.
-- Normal completion keeps the final looping. On outer replay, the body runs
+- Normal completion keeps the final iteration. On outer replay, the body runs
   again and its durable operations reuse their cached records; the region does
   not cache its whole return value like a Step.
 - Reusing a Step or sleep ID in the successor generation creates fresh work,
@@ -116,12 +116,16 @@ Workflow.loop("poll-job", PollState.initial) { (state, loop) =>
 ## Signals and children
 
 - A nested region restart preserves the workflow's visibility into the global
-  immutable event sequence. Exact-key signal cursors survive across loopings,
+  immutable event sequence. Exact-key signal cursors survive across iterations,
   while cached await Step rows in the region are discarded. Discarding an await
   result therefore does not make an event behind its signal cursor consumable
   again.
-- Children created in a discarded generation are handled according to their
-  `ParentClosePolicy`. Successor generations use distinct child identities.
+- Children created in a discarded generation are closed asynchronously
+  according to their `ParentClosePolicy`: the restart records a
+  `child_close_requests` row targeting exactly the discarded interior
+  (`…/id@restartCount`), delivered at each child's next run start or by the
+  child-close sweep, and never matches the successor generation's children.
+  Successor generations use distinct child identities.
 - Restartable regions have the same problems as `continueAsNew`: While Step and Await IDs can be reused after deletion, child IDs cannot, since the child may continue to live independently for a short time (there ID may then collide with the newly started child with the same ID). Thus, restartable regions must also include the loop count in the child's `WorkflowInstanceId` derivation (in the `scope` field), just like `continueAsNew` does for the generation. Each enclosing region's key and `restartCount` therefore
   contributes to the child's `scope`. The complete scope derivation rules are defined in `sub-workflows-iteration.md`.
 

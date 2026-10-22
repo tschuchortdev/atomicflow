@@ -79,25 +79,24 @@ object Step {
         stepId: String,
         invalidateOn: Seq[StepInput[?]] = Seq.empty,
         ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-    )(branches: Seq[() => R]): R
-    
-    @experimental
-    def firstToRunWithoutSuspension[R](
-        stepId: String,
-        invalidateOn: Seq[StepInput[?]] = Seq.empty,
-        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
-    )(branches: (() => R)*): R
+    )(branches: (String, () => WorkflowContext ?=> R)*): R
 }
 ```
 
+Like `Step.awaitRace` members, branches carry an explicit key: a stable, non-empty, unique identity (the `"_"`-leading form is reserved) that names the branch's scope. The branch runs one scope level below the race's key, so its scope path is the enclosing scope plus the race key plus the branch key (`.../stepId/branchKey`). Branch keys obey the scope-key rules of `ScopePath.requireValidKey` (see `steps.md`). Reordering branches never changes their identity.
+
+Note the `() => WorkflowContext ?=> R` branch type. The extra `() =>` layer is required: a bare `("key", { ... })` tuple whose element is a context function is typed eagerly in this Scala version, so the body would run at the call site (with the enclosing scope) instead of inside the branch. Wrapping the body in a lambda (`"key" -> { () => ... }`) makes the tuple element an ordinary function value — constructing a lambda has no side effects, and the body only runs when the race applies it with the branch's own `WorkflowContext`. The same deferral also applies to `Workflow.parallel`'s branch blocks.
+
 Because it is edge-triggered (not level-triggered like `Workflow.parallel`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
+
+The winner row persists only the winning branch's public returned value (the winning branch's identity is transaction-local and not retained, like an await's event selection). When the race resolves, every branch's pending subscriptions — including those of nested subscopes — are deleted BEFORE the winner row is written, so a committed winner row never coexists with branch subscriptions. The ordering is deliberate: the winner row is the durable first-wins marker, so a crash in between leaves no marker and the step's next run re-evaluates from scratch and re-deletes (the deletion runs at most twice).
 
 This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
 
 ```scala
 val result: R = Step.firstToRunWithoutSuspension("race-branches",
-    { Thread.sleep(10.minutes) },
-    { Step.await("timer", Awaitable.Timer(1.minute)) }
+    "sleep" -> { () => Thread.sleep(10.minutes) },
+    "timer" -> { () => Step.await("timer", Awaitable.Timer(1.minute)) }
 )
 ```
 One would expect the timer to win, but it will not: The timer suspends immediately by throwing an exception and will not become unblocked until the entire workflow is re-executed. The `Thread.sleep` will just block the thread and complete before the other branch has a chance to re-run. This must be clearly documented!
@@ -170,22 +169,26 @@ the child. It defaults to none; `SignalInheritance.all` permits every key and
   events are deleted. The child becomes cancelled or abandoned per its
   `ParentClosePolicy`, and any await Step result it already made remains cached
   for replay.
-- Replaying `startAsChild` replaces the current inheritance configuration.
-  Added prefixes can expose retained events; removed prefixes hide unresolved
-  events. Cached Step results are unaffected. Replaying an unchanged
-  configuration is a no-op and does not wake the subtree.
-- Updating the inheritance configuration does not acquire the child's execution
-  lease. A race with an await concurrently committing its result is deliberately left unordered; either the old or new configuration may be observed.
+- The inheritance configuration is **fixed at child creation**. Replaying
+  `startAsChild` with a different configuration does not replace it: the stored
+  configuration is kept and an SLF4J WARN is logged. Replaying an unchanged
+  configuration is a silent no-op. Cached Step results are unaffected. A child
+  whose policy differs from what a replay specifies can only exist via manual
+  row edits, and the run's read path then applies the stored policy.
 - The active parent, inheritance fields, and
   `inheritedEventsStartSequenceId` are persisted on the child's
   workflow-instance record.
 - Signals are immutable event facts, not copied deliveries. One committed
   send is therefore atomically visible to all currently eligible descendants.
   Awaiting inherited events uses a recursive ancestor query.
-- When the inheritance policy is updated, this may unblock awaits in the child. Thus, all grandchildren need to be scheduled for execution after an inheritance policy update. Descendant scheduling may be asynchronous and reuse the normal
-  workflow wakeup mechanism.
-- Synchronous `Update`s are never inherited because multiple descendant
-  responses would be ambiguous.
+- Because the configuration is fixed at creation, there is no
+  inheritance-policy update and therefore no ancestry-driven subtree wakeup:
+  signal and completion wakeups come only from the run's two wakeup passes,
+  which apply the stored policy (see `running-workflows.md`, "Sources of
+  wakeups").
+- The unimplemented Update design (see `signals-timers.md`) is intentionally not
+  inherited: a synchronous request cannot have one unambiguous response if
+  several descendants handle it.
 
 See `child-signal-inheritance.md` for ordering, cursor, and detachment semantics.
 
@@ -202,7 +205,7 @@ val results = Workflow.parallel(children.map { child => () => Step.await("comple
 
 // first to finish wins
 val result = Step.firstToRunWithoutSuspension("race-children",
-  children.map { child => () => Step.await("complete-" + child.id.key, child.completion) }
+  children.map { child => child.id.key -> { () => Step.await("complete-" + child.id.key, child.completion) } }
 )
 
 // partial: advance each, collect what's ready
@@ -217,7 +220,8 @@ carries the decoded `Throwable`, ready to rethrow for direct-style handling.
 ### `ParentClosePolicy`
 
 Controls what happens to a child when the parent reaches a terminal state —
-success, failure, cancellation, or termination — or calls `continueAsNew`:
+success, failure, cancellation, or termination — or calls `continueAsNew`,
+restarts an enclosing region, or is reset:
 
 | Policy | Behaviour |
 |---|---|
@@ -226,22 +230,62 @@ success, failure, cancellation, or termination — or calls `continueAsNew`:
 
 Application rules:
 
-- Applied when the parent's guarded terminal transition commits (or during the
-  `continueAsNew` child-close transaction); the active parent pointer on each
-  child is cleared in the same transaction.
-- **Idempotent.** Recovery, replay, and concurrent workers may re-trigger
-  application. Applying the policy twice is a no-op: a `Cancel` delivery to an
-  already-terminal child is a no-op, and `Abandon` clears an already-cleared
-  pointer.
+- **Asynchronous delivery.** The parent's terminal transition
+  (success/failure/cancellation/termination), its `continueAsNew`, its
+  region-restart, and its reset never touch child rows. Each instead records a
+  row in the dedicated **`child_close_requests`** table keyed by the parent's
+  own identity plus a `target_prefix` (and `created_at`); the composite primary
+  key deduplicates identical targets, and the foreign key cascades when the
+  parent row is deleted. The target is the scope prefix of the children to
+  close: the empty prefix for a terminal parent (all attached children), the
+  parent's identity plus `key@generation` for `continueAsNew` and reset
+  (exactly the closing generation), and that prefix plus the discarded region
+  interior for a region restart (exactly the discarded iteration). No request
+  row is written when no attached child matches, so the childless common case
+  leaves no bookkeeping. Targeting by exact prefix is what prevents collisions
+  between old and new children across generations and region iterations: a
+  later generation's or iteration's child carries markers past the prefix and
+  never matches. This is why no transaction ever locks another instance's rows.
+- **Delivery** happens at two asynchronous points, and the active parent pointer
+  on each child is cleared then: (a) the **run-start self-check** — whenever a
+  child's own run starts, before its body executes, it applies its own pending
+  policy; (b) the periodic **child-close sweep** — the driver loop applies every
+  pending closure in bounded batches, one child per short transaction. Both
+  re-verify under the child's own row lock and are idempotent, so they cooperate
+  safely with each other and with recovery. The sweep deletes a
+  `child_close_requests` row once no attached child matches it.
+- **A gone parent detaches.** A child whose parent instance row has been
+  hard-deleted is detached (pointer cleared) by the self-check or sweep; it is
+  never cancelled, matching the inheritance walk, which also stops at a missing
+  parent.
 - Per child state, `Cancel` follows the standard per-state cancel semantics
   (see `running-workflows.md`): a `CREATED` child is finalized `CANCELLED`
-  immediately without ever running; a `SUSPENDED` child gets
-  `cancel_requested_at` set and a resume scheduled in the same transaction; a
-  `RUNNING` child gets the flag set and delivers at its next checkpoint.
-- A cancelling parent never waits for the children it cancels. The parent is
-  terminal as soon as its own terminal transition commits; child cleanup is a
-  side obligation, and the global `cancelTimeout` escalation bounds any child
-  that never observes its cancellation.
+  without ever running; a `SUSPENDED` child gets `cancel_requested_at` set and a
+  wakeup scheduled; a `RUNNING` child gets the flag set and delivers at its next
+  checkpoint. `Abandon` clears the pointer only.
+- **Inherited-signal visibility cuts off at the closure event, not at
+  delivery.** The inheritance walk treats a parent as unusable — terminating the
+  walk exactly as a detached pointer does — when it is terminal or holds a
+  `child_close_requests` row whose target covers the child's scope. So even
+  before the pointer is cleared, no transitive ancestor event can leak through a
+  closed parent; a suspended child cannot consume a grandparent signal through a
+  parent that has continued as new or completed. Directly addressed `Signal`
+  events of the closing parent are deleted in its transition (before children
+  are delivered); with the walk cutoff, this ordering inversion is unobservable
+  to children.
+- **A cancelling parent never waits for the children it cancels.** The parent is
+  terminal as soon as its own transition commits; child cleanup is a side
+  obligation. Observably, a child may run (and even complete) in the window
+  between the parent's closure and its delivery, and the global `cancelTimeout`
+  escalation is measured from delivery, bounding any child that never observes
+  its cancellation.
+- **`startChild` is fenced.** A stale run can never attach a child that escapes
+  a closure record. Under the parent's own row lock, the insert is refused
+  (lease lost) when the parent's generation differs from the run's, when the
+  parent is terminal, or when a pending `child_close_requests` target already
+  covers the child's derived scope (a same-generation orphan attaching into a
+  discarded region interior). A legitimate new child never matches a pending
+  target, because targets name only discarded interiors and old generations.
 
 `Terminate` is intentionally absent from the policy enum. Force-stopping a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 
@@ -255,63 +299,69 @@ Application rules:
   complete enclosing `Workflow.scoped` path. Restartable and loop scopes appear
   as `scopeId@restartCount`; ordinary scopes appear as their scope ID. Segments
   retain their outer-to-inner order.
-- **Escaping.** The scope is a flat string whose *structural* delimiters are
-  `/` (segment boundary) and `@` (generation / restart-count marker, which is
-  always numeric). Every user-supplied segment that flows into a scope —
-  workflow IDs, instance keys, `Workflow.scoped` keys, restartable / loop IDs —
-  is **backslash-escaped** before being joined, so no segment content can be
-  confused with a structural delimiter. A single runtime function performs the
-  escaping for both scope composition and any scope-based prefix query:
+- **Representation.** The scope is a structured **segment array** (a
+  `TEXT[]` in Postgres, `Vector[String]` in Scala), not a joined string. The
+  array positions — not any delimiter — are what separate segments, so **no
+  escaping or shortening is performed anywhere**. User-supplied scope keys
+  (`Workflow.scoped` keys, restartable / loop IDs, step keys, race branch keys)
+  are validated by `ScopePath.requireValidKey` and never contain `/`, `*`, `@`,
+  `[`, `]`, `{`, `}` or a leading `_`; workflow IDs and instance keys are stored
+  verbatim. A single runtime function composes the array:
   ```scala
-  // escape `\`, `/`, `@`; the escaped `\` keeps the encoding unambiguous
-  def escapeScopeSegment(s: String): String =
-    s.replace("\\", "\\\\").replace("/", "\\/").replace("@", "\\@")
+  def deriveChildScope(parentInstanceScope, parentWorkflowId, parentKey,
+                       parentGeneration, enclosingScopePath): Vector[String] =
+    parentInstanceScope ++ Vector(parentWorkflowId, s"$parentKey@$parentGeneration") ++ enclosingScopePath
   ```
-  The `@count` marker is appended *after* the escaped key (e.g. `worker\-1@0`),
-  so the numeric count is never escaped. Escaping guarantees the derivation is
-  injective: a key crafted to look like a nested chain (say `x@0/B/y`) encodes
-  to `x\@0\/B\/y`, which cannot collide with a genuine chain `x@0/B/y@0`. This
-  is what makes the `(workflowId, instanceKey, scope)` uniqueness key safe even
-  though scope is derived from user-supplied keys.
+  The `@count` / `@generation` marker is appended to the segment text
+  (`worker-1@0`), so the numeric count is part of the segment, never a
+  separate field. Injectivity is structural: a key crafted to look like a
+  nested chain (say `x@0/B/y`) is a single array element `"x@0/B/y"`, which
+  can never collide with the genuine chain `["x@0", "B", "y@0"]`. This is what
+  makes the `(workflowId, instanceKey, scope)` uniqueness key safe even though
+  scope is derived from user-supplied keys.
 - **Prefix search.** Instance-key prefix operations
   (`getWorkflowInstancesByPrefix`, `deleteWorkflowInstancesByPrefix`) query the
-  raw `workflowInstanceKey` column and take an **unescaped** prefix — no
-  escaping is applied, because the escaped copy lives only inside the `scope`
-  column. Escaping matters only for a scope-based prefix query (e.g. all
-  children of a parent), and such a query must run its input segments through
-  `escapeScopeSegment` first so it matches the composed encoding.
+  raw `workflowInstanceKey` column with a literal prefix (escaped only for SQL
+  `LIKE`). Scope-scoped queries (e.g. all descendants of a parent) match a
+  segment-array **prefix** by comparing array slices: a child row's
+  `workflow_instance_scope` equals the parent's derived array on its first
+  `n` positions, where `n` is the parent's array length. Because segments are
+  verbatim, a prefix match on the array never over-matches a sibling or a
+  segment boundary.
 - Example:
   ```text
-  parent:      (orders, order-42, "")
-  child:       (worker, worker-1, "orders/order-42@3/items/poll@7")
-  grandchild:  (audit, audit-1, "orders/order-42@3/items/poll@7/worker/worker-1@0/chunk/retry@2")
+  parent:      (orders, order-42, {})
+  child:       (worker, worker-1, {orders, order-42@3, items, poll@7})
+  grandchild:  (audit, audit-1, {orders, order-42@3, items, poll@7, worker, worker-1@0, chunk, retry@2})
   ```
 - The parent workflow generation distinguishes children started before and
   after `continueAsNew`. Every enclosing restart count distinguishes children
-  started in different region loopings, including when an inner count starts
+  started in different region iterations, including when an inner count starts
   again after an outer region restarts.
 - Scope is part of immutable identity. If a child is abandoned, its active
   parent relationship is cleared but its derived scope does not change.
 - The database uniqueness key is `(workflowId, instanceKey, scope)`. Queries
-  accept an optional scope whose default is `""`; omitting it means exactly the
-  top-level scope, never all matching scopes.
-- The scope has a maximum encoded length. Before appending the current local
-  `Workflow.scoped`/restartable path, an overlong parent portion is replaced by
-  a marked stable hash such as `shortened[sha256:...]`. Local scope segments are
-  not part of that shortening calculation, ensuring that all children of one
-  parent instance and generation begin with the same normalized scope prefix.
-  When such a child later becomes a parent, its former local path is ancestry
-  and may be included in a shortened parent portion.
-- The readable slash-and-`@` form (with backslash escapes for embedded `/`,
-  `@`, `\`) is for debugging only. Callers must not construct or parse derived
-  scopes or rely on their textual layout.
+  accept an optional scope whose default is the empty array `{}`; omitting it
+  means exactly the top-level scope, never all matching scopes.
+- The scope has a maximum encoded length. When the composed array's joined
+  `/`-form would exceed the limit, derivation is **rejected** with an
+  `IllegalArgumentException` (nothing is truncated or hashed): the limit is
+  generous enough for deep legitimate nesting, and the Postgres btree index
+  entry that holds the `(workflowId, instanceKey, scope)` key would otherwise
+  fail at a slightly higher length. This replaces the former silent
+  prefix-preserving shortening, which existed only to keep string prefix
+  matching working and is obsolete now that scopes are structured arrays.
+- The readable slash-joined form (without escaping) is for debugging only.
+  Callers must not construct or parse derived scopes or rely on their textual
+  layout.
 - The returned handle is the normal way to address a child. Users should not
   normally reconstruct the derived scope.
 - The active parent relationship is stored separately as an optional
   `parentWorkflowInstanceId` on the storage record; it does not include the
-  generation and is cleared when the parent reaches a terminal state or
-  continues as new — in the same transaction that applies the
-  `ParentClosePolicy`. `WorkflowInstance.Info` exposes this as `parentId`.
+  generation. It is cleared when the parent's closure is delivered to the child
+  (run-start self-check or child-close sweep); it may therefore still be set for
+  a short asynchronous window after the parent reaches a terminal state or
+  continues as new. `WorkflowInstance.Info` exposes this as `parentId`.
 
 ## Recursion
 
@@ -343,7 +393,7 @@ val processorWf = Workflow("processor") { (state: State) =>
 - `Workflow.runToSuspension` is opt-in, not the default. Making every scope return `Either` would reintroduce monadic threading at every call site, defeating the purpose of direct style. `Either` is the right return type only when you actually need to handle suspension locally — which is `Workflow.parallel` and the fan-in partial-collection pattern.
 - Single `startAsChild` method: parent controls timing positionally, not via a deferred-creation API. `create`/`run` separation is only needed for external callers who must register a workflow in the same transaction as other business data.
 - Deriving child scope from parent identity, workflow generation, and enclosing
-  scope incarnations avoids persisting a randomized start ID while preventing
+  scope generations avoids persisting a randomized start ID while preventing
   collisions with top-level instances and children from discarded generations.
 - Parent reference without generation: there is only one active generation for
   an instance ID, and the parent pointer represents active ownership rather
@@ -366,4 +416,11 @@ val processorWf = Workflow("processor") { (state: State) =>
 
 2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstToRunWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
-3. **Race awaits cleanup** — **TODO**: Define how `Step.firstToRunWithoutSuspension` cleans up registered awaits from other branches when one branch has completed.
+3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
+   race resolves, every branch's pending subscriptions — including those
+   of nested subscopes — are deleted (a subtree delete over all three
+   subscription tables) BEFORE the winner's step row is written, so a losing
+   await can never wake the workflow later and a committed winner row never
+   coexists with branch subscriptions. The runtime primitive is
+   `WorkflowRuntime.deleteSubscriptionsUnderScopePaths`. Child-workflow
+   lifecycle on early branch exit remains the open TODO (2) above.

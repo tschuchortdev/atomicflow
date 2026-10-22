@@ -2,18 +2,18 @@
 
 Guideline for the caching, execution guarantees, and APIs of individual workflow steps.
 
-## Two orthogonal axes
+## Execution and cache policies
 
-Steps have independent guarantees on two axes:
+Steps have separate policies for crash recovery and cached-result reuse:
 
-### Axis 1: Execution guarantee (crash/persistence)
+### Execution guarantee
 
 - **at-least-once (default)**: Step body executes; result is persisted after completion. If a crash occurs between execution and persistence, the step re-executes on the next workflow run (because no cached result is found). Safe for idempotent effects (queries, read-only operations); unsafe for non-idempotent side effects without external deduplication.
 - **at-most-once**: If a started-but-no-result marker exists on replay, the step returns `None` without re-executing (a lost effect is assumed over a double-execution). The caller must handle the `Option[R]` return and decide how to proceed. Recommended for effects that cannot be safely retried (resource creation, payments without external idempotency keys).
 
 Both guarantees persist a `Started` record before the body executes, then replace it with a durable success or failure outcome. This gives both guarantees the same durable record shape and lets their public functions delegate to one implementation. Their replay policies differ only for an unresolved `Started` record: at-least-once re-executes, while at-most-once returns `None`.
 
-### Axis 2: Cache key drift policy (per-key)
+### Named-input and expiry policies
 
 When a step has been cached and is replayed:
 
@@ -21,7 +21,7 @@ When a step has been cached and is replayed:
 - **invalidateOn**: If any of these keys' values change, the previous result is discarded and the step body re-executes. Used for inputs that may legitimately change (e.g., retry with different parameters).
 - **invalidateAfter**: A TTL duration. The cached result expires after this time and re-executes automatically. Applied to the entire step, not per-key.
 
-The combination of both axes gives four primary patterns:
+The policies can be combined:
 
 | | ensureUnchanged | invalidateOn |
 |---|---|---|
@@ -55,12 +55,12 @@ Step.atLeastOnce("send-welcome", version = 1) {
 }
 
 // uses built-in retry functionality
-Step.atLeastOnce("check-results", retry = Step.RetryPolicy.exponentialBackoff(start = 1.minute, max = 3.days)) {
+Step.atLeastOnce("check-results", retry = Step.RetryPolicy.exponentialBackoff(initialDelay = 1.minute, maxCumulativeDelay = 3.days)) {
   checkResults()
 }
 ```
 
-- Constructor: `Step.atLeastOnce` or `Step.atMostOnce` is required; it sets Axis 1 (the guarantee).
+- Choose `Step.atLeastOnce` or `Step.atMostOnce` to set the crash-recovery policy.
 - `version` exists only on `Step.atLeastOnce`. Increasing it creates new retryable work and stops reusing the previous version's cached result. `Step.atMostOnce` deliberately has no version because a new version could execute after the old operation possibly produced its effect; use a new step ID and explicit workflow-version gating for a genuinely new operation.
 - Named parameters: `ensureUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty. Each `"key" -> value` pair is converted to a `StepInput` by an implicit conversion; see the `StepInput` Scaladoc.
 - **Named parameters are mandatory** — if you write `ensureUnchanged = Seq(...)`, the reader sees immediately what the policy is; positional ambiguity is impossible.
@@ -88,27 +88,21 @@ object RetryPolicy {
   ): RetryPolicy = ...
   
   def exponentialBackoff(
-      initialDelay: FiniteDuration, 
-      maxCumulativeDelay: FiniteDuration, 
-      multiplier: Float = 2, 
-      isRetriable: Throwable => Boolean = { _ => true }
-  ): RetryPolicy = ...
-  
-  def exponentialBackoff(
-      maxRetries: Long, 
-      initialDelay: FiniteDuration, 
+      initialDelay: FiniteDuration,
+      maxRetries: Long = Long.MaxValue,
+      maxCumulativeDelay: Duration = Duration.Inf,
       multiplier: Float = 2, 
       isRetriable: Throwable => Boolean = { _ => true }
   ): RetryPolicy = ...
 }
 ```
 
-- Delays that are long should be durable suspensions while short delays can be implemented with a simple `Thread.sleep`. The threshold between the two is configurable through the `WorkflowRunSettings`.
+- Delays at or below `WorkflowRuntime.durableRetryThreshold` block the executing thread. Longer delays persist a `RetryPending` step row carrying the retry bookkeeping and the deadline at which the body may run again (replacing the site's retry timer subscription with one at that deadline; the fired `TimerFired` event only wakes the instance). Set the threshold when constructing `PostgresWorkflowRuntime`.
 - The `failure` is the exact exception thrown by the Step body. If the policy decides to retry, it will not be serialized and cached.
 - `invalidateAfter` also invalidates ongoing retries or terminal failures. It is as if the step never executed before.
 - If the application crashes during a retry, it is as if the retry was never begun (scheduled retry in the database is not touched until the Step body has returned/thrown).
 
-Retry policies are orthogonal to "atLeastOnce" semantics: `Step.atLeastOnce` vs `Step.atMostOnce` is about how the workflow recovers from application crashes, when it is unclear whether the step body completed.  `RetryPolicy` retries when the body completed with an exception. This must be documented clearly for the user!
+Retry policy and crash recovery are separate. The execution guarantee decides what to do after a crash when the step's outcome is unknown. `RetryPolicy` decides what to do after an attempt throws an exception.
 
 ## Durable results and failures
 
@@ -120,7 +114,7 @@ NeverStarted | Started | Succeeded(value) | Failed(exception)
 
 ### API alternatives
 
-Three API shapes were considered:
+The alternatives below explain why failures use one contextual codec:
 
 ```scala
 // Rejected: union of declared failure types
@@ -148,17 +142,17 @@ def atLeastOnce[A: Cacheable](...)(body: => A)(using Cacheable[Throwable]): A
 def atMostOnce[A: Cacheable](...)(body: => A)(using Cacheable[Throwable]): Option[A]
 ```
 
-An application must explicitly import or define one global `Cacheable[Throwable]`:
+An application must define a contextual `Cacheable[Throwable]`:
 
 ```scala
-import Cacheable.forThrowable.genericStringMessageSerializer
+given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-// Or, for DBOS-like concrete Java exception serialization:
-import Cacheable.forThrowable.javaSerializable
+// Alternatively, preserve concrete exception classes with Java serialization:
+// given Cacheable[Throwable] = Cacheable.forThrowable.javaSerializable
 ```
 
-- `genericStringMessageSerializer` stores portable diagnostics and replays a library `StepFailed` exception. It is the recommended default for new workflows.
-- `javaSerializable` uses Java serialization and can preserve concrete exception classes, but persisted data is coupled to those classes and their serializable object graphs.
+- `genericStringMessageSerializer` stores portable diagnostics (class name, message, cause chain) and presents step failures as the library `StepFailed` exception, so catches can address the failing step (see "Step selectors and key rules" below). It is the recommended default for new workflows.
+- `javaSerializable` uses Java serialization and can preserve concrete exception classes, but persisted data is coupled to those classes and their serializable object graphs; step failures are rethrown unchanged and cannot be matched by step selector.
 - Custom codecs decide which concrete exception types remain catchable after replay. Workflow code must not assume more than the selected codec promises.
 - Neither codec is an automatic given. Choosing the throwable codec is part of workflow behavior and must be explicit at application setup.
 
@@ -175,15 +169,57 @@ body throws   -> serialize -> deserialize -> persist Failed    -> throw decoded 
 - The initial run also exposes the decoded representation, so it takes the same downstream pattern-match or `catch` branch as replay.
 - A Step result's object identity is not preserved, even during its initial execution. Code after a Step may rely on its value, but not on reference equality with an object created inside the Step.
 - Fatal JVM errors and the internal library control-flow exceptions for suspension, reset, and continue-as-new are never cached as Step failures. Lease loss raised inside a Step body — for example by an explicit `Workflow.heartbeat` call — likewise aborts the run without durable effect and is never a Step outcome. The public `WorkflowCancelledException` delivered at checkpoints is likewise never a Step outcome: delivery happens before a Step body executes, so a cancellation surfacing through a Step boundary cannot poison the Step cache.
-- If result or exception serialization/deserialization fails, the runtime persists and throws a runtime-owned `StepSerializationFailed`, a subtype of `StepFailed`. Its minimal encoding does not use the failing user codec, avoiding recursive failure.
-- A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic `StepFailed` representation is preferable to failing serialization.
+- If result or exception serialization fails, the step attempts to store `StepSerializationFailed` with the configured throwable codec. If that codec also fails, the original failure propagates without a stored step failure. `StepSerializationFailed` is independent of `StepFailed`.
+- A `Cacheable[Throwable]` is expected to handle every application `Throwable`; falling back to a generic portable representation is preferable to failing serialization.
+
+### StepFailed and step selectors
+
+With `genericStringMessageSerializer`, a step failure is thrown as
+`StepFailed(step, cause)` — on the run that persisted the failure and on every
+replay, so catches see the same type both times. `cause` is the decoded original
+failure in its portable form (rendering as the original exception, e.g.
+`Caused by: java.lang.RuntimeException: boom`); the retry policy still sees the
+raw body exception. Failures decoded by other codecs are rethrown unchanged.
+
+`StepFailed` is matched with the `stepId` string interpolator, whose pattern
+addresses the failing step by its scope path and key — the same path
+`Workflow.scoped`, `Workflow.loop`, and `firstToRun` branches build:
+
+```scala
+try {
+  Workflow.scoped("orders") { Step.atLeastOnce("charge")(...) }
+} catch {
+  case StepFailed(stepId"charge", msg)              => // key "charge", any depth
+  case StepFailed(stepId"orders/charge", msg)       => // suffix match: charge directly inside orders
+  case StepFailed(stepId"/orders/charge", msg)      => // anchored: the full path from the instance root
+  case StepFailed(stepId"poll/**/fetch", msg)       => // ** matches zero or more scope segments
+  case StepFailed(stepId"item-*/fetch", msg)        => // * matches text within one segment
+  case StepFailed(stepId"orders/$id/charge", msg)   => // $id binds the matched segment text
+}
+```
+
+- Matching is a pure function of the pattern and the step id: the first run and every replay agree.
+- Iteration markers (`name@3`, written by `Workflow.loop`) are ignored on both sides, so `orders` also matches `orders@3`; iteration counts cannot be pinned.
+- The same interpolator builds `StepSelector` values for `resetWorkflow`/`forkWorkflow` (`invalidateAllExecutedAfter = Seq(stepId"orders/charge")`) and is inspectable via `StepSelector.parse`/`render` for tooling.
+- In expression position, an interpolated `String` hole is a literal segment and any other `Fingerprintable` value becomes its fingerprint segment — the same segment `Workflow.scoped(elem)` derives.
+
+### Step keys and scope keys
+
+Keys that become scope-path segments or step keys — step keys, `Workflow.scoped`
+keys, region ids (`loop`/`restartable`), and `firstToRun` branch keys — must not
+be empty, must not start with `_`, and must not contain `/`, `*`, `@`, `[`, `]`,
+`{`, `}`. These characters are the selector pattern syntax, so a key containing
+them could never be addressed by a selector. Violations throw
+`IllegalArgumentException` when workflow execution reaches the operation.
+Fingerprint segments (derived by `scoped(elem)`) are encoded as unpadded
+Base64url and never contain the pattern-syntax characters.
 
 ### Workflow-level failures use the same codec
 
 The terminal outcome of a failed workflow is serialized with the same
 application-global `Cacheable[Throwable]` (see `running-workflows.md`).
 
-- The global given is in scope at the workflow boundary: `run`/`awaitResult`
+- The global given is in scope at the workflow boundary: `run`/`blockUntilCompleted`
   and the completion awaitable take it contextually, just as every Step call
   does.
 - The stored outcome payload records the selected codec IDs per the
@@ -222,7 +258,7 @@ given Cacheable[Throwable] =
 - Every tuple member must be a subtype of `Throwable` and have `Cacheable` and runtime type-test evidence.
 - On write, all matching members are considered and the unique most-specific member codec is selected. When none matches, the required `Cacheable[Throwable]` fallback is used.
 - On read, the persisted `stableSerializedTypeId` selects the same member directly; decoder trial order is never used.
-- The derivation macro rejects declarations where two potentially matching members are incomparable, such as overlapping exception traits, and reports that an explicit `Cacheable[Throwable]` is required.
+- Codec construction rejects runtime classes where two potentially matching members are incomparable, such as overlapping exception traits, and reports that an explicit `Cacheable[Throwable]` is required.
 - The explicit fallback avoids a recursive `Cacheable[Throwable]` lookup while constructing the global `Cacheable[Throwable]`, and makes the resulting codec total.
 
 Temporal follows the portable-wrapper approach: terminal Activity failures are recorded and replayed as framework failure types rather than arbitrary original exceptions. DBOS Java records Step failures using Java serialization and rethrows reconstructed concrete exceptions. The two provided codecs cover both styles.
@@ -236,26 +272,45 @@ Steps, runtime-computed awaits, `Step.firstToRunWithoutSuspension`, and
 ```text
 workflow_steps (
   workflowInstanceId, stepId, stepVersion, stepKind, stateKind, statePayload,
-  inputFingerprints, expiresAt, createdAt, updatedAt
+  retryDeadline, inputFingerprints, expiresAt, createdAt, updatedAt
 )
 ```
 
-- The natural key is `(workflowInstanceId, stepId, stepVersion)`. Unversioned
-  constructs use internal `stepVersion = 0`; public at-least-once versions are
-  positive. Reusing an ID with an incompatible `stepKind` is a conflict.
-- `stepKind` distinguishes `AtLeastOnce`, `AtMostOnce`, `Await`,
-  `FirstToRunWithoutSuspension`, and `RestartableRegion`.
-- `stateKind` distinguishes `Started`, `Succeeded`, `Failed`. 
-- `RestartableRegion` is permanently in state `Started` after the record was created. 
+- The natural key is `(workflowInstanceId, stepId, stepVersion, stepScopeWithinInstance)`. Unversioned
+  step kinds use internal `stepVersion = 0`; public at-least-once versions are
+  positive. A step key belongs to exactly one step kind: declaring the same key
+  for two different step kinds — e.g. an await and a step — is a definition
+  error; the runtime fails the run with a `StepKeyConflictException` instead of
+  overwriting the stored row.
+- `stepKind` records which step kind wrote the row: `Step` (both
+  `atLeastOnce` and `atMostOnce` rows), `Await`, `FirstToRun` (a
+  `firstToRunWithoutSuspension` winner row), or `RestartableRegion` (a
+  `Workflow.restartable`/`Workflow.loop` region row).
+- `stateKind` is legal only for the step kinds that actually write it, and
+  a state kind that is not legal for its row's kind is a parse error:
+  - kind `Step`: `Started`, `RetryPending`, `Succeeded`, `Failed`
+  - kind `Await`: `Succeeded` only (a suspended await persists no row at all;
+    its subscriptions carry the waiting)
+  - kind `FirstToRun`: `Succeeded` only (the winner marker)
+  - kind `RestartableRegion`: `RestartableRegion` only
+- `RestartableRegion` state rows carry the region's committed `restartCount`
+  and its encoded user state; the runtime replaces them in place on each
+  generation boundary.
+- `retryDeadline` is non-null only for `RetryPending`: the clock instant at which
+  the step body may run again. Core compares it against its clock to decide
+  due-ness; the retry's timer subscription is kept only to wake the instance at
+  that deadline, and a fired retry `TimerFired` event is never read by core.
 - `statePayload` is a runtime-owned encoded value, so it
   can carry a returned value, failure, retry bookkeeping, or a region's
   `(restartCount, currentState)` without kind-specific nullable columns.
 - Awaits and `firstToRunWithoutSuspension` persist only their public returned
   value. Their selected event and winning branch are used while committing the
   result, cursor movement, and subscription cleanup but are not retained.
-- A restartable region updates its own row on each looping and deletes
-  nested Step rows and subscriptions from the previous looping. It never caches
-  the region's final return value.
+- A restartable region replaces its own row on each generation boundary
+  (`Workflow.restartable`/`Workflow.loop`), and discards the previous
+  generation's nested Step rows and subscriptions idempotently after the new
+  row is committed, closing that generation's children per their
+  `ParentClosePolicy`. It never caches the region's final return value.
 - `inputFingerprints` is comparison data, not part of the natural key. An
   `ensureUnchanged` difference finds the existing row and raises
   `StepInputConflictException`; an `invalidateOn` difference replaces the
@@ -276,8 +331,8 @@ Deferred because:
 ## Cache key format: named pairs
 
 Cache keys are written as `"key" -> value` pairs. Each pair is converted to a
-`StepInput` by an implicit conversion. The sole purpose of `StepInput` is to
-reify the `Fingerprintable` instance of the value, so heterogeneous inputs can
+`StepInput` by an implicit conversion. `StepInput` retains the value's
+`Fingerprintable` instance, so inputs of different types can
 be fingerprinted without requiring a `Fingerprintable[Any]`; it is never
 constructed directly by callers.
 

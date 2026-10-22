@@ -1,3 +1,7 @@
+// Disabled prototype: this implementation does not support the current WorkflowRuntime API.
+// Use atomicflow.impl.db.PostgresWorkflowRuntime.
+
+/*
 package atomicflow.impl.memory
 
 import atomicflow.*
@@ -448,3 +452,5 @@ class InMemoryWorkflowRuntime extends WorkflowRuntime with WorkflowRuntime.Defau
 object InMemoryWorkflowRuntime {
 
 }
+
+*/

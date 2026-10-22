@@ -8,7 +8,7 @@ Single-instance operations exist on up to three levels; only `WorkflowRuntime` i
 
 | Layer | Role |
 |---|---|
-| `WorkflowRuntime` (trait) | Canonical home of all operations. Implemented per backend (in-memory, Postgres, ...). Convenience methods are `final`, built from a small set of abstract primitives. |
+| `WorkflowRuntime` (trait) | Creates, executes, queries, and stores workflow instances. Backends implement abstract operations; final methods combine them into convenience operations. |
 | `Workflow[In, Out]` methods | Pre-instance sugar (`create`, `run`, `createAndRun`, ...). Forward to a contextual `(using WorkflowRuntime)`. |
 | `WorkflowInstance[In, Out]` | Post-instance typed handle. Captures the workflow definition it came from; its runtime methods take a contextual `(using WorkflowRuntime)`. |
 
@@ -25,7 +25,7 @@ given WorkflowRuntime = ... // backend implementation
 myWorkflow.create(instanceKey, input): WorkflowInstance[In, Out]
 
 // Register + schedule: a job runner starts it (idempotent)
-myWorkflow.createAndSchedule(instanceKey, input): WorkflowInstance[In, Out]
+myWorkflow.createAndScheduleForAsyncRun(instanceKey, input): WorkflowInstance[In, Out]
 
 // Run a previously created instance on the caller thread (no input parameter!)
 myWorkflow.run(instanceKey): WorkflowRunResult[Out]
@@ -34,10 +34,10 @@ myWorkflow.run(instanceKey): WorkflowRunResult[Out]
 myWorkflow.createAndRun(instanceKey, input): WorkflowRunResult[Out]
 ```
 
-- `createAndSchedule` is the production fire-and-forget start: it registers the instance and upserts its first wakeup so a job runner picks it up ("Job runner and scheduling"). `createAndRun` executes inline on the caller thread until suspension or completion and leaves no wakeup behind — its suspension is covered by subscriptions, and events arriving during the run upsert a wakeup for the runner.
+- `createAndScheduleForAsyncRun` is the production fire-and-forget start: it registers the instance and upserts its first wakeup so a job runner picks it up ("Job runner and scheduling"). `createAndRun` executes inline on the caller thread until suspension or completion and leaves no wakeup behind — its suspension is covered by subscriptions, and in runner mode an event arriving during the run is picked up by the wakeup jobs (watermark dispatch / full subscription scan).
 - `create` without scheduling exists for pre-registration: instances that are only started by an explicit later action — conditionally triggered flows, ops/migration tooling, tests. Such instances are visible via `getUnfinishedWorkflowInstances`.
 - `create` and `run` are separate because `run` takes no input: the input is already persisted. All four are needed.
-- Idempotency: all create variants succeed if the instance already exists with equal input; they throw `WorkflowInputConflictException` if the input differs. `createAndSchedule` on an existing instance re-upserts the wakeup — at most one redundant no-op run. No separate `createIfNotExists` needed. `createWorkflowInstanceDiscardExisting` exists for explicitly replacing an instance.
+- Idempotency: all create variants succeed if the instance already exists with equal input; they throw `WorkflowInputConflictException` if the input differs. `createAndScheduleForAsyncRun` on an existing instance re-upserts the wakeup — at most one redundant no-op run. No separate `createIfNotExists` needed. `createWorkflowInstanceDiscardExisting` exists for explicitly replacing an instance.
 - Input is a **single parameter** (`In`); multiple values are passed as a case class or tuple. Scala 3 has no auto-tupling, so multi-param call sites would require type-level machinery (`TupledFunction` / match types) — can be added later as sugar without breaking the core API.
 
 `WorkflowRunResult` is the public synchronous execution outcome:
@@ -65,21 +65,44 @@ enum WorkflowRunResult[+A]:
 
 ## Job runner and scheduling
 
-Workflow execution runs on two kinds of threads: **caller threads**, which execute the blocking `run`/`createAndRun` API, and **runner threads**, which belong to a started **JobRunner**. The JobRunner is a **driver loop** plus an **executor**: each cycle it invokes the runtime's sweep operations — fire due timers, escalate overlong cancellations, recover expired leases — on their cadences, and claims due wakeups to execute instances. The sweep operations are *definition-agnostic operations of the runtime* (like `sendSignal`), not sub-components of the runner: any runner services every workflow in the shared tables, including other applications'. The executor is the only part that knows workflow code — it resolves definitions from the runner's registry.
+Workflow execution runs on two kinds of threads: **caller threads**, which execute the blocking `run`/`createAndRun` API, and **runner threads**, which belong to a started **JobRunner**. The JobRunner is a **driver loop** plus an **executor**: each cycle it invokes the runtime's sweep operations — fire due timers, escalate overlong cancellations, recover expired leases, deliver pending child closes (apply `ParentClosePolicy` records and detach children of deleted parents; see `sub-workflows-iteration.md`, `ParentClosePolicy`), run the best-effort event watermark dispatch, and (on its own cadence) run the full subscription scan that materializes signal and completion wakeups — and claims due wakeups to execute instances. The sweep operations are *definition-agnostic operations of the runtime* (like `sendSignal`), not sub-components of the runner: any runner services every workflow in the shared tables, including other applications'. The executor is the only part that knows workflow code — it resolves definitions from the runner's registry.
 
-**The runner and its runtime are one implementation family.** The driver loop executes backend-internal operations — wakeup claiming, conditional lease acquisition, fenced writes, the timer-firing primitive, the sweeps — that are deliberately absent from the public `WorkflowRuntime` trait. A generic runner parameterized by the public trait is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the runtime precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
+**The runner and its runtime are one implementation family.** The durable engine operations a run performs — fenced Step writes, awaits, timers, regions, lease renewal — are methods of the implementer-facing `WorkflowRuntimeInternals` trait, each taking the run's `Lease`: an opaque per-run handle the backend creates at lease acquisition and core carries on `WorkflowContext.currentExecution`. (Cancellation delivery is not a runtime operation: Step's checkpoints read the durable flag through `isCancellationRequested` and throw.) What remains deliberately absent from both views are the runner-internal operations — wakeup claiming, conditional lease acquisition, the sweeps. A generic runner parameterized by the runtime views alone is therefore impossible: each backend implements its own runner bound to its runtime, and pairings cannot be mixed and matched. `startJobRunner` lives on the application-facing `WorkflowRuntime` precisely so that a runner without its runtime — or with the wrong one — is unrepresentable.
 
-Every background path — signals, timers, child completions, cancellation, inheritance changes, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.**
+Every background path — signals, timers, child completions, cancellation, `continueAsNew` — reduces to the same mechanism: **upsert one coalesced row in `workflow_wakeups`; an executor claims it.** That is still true at the queue level; the only refinement is *who* materializes signal and completion wakeups — the driver loop's two wakeup jobs (best-effort watermark dispatch and the periodic full subscription scan) rather than the sender or the terminal transition.
+
+**Child close is the one background path that is not a wakeup.** A parent's terminal/`continueAsNew`/region-restart/reset transition records a row in the dedicated `child_close_requests` table (never a row on a child), and the child's close is delivered by the child-close sweep or by the child's own run-start self-check — so a cancelling parent's transaction never locks another instance's rows. See `sub-workflows-iteration.md`, `ParentClosePolicy`.
 
 ```scala
-trait WorkflowRuntime {
-  /** Creates and starts this process's job runner. Implemented per backend:
-    * the runner executes backend-internal operations and is bound to this
-    * runtime — runners and runtimes cannot be mixed and matched. */
+// The application-facing view: create, run, cancel, query.
+trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
+  /** Creates and starts a job runner. Implemented per backend:
+    * the runner executes the runner-internal operations (wakeup claiming,
+    * lease acquisition, the sweeps) and is bound to this runtime — runners
+    * and runtimes cannot be mixed and matched. Any number of runners may be
+    * started on the same runtime, each with its own settings and registry. */
   def startJobRunner(
       definitions: Seq[Workflow[?, ?]],
       settings: JobRunnerSettings = JobRunnerSettings.default
   ): JobRunner
+}
+
+// The library-core view: storage and execution primitives, reached through
+// WorkflowContext. A backend class implements both traits.
+trait WorkflowRuntimeInternals {
+  /** The opaque per-run execution handle: created by the backend when it
+    * acquires the instance's lease, identity-stable for the run, contents
+    * backend-owned. Carried by `WorkflowContext.currentExecution` and taken
+    * implicitly by every engine operation. */
+  type Lease
+
+  /** Durable engine operations — Step rows, awaits, timers, regions, lease
+    * renewal — each taking the run's `Lease`. `isCancellationRequested` is a
+    * plain durable read keyed by instance, consulted by Step's cancellation
+    * checkpoints. (Two representative members; the full surface is much
+    * larger.) */
+  def renewLease()(using Lease): Unit
+  def isCancellationRequested(instanceId: WorkflowInstanceId): Boolean
 }
 
 trait JobRunner {
@@ -96,9 +119,9 @@ val runner = runtime.startJobRunner(
 runner.stop(gracePeriod = 30.seconds)   // stop claiming, drain in-flight runs
 ```
 
-- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: calling `startJobRunner` while this runtime's runner is still active throws (two driver loops in one process double every sweep — a guard, not a correctness need; multi-process cooperation is unaffected); `stop` is idempotent; after `stop`, the factory may be called again. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
+- **One `JobRunner` type, created started; no separate handle type.** `startJobRunner` constructs *and* starts, so the returned runner needs only `stop` — a separate handle type would still be one-method ceremony. Lifecycle rules: any number of runners may be started on the same runtime, each with its own settings and registry; an extra runner costs redundant sweep and claim work but is never incorrect (the database's claim-atomic leases and idempotent sweeps arbitrate, exactly as they already do across processes); `stop` is idempotent and independent per runner. Runners of all processes sharing the storage cooperate through the database alone; no leader election, no external broker.
 - The runner holds the definition registry because it is the only component that ever resolves code from an id (below).
-- **Production always runs a runner; tests drive manually.** The runner is the default way workflows progress, and regular applications always start one. Tests of user workflows deliberately do not: they drive execution deterministically on caller threads via `run`/`createAndRun` (see "Testing"). Signals never need background machinery at all — senders append events and upsert wakeups on their own caller threads.
+- **Production always runs a runner; tests drive manually.** The runner is the default way workflows progress, and regular applications always start one. Tests of user workflows deliberately do not: they drive execution deterministically on caller threads via `run`/`createAndRun` (see "Testing"). Signals never need background machinery of their own — senders only append events; the signal and completion wakeups those events imply are produced asynchronously by the runner's two wakeup jobs (see "Sources of wakeups"). Manual-mode tests stay self-sufficient: they drive with `run` alone.
 - **No sweep is public API.** Timer firing, cancellation escalation, and lease recovery are internal steps of the runner's driver loop. Await evaluation is self-sufficient (see "Run semantics"), so no on-demand sweep operation exists: escalation and recovery are never needed by caller threads (an external `run` acquires an expired lease directly through the conditional update), and timer awaits fire their own due timers.
 - There is deliberately no way to run sweeps without the executor as a component: a signal-sending gateway needs no background machinery, and production needs everything together — no scenario wants services and execution as separately-managed components.
 - `stop` stops claiming and waits up to `gracePeriod` for in-flight runs. Runs abandoned at process exit are recovered after lease expiry (below).
@@ -113,30 +136,29 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 - **Resolution path**: claim a wakeup → load the instance row → registry lookup by `workflowId` → decode the persisted input with the definition's `Cacheable[In]` → execute the body on a worker thread. `workflowVersionAtCreation` is read from the instance row into `WorkflowContext`; the current body branches on it internally (see `workflow-evolution.md`). There is no multi-version registry.
 - **Claim filtering**: the executor only selects wakeups whose instance's `workflowId` is in its registry — the claim query joins `workflow_instances` and filters by the known ids (see the claim query below). A wakeup of an unknown workflow is invisible to this runner, never claimed, never requeued. This is what allows **different applications with different code to share the same tables**: each application's runners claim only their own workflows.
 - A workflow known to no runner anywhere is not an error anywhere — its wakeups simply age. That failure mode is detected by wakeup-age alerting (see "Sources of work"), not by any runner failing.
-- **Permissive call sites**: `create`, `createAndSchedule`, `createAndRun`, `run`, and `startAsChild` do not consult the registry. The in-hand `Workflow` object carries everything a direct call needs — identity, codecs, code — including inline execution until suspension.
+- **Permissive call sites**: `create`, `createAndScheduleForAsyncRun`, `createAndRun`, `run`, and `startAsChild` do not consult the registry. The in-hand `Workflow` object carries everything a direct call needs — identity, codecs, code — including inline execution until suspension.
 - **Concurrency resources.** By default the runner owns a daemon worker pool sized by `workerThreads`; `executor = Some(...)` overrides it with a user-supplied `Executor` (e.g. a virtual-thread-per-task executor). `maxConcurrentInstances` caps concurrently executing instances per `workflowId` (default unlimited).
 - **Cap enforcement at claim time.** Each runner process keeps an in-process permit count per `workflowId`. If a claimed instance's workflow is at capacity, the wakeup is deferred *in place* (`scheduled_at = now + capacityRetryDelay`, no lease taken) so a hot workflow can neither starve the FIFO batch nor pin a worker. Caps are per-process and multiply across processes; the lease still prevents concurrent execution of one instance. Caller-thread `run` bypasses caps — they are runner-side resource control, not a cross-process guarantee.
 
 ### Sources of wakeups
 
-`workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)` is the single scheduling queue. It holds **one row per instance** — many pending events coalesce — and every row means "this instance may have durable work". The queue is **instance-addressed only**: there are no rows meaning meta-work such as "run a thread which checks if a timer is due" — timer firing is time-driven, and only its *results* (a fired timer's wakeup for the owning instance) enter the queue. A sender's upsert uses `ON CONFLICT DO NOTHING` and never resets an existing row's timestamps. Sources:
+`workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)` is the single scheduling queue. It holds **one row per instance** — many pending events coalesce — and every row means "this instance may have durable work". The queue is **instance-addressed only**: there are no rows meaning meta-work such as "run a thread which checks if a timer is due" — timer firing is time-driven, and only its *results* (a fired timer's wakeup for the owning instance) enter the queue. Every wakeup upsert (dispatcher, scan, timer sweep, cancel, create/start, recovery, requeue) uses `ON CONFLICT DO NOTHING` and never resets an existing row's timestamps. Sources:
 
 | Source | Upserts a wakeup when |
 |---|---|
-| Signal sender | the appended event matches a pending subscription (exact key, or inherited from an allowed ancestor) |
+| Best-effort watermark dispatch | it processes an appended `Signal` past the stored watermark and a direct subscriber or eligible descendant subscription exists (its key matches), or a `WorkflowCompleted` past the watermark and completion subscribers exist (their wakeups — not the completing instance's) |
+| Full subscription scan | (periodic liveness pass) a non-terminal instance holds a pending signal or completion subscription with a visible, unconsumed candidate |
 | Timer firing | the sweep appended a `TimerFired` event for a due, not-yet-fired timer subscription |
-| Terminal transition | it appends `WorkflowCompleted` while completion subscribers exist (their wakeups — not the completing instance's) |
 | `cancel` | cancellation is requested while the instance has no live lease owner |
-| Inheritance broadening | the policy change may unblock awaits in the affected descendant subtree |
-| `createAndSchedule` / `startAsChild` | schedules the first execution of a new instance |
+| `createAndScheduleForAsyncRun` / `startAsChild` | schedules the first execution of a new instance |
 | Lease recovery sweep | a non-terminal instance's lease expired while held (worker crash) |
 | Executor requeue | a claimed run failed with a transient infrastructure error (delayed `scheduledAt`, `attempts + 1`) |
 
 - `createdAt` records when the row was first inserted and is never modified — not by requeue, backoff, or capacity defer. `scheduledAt` is when the instance becomes runnable again. **Wakeup age** is measured from `createdAt` (how long the work has been pending); **overdue time** from `scheduledAt` (how long it could have run). Both are exported as metrics; the oldest due wakeup per workflow is the alert that flags work no runner claims — an unknown definition, all runners down, or anything else that prevents claiming.
 
-- The sender never evaluates payload filters and never touches Step results; it appends the event and upserts the wakeup (see `signals-timers.md`).
+- The sender never evaluates payload filters and never touches Step results; it only appends the event. The wakeup is upserted asynchronously by the runner's watermark dispatch or full subscription scan (see `signals-timers.md`).
 - An event for a key nobody awaits creates no wakeup. The event stays in the log and the instance's next run finds it behind its cursor — wakeups accelerate subscribed awaits; the event log, not the queue, is the source of truth.
-- An event arriving while the instance is running is either observed by that run directly (the run evaluates awaits against events after the current `sequenceId`) or produces a wakeup row that the run re-checks before parking ("drain", below). Together with the existing recheck-before-commit rule on suspension, no event can be missed.
+- An event arriving while the instance is running is either observed by that run directly (the run evaluates awaits against events after the current `sequenceId`) or produces a wakeup row that the run re-checks before parking ("drain", below). A suspended instance always has a subscription, and the event log is the source of truth; the periodic full subscription scan is what catches any subscription committed concurrently with an event, so no event can be missed — correctness relies on the full scan, not on the writer.
 - Invariant: **a durably suspended instance always has at least one pending subscription row or one wakeup row.** Suspension commits together with its subscriptions; every operation that retires a subscription (await resolution, terminal cleanup) either produces the successor wakeup or is itself part of a run that re-evaluates the instance. Firing never retires a subscription (see `signals-timers.md`, "Why timer awaits need a subscription").
 
 ### The execution lease
@@ -144,7 +166,8 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 Ownership of an instance's execution is a **lease on the instance row, not a row lock and not an in-process mutex** (see `child-signal-inheritance.md`). Three columns on `workflow_instances`:
 
 ```text
-lease_owner (nullable)   -- worker identity, e.g. "processUuid:workerId"
+lease_owner (nullable)   -- worker identity, opaque; any stable unique string
+                         -- (caller-thread runs and each runner name themselves)
 fencing_token (bigint)   -- stale-writer fence, incremented on every lease acquisition
 lease_expires_at (nullable timestamp)
 ```
@@ -158,7 +181,7 @@ lease_expires_at (nullable timestamp)
     AND (lease_owner IS NULL OR lease_expires_at <= :now)
   ```
   Zero rows updated means a live owner or a terminal instance; the acquirer backs off.
-- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread; the lease is renewed on the workflow's own thread. The runtime invokes the heartbeat at every checkpoint (Step invocation, await evaluation, suspension), and long-running Step bodies call it explicitly through the public API below. `leaseDuration` must therefore exceed the longest gap between heartbeat opportunities. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
+- **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread and the runtime does not renew the lease on its own; renewal happens only when the workflow's own thread calls `Workflow.heartbeat()`. `leaseDuration` must therefore exceed the longest gap between such calls. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
 
 **`Workflow.heartbeat()` — public lease renewal**
 
@@ -166,8 +189,8 @@ lease_expires_at (nullable timestamp)
 object Workflow {
   /** Renews the execution lease of the instance executing on the current thread,
     * extending its `lease_expires_at` by the runtime's `leaseDuration`. The
-    * runtime calls this automatically at every checkpoint; call it explicitly
-    * inside long-running Step bodies, between checkpoints.
+    * runtime does not renew the lease on its own; call this explicitly inside
+    * long-running Step bodies.
     *
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
@@ -186,7 +209,7 @@ object Workflow {
   ```
   Zero rows updated → the runtime raises `LeaseLostException` and aborts the run without durable effect, identical to any other fenced-write loss.
 - **Not a cancellation checkpoint.** Heartbeat never delivers cancellation; delivery remains bound to checkpoints about to perform new work.
-- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; automatic and explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
+- **`Workflow.uncancellable` does not suppress renewal.** The region disables cancellation delivery only; explicit heartbeats continue inside it, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
 - Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
 - **Release.** A run releases the lease when it ends (suspension, terminal state, abort). Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
@@ -258,7 +281,7 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 ### Children, created instances, and continue-as-new
 
 - `startAsChild` creates the child instance and upserts the child's first wakeup; children are **never executed inline on the parent's thread**. Inline execution would hold two leases per thread and serialize large fan-outs; the parent normally suspends on `child.completion` immediately anyway.
-- `CREATED` instances are started by `createAndSchedule`, `createAndRun`, an external `run`, or a bulk start over a key prefix (an upsert of one wakeup per instance). Plain `create` deliberately schedules nothing — see "Core operations".
+- `CREATED` instances are started by `createAndScheduleForAsyncRun`, `createAndRun`, an external `run`, or a bulk start over a key prefix (an upsert of one wakeup per instance). Plain `create` deliberately schedules nothing — see "Core operations".
 - `continueAsNew` and restartable-region restarts re-enter the body inline on the same lease and thread. If the worker crashes after the transition commits, lease expiry plus recovery re-enqueue the successor generation.
 - Hazard: a generation containing no durable suspension (no await) inside a `continueAsNew`/loop cycle pins the thread across generations. Keep at least one suspension within a bounded number of generations. A checkpoint-free spin can only be stopped by `terminate` and the `cancelTimeout` escalation — and the pinned thread still persists until its next checkpoint (JVM limitation, "Cancellation and termination").
 
@@ -282,27 +305,30 @@ case class JobRunnerSettings(
   timerSweepInterval: FiniteDuration,
   timerBatchSize: Int,
   sweepInterval: FiniteDuration,        // escalation + recovery sweeps
+  eventDispatchBatchSize: Int,          // best-effort watermark dispatch: max events per driver cycle (default 1000)
+  fullSubscriptionScanInterval: FiniteDuration, // periodic full subscription scan; the liveness guarantee (default 1 minute)
   leaseDuration: FiniteDuration,        // must exceed the longest gap between Workflow.heartbeat calls
   leaseAcquireTimeout: FiniteDuration,  // wait bound for external run on a leased instance
   cancelTimeout: FiniteDuration,
+  workerId: Option[String] = None,    // lease_owner identity for this runner's claims; None → generated unique id
 )
 ```
 
 - PostgreSQL is the reference implementation: the database is the queue, the lease, and the coordination point. `LISTEN/NOTIFY` can reduce claim latency; **polling remains the correctness contract** (NOTIFY is lossy).
 - The in-memory backend implements the same behavior with a concurrent queue, a timer scheduler, and CAS-based leases; coalescing, exclusivity, and fencing semantics are identical, nothing is durable.
-- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it contextually, so `Awaitable.Timer` computes deadlines from it (see `signals-timers.md`). Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
+- **The runtime takes a `clock: Clock` parameter** (default `Clock.systemUTC()`) — the single time source for timer due-ness, retry thresholds, sweep predicates, and all `:now` parameters. The database server's clock is never consulted for logic. Workflow code reaches it through the workflow context's library view (`ctx.internals.clock`), so deadlines are always computed from the executing runtime's clock and an ambient `given Clock` is neither needed nor possible. Tests inject a small mutable `TestClock` (public utility, shipped with the in-memory backend) and advance it between runs.
 - `JobRunnerSettings.forTests` bundles test-friendly defaults: tiny `pollInterval`/`timerSweepInterval`, one worker thread for deterministic child ordering. Only used when a test explicitly starts a runner (see "Testing").
 
 ### Why this design
 
-- **One queue, instance-addressed only.** Signals, timers, completions, cancellation, inheritance changes, and crash recovery all reduce to coalesced wakeup rows, and every row means "this instance may have work" — the queue never carries meta-work like "check whether timers are due"; timer firing is time-driven and only its results enter the queue. The executor has a single claim path, and coalescing keeps queue cost O(1) per instance per burst.
+- **One queue, instance-addressed only.** Signals, timers, completions, cancellation, and crash recovery all reduce to coalesced wakeup rows, and every row means "this instance may have work" — the queue never carries meta-work like "check whether timers are due"; timer firing is time-driven and only its results enter the queue. The executor has a single claim path, and coalescing keeps queue cost O(1) per instance per burst.
 - **The database is the coordinator.** No leader election, no external broker, no distributed scheduler state. Multi-process cooperation is conditional row updates — exactly the guarantee the storage backends already provide. Horizontal scaling is "start another process with a runner". The registry-filtered claim even allows different applications with different code to share the same tables.
 - **Fencing instead of mutual exclusion.** Leases must survive process crashes, so exclusivity is eventually consistent. The `fencing_token` makes stale writers harmless instead of assuming they are gone, which is what makes crash recovery a bounded, self-healing event.
-- **Sweeps are the liveness mechanism.** Every kind of durable pending state — wakeup row, due timer, overlong cancellation, expired lease — is discovered by a bounded, idempotent, leaderless sweep on a fixed cadence. Correctness needs no lost-wakeup reasoning beyond the existing recheck-before-commit rule.
-- **Evaluation is self-sufficient; the scheduler is only latency.** Every await a run reaches resolves from durable state alone — including its own due timers, which the evaluation materializes itself. Sweeps and wakeups never affect correctness, only how quickly an unattended instance is noticed; the timer *subscription* is the deliberate exception — durable semantic state, not scheduling (`signals-timers.md`). That is what lets tests drive a workflow with `run` alone and what keeps production progress independent of any single mechanism.
+- **Sweeps are the liveness mechanism.** Every kind of durable pending state — wakeup row, due timer, overlong cancellation, expired lease — is discovered by a bounded, idempotent, leaderless sweep on a fixed cadence. For signal and completion wakeups the periodic full subscription scan is that mechanism: a suspended instance always has a subscription, and the scan catches any subscription committed concurrently with an event, so correctness needs no lost-wakeup reasoning on the writer's side.
+- **Manual runs can resolve waits.** Await evaluation reads stored events and fires its own due timers without a scheduler pass. Background jobs are needed to schedule unattended instances. Timer subscriptions retain the deadline and timer id needed by both manual and background evaluation; see `signals-timers.md`.
 - **Sweeps are runtime operations, not sub-components.** Timer firing, cancellation escalation, and lease recovery are definition-agnostic operations of the runtime, driven on a cadence by the runner's loop. None is public API — await evaluation's self-sufficiency removes the need for on-demand firing, and escalation/recovery are never needed by caller threads. There is deliberately no way to manage sweeps as a separate component: a gateway needs no background machinery, and production always needs everything together.
 - **The sweep pre-fires timers for race predictability** — why, and how firing stays exactly-once, is specified in `signals-timers.md` ("Timer firing: two paths, one primitive"); this document only states the scheduling consequence above: manual mode progresses timers without any sweep.
-- **Runner and runtime are one implementation family.** The runner executes backend-internal operations (claiming, lease acquisition, sweeps, timer firing) that the public `WorkflowRuntime` trait deliberately omits; a generic runner parameterized by the public trait could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
+- **Runner and runtime are one implementation family.** The durable engine operations are methods of the implementer-facing `WorkflowRuntimeInternals` trait, each taking the run's opaque `Lease` handle; what both views deliberately omit are the runner-internal operations (wakeup claiming, lease acquisition, the sweeps), so a generic runner parameterized by the runtime views alone could not exist. Each backend implements its own runner, created by its runtime via `startJobRunner`, and pairings cannot be mixed.
 - **Registration on the runner, permissive call sites.** The executor is the only consumer that starts from an id alone, so the id→definition registry is passed to `startJobRunner`, lives on the runner object, and is validated once at start. Direct API calls keep working with any in-hand definition object; a workflow known to no runner anywhere surfaces through wakeup-age alerting instead of failing anywhere.
 
 ## Testing
@@ -346,7 +372,7 @@ assert(parentWf.run("p-1") == Result(allDone))
 - **The manual-mode contract**: no runner, no threads. Events delivered before a `run` always precede anything that run materializes — so `advanceBy` + `run` decides timer races deterministically. In runner mode the sweep pre-fires timers earlier; occurrence windows and race ordering rules are specified in `signals-timers.md` ("Timer firing: two paths, one primitive", "Racing signals/timers").
 - **Determinism guidance**: assert terminal states (`Result`, `WorkflowCancelled`, ...) and intermediate state via `Step.getExecutionState`, `getInfo`, and stub counters — never mid-flight wall-clock timing. With no runner running, `WorkflowSuspended` between runs is itself a valid assertion.
 - **Recipe**: `InMemoryWorkflowRuntime(clock = testClock)` + retry threshold set low (workflow settings) so step retries become *durable* suspensions (driven by `advanceBy` + `run`) instead of inline `Thread.sleep`s. Start a real runner only for tests that specifically exercise scheduling behavior (coalescing, fairness, lease takeover): `rt.startJobRunner(definitions, JobRunnerSettings.forTests)`.
-- **Footguns**: `createAndSchedule` is inert without a runner — tests use `createAndRun`/`run` (or `create` + explicit runs). `awaitResult` is a passive waiter: without a runner or further `run` calls a suspended instance times out; it is for asserting terminal states, not for driving. Cancellation delivery and compensation (`Workflow.uncancellable`) are tested the same way: `runtime.cancel` + the next `run` delivers at the frontier checkpoint.
+- **Test execution**: `createAndScheduleForAsyncRun` requires a runner. Manual tests use `createAndRun` or `create` followed by explicit `run` calls. `blockUntilCompleted` only polls for completion; it times out if no runner or manual call advances a suspended instance. After `runtime.cancel`, the next `run` delivers cancellation before an uncached step or wait.
 
 ### Runtime-internal test hooks
 
@@ -404,8 +430,10 @@ Rules:
   (`WHERE terminal_state IS NULL`) and runs in the same transaction that
   appends the `WorkflowCompleted` event, setting `terminal_state` and
   `terminal_outcome` together. Concurrent attempts are serialized by the
-  guarded update: exactly one wins; the loser re-reads and adopts the winner's
-  outcome. **The first terminal event wins.** In particular, a workflow that
+  guarded update: exactly one wins; the loser's fenced write affects zero rows
+  and the run aborts with `LeaseLostException` without recording its outcome —
+  a later read or `run` adopts the winner's outcome. **The first terminal
+  event wins.** In particular, a workflow that
   catches a delivered cancellation and finishes normally is `COMPLETED` (with
   `cancel_requested_at` set) if its completion event lands first.
 - **Every resume path re-checks `terminal_state` before running user code** and
@@ -449,7 +477,7 @@ enum WorkflowCompletionResult[+R]:
   IDs per the `Cacheable` composition scheme (see `steps.md`), so a stored
   payload states how it was written.
 - Every operation that surfaces the completion takes the codecs contextually.
-  `run`/`awaitResult` already have `Cacheable[Out]` from the definition and
+  `run`/`blockUntilCompleted` already have `Cacheable[Out]` from the definition and
   receive `Cacheable[Throwable]` — the application-global throwable codec that
   every application must select explicitly (see `steps.md`). `Step.await` on a
   completion awaitable resolves the composite codec at the call site, matching
@@ -492,7 +520,7 @@ the same outcome as the run that completed the instance.
 - No machine-readable suspension reason — a debug string / stack trace is enough. A structured reason model would be complex to implement and has no driving use case.
 - Failures propagate as exceptions (direct style), not as error-encoding return values.
 - Suspension, reset, and continue-as-new each use a distinct internal control-flow exception — suspension's is `WorkflowSuspendedException`. The library catches them at its workflow boundary; they must never escape outside the workflow body. Broad catches and resource wrappers inside workflow code must rethrow library control-flow exceptions, so the library provides a `NonFatal`-like extractor that excludes them.
-- Planned: `awaitResult(timeout)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` returns `WorkflowRunResult[Out]` and blocks through intermediate suspensions until the instance reaches a terminal state, with a **mandatory timeout** as footgun guard. For request-scoped workflows (production, next to a runner) and for asserting on terminal states. It is a **passive waiter**: it never executes the workflow itself and never fires timers — it only waits for the terminal outcome. Progress comes from a runner or from caller-thread `run` calls; a suspended instance with no runner and no further `run` calls simply times out. Workflows that never suspend need no runner at all — `createAndRun` executes them inline to completion and `awaitResult` returns immediately. Implementation: in-memory registers a completion listener; Postgres polls the terminal projection, optionally optimized with `LISTEN/NOTIFY`. Tests drive progress deterministically with `run` and assert with `awaitResult` (see "Testing").
+- `blockUntilCompleted(timeout, pollInterval)` on `WorkflowRuntime`, `Workflow`, and `WorkflowInstance` polls the persisted instance row until the instance has a terminal outcome or the required timeout expires. It returns `WorkflowRunResult[Out]` or throws the stored failure. It never executes the workflow or fires timers. Progress requires a runner or explicit `run` calls. The poll interval defaults to `50.milliseconds`; each poll re-reads the full instance row (`readInstance`). `LISTEN/NOTIFY` is a possible future optimization.
 
 ## Multi-instance operations
 
@@ -543,22 +571,24 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
   outcome), revoke the lease, and never schedule the instance again. No resume
   is scheduled and no `WorkflowCancelledException` is delivered — the body gets no
   chance to run.
+- Directly addressed `Signal` events are deleted in the same transition. There
+  is no user-facing handler for unconsumed signals; they are ignored.
 - If currently running: the orphan thread may continue briefly but can never
   commit — all lease-checked writes are rejected, and its next checkpoint
   re-check observes the stored terminal state and discards the execution.
-- **JVM limitation**: there is no safe way to forcibly stop a JVM thread. `terminate` guarantees the instance is *durably stopped and lease-revoked*; it cannot guarantee the orphan thread stops immediately. A thread stuck in uninterruptible blocking I/O or a tight loop will run until it next reaches a checkpoint or the process ends. Document this as an inherent JVM constraint rather than hiding it.
+- **JVM limitation**: there is no safe way to forcibly stop a JVM thread. `terminate` records a terminal state and revokes the lease, but cannot stop an external operation already running on a thread. The thread can continue until its next ownership check or process exit.
 - Positioned as a **last-resort / manual-intervention** tool (matching the manual-intervention design goal) and as the escalation target of `cancelTimeout`. Prefer `cancel` for all lifecycle management; use `terminate` for stuck, buggy, or non-cooperative workflows and ops tooling.
 - Intentionally absent from `ParentClosePolicy`; not a lifecycle primitive.
 
 ### Delivery mechanics
 
-- **Delivery points are frontier checkpoints.** While `cancel_requested_at` is set, the runtime throws `WorkflowCancelledException` at every checkpoint that is about to perform *new* work (not cached) — a Step body about to execute, or an await about to be evaluated or resolved. Replay of cached Step results never delivers. On every resume, delivery therefore happens at the same place: the first checkpoint without a cached result — exactly the pending await or the next not-yet-run Step, where the user's reconstructed `try`/`catch` and its local scope live. The Step cache is what tells the runtime where that point is; later not-yet-run Steps are never reached, because the frontier throws first.
+- **Cancellation is checked before new work.** While `cancel_requested_at` is set, the runtime throws `WorkflowCancelledException` before an uncached step body or wait evaluation. Cached results replay without a cancellation check. Re-executing the workflow body rebuilds the local `try`/`catch` scope before cancellation is thrown at the pending operation.
 - **`WorkflowCancelledException` is a public, runtime-owned `RuntimeException`.** Ordinary cleanup works: `scala.util.control.NonFatal` catches it, so `catch { case NonFatal(e) => ... }` blocks run on cancellation. It is deliberately *not* one of the internal control-flow exceptions (suspension, reset, continue-as-new) that must be rethrown and are excluded by the library's `NonFatal`-like extractor — catching cancellation is legitimate user behavior.
 - **`Thread.interrupt` plays no role.** There is no JDK interrupt semantics to mimic: no interrupt flag is set, cleared, or read by the runtime. A stray or user-set interrupt on a worker thread has no contractual meaning — an interrupt targets a thread, but the unit of semantics here is the durable workflow — and the runtime clears interrupt status it observes to protect its own I/O. The supported channel is `cancel` plus the durable flag.
-- **Level, with one escape hatch.** Redelivery repeats at every new-work checkpoint until the instance is terminal; the only suppression is `Workflow.uncancellable` (below). A workflow that catches and continues can never outrun its cancellation.
+- **The request remains set.** Every later uncached operation checks it again, even if workflow code catches an earlier cancellation. `Workflow.uncancellable` suppresses these checks within its body.
 - Known limitation: a throw at a checkpoint cannot unblock a library call that is already in progress inside a Step body. Cancellation is observed at the next checkpoint; a long-running Step delays it until the Step returns. The `cancelTimeout` escalation bounds the wait.
 - The `run`/`createAndRun` functions are the outermost boundary. Any `WorkflowCancelledException` that escapes the workflow body is caught there and returned as `WorkflowCancelled`.
-- **Suspension is a normal public outcome**, even though an internal exception (`WorkflowSuspendedException`) performs the non-local control transfer. `WorkflowSuspended` means the instance suspended waiting on a signal, timer, or other workflow. Cancellation during a pending await propagates when the instance resumes and the frontier checkpoint throws.
+- **Suspension is a public outcome.** `WorkflowSuspendedException` returns control to the runtime, which reports `WorkflowSuspended`. Cancellation requested during a pending wait is checked when the instance next runs that wait.
 - No thread handles are ever exposed to external callers: the runtime needs none, because delivery goes through the durable flag and checkpoint checks, not through cross-thread signaling.
 
 ### `Workflow.uncancellable[R](f: WorkflowCtx ?=> R)` — the compensation region
@@ -588,7 +618,7 @@ try {
   new-work checkpoint throws again.
 - Lexical and re-entrant. Entry is replayed user code, so the region is
   replay-deterministic: if a worker crashes mid-compensation, the resumed run
-  re-delivers at the same frontier checkpoint, re-enters the catch block, and
+  checks cancellation at the same pending operation, re-enters the catch block, and
   already-completed compensation Steps are returned from the cache.
 - If the workflow swallows the cancellation and finishes normally, the
   first-terminal-event rule applies and the instance is `COMPLETED`.
@@ -601,7 +631,7 @@ try {
 - Two distinct operations (`cancel` vs `terminate`) are necessary because cancel's delivery is path-dependent under non-determinism — it can miss entirely. `terminate` provides the unconditional stop that `cancel` cannot guarantee.
 - Re-running a workflow to deliver cancellation (rather than injecting it without replay) is consistent with the replay model and ensures `WorkflowCancelledException` surfaces inside the user's live `try`/`catch` block, where compensation code has access to local scope variables. Without replay, there is no scope to deliver into.
 - `WorkflowCancelledException` is a plain public `RuntimeException` rather than `InterruptedException` so that cleanup is reachable from ordinary catch handlers — including broad `NonFatal` blocks, which `InterruptedException` would silently bypass. Catching it is legitimate user behavior; only the internal control-flow exceptions (suspension, reset, continue-as-new) are must-rethrow.
-- Cancellation as a durable level — a never-reset timestamp with redelivery at every new-work checkpoint, plus `Workflow.uncancellable` as the scoped escape for compensation — instead of a one-shot signal: a workflow that catches and continues can never outrun its cancellation, and the timestamp doubles as the escalation clock without extra columns. This matches Temporal's proven shape (level delivery + detached cancellation scopes); DBOS and Inngest instead make external cancellation uncatchable and push cleanup to out-of-band handlers.
+- The stored cancellation timestamp is never cleared. It supports repeated checks before new work and records when cancellation escalation becomes due. `Workflow.uncancellable` allows cleanup while retaining that request.
 - Fewer execution modes is better; two (cooperative/forceful) is the minimum needed to cover the JVM and non-determinism constraints.
 
 ## `continueAsNew` — bounded-history tail loops and tail recursion
@@ -618,11 +648,11 @@ The public operation is available only inside an executing workflow through the 
 ### Semantics
 
 1. `continueAsNew` is implemented as a special control-flow exception, caught at the outermost runtime boundary — the same mechanism as suspension. User code that calls it experiences it as a tail call: execution stops immediately, all local state is abandoned, and the runtime takes over.
-2. After the unconsumed-signal handler finishes, one atomic transaction closes
-   old child relationships before deleting directly addressed `Signal` events
-   addressed to this instance, erases the remaining current execution state
-   (including old subscriptions and wakeups but not cursors), increments the generation counter,
-   and persists `newInput`. Older generations are not retained separately.
+2. One atomic transaction erases the current execution state (including old
+   subscriptions and wakeups but not cursors), closes old child relationships,
+   deletes the directly addressed `Signal` events, increments the generation
+   counter, and persists `newInput`. Older generations are not retained
+   separately.
 3. The new generation therefore starts with a **completely empty** set of Step
    rows, subscriptions, and directly addressed event rows. Exact-key signal
    cursors survive the transition.
@@ -636,10 +666,10 @@ The public operation is available only inside an executing workflow through the 
 
 ### Unconsumed signals at the reset boundary
 
-Before transition, the workflow's `onUnconsumedSignals` handler receives all
-currently visible signals after the old generation's exact-key cursors. After
-the handler finishes and old child relationships are closed, directly addressed
-`Signal` events are physically deleted. Cached child Step results remain
+Inside the transition transaction the directly addressed
+`Signal` events after the old generation's exact-key cursors are physically
+deleted as part of that same transaction; unconsumed signals are ignored
+(there is no user-facing handler for them). Cached child Step results remain
 replayable without their source event. Events belonging to other workflow
 instances are not owned by this transition and are not deleted. A continuing
 child remains attached to its own parent and can inherit retained parent events
@@ -681,9 +711,9 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 ## Open points
 
-- `awaitResult` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `awaitResult`. `LISTEN/NOTIFY` is an optional latency optimization.
+- `blockUntilCompleted` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `blockUntilCompleted`. `LISTEN/NOTIFY` is an optional latency optimization.
 - Retention / auto-deletion of completed instances. The job runner's sweep mechanism is the designated hook (see "Job runner and scheduling").
 - **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token bump (see "Job runner and scheduling").
-- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime invokes it automatically at every checkpoint; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
+- **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime does not renew the lease automatically; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write; `Workflow.uncancellable` does not suppress it.
 - **Scheduler tuning** — Priority/fairness classes beyond `perWorkflowBatchShare` and per-workflow caps, and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
 - **`fork` / `forkFromFailure`** — `forkWorkflow` is specified in `continue-as-new-fork-reset.md`; its one open point there is the causal boundary for parallel-branch step prefixes. `forkFromFailure` is not yet specified.
