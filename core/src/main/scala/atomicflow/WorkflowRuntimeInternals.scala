@@ -198,12 +198,13 @@ trait WorkflowRuntimeInternals {
     */
   def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
 
-  /** Records the run's terminal outcome under the lease. Returns `Applied` when
-    * this run made the transition, or `AlreadyTerminal` when another writer
-    * already did.
+  /** Records the run's terminal outcome under the lease. A fenced write: throws
+    * [[LeaseLostException]] when the guarded terminal transition affects no row —
+    * the lease was taken over or the instance is already terminal — so this
+    * run's claim is void and its outcome was not recorded.
     */
-  def completeInstance(outcome: TerminalOutcome)(using Lease): CompletionResult
+  def completeInstance(outcome: TerminalOutcome)(using Lease): Unit
 
-  /** Commits a continue-as-new transition with `nextInput`. */
+  /** Commits a continue-as-new transition with `nextInput` under the lease. */
   def continueAsNew(nextInput: SerializedValue)(using Lease): Unit
 }
