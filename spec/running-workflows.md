@@ -398,7 +398,7 @@ timer, or child completion) until it reaches exactly one terminal state:
 | `CREATED` | first `run` takes the lease | `RUNNING` |
 | `RUNNING` | parked on an await, timer, or child completion | `SUSPENDED` |
 | `SUSPENDED` | resume reaches the suspension point | `RUNNING` |
-| `CREATED` | cancel before first start | `CANCELLED` — finalized immediately; the body never runs |
+| `CREATED` | cancel before first start | flagged; delivered at the first checkpoint, uniform with every state |
 | `RUNNING` | uncaught non-control-flow exception | `FAILED` |
 | any non-terminal | terminal transition (guarded) | `COMPLETED` / `FAILED` / `CANCELLED` / `TERMINATED` |
 
@@ -556,8 +556,11 @@ Cancellation is a **level, not an edge**: `cancel_requested_at` stays set foreve
    delivery: schedule a resume if the instance has no live owner; a live owner
    observes the flag at its next checkpoint. If the instance is already
    terminal, `cancel` is a no-op (the guarded terminal transition keeps this
-   idempotent). If the instance has never started and has no execution state to
-   deliver into, finalize it as `CANCELLED` immediately — the body never runs.
+   idempotent). Delivery is uniform across all instance states — an instance
+   that has never started is not finalized in place; it delivers at its first
+   checkpoint like any other, so a body whose first action is a checkpoint-free
+   completion may complete despite the pending cancel (rule 6 and the
+   first-terminal-event rule).
 2. If the instance is currently **suspended** (no thread): Instance is scheduled for execution. When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `WorkflowCancelledException`. User code may catch this to run compensating code and then re-throw (or let it propagate).
 3. If the instance is currently **running**: Instance is scheduled for execution. The owner re-reads the durable flag around every Step and Await boundary and, when set, throws the same `WorkflowCancelledException` at that checkpoint. If the currently executing run already notices the cancellation and finishes the workflow, the job runner will notice in the future that the scheduled workflow is already finished and skip it. No thread is ever interrupted; delivery is a runtime throw at a checkpoint, uniform with the suspended path.
 4. **Sticky redelivery.** If user code catches the `WorkflowCancelledException` and continues, the flag remains set and every subsequent cached checkpoint throws again. Catching it is for compensation, not for declining the cancel. The only way past it is to reach a terminal state — and if the workflow completes normally despite the pending cancel, the first-terminal-event rule applies: its `WorkflowCompleted` event wins and the instance is `COMPLETED`.

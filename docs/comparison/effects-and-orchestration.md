@@ -291,14 +291,18 @@ result = handle.get_result()
 
 **Implementation.** AtomicFlow's parent-close delivery is **asynchronous**: the
 parent's terminal/continue-as-new/reset/region-restart transition writes a row to
-`child_close_requests` (keyed by the parent's identity + a `target_prefix`) and
-never touches child rows. Delivery happens at the child's own run start or via a
-dedicated sweep, one child per short transaction, so **no transaction ever locks
-rows of more than one instance**. Consequences: the active parent pointer can
-linger briefly; a child can run (even complete) before its cancellation is
-delivered; `cancelTimeout` is measured from delivery. A cancelled/abandoned child
-replays already-consumed inherited signals from its cached step results, so the
-source event rows are not required.
+`child_close_requests` (keyed by the parent's identity + an absolute
+`scope_prefix` of the targeted children's identities) and never touches child
+rows. Delivery happens at the child's own run start or via a dedicated sweep,
+one child per short transaction, so **no transaction ever locks rows of more
+than one instance**. Delivery detaches the child and — for `Cancel` — sets
+`cancel_requested_at`; the child then delivers the cancellation itself at its
+next checkpoint, exactly like `runtime.cancel`, so a never-started child runs
+its body up to that first checkpoint before cancelling. Consequences: the
+active parent pointer can linger briefly; a child can run (even complete) before
+its cancellation is delivered; `cancelTimeout` is measured from delivery. A
+cancelled/abandoned child replays already-consumed inherited signals from its
+cached step results, so the source event rows are not required.
 
 Temporal propagates cancellation/termination from parent to child per the
 parent-close policy when the parent closes; children have their own histories and

@@ -234,39 +234,51 @@ Application rules:
   (success/failure/cancellation/termination), its `continueAsNew`, its
   region-restart, and its reset never touch child rows. Each instead records a
   row in the dedicated **`child_close_requests`** table keyed by the parent's
-  own identity plus a `target_prefix` (and `created_at`); the composite primary
+  own identity plus a `scope_prefix` (and `created_at`); the composite primary
   key deduplicates identical targets, and the foreign key cascades when the
-  parent row is deleted. The target is the scope prefix of the children to
-  close: the empty prefix for a terminal parent (all attached children), the
-  parent's identity plus `key@generation` for `continueAsNew` and reset
-  (exactly the closing generation), and that prefix plus the discarded region
-  interior for a region restart (exactly the discarded iteration). No request
-  row is written when no attached child matches, so the childless common case
-  leaves no bookkeeping. Targeting by exact prefix is what prevents collisions
-  between old and new children across generations and region iterations: a
-  later generation's or iteration's child carries markers past the prefix and
-  never matches. This is why no transaction ever locks another instance's rows.
+  parent row is deleted. The prefix is an **absolute** prefix of the targeted
+  children's `workflow_instance_scope`, composed by the same function that
+  derives child identities: the parent's identity plus `key@generation` for a
+  terminal parent, `continueAsNew`, and reset (exactly the closing generation's
+  children), and that prefix plus the discarded region interior for a region
+  restart (exactly the discarded iteration). There is no empty or wildcard
+  prefix. A terminal parent targets only its current generation's children;
+  children of older generations remain covered by the requests their own
+  `continueAsNew`/reset transitions recorded, which cannot be removed while
+  such a child is still attached. No request row is written when no attached
+  child matches, so the childless common case leaves no bookkeeping. Targeting
+  by exact prefix is what prevents collisions between old and new children
+  across generations and region iterations: a later generation's or iteration's
+  child carries markers past the prefix and never matches. This is why no
+  transaction ever locks another instance's rows.
 - **Delivery** happens at two asynchronous points, and the active parent pointer
   on each child is cleared then: (a) the **run-start self-check** — whenever a
   child's own run starts, before its body executes, it applies its own pending
   policy; (b) the periodic **child-close sweep** — the driver loop applies every
-  pending closure in bounded batches, one child per short transaction. Both
-  re-verify under the child's own row lock and are idempotent, so they cooperate
-  safely with each other and with recovery. The sweep deletes a
+  pending closure in bounded batches, one child per short transaction. Under
+  the child's own row lock, the parent's existence decides between applying the
+  recorded policy and a bare detach; both paths are idempotent, so they
+  cooperate safely with each other and with recovery. (The sweep does not
+  re-check the request row: a request is deleted only once no attached child
+  matches it, and the locked child is still attached, so the request that
+  selected the candidate cannot be gone.) The sweep deletes a
   `child_close_requests` row once no attached child matches it.
 - **A gone parent detaches.** A child whose parent instance row has been
   hard-deleted is detached (pointer cleared) by the self-check or sweep; it is
   never cancelled, matching the inheritance walk, which also stops at a missing
   parent.
 - Per child state, `Cancel` follows the standard per-state cancel semantics
-  (see `running-workflows.md`): a `CREATED` child is finalized `CANCELLED`
-  without ever running; a `SUSPENDED` child gets `cancel_requested_at` set and a
-  wakeup scheduled; a `RUNNING` child gets the flag set and delivers at its next
-  checkpoint. `Abandon` clears the pointer only.
+  (see `running-workflows.md`): the child gets `cancel_requested_at` set and —
+  when it has no live lease — a wakeup scheduled, and it delivers the
+  cancellation itself at its next checkpoint, exactly like `runtime.cancel`. A
+  `CREATED` child therefore executes its body up to its first checkpoint before
+  cancelling; because a checkpoint precedes every Step body and await
+  evaluation, no durable step effect runs. A `RUNNING` child delivers at its
+  next checkpoint. `Abandon` clears the pointer only.
 - **Inherited-signal visibility cuts off at the closure event, not at
   delivery.** The inheritance walk treats a parent as unusable — terminating the
   walk exactly as a detached pointer does — when it is terminal or holds a
-  `child_close_requests` row whose target covers the child's scope. So even
+  `child_close_requests` row whose prefix covers the child's scope. So even
   before the pointer is cleared, no transitive ancestor event can leak through a
   closed parent; a suspended child cannot consume a grandparent signal through a
   parent that has continued as new or completed. Directly addressed `Signal`
@@ -282,10 +294,10 @@ Application rules:
 - **`startChild` is fenced.** A stale run can never attach a child that escapes
   a closure record. Under the parent's own row lock, the insert is refused
   (lease lost) when the parent's generation differs from the run's, when the
-  parent is terminal, or when a pending `child_close_requests` target already
+  parent is terminal, or when a pending `child_close_requests` prefix already
   covers the child's derived scope (a same-generation orphan attaching into a
   discarded region interior). A legitimate new child never matches a pending
-  target, because targets name only discarded interiors and old generations.
+  prefix, because prefixes name only discarded interiors and old generations.
 
 `Terminate` is intentionally absent from the policy enum. Force-stopping a child at parent close is a rare ops need, not a lifecycle need; it is reachable via `runtime.terminate` for manual/ops use only.
 

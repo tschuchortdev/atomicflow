@@ -51,19 +51,25 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
       """.query[Int].option
     ).isDefined
 
-  test("cancel before first start finalizes CANCELLED immediately and the body never runs") {
+  test("cancel before first start delivers at the first checkpoint; the body's steps never run") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "created-cancel") { in =>
-      counter.incrementAndGet()
-      s"out-$in"
+      Step.atLeastOnce[String]("A") { counter.incrementAndGet(); s"out-$in" }
     }
     val id = rt.createWorkflowInstance(wf, "k", "a").id
 
     rt.cancel(id)
 
-    assertEquals(counter.get(), 0, "the body must never run")
+    assertEquals(counter.get(), 0, "the body never ran")
+    assertEquals(terminalRow(wf.id, "k").get._1, None,
+                 "cancel does not finalize in place; delivery happens at the checkpoint")
+    assertEquals(cancelRequestedAt(wf.id, "k").isDefined, true)
+    assertEquals(hasWakeup(wf.id, "k"), true, "cancel with no live owner upserts a wakeup")
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
+    assertEquals(counter.get(), 0, "the step body never runs: the first checkpoint throws before it")
     assertEquals(terminalRow(wf.id, "k").get._1, Some("cancelled"))
     assertEquals(
       terminalRow(wf.id, "k").get._2.map(Cacheable[WorkflowCompletionResult[String]].read(_)),
@@ -78,8 +84,22 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(
       rt.runWorkflowInstance(wf, id),
       WorkflowRunResult.WorkflowCancelled,
-      "re-running a cancelled-before-start instance returns WorkflowCancelled"
+      "re-running a cancelled instance returns its stored outcome"
     )
+  }
+
+  test("cancel on a checkpoint-free never-started body is best-effort: the instance completes (first-terminal-event rule)") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val wf = Workflow[String, String](id = "created-cancel-pure") { in => s"out-$in" }
+    val id = rt.createWorkflowInstance(wf, "k", "a").id
+
+    rt.cancel(id)
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("out-a"),
+                 "no checkpoint ever runs, so the cancellation is not delivered before completion")
+    assertEquals(terminalRow(wf.id, "k").get._1, Some("completed"))
+    assertEquals(cancelRequestedAt(wf.id, "k").isDefined, true, "the flag stays set even though the instance completed")
   }
 
   test("cancel on a terminal instance is a no-op") {
