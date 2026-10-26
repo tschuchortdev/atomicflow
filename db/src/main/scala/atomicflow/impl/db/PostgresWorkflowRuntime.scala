@@ -416,8 +416,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
         // the pre-increment generation, same as continueAsNew): children
         // created before the reset boundary are closed; body replay recreates
         // what is needed. The successor generation's children carry the
-        // incremented marker and never match this target.
-        _ <- insertChildCloseRequestQ(wf, key, scope, scope.segments ++ Vector(wf, s"$key@$generation"))
+        // incremented marker and never match this prefix.
+        _ <- insertChildCloseRequestQ(wf, key, scope, generationScopePrefix(wf, key, scope, generation))
         _ <- sql"""
           UPDATE workflow_instances SET generation = generation + 1
           WHERE workflow_id = $wf AND workflow_instance_key = $key AND workflow_instance_scope = $scope
@@ -557,7 +557,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * node's stored permitted-prefix set contains a prefix of the key (the
     * empty-string prefix permits every key, the empty set permits nothing). The
     * parent must be non-terminal and not
-    * covered by a pending `child_close_requests` target for the child's scope.
+    * covered by a pending `child_close_requests` prefix for the child's scope.
     * The subscriber's own `inherit_past_events` and
     * `inherited_events_start_sequence_id` are carried unchanged (they belong to
     * the subscriber, not to an edge). There is no depth cap: the walk is bounded
@@ -588,7 +588,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           AND NOT EXISTS (
             SELECT 1 FROM child_close_requests r
             WHERE r.workflow_id = p.workflow_id AND r.workflow_instance_key = p.workflow_instance_key AND r.workflow_instance_scope = p.workflow_instance_scope
-              AND a.node_scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix)
+              AND a.node_scope[1:array_length(r.scope_prefix,1)] = r.scope_prefix)
           AND EXISTS (
             SELECT 1 FROM unnest(a.node_prefixes) AS p(pfx)
             WHERE starts_with(a.signal_key, pfx))
@@ -690,7 +690,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
           SELECT 1 FROM child_close_requests r
           WHERE r.workflow_id = ${parentId.workflowId} AND r.workflow_instance_key = ${parentId.workflowInstanceKey}
             AND r.workflow_instance_scope = ${parentId.scope}
-            AND $derivedScope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
+            AND $derivedScope[1:array_length(r.scope_prefix,1)] = r.scope_prefix
           LIMIT 1
         """.query[Int].option
         _ <- if (covered.isDefined) throw LeaseLostException(parentId) else ().pure[ConnectionIO]
@@ -753,10 +753,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** Requests cooperative cancellation of an instance. In one transaction:
     * row-lock the instance; a missing instance throws, a terminal one is a no-op.
-    * An instance that has never started and has no execution state is finalized
-    * `CANCELLED` immediately (the body never runs). Otherwise `cancel_requested_at`
-    * is set once (never reset) and, when there is no live lease owner, a wakeup is
-    * upserted so the pending await is resumed and its cancellation check throws.
+    * Otherwise `cancel_requested_at` is set once (never reset) and, when there
+    * is no live lease owner, a wakeup is upserted so the instance resumes and
+    * its next cancellation checkpoint throws. Delivery is uniform across all
+    * instance states: a never-started instance is not finalized in place — it
+    * delivers at its first checkpoint like any other, so a body whose first
+    * action is a checkpoint-free completion may complete despite the pending
+    * cancel (the first-terminal-event rule).
     */
   override def cancel(instanceId: WorkflowInstanceId): Unit = {
     val workflowId = instanceId.workflowId
@@ -766,35 +769,29 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runTransaction {
       for {
         row <- sql"""
-          SELECT terminal_state, times_executed, lease_owner, lease_expires_at
+          SELECT terminal_state, lease_owner, lease_expires_at
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
-        """.query[(Option[String], Int, Option[String], Option[java.time.Instant])].option
+        """.query[(Option[String], Option[String], Option[java.time.Instant])].option
         _ <- row match {
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
 
-          case Some((Some(_), _, _, _)) =>
+          case Some((Some(_), _, _)) =>
             ().pure[ConnectionIO]
 
-          case Some((None, timesExecuted, leaseOwner, leaseExpiresAt)) =>
+          case Some((None, leaseOwner, leaseExpiresAt)) =>
             for {
-              hasExecutionState <- hasExecutionStateQ(workflowId, key, scope)
-              _ <- if (timesExecuted == 0 && !hasExecutionState)
-                  finalizeCancelledWithoutLease(workflowId, key, scope)
+              _ <- sql"""
+                UPDATE workflow_instances SET cancel_requested_at = $now
+                WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+                  AND cancel_requested_at IS NULL
+              """.update.run
+              _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
+                  upsertWakeupQ(workflowId, key, scope, now)
                 else
-                  for {
-                    _ <- sql"""
-                      UPDATE workflow_instances SET cancel_requested_at = $now
-                      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                        AND cancel_requested_at IS NULL
-                    """.update.run
-                    _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
-                        upsertWakeupQ(workflowId, key, scope, now)
-                      else
-                        ().pure[ConnectionIO]
-                  } yield ()
+                  ().pure[ConnectionIO]
             } yield ()
         }
       } yield ()
@@ -812,42 +809,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Boolean =
     owner.isEmpty || expiresAt.forall(!_.isAfter(now))
 
-  /** Whether the instance carries any durable execution state (step rows,
-    * subscriptions, or a wakeup row). Used to detect an instance that has never
-    * started and has nothing to deliver into.
-    */
-  private def hasExecutionStateQ(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: ScopePath
-  ): ConnectionIO[Boolean] =
-    for {
-      steps <- sql"""
-        SELECT 1 FROM workflow_steps
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope LIMIT 1
-      """.query[Int].option
-      
-      signal <- sql"""
-        SELECT 1 FROM workflow_signal_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope LIMIT 1
-      """.query[Int].option
-      
-      timer <- sql"""
-        SELECT 1 FROM workflow_timer_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope LIMIT 1
-      """.query[Int].option
-      
-      completion <- sql"""
-        SELECT 1 FROM workflow_completion_subscriptions
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope LIMIT 1
-      """.query[Int].option
-      
-      wakeup <- sql"""
-        SELECT 1 FROM workflow_wakeups
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope LIMIT 1
-      """.query[Int].option
-    } yield steps.isDefined || signal.isDefined || timer.isDefined || completion.isDefined || wakeup.isDefined
-
   /** Upserts a coalesced wakeup row due immediately, within the caller's
     * transaction.
     */
@@ -862,40 +823,6 @@ class PostgresWorkflowRuntime private[atomicflow] (
       VALUES ($workflowId, $key, $scope, $now, $now, 0)
       ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
     """.update.run.map(_ => ())
-
-  /** The guarded `CANCELLED` terminal transition for an instance that has no
-    * execution lease (finalized from a cancel request before first start): the
-    * guarded status update plus the `WorkflowCompleted(Cancelled)` event, in one
-    * transaction. The directly addressed `Signal` events are deleted in the same
-    * transaction. Completion wakeups are produced asynchronously by the job
-    * runner. The `Cancelled` outcome carries no user code, so it is encoded
-    * directly with the runtime's framing.
-    */
-  private def finalizeCancelledWithoutLease(
-      workflowId: WorkflowId,
-      key: WorkflowInstanceKey,
-      scope: ScopePath
-  ): ConnectionIO[Unit] = {
-    val payload = Framing.write("cancelled")
-    for {
-      updated <- sql"""
-        UPDATE workflow_instances
-        SET terminal_state = 'cancelled', terminal_outcome = $payload
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          AND terminal_state IS NULL
-      """.update.run
-      
-      _ <- if (updated == 1)
-          for {
-            _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
-            _ <- appendCompletedEvent(workflowId, key, scope, payload)
-            _ <- terminalCleanupIO(workflowId, key, scope)
-            _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
-          } yield ()
-        else 
-          ().pure[ConnectionIO]
-    } yield ()
-  }
 
   /** Terminal cleanup of an instance's own scheduling and subscription rows:
     * its wakeup row and its signal/timer/completion subscriptions. Called inside
@@ -932,21 +859,30 @@ class PostgresWorkflowRuntime private[atomicflow] (
     """.update.run.map(_ => ())
 
   /** Records a pending child close as a row in the dedicated
-    * `child_close_requests` table: the parent's own identity plus the target
-    * prefix of the children to close. `Vector.empty` targets every attached
-    * child (a terminal parent closes all of them); a non-empty prefix targets
-    * exactly the children whose derived scope lies under it, which keeps
-    * targeting collision-free across generations and region iterations:
-    * children started by a later generation or a later iteration carry markers
-    * past the prefix and never match. The row is runtime bookkeeping in a
-    * dedicated table — never a `workflow_steps` row — so no generic step
-    * deletion (continueAsNew's generation erase, region-interior erases, fork
-    * copies, resets) needs to exclude it. Delivery is asynchronous — the
-    * child-close sweep and the run-start self-check apply the policies, and the
-    * sweep deletes the row once no attached child matches it — so no parent
-    * transaction ever locks another instance's rows.
+    * `child_close_requests` table: the closing instance's own identity plus the
+    * absolute `scope_prefix` of the children to close. The prefix is always
+    * non-empty and always an exact prefix of the targeted children's
+    * `workflow_instance_scope` — the identity prefix
+    * (`instanceScope ++ [workflowId, "key@generation"]`) targets every child of
+    * the closing generation (a terminal, `continueAsNew`, or reset transition),
+    * and that prefix plus a discarded region's step-scope path targets exactly
+    * the discarded iteration's children. Because children embed the parent's
+    * generation and every enclosing region restart count in their identity, a
+    * closure request can never match a child started later: later children
+    * carry markers past the prefix. A terminal parent targets only its current
+    * generation's children; children of older generations remain covered by the
+    * requests their own `continueAsNew`/reset transitions recorded, which
+    * cannot be garbage-collected while such a child is still attached.
     *
-    * No row is written when no attached child matches the target (the common
+    * The row is runtime bookkeeping in a dedicated table — never a
+    * `workflow_steps` row — so no generic step deletion (continueAsNew's
+    * generation erase, region-interior erases, fork copies, resets) needs to
+    * exclude it. Delivery is asynchronous — the child-close sweep and the
+    * run-start self-check apply the policies, and the sweep deletes the row once
+    * no attached child matches it — so no parent transaction ever locks another
+    * instance's rows.
+    *
+    * No row is written when no attached child matches the prefix (the common
     * childless case: terminal transitions of leaf instances, `continueAsNew`
     * and region restarts without children), so bookkeeping stays proportional
     * to actual pending work. The existence check is a read of the parent's own
@@ -959,68 +895,85 @@ class PostgresWorkflowRuntime private[atomicflow] (
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath,
-      target: Vector[String]
+      scopePrefix: Vector[String]
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
     for {
       pending <- sql"""
         SELECT 1 FROM workflow_instances c
         WHERE c.parent_workflow_id = $workflowId AND c.parent_instance_key = $key AND c.parent_instance_scope = $scope
-          AND c.workflow_instance_scope[1:${target.length}] = $target
+          AND c.workflow_instance_scope[1:${scopePrefix.length}] = $scopePrefix
         LIMIT 1
       """.query[Int].option
-      
+
       _ <- if (pending.isDefined)
           sql"""
-            INSERT INTO child_close_requests (workflow_id, workflow_instance_key, workflow_instance_scope, target_prefix, created_at)
-            VALUES ($workflowId, $key, $scope, $target, $now)
-            ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, target_prefix) DO NOTHING
+            INSERT INTO child_close_requests (workflow_id, workflow_instance_key, workflow_instance_scope, scope_prefix, created_at)
+            VALUES ($workflowId, $key, $scope, $scopePrefix, $now)
+            ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope, scope_prefix) DO NOTHING
           """.update.run
-        else 
+        else
           ().pure[ConnectionIO]
     } yield ()
   }
 
-  /** Closes one child per its `ParentClosePolicy` (see [[insertChildCloseRequestQ]]
-    * and the sweep/self-check paths for the delivery semantics). For every
-    * child whose active parent pointer still points at the closing parent, the
-    * pointer is cleared (both policies). `Cancel` additionally delivers a
-    * cooperative cancellation per child state: a CREATED child (never started,
-    * no execution state) is finalized `CANCELLED` immediately; a SUSPENDED or
-    * RUNNING child gets `cancel_requested_at` set and, when no live lease
-    * exists, a wakeup. `Abandon` clears the pointer only. Idempotent: after the
-    * first application the pointer is cleared, so a re-trigger is a no-op, and
-    * an already-terminal child is a delivery no-op.
+  /** The absolute close-request prefix targeting every child created by the
+    * instance's current generation: exactly the identity segments every child
+    * scope embeds (`deriveChildScope` with an empty enclosing scope path), so
+    * the prefix is composed by the same function that derives child identities.
     */
-  private def closeOneChildQ(
-      child: (WorkflowId, WorkflowInstanceKey, ScopePath, Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+  private def generationScopePrefix(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: ScopePath,
+      generation: Long
+  ): Vector[String] =
+    ScopePath.deriveChildScope(scope, workflowId, key, generation, ScopePath.empty).segments
+
+  /** Applies a parent-close delivery to one child whose row the caller has
+    * already locked (the sweep's per-child transaction and the run-start
+    * self-check). For every child whose active parent pointer still points at
+    * the closing parent, the pointer is cleared (both policies). `Cancel`
+    * additionally sets `cancel_requested_at` and, when no live lease exists, a
+    * wakeup — the child then delivers the cancellation itself at its next
+    * checkpoint, exactly like `runtime.cancel`; a never-started child runs its
+    * body up to that first checkpoint before cancelling. `Abandon` clears the
+    * pointer only. Idempotent: after the first application the pointer is
+    * cleared, so a re-trigger is a no-op, and an already-terminal child is a
+    * delivery no-op.
+    */
+  private def applyCloseToChildQ(
+      workflowId: WorkflowId,
+      key: WorkflowInstanceKey,
+      scope: ScopePath,
+      policy: Option[String],
+      terminalState: Option[String],
+      leaseOwner: Option[String],
+      leaseExpiresAt: Option[java.time.Instant]
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
-    val (cwf, ckey, cscope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt) = child
 
     val clearPointer = sql"""
       UPDATE workflow_instances
       SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_instance_scope = NULL
-      WHERE workflow_id = $cwf AND workflow_instance_key = $ckey AND workflow_instance_scope = $cscope
+      WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
     """.update.run.map(_ => ())
 
     val deliver = policy match {
       case Some("abandon") => ().pure[ConnectionIO]
 
-      case _ => terminal match {
+      case _ => terminalState match {
         case Some(_) => ().pure[ConnectionIO]
 
         case None =>
-          if (timesExecuted == 0)
-            finalizeCancelledWithoutLease(cwf, ckey, cscope)
-          else for {
+          for {
             _ <- sql"""
               UPDATE workflow_instances SET cancel_requested_at = $now
-              WHERE workflow_id = $cwf AND workflow_instance_key = $ckey AND workflow_instance_scope = $cscope
+              WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                 AND cancel_requested_at IS NULL
             """.update.run
             _ <- if (noLiveLease(leaseOwner, leaseExpiresAt, now))
-                upsertWakeupQ(cwf, ckey, cscope, now)
+                upsertWakeupQ(workflowId, key, scope, now)
               else
                 ().pure[ConnectionIO]
           } yield ()
@@ -1034,16 +987,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
   }
 
   /** The child-close delivery sweep (the asynchronous half of
-    * [[insertChildCloseRequestQ]]): applies every pending closure whose target
+    * [[insertChildCloseRequestQ]]): applies every pending closure whose prefix
     * still matches attached children, and detaches children whose parent row is
     * gone (a hard-deleted parent detaches its children; it never cancels them,
     * matching the behavior of the inheritance walk, which also stops at a
     * missing parent). Candidates are read without locks; each child is closed in
-    * its own short transaction that locks only that child's row and re-verifies
-    * the condition, so the sweep never locks rows of other instances and is
-    * idempotent under concurrent sweeps and run-start self-checks. Finally,
-    * `child_close_requests` rows that no longer match any attached child are
-    * deleted (exhausted records). Returns the number of children closed.
+    * its own short transaction that locks only that child's row, so the sweep
+    * never locks rows of other instances and is idempotent under concurrent
+    * sweeps and run-start self-checks. Finally, `child_close_requests` rows that
+    * no longer match any attached child are deleted (exhausted records). Returns
+    * the number of children closed.
     */
   private[atomicflow] def closePendingChildClosures(limit: Int): Int = {
     val candidates = withDeadlockRetry {
@@ -1057,11 +1010,11 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 ON r.workflow_id = c.parent_workflow_id AND r.workflow_instance_key = c.parent_instance_key
                    AND r.workflow_instance_scope = c.parent_instance_scope
               WHERE c.parent_workflow_id IS NOT NULL
-                AND c.workflow_instance_scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
+                AND c.workflow_instance_scope[1:array_length(r.scope_prefix,1)] = r.scope_prefix
               ORDER BY c.workflow_id, c.workflow_instance_key, c.workflow_instance_scope
               LIMIT $limit
             """.query[(WorkflowId, WorkflowInstanceKey, ScopePath)].to[Vector]
-            
+
           orphans <-
             sql"""
               SELECT c.workflow_id, c.workflow_instance_key, c.workflow_instance_scope
@@ -1095,23 +1048,29 @@ class PostgresWorkflowRuntime private[atomicflow] (
             WHERE c.parent_workflow_id = r.workflow_id
               AND c.parent_instance_key = r.workflow_instance_key
               AND c.parent_instance_scope = r.workflow_instance_scope
-              AND c.workflow_instance_scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix)
+              AND c.workflow_instance_scope[1:array_length(r.scope_prefix,1)] = r.scope_prefix)
         """.update.run
       }
     }
     val total = closed + removed
-    if (total > 0) 
+    if (total > 0)
       log.info(s"Child-close sweep closed $closed children and removed $removed exhausted records")
-    
+
     closed
   }
 
   /** Closes one sweep candidate in its own transaction, locking only that
-    * child's row. Re-verifies under the lock that the parent pointer is still
-    * set and — for a closable candidate — that a `child_close_requests` row of
-    * that parent still matches this child's scope, or — for an orphan candidate
-    * — that the parent row is still gone; a raced-away condition makes this a
-    * no-op (returns `false`).
+    * child's row. Under the lock, the parent pointer being still set is what
+    * makes the candidate actionable; the parent's existence then decides
+    * between applying the recorded policy and a bare detach (a hard-deleted
+    * parent detaches its children; it never cancels them). For a closable
+    * candidate the matching `child_close_requests` row is not re-checked: a
+    * request row is deleted only once no attached child matches it, and this
+    * child is still attached and its identity (which embeds the target) is
+    * immutable, so the request that selected the candidate cannot have been
+    * removed. An orphan candidate whose parent row has reappeared is a no-op —
+    * the instance was recreated, and the closable query re-evaluates it on a
+    * later sweep. Returns whether the candidate was actioned.
     */
   private def closeOnePendingChildQ(
       workflowId: WorkflowId,
@@ -1121,44 +1080,42 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Boolean] =
     for {
       row <- sql"""
-        SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state, times_executed, lease_owner, lease_expires_at
+        SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state, lease_owner, lease_expires_at
         FROM workflow_instances
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
         FOR UPDATE
       """.query[
-              (Option[String], Option[String], Option[ScopePath], Option[String], Option[String], Int, Option[String], Option[java.time.Instant])
+              (Option[String], Option[String], Option[ScopePath], Option[String], Option[String], Option[String], Option[java.time.Instant])
             ].option
-      
+
       done <- row match {
-        case Some((Some(pwf), Some(pkey), Some(pscope), policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt)) =>
-          if (orphan) {
-            for {
-              stillGone <- sql"""
-                SELECT 1 FROM workflow_instances
-                WHERE workflow_id = $pwf AND workflow_instance_key = $pkey AND workflow_instance_scope = $pscope
-              """.query[Int].option
-              _ <- if (stillGone.isEmpty)
+        case Some((Some(pwf), Some(pkey), Some(pscope), policy, terminal, leaseOwner, leaseExpiresAt)) =>
+          for {
+            parentUsable <- sql"""
+              SELECT 1 FROM workflow_instances
+              WHERE workflow_id = $pwf AND workflow_instance_key = $pkey AND workflow_instance_scope = $pscope
+            """.query[Int].option
+            actioned <- parentUsable match {
+              // A hard-deleted (or deleted-and-not-recreated) parent detaches
+              // its child; it never cancels.
+              case None =>
                 sql"""
                   UPDATE workflow_instances
                   SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_instance_scope = NULL
                   WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                """.update.run
-              else ().pure[ConnectionIO]
-            } yield stillGone.isEmpty
-          } else {
-            for {
-              matched <- sql"""
-                SELECT 1 FROM child_close_requests r
-                WHERE r.workflow_id = $pwf AND r.workflow_instance_key = $pkey AND r.workflow_instance_scope = $pscope
-                  AND $scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
-                LIMIT 1
-              """.query[Int].option
-              _ <- if (matched.isDefined)
-                  closeOneChildQ((workflowId, key, scope, policy, terminal, timesExecuted, leaseOwner, leaseExpiresAt))
-                else ().pure[ConnectionIO]
-            } yield matched.isDefined
-          }
-          
+                """.update.run.map(_ => true)
+
+              case Some(_) if !orphan =>
+                applyCloseToChildQ(workflowId, key, scope, policy, terminal, leaseOwner, leaseExpiresAt)
+                  .map(_ => true)
+
+              // An orphan whose parent row reappeared: the instance was
+              // recreated; leave the pointer for the closable query to
+              // re-evaluate against the new parent's close requests.
+              case Some(_) => false.pure[ConnectionIO]
+            }
+          } yield actioned
+
         case _ => false.pure[ConnectionIO]
       }
     } yield done
@@ -1167,96 +1124,70 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * delivery): if this instance is a child whose parent has recorded a pending
     * closure matching this instance's scope — or whose parent row is gone —
     * apply the child's own `ParentClosePolicy` now, before the body executes.
-    * Runs in one transaction that locks only this instance's own row. Returns
-    * `true` only when the run must abort because a never-started child was
-    * finalized `CANCELLED` before its first execution; in every other case the
-    * run proceeds (a delivered Cancel flag makes the next cancellation
-    * checkpoint throw, and `Abandon` merely detaches). A never-started child
-    * finalized here records `times_executed = 1` (the run bumps before
-    * checking), whereas the same child finalized by the sweep records 0; the
-    * terminal outcome is identical and `times_executed` is bookkeeping.
+    * Runs in one transaction that locks only this instance's own row. The run
+    * always proceeds: a delivered `Cancel` flag makes the next cancellation
+    * checkpoint throw — uniform with `runtime.cancel`, so a never-started child
+    * executes its body up to that first checkpoint before cancelling — and
+    * `Abandon` merely detaches. No wakeup is scheduled: this run is live and is
+    * itself the delivery vehicle.
     */
   private def parentClosureSelfCheck(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey,
       scope: ScopePath
-  ): Boolean = {
-    val now = clock.instant()
+  ): Unit = {
     runTransaction {
       for {
         row <- sql"""
-          SELECT times_executed, terminal_state, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy
+          SELECT terminal_state, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, lease_owner, lease_expires_at
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
         """.query[
-                (Int, Option[String], Option[String], Option[String], Option[ScopePath], Option[String])
+                (Option[String], Option[String], Option[String], Option[ScopePath], Option[String], Option[String], Option[java.time.Instant])
               ].option
-        
-        abort <- row match {
-          case Some((timesExecuted, None, Some(pwf), Some(pkey), Some(pscope), policy)) =>
-            val clearPointer =
-              sql"""
-                UPDATE workflow_instances
-                SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_instance_scope = NULL
-                WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-              """.update.run
-              
+
+        _ <- row match {
+          case Some((None, Some(pwf), Some(pkey), Some(pscope), policy, leaseOwner, leaseExpiresAt)) =>
             for {
               parentUsable <- sql"""
                 SELECT 1 FROM workflow_instances p
                 WHERE p.workflow_id = $pwf AND p.workflow_instance_key = $pkey AND p.workflow_instance_scope = $pscope
               """.query[Int].option
-              
-              result <- parentUsable match {
+
+              _ <- parentUsable match {
                 // A hard-deleted parent detaches its child; it never cancels.
-                case None => clearPointer.as(false)
+                case None =>
+                  sql"""
+                    UPDATE workflow_instances
+                    SET parent_workflow_id = NULL, parent_instance_key = NULL, parent_instance_scope = NULL
+                    WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+                  """.update.run.map(_ => ())
 
                 case Some(_) =>
                   for {
                     matched <- sql"""
                       SELECT 1 FROM child_close_requests r
                       WHERE r.workflow_id = $pwf AND r.workflow_instance_key = $pkey AND r.workflow_instance_scope = $pscope
-                        AND $scope[1:COALESCE(array_length(r.target_prefix,1),0)] = r.target_prefix
+                        AND $scope[1:array_length(r.scope_prefix,1)] = r.scope_prefix
                       LIMIT 1
                     """.query[Int].option
-                    
-                    r <- matched match {
-                      case None => false.pure[ConnectionIO]
 
-                      case Some(_) =>
-                        policy match {
-                          case Some("abandon") => clearPointer.as(false)
+                    _ <- if (matched.isDefined)
+                        // The lease fields are this run's own (live) lease, so
+                        // the shared helper detaches and sets the flag without
+                        // scheduling a wakeup — this run is the delivery
+                        // vehicle.
+                        applyCloseToChildQ(workflowId, key, scope, policy, terminalState = None,
+                          leaseOwner, leaseExpiresAt)
+                      else ().pure[ConnectionIO]
+                  } yield ()
+                }
+            } yield ()
 
-                          case _ =>
-                            if (timesExecuted == 1) {
-                              // The first execution of a never-started child: the
-                              // body never runs; finalize CANCELLED and abort.
-                              for {
-                                _ <- clearPointer
-                                _ <- finalizeCancelledWithoutLease(workflowId, key, scope)
-                              } yield true
-                            } else {
-                              // A started child: deliver the cooperative flag;
-                              // the next cancellation checkpoint throws.
-                              for {
-                                _ <- clearPointer
-                                _ <- sql"""
-                                  UPDATE workflow_instances SET cancel_requested_at = $now
-                                  WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-                                    AND cancel_requested_at IS NULL
-                                """.update.run
-                              } yield false
-                            }
-                        }
-                    }
-                  } yield r
-              }
-            } yield result
-            
-          case _ => false.pure[ConnectionIO]
+          case _ => ().pure[ConnectionIO]
         }
-      } yield abort
+      } yield ()
     }
   }
 
@@ -1325,7 +1256,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               """.update.run
               _ <- terminalCleanupIO(workflowId, key, scope)
               _ <- insertChildCloseRequestQ(workflowId, key, scope,
-                                         scope.segments ++ Vector(workflowId, s"$key@$generation"))
+                                           generationScopePrefix(workflowId, key, scope, generation))
               _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
               _ <- sql"""
                 UPDATE workflow_instances
@@ -1363,17 +1294,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runTransaction {
       for {
         terminal <- sql"""
-          SELECT terminal_state FROM workflow_instances
+          SELECT terminal_state, generation FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
-        """.query[Option[String]].option
-        
+        """.query[(Option[String], Long)].option
+
         updated <- terminal match {
           case None => false.pure[ConnectionIO]
-          
-          case Some(Some(_)) => false.pure[ConnectionIO]
 
-          case Some(None) =>
+          case Some((Some(_), _)) => false.pure[ConnectionIO]
+
+          case Some((None, generation)) =>
             for {
               u <- sql"""
                 UPDATE workflow_instances
@@ -1388,7 +1319,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                     _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
                     _ <- appendCompletedEvent(workflowId, key, scope, payload)
                     _ <- terminalCleanupIO(workflowId, key, scope)
-                    _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
+                    _ <- insertChildCloseRequestQ(workflowId, key, scope, generationScopePrefix(workflowId, key, scope, generation))
                   } yield ()
                 else
                   ().pure[ConnectionIO]
@@ -1619,11 +1550,12 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** The shared lease-acquisition follow-on: bump `times_executed` (+
     * `last_run_at`) fenced by `worker`/`token`, re-read the instance row under
-    * the same fence, and apply the run-start parent-close self-check. Returns
-    * `Left(record)` when the instance is terminal (an already-terminal row, or a
-    * never-started child finalized `CANCELLED` by the self-check), otherwise
-    * `Right(lease)` carrying the freshly read record. Throws
-    * [[LeaseLostException]] when the fenced bump or re-read affects no row.
+    * the same fence, and apply the run-start parent-close self-check (which
+    * detaches and flags; the run always proceeds and delivers any pending
+    * cancellation at its first checkpoint). Returns `Left(record)` only when the
+    * instance is already terminal, otherwise `Right(lease)` carrying the freshly
+    * read record. Throws [[LeaseLostException]] when the fenced bump or re-read
+    * affects no row.
     */
   private def leaseUnderAcquisition(
       instance: WorkflowInstanceId,
@@ -1642,8 +1574,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
           AND lease_owner = $worker AND fencing_token = $token
       """.update.run
     }
-    
-    if (bumped != 1) 
+
+    if (bumped != 1)
       throw LeaseLostException(instance)
 
     // Re-read the instance row now that we hold the lease. A caller-thread run
@@ -1654,22 +1586,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val fresh = readFencedInstanceRecord(instance, worker, token).getOrElse(
       throw LeaseLostException(instance)
     )
-    
+
     fresh.terminalState match {
       case Some(_) => Left(fresh)
       case None =>
-        val parentCloseAbort =
-          if (fresh.parentId.isDefined)
-            parentClosureSelfCheck(workflowId, key, scope)
-          else false
-        
-        if (parentCloseAbort) {
-          log.info(s"Workflow instance $instance cancelled by pending parent close before first execution")
-          Left(readInstance(instance).getOrElse(throw LeaseLostException(instance)))
-        } else {
-          log.debug(s"Running workflow instance $instance (fencingToken=$token)")
-          Right(new PostgresCurrentExecution(worker, token, workflowId, key, scope, fresh.generation, fresh))
-        }
+        if (fresh.parentId.isDefined)
+          parentClosureSelfCheck(workflowId, key, scope)
+        log.debug(s"Running workflow instance $instance (fencingToken=$token)")
+        Right(new PostgresCurrentExecution(worker, token, workflowId, key, scope, fresh.generation, fresh))
     }
   }
 
@@ -1875,9 +1799,10 @@ class PostgresWorkflowRuntime private[atomicflow] (
     }
 
   /** The guarded terminal transition, atomic with the `WorkflowCompleted` event
-    * append and the deletion of this instance's directly addressed `Signal`
-    * events: the guarded `terminal_state`/`terminal_outcome` update, the event
-    * append, and the `Signal` deletion commit together in one transaction.
+    * append, the deletion of this instance's directly addressed `Signal` events,
+    * and the current generation's child-close request: the guarded
+    * `terminal_state`/`terminal_outcome` update, the event append, the `Signal`
+    * deletion, and the close request commit together in one transaction.
     * Completion wakeups are produced asynchronously by the job runner. A fenced
     * write: wins only if the instance is not already terminal and the lease is
     * still ours; otherwise it throws [[LeaseLostException]] and this run's
@@ -1896,22 +1821,36 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): Unit = {
     val updated = runTransaction {
       for {
-        updated <- sql"""
-          UPDATE workflow_instances
-          SET terminal_state = $state, terminal_outcome = $payload
+        locked <- sql"""
+          SELECT generation FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-            AND terminal_state IS NULL AND lease_owner = $worker AND fencing_token = $token
-        """.update.run
-        
-        _ <- if (updated == 1)
+            AND lease_owner = $worker AND fencing_token = $token
+          FOR UPDATE
+        """.query[Long].option
+
+        updated <- locked match {
+          case Some(generation) =>
             for {
-              _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
-              _ <- appendCompletedEvent(workflowId, key, scope, payload)
-              _ <- terminalCleanupIO(workflowId, key, scope)
-              _ <- insertChildCloseRequestQ(workflowId, key, scope, Vector.empty)
-            } yield ()
-          else 
-            ().pure[ConnectionIO]
+              u <- sql"""
+                UPDATE workflow_instances
+                SET terminal_state = $state, terminal_outcome = $payload
+                WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
+                  AND terminal_state IS NULL
+              """.update.run
+
+              _ <- if (u == 1)
+                  for {
+                    _ <- deleteDirectSignalEventsQ(workflowId, key, scope)
+                    _ <- appendCompletedEvent(workflowId, key, scope, payload)
+                    _ <- terminalCleanupIO(workflowId, key, scope)
+                    _ <- insertChildCloseRequestQ(workflowId, key, scope, generationScopePrefix(workflowId, key, scope, generation))
+                  } yield ()
+                else
+                  ().pure[ConnectionIO]
+            } yield u
+
+          case None => 0.pure[ConnectionIO]
+        }
       } yield updated
     }
     if (updated != 1)
@@ -2371,10 +2310,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
       // Child instances store their creation scope as the parent's instance
       // scope, the parent's workflow id and `key@generation` marker, and then
       // the parent's step scope path; translate the prefix accordingly.
-      val target = lease.instanceScope.segments ++
-        Vector(lease.workflowId, s"${lease.instanceKey}@${lease.generation}") ++
+      val target = generationScopePrefix(lease.workflowId, lease.instanceKey, lease.instanceScope, lease.generation) ++
         scopePathPrefix.segments
-      
+
       insertChildCloseRequestQ(lease.workflowId, lease.instanceKey, lease.instanceScope, target)
     }
 

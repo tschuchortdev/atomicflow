@@ -12,8 +12,11 @@ import scala.concurrent.duration.*
   * `continueAsNew`, region restart, and reset record a request row in the
   * dedicated `child_close_requests` table and never touch child rows; the close
   * is delivered (a) at the child's own run start (the self-check) and (b) by
-  * the periodic child-close sweep. Lives in package `atomicflow` so it can
-  * drive the package-private sweep hook deterministically.
+  * the periodic child-close sweep, by detaching the child and — for `Cancel` —
+  * setting `cancel_requested_at`; the child then delivers the cancellation
+  * itself at its next checkpoint, exactly like `runtime.cancel`. Lives in
+  * package `atomicflow` so it can drive the package-private sweep hook
+  * deterministically.
   */
 class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
@@ -114,8 +117,10 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(childRow("worker", "worker-1", scope).get.terminalState, Some("cancelled"))
   }
 
-  test("terminal close of a never-started Cancel child finalizes it CANCELLED via the sweep") {
-    val childWf   = Workflow[String, String]("worker") { in => in.toUpperCase }
+  test("terminal close of a never-started Cancel child cancels it at its own first checkpoint") {
+    val childWf   = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf  = Workflow[String, String]("orders") { in =>
       childWf.startAsChild("worker-1", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       "done"
@@ -124,15 +129,24 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
 
     val scope = ScopePath("orders", "order-42@0")
+    val childId = WorkflowInstanceId("worker", "worker-1", scope)
     assertEquals(childRow("worker", "worker-1", scope).get.timesExecuted, 0, "the child never ran")
     assertEquals(childCloseRowCount(), 1)
 
     sweep(childWf)
 
     val row = childRow("worker", "worker-1", scope).get
-    assertEquals(row.terminalState, Some("cancelled"), "a never-started child is finalized CANCELLED without running")
-    assertEquals(row.timesExecuted, 0)
+    assertEquals(row.terminalState, None, "delivery flags the child; it is not finalized in place")
+    assertEquals(row.cancelRequestedAt.isDefined, true, "the sweep requests cancellation")
     assertEquals(row.parentWf, None)
+    assert(hasWakeup("worker", "worker-1", scope), "the sweep wakes the never-started child")
+
+    // The child's own run delivers the cancellation at its first checkpoint
+    // (before the step body), uniform with runtime.cancel.
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
+    val finalRow = childRow("worker", "worker-1", scope).get
+    assertEquals(finalRow.terminalState, Some("cancelled"))
+    assertEquals(finalRow.timesExecuted, 1)
   }
 
   test("terminal close of an Abandon child detaches it and the child continues independently") {
@@ -427,9 +441,11 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("the self-check finalizes a never-start-gone child on its first run without executing the body") {
+  test("the self-check delivers a pending close on a never-started child's first run before its first step") {
     val parentGate = Signal[String]("pgate")
-    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val childWf    = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf = Workflow[String, String]("orders") { in =>
       childWf.startAsChild("w", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
@@ -443,11 +459,21 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     val scope   = ScopePath("orders", "order-42@0")
     val childId = WorkflowInstanceId("worker", "w", scope)
 
-    // No sweep: the child's own first run applies the close and never runs its body.
+    // No sweep: the child's own first run applies the close, and the first
+    // cancellation checkpoint (before the step body) delivers the cancel.
     assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
     val row = childRow("worker", "w", scope).get
     assertEquals(row.terminalState, Some("cancelled"))
     assertEquals(row.parentWf, None)
+    assertEquals(row.timesExecuted, 1)
+
+    val stepRows = run(
+      sql"""
+        SELECT COUNT(*) FROM workflow_steps
+        WHERE workflow_id = 'worker' AND workflow_instance_key = 'w'
+      """.query[Int].unique
+    )
+    assertEquals(stepRows, 0, "the cancellation checkpoint throws before the step body executes")
   }
 
   test("reset closes the children of the old generation; the successor's children are untouched") {
@@ -497,7 +523,9 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
   test("reset closes a child whose startAsChild is cached before the boundary and does not recreate it") {
     val parentGate = Signal[String]("pgate")
-    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val childWf    = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf = Workflow[String, String]("orders") { in =>
       Step.atLeastOnce[String]("start-child") {
         childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
@@ -520,8 +548,13 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     rt.resetWorkflow[String, String](parentId, Seq.empty, Seq(stepId"/post"))(using parentWf)
 
     sweep(childWf)
-    assertEquals(childRow("worker", "c", child0.scope).get.terminalState, Some("cancelled"),
-                 "the cached-before-boundary child is finalized CANCELLED by reset's closure")
+    val flagged = childRow("worker", "c", child0.scope).get
+    assertEquals(flagged.terminalState, None, "delivery flags the child; it is not finalized in place")
+    assertEquals(flagged.cancelRequestedAt.isDefined, true, "the cached-before-boundary child is flagged by reset's closure")
+
+    // The child's own run delivers the cancellation at its first checkpoint.
+    assertEquals(rt.runWorkflowInstance(childWf, child0), WorkflowRunResult.WorkflowCancelled)
+    assertEquals(childRow("worker", "c", child0.scope).get.terminalState, Some("cancelled"))
 
     // The replay resumes at the await; startAsChild is not re-executed.
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
@@ -538,7 +571,9 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
 
   test("a locked child row does not block the parent's terminal transition") {
     val parentGate = Signal[String]("pgate")
-    val childWf    = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val childWf    = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf = Workflow[String, String]("orders") { in =>
       childWf.startAsChild("c", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       Step.await[String]("pwait", Awaitable.SignalEvent(parentGate))
@@ -575,8 +610,12 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     }
 
     sweep(childWf)
-    assertEquals(childRow("worker", "c", scope).get.terminalState, Some("cancelled"),
-                 "after the lock is released, the sweep closes the child")
+    assertEquals(childRow("worker", "c", scope).get.cancelRequestedAt.isDefined, true,
+                 "after the lock is released, the sweep flags the child")
+
+    // The child's own run delivers the cancellation at its first checkpoint.
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
+    assertEquals(childRow("worker", "c", scope).get.terminalState, Some("cancelled"))
   }
 
   test("Info.parentId is cleared after delivery") {

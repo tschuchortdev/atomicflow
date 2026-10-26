@@ -32,13 +32,16 @@ CREATE TABLE child_close_requests (
   workflow_id VARCHAR NOT NULL,
   workflow_instance_key VARCHAR NOT NULL,
   workflow_instance_scope VARCHAR[] NOT NULL,
-  target_prefix VARCHAR[] NOT NULL,
+  scope_prefix VARCHAR[] NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, target_prefix),
+  PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope, scope_prefix),
   FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
     REFERENCES workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope)
     ON DELETE CASCADE
 );
+
+COMMENT ON COLUMN child_close_requests.scope_prefix IS
+  'An absolute prefix of the workflow_instance_scope of the children to close: the closing instance''s own identity segments followed by `instanceKey@generation` and, for a discarded region interior, the discarded step-scope path. A child matches when its scope equals this prefix on its first positions, so a later generation''s or iteration''s child never matches. There is no empty/wildcard prefix; a terminal or continuing-as-new parent targets exactly its current generation''s children, and children of older generations remain covered by the requests their own closing transitions recorded.';
 
 CREATE TABLE workflow_events (
   sequence_id BIGINT PRIMARY KEY,

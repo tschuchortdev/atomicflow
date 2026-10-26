@@ -173,9 +173,11 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(countSignalEvents(wf.id, "k"), 0, "directly addressed Signal events are deleted")
   }
 
-  test("continueAsNew closes CREATED children per policy: Cancel finalizes CANCELLED, Abandon detaches") {
+  test("continueAsNew flags CREATED children per policy: Cancel cancels on the child's first run, Abandon detaches") {
     val rt = newRuntime
-    val childWf = Workflow[String, String]("can-worker4") { in => in }
+    val childWf = Workflow[String, String]("can-worker4") { in =>
+      Step.atLeastOnce[String]("work") { in }
+    }
     val parentWf = Workflow[String, String]("can-parent4") { in =>
       childWf.startAsChild("cancel-child", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       childWf.startAsChild("abandon-child", "hi", parentClosePolicy = ParentClosePolicy.Abandon)
@@ -186,7 +188,15 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
 
     val scope = ScopePath("can-parent4", "p@0")
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+
+    val cc = childRow(childWf.id, "cancel-child", scope).get
+    assertEquals(cc.terminalState, None, "delivery flags the child; it is not finalized in place")
+    assertEquals(cc.cancelRequestedAt.isDefined, true, "cancel_requested_at is set on the CREATED child")
+    assertEquals(cc.parentWf, None, "the cancel child's active-parent pointer is cleared")
+    assertEquals(rt.runWorkflowInstance(childWf, WorkflowInstanceId(childWf.id, "cancel-child", scope)),
+                 WorkflowRunResult.WorkflowCancelled)
     assertEquals(childRow(childWf.id, "cancel-child", scope).get.terminalState, Some("cancelled"))
+
     val ab = childRow(childWf.id, "abandon-child", scope).get
     assertEquals(ab.terminalState, None, "an abandoned child is not cancelled")
     assertEquals(ab.cancelRequestedAt, None)

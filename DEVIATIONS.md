@@ -99,9 +99,10 @@ adds detail to, the documents in `spec/`.
   the periodic full subscription scan also finds subscriptions that committed
   concurrently with those events. Both passes retry database deadlocks.
 - Cancellation, lease recovery, and child-close sweeps use batches of 128.
-- Cancellation immediately finalizes an instance only when it has never run
-  and has no step, subscription, or wakeup records. Otherwise it is delivered
-  before the next uncached step or wait.
+- Cancellation is never finalized in place; it is delivered before the next
+  uncached step or wait, for every instance state including one that has never
+  run. A body that reaches a terminal state without passing a checkpoint
+  completes despite the pending cancel (first-terminal-event rule).
 - Internal test helpers allow manual driver cycles, sweeps, and injected run
   failures without starting a background loop.
 - Unconsumed directly addressed signals are deleted in the same

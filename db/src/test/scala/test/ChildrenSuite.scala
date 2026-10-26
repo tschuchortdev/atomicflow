@@ -178,10 +178,12 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(scopesOf(childWf.id, "worker-1"), Vector(Vector("orders", "order@42/foo@0")))
   }
 
-  test("ParentClosePolicy.Cancel on a CREATED child finalizes it CANCELLED immediately") {
+  test("ParentClosePolicy.Cancel on a CREATED child flags it; its first run cancels before the first step") {
     val rt = newRuntime
     val gate = Signal[String]("gate")
-    val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val childWf = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf = Workflow[String, String]("orders") { in =>
       childWf.startAsChild("worker-1", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       Step.await[String]("gate", Awaitable.SignalEvent(gate))
@@ -191,6 +193,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
     val scope = ScopePath("orders", "order-42@0")
+    val childId = WorkflowInstanceId(childWf.id, "worker-1", scope)
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, None)
 
     gate.send(parentId, "go")(using rt)
@@ -199,8 +202,14 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
     val row = childRow(childWf.id, "worker-1", scope).get
-    assertEquals(row.terminalState, Some("cancelled"), "a CREATED child under Cancel is finalized CANCELLED by delivery")
-    assertEquals(row.timesExecuted, 0)
+    assertEquals(row.terminalState, None, "delivery flags the child; it is not finalized in place")
+    assertEquals(row.cancelRequestedAt.isDefined, true, "cancel_requested_at is set on the CREATED child")
+    assertEquals(row.parentWf, None, "the active-parent pointer is cleared")
+
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
+    val finalRow = childRow(childWf.id, "worker-1", scope).get
+    assertEquals(finalRow.terminalState, Some("cancelled"), "the child's own run cancels at its first checkpoint")
+    assertEquals(finalRow.timesExecuted, 1)
   }
 
   test("ParentClosePolicy.Cancel on a SUSPENDED child flags it, wakes it, and cancels on the next run") {
@@ -300,7 +309,9 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
   test("ParentClosePolicy application is idempotent: terminating the parent twice gives the same end state") {
     val rt = newRuntime
     val gate = Signal[String]("gate")
-    val childWf = Workflow[String, String]("worker") { in => in.toUpperCase }
+    val childWf = Workflow[String, String]("worker") { in =>
+      Step.atLeastOnce[String]("work") { in.toUpperCase }
+    }
     val parentWf = Workflow[String, String]("orders") { in =>
       childWf.startAsChild("worker-1", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
       Step.await[String]("gate", Awaitable.SignalEvent(gate))
@@ -310,8 +321,12 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
 
     val scope = ScopePath("orders", "order-42@0")
+    val childId = WorkflowInstanceId(childWf.id, "worker-1", scope)
     rt.terminate(parentId)
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
+    assertEquals(childRow(childWf.id, "worker-1", scope).get.cancelRequestedAt.isDefined, true,
+                 "delivery flags the child")
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowCancelled)
     assertEquals(childRow(childWf.id, "worker-1", scope).get.terminalState, Some("cancelled"))
 
     rt.terminate(parentId)

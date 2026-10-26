@@ -192,7 +192,9 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
   test("children from discarded iterations close according to policy; later iterations use distinct identities") {
     val rt = newRuntime
     val gate = Signal[String]("gate")
-    val childWf = Workflow[String, String]("rl-worker") { in => in }
+    val childWf = Workflow[String, String]("rl-worker") { in =>
+      Step.atLeastOnce[String]("work") { in }
+    }
     val wf = Workflow[String, String]("rl-children") { in =>
       val r = Workflow.loop[Int, String]("R", 0) { (state, loop) =>
         childWf.startAsChild("c", "hi-" + state, parentClosePolicy = ParentClosePolicy.Cancel)
@@ -207,8 +209,19 @@ class RestartableSuite extends PostgresWorkflowRuntimeSuite {
 
     ChildCloseTestSupport.sweepChildCloses(rt, childWf)
 
+    val rows0 = childRows(childWf.id, "c")
+    assertEquals(rows0.size, 3, "one distinct child identity per iteration")
+
+    // Delivery flags the discarded iterations' children; each child's own run
+    // delivers the cancellation at its first checkpoint.
+    val discardedScopes = rows0.map(_._1).filter(s => s.contains("R@0") || s.contains("R@1"))
+    assertEquals(discardedScopes.size, 2)
+    discardedScopes.foreach { s =>
+      assertEquals(rt.runWorkflowInstance(childWf, WorkflowInstanceId(childWf.id, "c", ScopePath(s*))),
+                   WorkflowRunResult.WorkflowCancelled)
+    }
+
     val rows = childRows(childWf.id, "c")
-    assertEquals(rows.size, 3, "one distinct child identity per iteration")
     val cancelledScopes = rows.filter(_._2.contains("cancelled")).map(_._1)
     val activeScopes = rows.filter(_._2.isEmpty).map(_._1)
     assertEquals(cancelledScopes.size, 2, "children of the two discarded iterations are cancelled")
