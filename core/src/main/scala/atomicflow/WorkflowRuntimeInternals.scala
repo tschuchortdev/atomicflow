@@ -192,11 +192,9 @@ trait WorkflowRuntimeInternals {
       enclosingScopePath: ScopePath
   )(using Cacheable[In], Lease): WorkflowInstance[In, Out]
 
-  /** Upsert a coalesced wakeup row for an instance, `ON CONFLICT DO NOTHING` so an
-    * existing row's timestamps are never reset. The backend derives `scheduled_at`
-    * from its own clock (`clock.now + delay`).
-    */
-  def upsertWakeup(instanceId: WorkflowInstanceId, delay: FiniteDuration): Unit
+  /** Upsert a coalesced wakeup row due immediately for an instance,
+    * `ON CONFLICT DO NOTHING` so an existing row is never modified. */
+  def upsertWakeup(instanceId: WorkflowInstanceId): Unit
 
   /** Records the run's terminal outcome under the lease. A fenced write: throws
     * [[LeaseLostException]] when the guarded terminal transition affects no row —

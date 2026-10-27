@@ -86,7 +86,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""
         UPDATE workflow_instances
-        SET lease_owner = 'worker', fencing_token = fencing_token + 1, lease_expires_at = $leaseExpiry
+        SET fencing_token = fencing_token + 1, lease_expires_at = $leaseExpiry
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )
@@ -112,7 +112,7 @@ class SignalSuite extends PostgresWorkflowRuntimeSuite {
 
     val wake = run(
       sql"""
-        SELECT scheduled_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        SELECT created_at FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.query[
           Instant
         ].option

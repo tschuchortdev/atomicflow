@@ -97,10 +97,13 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
            "the parent's wakeup is gone; its completion await is otherwise unobservable")
 
     val settings = JobRunnerSettings.forTests.copy(
-      fullSubscriptionScanInterval = 0.millis,
-      maxConcurrentInstances = _ => 0
+      fullSubscriptionScanInterval = 0.millis
     )
-    val runner = rt.startJobRunnerForTests(Seq(parent), settings)
+    // The runner's registry holds only a bystander workflow, so the claim never
+    // touches the parent's wakeup while the dispatcher and full scan (which are
+    // registry-independent) still run every cycle.
+    val bystander = Workflow[String, String](id = "liv-parent-bystander")(in => s"out-$in")
+    val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
       runner.runDriverCycle()
       assertEquals(
@@ -146,10 +149,10 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     )
 
     val settings = JobRunnerSettings.forTests.copy(
-      fullSubscriptionScanInterval = 0.millis,
-      maxConcurrentInstances = _ => 0
+      fullSubscriptionScanInterval = 0.millis
     )
-    val runner = rt.startJobRunnerForTests(Seq(child), settings)
+    val bystander = Workflow[String, String](id = "liv-child-bystander")(in => s"out-$in")
+    val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
       runner.runDriverCycle()
       assertEquals(
@@ -200,10 +203,10 @@ class WakeupLivenessSuite extends PostgresWorkflowRuntimeSuite {
     )
 
     val settings = JobRunnerSettings.forTests.copy(
-      fullSubscriptionScanInterval = 0.millis,
-      maxConcurrentInstances = _ => 0
+      fullSubscriptionScanInterval = 0.millis
     )
-    val runner = rt.startJobRunnerForTests(Seq(child), settings)
+    val bystander = Workflow[String, String](id = "liv-child-some-bystander")(in => s"out-$in")
+    val runner = rt.startJobRunnerForTests(Seq(bystander), settings)
     try {
       runner.runDriverCycle()
       assertEquals(

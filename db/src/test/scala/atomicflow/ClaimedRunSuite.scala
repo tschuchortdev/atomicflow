@@ -15,7 +15,7 @@ class ClaimedRunSuite extends PostgresWorkflowRuntimeSuite {
     val wf = Workflow[String, String](id = "claimed-gone")(in => in)
 
     intercept[WorkflowNotFoundException] {
-      rt.runClaimedInstance(wf, WorkflowInstanceId(wf.id, "missing"), "worker", 0L)
+      rt.runClaimedInstance(wf, WorkflowInstanceId(wf.id, "missing"), 0L)
     }
   }
 
@@ -25,7 +25,7 @@ class ClaimedRunSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.Result("out-a"))
 
     assertEquals(
-      rt.runClaimedInstance(wf, WorkflowInstanceId(wf.id, "k"), "worker", 0L),
+      rt.runClaimedInstance(wf, WorkflowInstanceId(wf.id, "k"), 0L),
       WorkflowRunResult.Result("out-a")
     )
   }

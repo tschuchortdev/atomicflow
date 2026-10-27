@@ -73,7 +73,12 @@ enum SignalInheritance {
 }
 
 /** The public synchronous execution outcome of `run`/`createAndRun`/
-  * `blockUntilCompleted`. Failures still propagate as exceptions.
+  * `blockUntilCompleted`: suspension, cancellation, termination,
+  * continue-as-new, successful completion as [[Result]] — and [[Failed]],
+  * carrying the decoded failure of a workflow whose body failed. Callers match
+  * on the outcome; the runtime never rethrows a workflow's own failure. The job
+  * runner consumes the same outcome as a value (log the cause, never re-execute
+  * the instance).
   */
 enum WorkflowRunResult[+A] {
   case WorkflowSuspended
@@ -81,4 +86,5 @@ enum WorkflowRunResult[+A] {
   case WorkflowTerminated
   case ContinueAsNew
   case Result(value: A)
+  case Failed(cause: Throwable)
 }

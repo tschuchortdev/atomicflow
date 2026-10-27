@@ -62,14 +62,6 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
         ].option
     )
 
-  private def leaseOwner(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
-    run(
-      sql"""
-        SELECT lease_owner FROM workflow_instances
-        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-      """.query[Option[String]].option
-    ).flatten
-
   private def countWakeups(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""
@@ -323,7 +315,7 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "a").id
     run(
       sql"""
-        UPDATE workflow_instances SET lease_owner = 'some-worker', lease_expires_at = now() + interval '1 hour'
+        UPDATE workflow_instances SET lease_expires_at = now() + interval '1 hour'
         WHERE workflow_id = $wfId AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )
@@ -333,12 +325,11 @@ class TerminateSuite extends PostgresWorkflowRuntimeSuite {
 
     val row = instanceRow(wf.id, "k").get
     assertEquals(row._1, Some("terminated"))
-    assertEquals(row._3, before + 1, "terminate must bump the fencing token to revoke the lease")
-    assertEquals(leaseOwner(wf.id, "k"), None, "terminate must clear the lease owner")
+    assert(row._3 > before, "terminate must advance the fencing token to revoke the lease")
     assertEquals(leaseExpiry(wf.id, "k"), None, "terminate must clear the lease expiry")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowTerminated)
-    assertEquals(instanceRow(wf.id, "k").get._3, before + 1, "a terminal read short-circuits without re-acquiring")
+    assertEquals(instanceRow(wf.id, "k").get._3, row._3, "a terminal read short-circuits without re-acquiring")
   }
 
   test("an orphan fenced write after terminate throws LeaseLostException and does not become terminal") {

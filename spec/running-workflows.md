@@ -53,7 +53,8 @@ enum WorkflowRunResult[+A]:
 - `WorkflowSuspended` means execution durably suspended on an await.
 - `WorkflowCancelled` means cooperative cancellation escaped the workflow body.
 - `WorkflowTerminated` means the instance was force-stopped — by `runtime.terminate` or by the cancellation-timeout escalation.
-- `Result(value)` means the workflow completed successfully. Failures still propagate as exceptions.
+- `Result(value)` means the workflow completed successfully.
+- `Failed(cause)` means the workflow body failed and the failure is durably recorded; `cause` is the decoded failure. Public callers match on the outcome — the runtime never rethrows a workflow's own failure from `run`/`createAndRun`/`blockUntilCompleted`. (Awaiting a failed completion inside another workflow is different: `completionResult.get` rethrows in direct style, see below.)
 - Calling `run` again on a terminal instance returns the same outcome as the run that completed it — see "Re-run determinism".
 
 ## Run semantics
@@ -137,12 +138,11 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 - **Claim filtering**: the executor only selects wakeups whose instance's `workflowId` is in its registry — the claim query joins `workflow_instances` and filters by the known ids (see the claim query below). A wakeup of an unknown workflow is invisible to this runner, never claimed, never requeued. This is what allows **different applications with different code to share the same tables**: each application's runners claim only their own workflows.
 - A workflow known to no runner anywhere is not an error anywhere — its wakeups simply age. That failure mode is detected by wakeup-age alerting (see "Sources of work"), not by any runner failing.
 - **Permissive call sites**: `create`, `createAndScheduleForAsyncRun`, `createAndRun`, `run`, and `startAsChild` do not consult the registry. The in-hand `Workflow` object carries everything a direct call needs — identity, codecs, code — including inline execution until suspension.
-- **Concurrency resources.** By default the runner owns a daemon worker pool sized by `workerThreads`; `executor = Some(...)` overrides it with a user-supplied `Executor` (e.g. a virtual-thread-per-task executor). `maxConcurrentInstances` caps concurrently executing instances per `workflowId` (default unlimited).
-- **Cap enforcement at claim time.** Each runner process keeps an in-process permit count per `workflowId`. If a claimed instance's workflow is at capacity, the wakeup is deferred *in place* (`scheduled_at = now + capacityRetryDelay`, no lease taken) so a hot workflow can neither starve the FIFO batch nor pin a worker. Caps are per-process and multiply across processes; the lease still prevents concurrent execution of one instance. Caller-thread `run` bypasses caps — they are runner-side resource control, not a cross-process guarantee.
+- **Concurrency resources.** By default the runner owns a daemon worker pool sized by `workerThreads`; `executor = Some(...)` overrides it with a user-supplied `Executor` (e.g. a virtual-thread-per-task executor). The claim batch is bounded by `wakeupBatchSize`; there are no per-workflow concurrency caps or batch shares — a single hot workflow may fill every batch, and cross-workflow fairness is FIFO by wakeup age.
 
 ### Sources of wakeups
 
-`workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)` is the single scheduling queue. It holds **one row per instance** — many pending events coalesce — and every row means "this instance may have durable work". The queue is **instance-addressed only**: there are no rows meaning meta-work such as "run a thread which checks if a timer is due" — timer firing is time-driven, and only its *results* (a fired timer's wakeup for the owning instance) enter the queue. Every wakeup upsert (dispatcher, scan, timer sweep, cancel, create/start, recovery, requeue) uses `ON CONFLICT DO NOTHING` and never resets an existing row's timestamps. Sources:
+`workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, attempts)` is the single scheduling queue. It holds **one row per instance** — many pending events coalesce — and every row means "this instance may have durable work". The queue is **instance-addressed only**: there are no rows meaning meta-work such as "run a thread which checks if a timer is due" — timer firing is time-driven, and only its *results* (a fired timer's wakeup for the owning instance) enter the queue. Every wakeup upsert uses `ON CONFLICT DO NOTHING`: a row is created due immediately or left untouched, never delayed — there is no `scheduled_at` column and no per-row backoff. Sources:
 
 | Source | Upserts a wakeup when |
 |---|---|
@@ -151,36 +151,36 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 | Timer firing | the sweep appended a `TimerFired` event for a due, not-yet-fired timer subscription |
 | `cancel` | cancellation is requested while the instance has no live lease owner |
 | `createAndScheduleForAsyncRun` / `startAsChild` | schedules the first execution of a new instance |
-| Lease recovery sweep | a non-terminal instance's lease expired while held (worker crash) |
-| Executor requeue | a claimed run failed with a transient infrastructure error (delayed `scheduledAt`, `attempts + 1`) |
+| Lease recovery sweep | a non-terminal instance's lease expired while held (worker crash, or a failed post-run release) |
+| Technical-failure restore | a claimed run failed with a technical error: the wakeup is re-inserted with a fresh `created_at` (re-entering the claim FIFO at the back) and `attempts + 1`, and the lease is released in the same transaction |
 
-- `createdAt` records when the row was first inserted and is never modified — not by requeue, backoff, or capacity defer. `scheduledAt` is when the instance becomes runnable again. **Wakeup age** is measured from `createdAt` (how long the work has been pending); **overdue time** from `scheduledAt` (how long it could have run). Both are exported as metrics; the oldest due wakeup per workflow is the alert that flags work no runner claims — an unknown definition, all runners down, or anything else that prevents claiming.
+- `createdAt` records when the row was first inserted — or, after a technical-failure restore, when the instance was re-enqueued — and is otherwise never modified. **Wakeup age** is measured from `createdAt`; the oldest wakeup per workflow is the alert that flags work no runner is making progress on — an unknown definition, all runners down, or an instance that keeps failing technically (`attempts` grows).
 
 - The sender never evaluates payload filters and never touches Step results; it only appends the event. The wakeup is upserted asynchronously by the runner's watermark dispatch or full subscription scan (see `signals-timers.md`).
 - An event for a key nobody awaits creates no wakeup. The event stays in the log and the instance's next run finds it behind its cursor — wakeups accelerate subscribed awaits; the event log, not the queue, is the source of truth.
-- An event arriving while the instance is running is either observed by that run directly (the run evaluates awaits against events after the current `sequenceId`) or produces a wakeup row that the run re-checks before parking ("drain", below). A suspended instance always has a subscription, and the event log is the source of truth; the periodic full subscription scan is what catches any subscription committed concurrently with an event, so no event can be missed — correctness relies on the full scan, not on the writer.
+- An event arriving while the instance is running is either observed by that run directly (the run evaluates awaits against events after the current `sequenceId`) or produces a wakeup row that the next claim cycle picks up. A suspended instance always has a subscription, and the event log is the source of truth; the periodic full subscription scan is what catches any subscription committed concurrently with an event, so no event can be missed — correctness relies on the full scan, not on the writer.
 - Invariant: **a durably suspended instance always has at least one pending subscription row or one wakeup row.** Suspension commits together with its subscriptions; every operation that retires a subscription (await resolution, terminal cleanup) either produces the successor wakeup or is itself part of a run that re-evaluates the instance. Firing never retires a subscription (see `signals-timers.md`, "Why timer awaits need a subscription").
 
 ### The execution lease
 
-Ownership of an instance's execution is a **lease on the instance row, not a row lock and not an in-process mutex** (see `child-signal-inheritance.md`). Three columns on `workflow_instances`:
+Ownership of an instance's execution is a **lease on the instance row, not a row lock and not an in-process mutex** (see `child-signal-inheritance.md`). Two columns on `workflow_instances`:
 
 ```text
-lease_owner (nullable)   -- worker identity, opaque; any stable unique string
-                         -- (caller-thread runs and each runner name themselves)
-fencing_token (bigint)   -- stale-writer fence, incremented on every lease acquisition
-lease_expires_at (nullable timestamp)
+fencing_token (bigint)   -- ownership identity, drawn from a database sequence
+                         -- (never repeats): advanced on every lease acquisition
+                         -- and every revocation (recovery, termination)
+lease_expires_at (nullable timestamp)  -- liveness signal; NULL when unowned
 ```
 
 - **Acquire** is one conditional update — the sole concurrency arbiter between any two executors (runner threads, external `run` calls, other processes):
   ```sql
   UPDATE workflow_instances
-  SET lease_owner = :worker, fencing_token = fencing_token + 1, lease_expires_at = :now + :leaseDuration
+  SET fencing_token = nextval('workflow_fencing_token_seq'), lease_expires_at = :now + :leaseDuration
   WHERE workflow_instance_id = :id
     AND terminal_state IS NULL
-    AND (lease_owner IS NULL OR lease_expires_at <= :now)
+    AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
   ```
-  Zero rows updated means a live owner or a terminal instance; the acquirer backs off.
+  Zero rows updated means a live owner or a terminal instance; the acquirer backs off. The token is the ownership identity: at most one claim can hold the current token, and every ownership change (acquire or revocation) advances it, so a token-only guard always detects a stale writer. Drawing the token from a sequence — rather than incrementing the column — is what makes that guard safe across an instance's deletion and recreation (discard-existing and prefix deletes reset the row to its defaults; a sequence never resets).
 - **Renewal — `Workflow.heartbeat`.** There is no background heartbeater thread and the runtime does not renew the lease on its own; renewal happens only when the workflow's own thread calls `Workflow.heartbeat()`. `leaseDuration` must therefore exceed the longest gap between such calls. A lease that expires mid-Step invites takeover and at-least-once re-execution of that Step; fenced writes still prevent state corruption, but the side effect may duplicate.
 
 **`Workflow.heartbeat()` — public lease renewal**
@@ -205,7 +205,6 @@ object Workflow {
   UPDATE workflow_instances
   SET lease_expires_at = :now + :leaseDuration
   WHERE workflow_instance_id = :id
-    AND lease_owner = :worker
     AND fencing_token = :token
     AND terminal_state IS NULL
   ```
@@ -214,8 +213,8 @@ object Workflow {
 - **`Workflow.uncancellable` suppresses delivery, not renewal.** The region disables cancellation delivery only; a heartbeat inside it renews the lease even while a cancel is pending, so a long Saga compensation keeps its lease while the `cancelTimeout` escalation still bounds it.
 - Available only inside an executing workflow: the `(using WorkflowContext)` requirement makes external or off-thread calls unrepresentable.
 - **Fenced writes.** Every write that mutates execution state — Step rows, subscription rows, cursor movements, and the guarded terminal transition (on top of its `WHERE terminal_state IS NULL` guard) — carries `AND fencing_token = :token`. After a takeover, a stale run's next write affects zero rows; the runtime raises an internal `LeaseLostException` and aborts the run without durable effect.
-- **Release.** A run releases the lease when it ends (suspension, terminal state, abort). Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
-- **Expiry is the crash signal**: `lease_owner IS NOT NULL AND lease_expires_at <= now()` means the worker died or stalled; the recovery sweep re-enqueues the instance.
+- **Release.** A run releases the lease when it ends (suspension, terminal state, abort) by clearing `lease_expires_at`, guarded by its token. Release is an optimization for prompt takeover; correctness relies only on expiry plus fencing.
+- **Expiry is the crash signal**: `lease_expires_at IS NOT NULL AND lease_expires_at <= now()` means the worker died or stalled — or a post-completion release failed; the recovery sweep revokes the lease (clears the expiry and advances the fencing token, fencing out the crashed run) and re-enqueues non-terminal instances (terminal instances keep their outcome and only lose the stale lease). The expiry is re-checked in the recovery transaction itself, so a lease renewed or taken over between selection and recovery is never revoked.
 - External `run` on a leased instance waits for the lease up to `leaseAcquireTimeout` (bounded poll of the conditional update) and then throws a runtime-owned lease-unavailable exception. It never steals a live lease.
 
 ### Claiming wakeups and the run loop
@@ -225,20 +224,13 @@ Every runner process runs this loop; processes cooperate only through storage:
 ```text
 loop until stopped:
   BEGIN
-    due = WITH ranked AS (
-            SELECT w.workflow_instance_id, w.scheduled_at, w.attempts,
-                   ROW_NUMBER() OVER (PARTITION BY i.workflow_id
-                                      ORDER BY w.scheduled_at) AS share
-            FROM workflow_wakeups w
-            JOIN workflow_instances i USING (workflow_instance_id)
-            WHERE w.scheduled_at <= now()
-              AND i.terminal_state IS NULL
-              AND i.workflow_id IN (:knownWorkflowIds)     -- this runner's registry
-          )
-          SELECT r.* FROM ranked r
-          JOIN workflow_wakeups w USING (workflow_instance_id)
-          WHERE r.share <= :perWorkflowBatchShare
-          ORDER BY r.scheduled_at LIMIT :wakeupBatchSize
+    due = SELECT w.workflow_instance_id, w.created_at, w.attempts
+          FROM workflow_wakeups w
+          JOIN workflow_instances i USING (workflow_instance_id)
+          WHERE i.terminal_state IS NULL
+            AND (i.lease_expires_at IS NULL OR i.lease_expires_at <= now())  -- skip live-leased
+            AND i.workflow_id IN (:knownWorkflowIds)     -- this runner's registry
+          ORDER BY w.created_at LIMIT :wakeupBatchSize   -- FIFO by wakeup age
           FOR UPDATE OF w SKIP LOCKED
     claimed = for each selected row:
       lease acquire (conditional update above)   -- 0 rows → skip, row stays
@@ -249,20 +241,16 @@ loop until stopped:
     outcome = run(id)      // resolves the Workflow definition from the registry
                            // and decodes persisted input first; then the same
                            // code path as the public run API
-    on suspension: if a wakeup row exists again, loop again immediately (drain)
-    on terminal: done (the terminal transition already cleaned wakeups/subscriptions)
-    on abort:
-      lease still ours and terminal unset → requeue (transient failure, below)
-      lease lost → do nothing; the new owner is responsible
     release the lease if still ours
 ```
 
+- **Live-leased instances are excluded from the candidate selection** (`lease_expires_at IS NULL OR lease_expires_at <= now()`): an event-driven wakeup upserted while its instance is running would otherwise sit at the FIFO head, and at small batch sizes starve newer healthy work behind it. The conditional lease acquire below remains the final correctness check against races between the SELECT and the acquire.
 - **`FOR UPDATE SKIP LOCKED` on the wakeup rows** distributes disjoint batches to concurrent runners. Without it, every process polls the same FIFO head each cycle, races on the same lease acquires, and burns poll cycles on conflicts — correct, but wasteful and convoy-prone. SKIP LOCKED is an efficiency mechanism only: the conditional lease update remains the correctness arbiter against executors that do not select through this path (external `run`, lease takeover after expiry).
-- **Fairness.** The selection ranks due wakeups per `workflowId` and takes at most `perWorkflowBatchShare` of each per batch, ordered by `scheduledAt`. A burst from one workflow cannot monopolize the batch, and an instance queued behind N same-workflow instances waits at most ⌈N / share⌉ polls. Within one workflow it is FIFO by `scheduledAt`. Together with the per-workflow concurrency caps this bounds cross-workflow starvation; there is no cross-workflow ordering guarantee — the durable event order (`sequenceId`) remains the only ordering contract.
+- **Ordering is FIFO by wakeup age (`created_at`)** — there is no per-workflow ranking, batch share, or due-time filter, and no per-workflow concurrency cap. A single hot workflow may fill every batch; there is no cross-workflow ordering guarantee beyond age — the durable event order (`sequenceId`) remains the only ordering contract.
 - **Registry filter.** The join with `workflow_instances` and the `IN (:knownWorkflowIds)` predicate implement claim filtering (see "Definitions, registration, and execution resources"): unknown workflows are invisible to this runner, which is what allows several applications to share one set of tables.
-- Claim is atomic with lease acquisition: **the wakeup row is removed only when the worker has obtained the lease and accepted responsibility** (existing invariant). The delete matches the row's seen `scheduled_at`, so a row requeued with a future time by a previous failed attempt survives. On lease conflict the row stays and a later poll retries; the competing owner's own drain removes it.
-- **Classify outcomes by durable state, not by exception type.** After the run boundary, the worker checks `terminal_state`: if set, the run is done — including `FAILED` workflows, whose decoded failure is logged and metered, never rescheduled, and left inspectable via `terminal_outcome`. If unset and the lease was lost, the new owner is responsible. Only otherwise is the failure transient.
-- **Transient failures** (connection loss, deadlock, serialization failure): requeue with `created_at` unchanged, `scheduled_at = GREATEST(existing, now + backoff(attempts))`, and `attempts = attempts + 1`; capped exponential backoff, unbounded retries, `attempts` exported for alerting. A parked row delays only its own instance; other work proceeds.
+- Claim is atomic with lease acquisition: **the wakeup row is removed only when the worker has obtained the lease and accepted responsibility** (existing invariant). The delete addresses the row by its primary key. On lease conflict the row stays and a later poll retries; the competing owner's own claim removes it.
+- **Classify outcomes by exception type, never by re-reading durable state.** The run's outcome is known to the caller; the runner dispatches on it directly: a terminal outcome (including `FAILED`, returned as the `WorkflowRunResult.Failed` outcome whose `cause` is the decoded user failure) is done — logged and metered, never rescheduled, left inspectable via `terminal_outcome`; a lost lease leaves the instance to its new owner; a **technical failure** restores the wakeup (below); and any *unknown* exception escaping the run is treated as technical too — it is a library bug, not a workflow failure, and must never be persisted as one.
+- **Technical failures** (connection loss, serialization failure, timeout — raised by the runtime as `WorkflowTechnicalException`): restore the wakeup with a **fresh `created_at`** (the instance re-enters the claim FIFO at the back, so a repeatedly failing instance defers to all pre-existing work — its retry rate is throttled by however much older work remains; alone in the queue it retries as fast as its own runs fail, which `attempts` growth and the WARN logs make visible) and `attempts = attempts + 1`, and release the lease, **in one transaction — both or neither**. If the restore cannot commit (the database may still be down), the lease is deliberately left in place and the lease-expiry recovery sweep re-enqueues the instance, so the instance is never left with neither a wakeup nor an owned lease. Retries are unbounded; `attempts` is the durable alerting trace. Global pacing for an unreachable database needs no mechanism of its own: the claim transaction itself fails and the driver loop's cycle backoff applies.
 
 ### Background sweeps
 
@@ -271,13 +259,13 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 | Sweep | Predicate | Action |
 |---|---|---|
 | Timer firing | due, not-yet-fired timer subscriptions | fire + upsert wakeup (mechanics: `signals-timers.md`, "Timer firing: two paths, one primitive") |
-| Cancellation escalation | `cancel_requested_at IS NOT NULL AND terminal_state IS NULL AND cancel_requested_at <= now() - cancelTimeout` | guarded `terminate` transition: `TERMINATED` outcome, lease revoked (fencing-token bump), wakeups deleted |
-| Lease recovery | `lease_owner IS NOT NULL AND lease_expires_at <= now() AND terminal_state IS NULL` | clear `lease_owner`, upsert wakeup |
+| Cancellation escalation | `cancel_requested_at IS NOT NULL AND terminal_state IS NULL AND cancel_requested_at <= now() - cancelTimeout` | guarded `terminate` transition: `TERMINATED` outcome, lease revoked (fencing-token advance), wakeups deleted |
+| Lease recovery | `lease_expires_at IS NOT NULL AND lease_expires_at <= now()` | revoke the lease: clear `lease_expires_at` and advance `fencing_token` (fencing the crashed run out); upsert wakeup for non-terminal instances (a terminal instance's stale lease is only revoked). The expiry is re-checked inside the recovery transaction, so a lease renewed or taken over after selection is left alone |
 
 - The timer sweep processes due timers in deadline order within bounded batches (`timerBatchSize`), so timer catch-up (after downtime or mass registration) cannot starve signal and completion events.
 - **Timers progress without the sweep.** A manual run — no runner, no sweep — fires the await's own due timers during evaluation, so timer waits resolve correctly in manual mode too; the sweep exists only so *unattended* instances are noticed promptly. Mechanics in `signals-timers.md` ("Run semantics" above; "Timer firing: two paths, one primitive" there).
 - The escalation sweep implements `cancelTimeout` ("Cancellation and termination") and is the only path that turns a stuck `CANCELLING` instance into `TERMINATED`.
-- Lease recovery bounds worker crashes: the crashed run is fenced out by the next fencing-token bump, and the instance is replayed from its Step cache.
+- Lease recovery bounds worker crashes: the crashed run is fenced out by the fencing-token advance, and the instance is replayed from its Step cache.
 - The same sweep mechanism is the designated hook for future retention (auto-deletion of terminal instances).
 
 ### Children, created instances, and continue-as-new
@@ -289,9 +277,9 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 
 ### Transient failures and observability
 
-- Runner-level metrics: due-wakeup queue depth, wakeup age (per workflow: `now - created_at` of the oldest due row — the alert for work no runner claims), overdue time (`now - scheduled_at`), claim-to-start latency, timer firing lag, run duration, transient requeues (`attempts`), lease takeovers, cancellations escalated to `TERMINATED`, terminal `FAILED` outcomes.
+- Runner-level metrics: wakeup queue depth, wakeup age (per workflow: `now - created_at` of the oldest row — the alert for work no runner is progressing), claim-to-start latency, timer firing lag, run duration, technical-failure restores (`attempts`), lease takeovers, cancellations escalated to `TERMINATED`, terminal `FAILED` outcomes.
 - A runner whose storage is unavailable sleeps with backoff and keeps looping; its leases expire and other processes (or itself, later) recover the instances.
-- `workerThreads` (or the user-supplied `executor`) and `maxConcurrentInstances` bound concurrently *executing instances*; a run's internal parallelism (`Workflow.parallel`) is layered on top by the execution engine.
+- `workerThreads` (or the user-supplied `executor`) bounds concurrently *executing instances*; a run's internal parallelism (`Workflow.parallel`) is layered on top by the execution engine.
 
 ### Settings and backends
 
@@ -299,11 +287,8 @@ Timer firing, cancellation escalation, and lease recovery are internal operation
 case class JobRunnerSettings(
   workerThreads: Int,                   // runtime-owned daemon pool; ignored when executor is set
   executor: Option[Executor] = None,    // user-supplied pool override (e.g. virtual threads)
-  maxConcurrentInstances: WorkflowId => Int = { _ => Int.MaxValue }, // per-workflow cap, per process
-  capacityRetryDelay: FiniteDuration = 1.second, // in-place wakeup defer when a cap is reached
-  perWorkflowBatchShare: Int,           // fairness: max claimed wakeups per workflowId per batch
   pollInterval: FiniteDuration,         // wakeup poll; jittered per process
-  wakeupBatchSize: Int,
+  wakeupBatchSize: Int,                 // FIFO claim bound (no per-workflow shares or caps)
   timerSweepInterval: FiniteDuration,
   timerBatchSize: Int,
   sweepInterval: FiniteDuration,        // escalation + recovery sweeps
@@ -312,7 +297,6 @@ case class JobRunnerSettings(
   leaseDuration: FiniteDuration,        // must exceed the longest gap between Workflow.heartbeat calls
   leaseAcquireTimeout: FiniteDuration,  // wait bound for external run on a leased instance
   cancelTimeout: FiniteDuration,
-  workerId: Option[String] = None,    // lease_owner identity for this runner's claims; None → generated unique id
 )
 ```
 
@@ -718,7 +702,7 @@ val paginatedWf = Workflow("paginated-fetch") { (cursor: Cursor) =>
 
 - `blockUntilCompleted` — **Resolved**: passive waiter for the terminal outcome (see "Suspension and results"); tests drive progress with `run` and assert with `blockUntilCompleted`. `LISTEN/NOTIFY` is an optional latency optimization.
 - Retention / auto-deletion of completed instances. The job runner's sweep mechanism is the designated hook (see "Job runner and scheduling").
-- **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token bump (see "Job runner and scheduling").
+- **Cancellation mechanism** — **Resolved at design level**: delivery is scheduled through the wakeup queue, the `cancelTimeout` escalation is the background sweep, and `terminate` revokes the lease via the fencing-token advance (see "Job runner and scheduling").
 - **`Workflow.heartbeat`** — **Resolved**: public API on `Workflow` for explicit lease renewal (see "The execution lease"). The runtime does not renew the lease automatically; long-running Step bodies call it explicitly. Renewal is a fenced, token-preserving write. Heartbeat also delivers a pending cancellation (outside `Workflow.uncancellable`) instead of renewing, giving long-running Step bodies an in-body delivery point; the region suppresses the delivery but not the renewal.
-- **Scheduler tuning** — Priority/fairness classes beyond `perWorkflowBatchShare` and per-workflow caps, and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
+- **Scheduler tuning** — priority/fairness classes beyond FIFO-by-wakeup-age (e.g. per-workflow shares or concurrency caps), and Postgres claim-latency optimization (`LISTEN/NOTIFY` vs short poll) — see "Job runner and scheduling".
 - **`fork` / `forkFromFailure`** — `forkWorkflow` is specified in `continue-as-new-fork-reset.md`; its one open point there is the causal boundary for parallel-branch step prefixes. `forkFromFailure` is not yet specified.

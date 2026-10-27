@@ -263,7 +263,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val future = Instant.now().plusSeconds(3600)
     run(sql"""
       UPDATE workflow_instances
-      SET lease_owner = 'x', lease_expires_at = $future, times_executed = 1
+      SET lease_expires_at = $future, times_executed = 1
       WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}
     """.update.run)
     deleteWakeup(childWf.id, "worker-1", scope)
@@ -406,9 +406,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
       WHERE workflow_id = 'worker' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}
     """.update.run)
 
-    val conflict = intercept[RuntimeException] {
-      rt.runWorkflowInstance(parentWf, parentId)
-    }
+    val WorkflowRunResult.Failed(conflict) = rt.runWorkflowInstance(parentWf, parentId)
     assert(conflict.toString.contains("WorkflowInputConflictException"), conflict.toString)
     assert(!hasWakeup(childWf.id, "worker-1", scope), "a conflicting replay must not commit a wakeup side effect")
   }

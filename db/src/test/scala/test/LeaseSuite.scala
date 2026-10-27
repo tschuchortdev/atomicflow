@@ -120,7 +120,7 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(wf, "k", "a")
     run(
       sql"""
-        UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() - interval '1 hour'
+        UPDATE workflow_instances SET lease_expires_at = now() - interval '1 hour'
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )
@@ -130,6 +130,27 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     val row = instanceRow(wf.id, "k").get
     assertEquals(row._1, Some("completed"))
     assert(row._3 > 0, "the fencing token must be bumped on acquisition")
+  }
+
+  test("a recreated instance never reuses a previous incarnation's fencing token") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "recreate-token")(in => s"out-$in")
+
+    // First incarnation runs and holds a sequence-drawn token.
+    rt.createWorkflowInstance(wf, "k", "a")
+    assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("out-a"))
+    val firstToken = instanceRow(wf.id, "k").get._3
+    assert(firstToken > 0)
+
+    // Delete + recreate resets the row (fencing_token back to its default 0).
+    assert(rt.createWorkflowInstanceDiscardExisting(wf, "k", "b"))
+
+    // The replacement's first acquisition must draw from the sequence, so a run
+    // of the old incarnation paused at token `firstToken` could never pass the
+    // token-only fence again.
+    assertEquals(rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k")), WorkflowRunResult.Result("out-b"))
+    val secondToken = instanceRow(wf.id, "k").get._3
+    assert(secondToken > firstToken, "the new incarnation's token must exceed every previous incarnation's token")
   }
 
   test("WorkflowNonFatal matches LeaseLostException and LeaseUnavailableException") {

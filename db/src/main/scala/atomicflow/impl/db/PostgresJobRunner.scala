@@ -6,14 +6,14 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 import org.slf4j.LoggerFactory
 
-import java.util.concurrent.{ConcurrentHashMap, CountDownLatch, Executor, ExecutorService, Executors, ThreadFactory}
+import java.util.concurrent.{CountDownLatch, Executor, ExecutorService, Executors, ThreadFactory}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.concurrent.duration.*
 import cats.syntax.all.*
 
-/** Claims scheduled workflow runs and executes them on a bounded worker pool.
-  * A claim acquires the execution lease and removes the wakeup in one transaction.
-  * Only registered workflow definitions are run; each workflow gets a batch limit.
+/** Claims workflow wakeups and executes them on a bounded worker pool. A claim
+  * acquires the execution lease and removes the wakeup in one transaction; the
+  * claim is FIFO by wakeup age. Only registered workflow definitions are run.
   */
 final class PostgresJobRunner private[atomicflow] (
     runtime: PostgresWorkflowRuntime,
@@ -34,40 +34,7 @@ final class PostgresJobRunner private[atomicflow] (
     }
   }
 
-  /** The worker identity recorded under `lease_owner` for this runner's claims
-    * and leases: user-configurable via `JobRunnerSettings.workerId`, otherwise
-    * a generated unique id — two runners of the same runtime never share one.
-    */
-  private val runnerWorkerId: String =
-    settings.workerId.getOrElse(s"jobrunner-${java.util.UUID.randomUUID()}")
-
   private val isStopped = new AtomicBoolean(false)
-
-  private val RequeueBackoffBase: FiniteDuration = 1.second
-  private val RequeueBackoffCap: FiniteDuration = 5.minutes
-
-  private def requeueDelay(attempts: Int): FiniteDuration = {
-    val baseNanos = RequeueBackoffBase.toNanos
-    val delayNanos = baseNanos * (1L << math.min(attempts, 30))
-    (delayNanos.nanos) min RequeueBackoffCap
-  }
-
-  private val runningInstanceCounts = new ConcurrentHashMap[WorkflowId, java.lang.Integer]()
-
-  private def isWorkflowAtCapacity(workflowId: WorkflowId): Boolean =
-    runningInstanceCounts.getOrDefault(workflowId, java.lang.Integer.valueOf(0)).intValue() >=
-      settings.maxConcurrentInstances(workflowId)
-
-  private def acquirePermit(workflowId: WorkflowId): Unit =
-    runningInstanceCounts.merge(workflowId, java.lang.Integer.valueOf(1), (a: Integer, b: Integer) =>
-      java.lang.Integer.valueOf(a + b)
-    )
-
-  private def releasePermit(workflowId: WorkflowId): Unit =
-    runningInstanceCounts.computeIfPresent(
-      workflowId,
-      (_: WorkflowId, v: java.lang.Integer) => if (v <= 1) null else java.lang.Integer.valueOf(v - 1)
-    )
 
   /** Tests can replace this function to fail a claimed run before its body starts.
     * The lease remains owned and the instance has no terminal state, allowing
@@ -106,45 +73,41 @@ final class PostgresJobRunner private[atomicflow] (
       instanceKey: WorkflowInstanceKey,
       scope: ScopePath,
       createdAt: java.time.Instant,
-      scheduledAt: java.time.Instant,
       attempts: Int
   )
 
   private final case class ClaimedInstance(
       instanceId: WorkflowInstanceId,
-      worker: String,
       token: Long,
-      attempts: Int,
-      createdAt: java.time.Instant
+      attempts: Int
   )
 
-  /** The ranked claim: per-workflow ROW_NUMBER over due, non-terminal wakeups of
-    * registered workflows, bounded per workflow by `perWorkflowBatchShare` and
-    * overall by `wakeupBatchSize`, locking the selected wakeup rows with
-    * `FOR UPDATE SKIP LOCKED`. Runs in the caller's transaction so the lease
-    * acquire and the wakeup delete are atomic with it.
+  /** The claim: FIFO over non-terminal wakeups of registered workflows, oldest
+    * `created_at` first, bounded by `wakeupBatchSize`, locking the selected
+    * wakeup rows with `FOR UPDATE SKIP LOCKED`. Runs in the caller's transaction
+    * so the lease acquire and the wakeup delete are atomic with it. There is no
+    * due-time filter and no per-workflow ranking: every wakeup row means "this
+    * instance needs execution", and a technically failing instance re-enters the
+    * FIFO at the back (its restore records a fresh `created_at`), which is what
+    * throttles it without any per-instance retry state. Instances holding a
+    * live lease are excluded from the candidate selection (an event-driven
+    * wakeup upserted while its instance is running would otherwise sit at the
+    * FIFO head and starve newer work behind it); the conditional lease acquire
+    * below remains the final correctness check against races.
     */
   private def claimDueWakeups(): Vector[ClaimedInstance] = {
     val now = runtime.clock.instant()
     val ids: List[WorkflowId] = workflowDefinitionsRegistry.keys.toList
     val query =
       fr"""
-        WITH ranked AS (
-          SELECT w.workflow_id, w.workflow_instance_key, w.workflow_instance_scope, w.created_at, w.scheduled_at, w.attempts,
-                 ROW_NUMBER() OVER (PARTITION BY w.workflow_id ORDER BY w.scheduled_at, w.workflow_instance_key) AS share
-          FROM workflow_wakeups w
-          JOIN workflow_instances i
-            ON i.workflow_id = w.workflow_id AND i.workflow_instance_key = w.workflow_instance_key AND i.workflow_instance_scope = w.workflow_instance_scope
-          WHERE w.scheduled_at <= $now
-            AND i.terminal_state IS NULL
-            AND w.workflow_id = ANY($ids)
-        )
-        SELECT r.workflow_id, r.workflow_instance_key, r.workflow_instance_scope, r.created_at, r.scheduled_at, r.attempts
-        FROM ranked r
-        JOIN workflow_wakeups w
-          ON w.workflow_id = r.workflow_id AND w.workflow_instance_key = r.workflow_instance_key AND w.workflow_instance_scope = r.workflow_instance_scope
-        WHERE r.share <= ${settings.perWorkflowBatchShare}
-        ORDER BY r.scheduled_at, r.workflow_id, r.workflow_instance_key
+        SELECT w.workflow_id, w.workflow_instance_key, w.workflow_instance_scope, w.created_at, w.attempts
+        FROM workflow_wakeups w
+        JOIN workflow_instances i
+          ON i.workflow_id = w.workflow_id AND i.workflow_instance_key = w.workflow_instance_key AND i.workflow_instance_scope = w.workflow_instance_scope
+        WHERE i.terminal_state IS NULL
+          AND (i.lease_expires_at IS NULL OR i.lease_expires_at <= $now)
+          AND w.workflow_id = ANY($ids)
+        ORDER BY w.created_at, w.workflow_instance_key
         LIMIT ${settings.wakeupBatchSize}
         FOR UPDATE OF w SKIP LOCKED
       """
@@ -152,62 +115,21 @@ final class PostgresJobRunner private[atomicflow] (
       for {
         rows <- query.query[DueWakeupRow].to[Vector]
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
-          if (isWorkflowAtCapacity(row.workflowId)) deferWakeupIO(row, now).as(acc)
-          else
-            runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope, runnerWorkerId, settings.leaseDuration).flatMap {
-              case Some(token) =>
-                sql"""
-                      DELETE FROM workflow_wakeups
-                      WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
-                        AND scheduled_at = ${row.scheduledAt}
-                """
-                  .update.run
-                  .map { _ =>
-                    acquirePermit(row.workflowId)
-                    acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), runnerWorkerId, token, row.attempts, row.createdAt)
-                  }
-              case None => acc.pure[ConnectionIO]
-            }
+          runtime.tryAcquireLeaseQ(row.workflowId, row.instanceKey, row.scope, settings.leaseDuration).flatMap {
+            case Some(token) =>
+              sql"""
+                    DELETE FROM workflow_wakeups
+                    WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
+              """
+                .update.run
+                .map { _ =>
+                  acc :+ ClaimedInstance(WorkflowInstanceId(row.workflowId, row.instanceKey, row.scope), token, row.attempts)
+                }
+            case None => acc.pure[ConnectionIO]
+          }
         }
       } yield claimed
     }
-  }
-
-  /** Defer a wakeup in place when its workflow is at capacity: push `scheduled_at`
-    * out by `capacityRetryDelay` (no lease taken, attempts untouched) so a hot
-    * workflow neither starves the FIFO batch nor pins a worker. Matches the row's
-    * seen `scheduled_at` so a concurrently requeued/future row is not clobbered.
-    */
-  private def deferWakeupIO(row: DueWakeupRow, now: java.time.Instant): ConnectionIO[Unit] = {
-    val deferred = now.plus(java.time.Duration.ofNanos(settings.capacityRetryDelay.toNanos))
-    sql"""
-          UPDATE workflow_wakeups
-          SET scheduled_at = $deferred
-          WHERE workflow_id = ${row.workflowId} AND workflow_instance_key = ${row.instanceKey} AND workflow_instance_scope = ${row.scope}
-            AND scheduled_at = ${row.scheduledAt}
-    """.update.run.map(_ => ())
-  }
-
-  /** Requeues a claimed wakeup after a transient failure. One transaction: the
-    * row was deleted at claim, but a racing delivery may have re-inserted it, so
-    * an upsert preserves the original `created_at` carried from the claim (a fresh
-    * insert records `createdAt`; a conflict keeps the existing row's `created_at`
-    * unchanged), pushes `scheduled_at` out to the capped exponential backoff
-    * (never earlier than an existing future time), and bumps `attempts` by one.
-    */
-  private[atomicflow] def requeueTransient(instanceId: WorkflowInstanceId, attempts: Int, createdAt: java.time.Instant): Unit = {
-    val scheduledAt = runtime.clock.instant().plus(java.time.Duration.ofNanos(requeueDelay(attempts).toNanos))
-    runtime.runTransaction {
-      sql"""
-            INSERT INTO workflow_wakeups (workflow_id, workflow_instance_key, workflow_instance_scope, created_at, scheduled_at, attempts)
-            VALUES (${instanceId.workflowId}, ${instanceId.workflowInstanceKey}, ${instanceId.scope}, $createdAt, $scheduledAt, ${attempts + 1})
-            ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO UPDATE
-            SET created_at = workflow_wakeups.created_at,
-                scheduled_at = GREATEST(workflow_wakeups.scheduled_at, EXCLUDED.scheduled_at),
-                attempts = workflow_wakeups.attempts + 1
-      """.update.run
-    }
-    ()
   }
 
   private def dispatchRun(c: ClaimedInstance): Unit = {
@@ -217,46 +139,62 @@ final class PostgresJobRunner private[atomicflow] (
         val result = runtime.runClaimedInstance(
           workflow,
           c.instanceId,
-          c.worker,
           c.token
         )(using settings.throwableCacheable)
         result match {
+          case WorkflowRunResult.Failed(cause) =>
+            // The workflow reached its durable terminal FAILED outcome (the
+            // cause is the decoded user failure): never re-execute.
+            logger.warn(s"Workflow instance ${c.instanceId} failed and will not be rescheduled", cause)
           case WorkflowRunResult.WorkflowSuspended =>
             logger.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
           case other =>
             logger.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
         }
       })
+      // Normal outcome (result, suspension, terminal decode — FAILED included):
+      // the lease is ours and the instance is either suspended (subscriptions
+      // cover it) or terminal, so release and move on.
+      runtime.releaseLeaseIfStillOwned(c.instanceId, c.token)
     } catch {
       case _: WorkflowNotFoundException =>
+        // The instance was deleted between claim and run (e.g. discard-existing):
+        // its lease row is gone with it, nothing to release or restore.
         logger.warn(s"Claimed workflow instance ${c.instanceId} was not found; wakeup already consumed")
+
+      case _: LeaseLostException =>
+        // Another owner took over (or the instance was terminated): that owner
+        // is responsible for the instance and its scheduling.
+        logger.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
+
+      case e: WorkflowTechnicalException =>
+        logger.warn(s"Workflow instance ${c.instanceId} ended with a technical failure; restoring its wakeup", e)
+        restoreAfterFailure(c)
+
       case e: Throwable =>
-        classifyFailure(c, e)
-    } finally {
-      runtime.releaseLeaseIfStillOwned(c.instanceId, c.worker, c.token)
-      releasePermit(c.instanceId.workflowId)
+        // An unknown exception escaping the run is a library bug, not a workflow
+        // failure. It must never be persisted as one; restoring the wakeup keeps
+        // the instance re-executable (and, if deterministic, visibly retried).
+        logger.error(s"Workflow instance ${c.instanceId} ended with an unexpected internal error; treating it as technical", e)
+        restoreAfterFailure(c)
     }
   }
 
-  /** Classifies a run that ended by throwing, by the instance's durable state
-    * rather than the exception type: terminal (including FAILED, which is logged
-    * and never rescheduled), lease lost (new owner responsible), or transient
-    * (requeued with capped exponential backoff, unbounded retries).
+  /** Restores the wakeup and releases the lease after a technical failure. If
+    * the restore transaction itself cannot commit (the database may still be
+    * down), the lease is deliberately left in place: the lease-expiry recovery
+    * sweep then clears it and upserts the wakeup, so the instance is never left
+    * with neither a wakeup nor an owned lease. A lease that cannot be released
+    * on a terminal outcome likewise expires into the recovery sweep.
     */
-  private def classifyFailure(c: ClaimedInstance, e: Throwable): Unit =
-    runtime.readTerminalState(c.instanceId) match {
-      case Some("failed") =>
-        logger.warn(s"Workflow instance ${c.instanceId} failed and will not be rescheduled", e)
-
-      case Some(_) =>
-        logger.debug(s"Workflow instance ${c.instanceId} reached a terminal state; adopting its outcome")
-
-      case None =>
-        if (runtime.isLeaseStillOwned(c.instanceId, c.worker, c.token)) {
-          logger.warn(s"Workflow instance ${c.instanceId} ended with a transient failure; requeueing with backoff", e)
-          requeueTransient(c.instanceId, c.attempts, c.createdAt)
-        } else
-          logger.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
+  private def restoreAfterFailure(c: ClaimedInstance): Unit =
+    try runtime.restoreWakeupAndReleaseLease(c.instanceId, c.token, c.attempts)
+    catch {
+      case e: Throwable =>
+        logger.warn(
+          s"Could not restore the wakeup of ${c.instanceId}; leaving its lease for the recovery sweep",
+          e
+        )
     }
 
   private def dispatchAndAwait(claimed: Vector[ClaimedInstance]): Unit = {
@@ -273,10 +211,8 @@ final class PostgresJobRunner private[atomicflow] (
         })
       } catch {
         case e: Throwable =>
-          logger.warn(s"Executor rejected the dispatch of ${c.instanceId}; requeueing", e)
-          runtime.releaseLeaseIfStillOwned(c.instanceId, c.worker, c.token)
-          releasePermit(c.instanceId.workflowId)
-          requeueTransient(c.instanceId, c.attempts, c.createdAt)
+          logger.warn(s"Executor rejected the dispatch of ${c.instanceId}; restoring its wakeup", e)
+          restoreAfterFailure(c)
           latch.countDown()
       }
     }
@@ -361,18 +297,21 @@ final class PostgresJobRunner private[atomicflow] (
     escalated
   }
 
-  /** Lease recovery: clears the owner of every non-terminal instance whose lease
-    * has expired (the crashed run is fenced out by the next acquire's
-    * fencing-token bump) and upserts the instance's wakeup so it is replayed
-    * from its Step cache. Bounded batch of 128. Idempotent. Returns the number
-    * of leases recovered.
+  /** Lease recovery: revokes every instance whose lease has expired — clearing
+    * the expiry and advancing the fencing token, so the crashed run is fenced out
+    * by the next guarded write — and upserts the non-terminal instance's wakeup
+    * so it is replayed from its Step cache. Terminal instances only get their
+    * stale lease revoked (a failed post-completion release must not linger);
+    * the expiry is re-checked inside the recovery transaction itself, so a lease
+    * renewed or taken over after selection is left alone. Bounded batch of 128.
+    * Idempotent. Returns the number of leases recovered.
     */
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
     val rows = runtime.runTransaction {
       sql"""
             SELECT workflow_id, workflow_instance_key, workflow_instance_scope FROM workflow_instances
-            WHERE lease_owner IS NOT NULL AND lease_expires_at <= $now AND terminal_state IS NULL
+            WHERE lease_expires_at IS NOT NULL AND lease_expires_at <= $now
             LIMIT 128
       """
         .query[InstanceRow].to[Vector]

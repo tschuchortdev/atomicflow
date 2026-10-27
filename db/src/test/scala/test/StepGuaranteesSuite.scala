@@ -248,7 +248,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
 
     // The run engine replays body-level failures through the throwable codec,
     // so the conflict surfaces as the decoded failure carrying the conflict message.
-    val failure = intercept[RuntimeException](rt.runWorkflowInstance(wf, id))
+    val WorkflowRunResult.Failed(failure) = rt.runWorkflowInstance(wf, id)
     assert(failure.toString.contains("StepKeyConflictException"))
     assertEquals(
       run(

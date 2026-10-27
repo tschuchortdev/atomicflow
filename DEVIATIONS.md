@@ -46,6 +46,13 @@ adds detail to, the documents in `spec/`.
   through `withLease`, which guarantees the lease is released.
 - The handle's identity is stable during a run. A backend that mutates its
   contents must support concurrent access from parallel branches.
+- The Postgres lease has no owner column: the fencing token is the ownership
+  identity. Every acquire advances it, and so does every revocation (lease
+  recovery, termination), so a token-only guard fences out superseded runs;
+  `lease_expires_at` is the liveness signal the recovery sweep acts on.
+  The token comes from a database sequence, so it never repeats across an
+  instance's deletion and recreation. `JobRunnerSettings.workerId` is
+  therefore gone.
 - `WorkflowContext` holds the enclosing step scope and cancellation-suppression
   depth. Nested scopes pass an immutable copy to their bodies, so a captured
   context works on another thread without thread-local state.
@@ -90,15 +97,58 @@ adds detail to, the documents in `spec/`.
 
 ## Scheduling and cancellation
 
-- A runner processes a claimed batch before claiming another. Per-workflow
-  limits control batch share and concurrent execution.
-- Transient execution failures are rescheduled with unbounded retries and
-  exponential delay: 1 second initially, capped at 5 minutes.
+- The claim is FIFO by wakeup age: every wakeup row means "this instance needs
+  execution", ordered by `created_at`, bounded per cycle by `wakeupBatchSize`.
+  Instances holding a live lease are excluded from the candidate selection, so a
+  wakeup upserted while its instance runs cannot starve newer work. There is no
+  `scheduled_at` column, no per-workflow batch share, and no
+  per-workflow concurrency cap. A single hot workflow may fill every batch.
+- Run outcomes are classified by type and value, never by re-reading durable
+  state. A terminal outcome is final and never rescheduled; a lost
+  lease leaves the instance to its new owner. `FAILED` reaches the runner as
+  the `WorkflowRunResult.Failed` outcome, and public entry points return it the
+  same way — callers match on the outcome; the runtime never rethrows a
+  workflow's own failure.
+- Exceptions escaping the runtime's transactions are split by type, not by a
+  predicate: everything the library raises deliberately carries a
+  `WorkflowException` marker (public API contracts, sealed control flow,
+  runtime-internal markers, and the private carrier for user code inside a
+  transaction) and passes through unwrapped; everything else — connection loss,
+  serialization failure, timeout, an unexpected internal error, or a violated
+  internal `require` invariant — is wrapped in a
+  `WorkflowTechnicalException` (never persisted as a workflow or step
+  failure). `resetWorkflow`'s documented terminal-instance
+  `IllegalStateException` is thrown as an anonymous mixin so it keeps its
+  contract across the boundary.
+- A technical failure restores the wakeup with a fresh `created_at` (the
+  instance re-enters the claim FIFO at the back, throttling a repeatedly failing
+  instance to at most one attempt per queue drain — alone in the queue it
+  retries as fast as its own runs fail) and `attempts + 1`, and
+  releases the lease, in one transaction — both or neither. If the restore
+  cannot commit, the lease is left for the lease-expiry recovery sweep, so an
+  instance is never left with neither a wakeup nor an owned lease. Retries are
+  unbounded; `attempts` is the durable alerting trace. An unreachable database
+  needs no additional pacing: the claim transaction itself fails and the driver
+  loop's cycle backoff applies.
+- Lease recovery re-checks the expiry inside its own transaction, so a lease
+  renewed by a heartbeat or taken over after the sweep's selection is never
+  cleared; terminal instances lose only a stale lease, never their outcome.
+- A technical failure inside a `Workflow.parallel` branch is a collected branch
+  outcome, joined like every other: no branch is interrupted by an
+  infrastructure abort, so no sibling Step can persist an
+  interrupt-caused durable failure. At the join point the technical failure
+  wins over control flow, failures, and suspension.
+- User code that runs inside a transaction — the `decide` callback of an await
+  evaluation (signal filters, `Awaitable.map` functions) — has its exceptions
+  carried out of the transaction intact; a workflow-code failure there is never
+  reclassified as a technical failure.
 - Signal sends and completion transitions append events without scheduling
   subscribers in their transactions. Event dispatch handles recent events;
   the periodic full subscription scan also finds subscriptions that committed
   concurrently with those events. Both passes retry database deadlocks.
 - Cancellation, lease recovery, and child-close sweeps use batches of 128.
+  Lease recovery also clears a stale lease on a terminal instance (without
+  scheduling it) so a failed post-completion release cannot linger.
 - Cancellation is never finalized in place; it is delivered before the next
   uncached step or wait, for every instance state including one that has never
   run. A body that reaches a terminal state without passing a checkpoint
@@ -111,6 +161,14 @@ adds detail to, the documents in `spec/`.
 - `sendSignal` rejects terminal instances by checking `terminal_state` under
   the same instance-row-lock used by completion. There is no separate
   `is_accepting_signals` flag.
+- `createWorkflowInstanceDiscardExisting` deletes the identity's events
+  explicitly (events have no foreign key to instances), so a re-created
+  identity starts with an empty event log instead of inheriting its previous
+  incarnation's signal events behind a reset cursor. The transaction locks the
+  instance row first, in the same order as signal sends: a send racing a
+  discard either has its signal deleted with the old incarnation, or is
+  rejected with `WorkflowNotFoundException` — it can never leak into the new
+  incarnation.
 
 ## Child workflows and history changes
 

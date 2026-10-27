@@ -57,25 +57,28 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
   private def wakeupRow(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey
-  ): Option[(Instant, Instant, Int)] =
+  ): Option[(Instant, Int)] =
     run(
       sql"""
-        SELECT created_at, scheduled_at, attempts FROM workflow_wakeups
+        SELECT created_at, attempts FROM workflow_wakeups
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-      """.query[(Instant, Instant, Int)].option
+      """.query[(Instant, Int)].option
     )
 
-  private def deleteWakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Unit =
-    run(sql"""
-      DELETE FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-    """.update.run)
-
-  private def leaseOwner(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
+  private def wakeupCount(workflowId: WorkflowId, key: WorkflowInstanceKey): Int =
     run(
       sql"""
-        SELECT lease_owner FROM workflow_instances
+        SELECT COUNT(*) FROM workflow_wakeups
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
-      """.query[Option[String]].unique
+      """.query[Int].unique
+    )
+
+  private def leaseExpiresAt(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[Instant] =
+    run(
+      sql"""
+        SELECT lease_expires_at FROM workflow_instances
+        WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
+      """.query[Option[Instant]].unique
     )
 
   test("started runner claims the createAndScheduleForAsyncRun wakeup and completes the instance autonomously") {
@@ -116,22 +119,19 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("the ranked claim honors perWorkflowBatchShare fairness across workflows") {
+  test("the claim is FIFO by wakeup age across workflows") {
     val rt = newRuntime
-    val wfA = simpleWf("fa")
-    val wfB = simpleWf("fb")
-    (1 to 3).foreach(i => wfA.createAndScheduleForAsyncRun(s"a$i", "x")(using rt))
-    (1 to 3).foreach(i => wfB.createAndScheduleForAsyncRun(s"b$i", "x")(using rt))
-    val runner = rt.startJobRunnerForTests(
-      Seq(wfA, wfB),
-      JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 1, wakeupBatchSize = 2)
-    )
+    val wfA = simpleWf("fifo-a")
+    val wfB = simpleWf("fifo-b")
+    wfA.createAndScheduleForAsyncRun("a1", "x")(using rt)
+    wfB.createAndScheduleForAsyncRun("b1", "x")(using rt)
+    wfA.createAndScheduleForAsyncRun("a2", "x")(using rt)
+    val runner = rt.startJobRunnerForTests(Seq(wfA, wfB), JobRunnerSettings.forTests.copy(wakeupBatchSize = 2))
     try {
       runner.runDriverCycle()
       val claimed = runner.lastClaimedBatch
       assertEquals(claimed.size, 2)
-      assert(claimed.exists(_.workflowId == wfA.id), s"expected a workflow A instance in the batch, got $claimed")
-      assert(claimed.exists(_.workflowId == wfB.id), s"expected a workflow B instance in the batch, got $claimed")
+      assertEquals(claimed.map(_.workflowInstanceKey), Vector("a1", "b1"), "oldest wakeups first, regardless of workflow")
     } finally runner.stop(1.second)
   }
 
@@ -142,7 +142,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""
         UPDATE workflow_instances
-        SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
+        SET lease_expires_at = now() + interval '1 hour'
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )
@@ -264,7 +264,7 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("a transient failure requeues the wakeup with backoff, attempts+1, and created_at preserved") {
+  test("a technical failure restores the wakeup with a fresh created_at, attempts+1, and releases the lease") {
     val t0 = Instant.parse("2026-01-02T00:00:00Z")
     val clock = new TestClock(t0)
     val rt = newRuntime(clock)
@@ -277,47 +277,39 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       runner.runDriverCycle()
       assertEquals(runner.lastClaimedBatch, Vector(inst.id))
       val row = wakeupRow(wf.id, "k").get
-      assertEquals(row._3, 1, "first requeue must set attempts to 1")
-      assertEquals(row._1, t0, "created_at must be preserved across the claim->requeue cycle, not reset to now")
-      assert(row._2.isAfter(clock.instant()), "scheduled_at must be pushed into the future by backoff")
+      assertEquals(row._2, 1, "the first restore must set attempts to 1")
+      assertEquals(row._1, clock.instant(), "created_at must be fresh, so the instance re-enters the FIFO at the back")
+      assertEquals(leaseExpiresAt(wf.id, "k"), None, "the restore must release the lease in the same transaction")
+      assertEquals(instanceRow(wf.id, "k").get._1, None, "a technical failure must not terminalize the instance")
     } finally runner.stop(1.second)
   }
 
-  test("requeue preserves created_at across requeues while attempts and backoff grow") {
-    val t0 = Instant.parse("2026-01-02T00:00:00Z")
-    val clock = new TestClock(t0)
-    val rt = newRuntime(clock)
+  test("repeated technical failures keep the instance re-executable and grow attempts") {
+    val rt = newRuntime
     val wf = simpleWf("req2")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
-      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
-      deleteWakeup(wf.id, "k")
-      runner.requeueTransient(inst.id, 0, t0)
-      val first = wakeupRow(wf.id, "k").get
-      assertEquals(first._3, 1)
-      assertEquals(first._1, t0)
-      val firstScheduled = first._2
-      clock.advanceBy(1.second)
-      runner.requeueTransient(inst.id, 1, t0)
-      val second = wakeupRow(wf.id, "k").get
-      assertEquals(second._3, 2, "the second requeue must bump attempts to 2")
-      assertEquals(second._1, t0, "created_at must be unchanged across requeues")
-      assert(second._2.isAfter(firstScheduled), "backoff must grow with attempts")
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1)
+      runner.runDriverCycle()
+      val row = wakeupRow(wf.id, "k").get
+      assertEquals(row._2, 2, "the second restore must bump attempts to 2")
+      assertEquals(instanceRow(wf.id, "k").get._1, None, "still re-executable: no durable failure was recorded")
     } finally runner.stop(1.second)
   }
 
-  test("after a transient requeue the next cycle runs the instance to completion") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val rt = newRuntime(clock)
+  test("after a technical failure the next cycle runs the instance to completion") {
+    val rt = newRuntime
     val wf = simpleWf("reqok")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
       runner.testRunWrapper = _ => throw new RuntimeException("simulated infrastructure failure")
       runner.runDriverCycle()
-      assertEquals(wakeupRow(wf.id, "k").get._3, 1)
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1)
       runner.testRunWrapper = run => run()
-      clock.advanceBy(10.seconds)
       runner.runDriverCycle()
       val row = instanceRow(wf.id, "k").get
       assertEquals(row._1, Some("completed"))
@@ -325,9 +317,22 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("a lease-lost run is not requeued; the new owner is responsible") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val rt = newRuntime(clock)
+  test("a WorkflowTechnicalException abort is classified as technical: restored, never terminalized") {
+    val rt = newRuntime
+    val wf = simpleWf("wte")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new WorkflowTechnicalException(new RuntimeException("db down"))
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1, "the wakeup must be restored for re-execution")
+      assertEquals(leaseExpiresAt(wf.id, "k"), None, "the restore must release the lease")
+      assertEquals(instanceRow(wf.id, "k").get._1, None, "a technical failure must not terminalize the instance")
+    } finally runner.stop(1.second)
+  }
+
+  test("a lease-lost run is not restored; the new owner is responsible") {
+    val rt = newRuntime
     val wf = simpleWf("leaselost")
     val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
@@ -335,81 +340,179 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       runner.testRunWrapper = { _ =>
         run(
           sql"""
-            UPDATE workflow_instances SET lease_owner = 'other', fencing_token = fencing_token + 1,
+            UPDATE workflow_instances SET fencing_token = fencing_token + 1,
             lease_expires_at = now() + interval '1 hour'
             WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
           """.update.run
         )
-        throw new RuntimeException("simulated infrastructure failure")
+        throw new LeaseLostException("simulated fenced write after a takeover")
       }
       runner.runDriverCycle()
-      assert(!wakeupExists(wf.id, "k"), "no requeue may occur when the lease was lost")
+      assert(!wakeupExists(wf.id, "k"), "no wakeup may be restored when the lease was lost")
+      assert(leaseExpiresAt(wf.id, "k").exists(_.isAfter(Instant.now())), "the new owner's lease must be untouched")
     } finally runner.stop(1.second)
   }
 
-  test("per-workflow cap defers excess due instances in place without a lease") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val rt = newRuntime(clock)
-    val wf = simpleWf("cap")
-    val settings = JobRunnerSettings.forTests.copy(
-      maxConcurrentInstances = id => if (id == wf.id) 1 else Int.MaxValue,
-      capacityRetryDelay = 5.seconds
+  test("a technically failing instance re-enters the FIFO at the back, behind older wakeups") {
+    val rt = newRuntime
+    val poison = simpleWf("poison")
+    val healthy = simpleWf("poison-healthy")
+    // The poison is created first, so it is initially the oldest wakeup.
+    val pInst = poison.createAndScheduleForAsyncRun("p1", "x")(using rt)
+    healthy.createAndScheduleForAsyncRun("h1", "x")(using rt)
+    val runner = rt.startJobRunnerForTests(
+      Seq(healthy, poison),
+      JobRunnerSettings.forTests.copy(wakeupBatchSize = 1)
     )
-    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
     try {
-      wf.createAndScheduleForAsyncRun("k1", "x")(using rt)
-      wf.createAndScheduleForAsyncRun("k2", "x")(using rt)
+      // Cycle 1 claims the oldest wakeup (p1), which fails technically and
+      // re-enters the FIFO with a fresh created_at.
+      runner.testRunWrapper = _ => throw new RuntimeException("poison")
       runner.runDriverCycle()
-      assertEquals(runner.lastClaimedBatch.size, 1, "only one instance may be claimed under the cap")
-      val deferred = wakeupRow(wf.id, "k2").get
-      assertEquals(deferred._3, 0, "defer must not touch attempts")
-      assertEquals(deferred._2, clock.instant().plusSeconds(5), "deferred in place by capacityRetryDelay")
-      assertEquals(leaseOwner(wf.id, "k2"), None, "no lease may be taken on a deferred instance")
-      assertEquals(instanceRow(wf.id, "k1").get._1, Some("completed"))
-      clock.advanceBy(6.seconds)
+      assertEquals(runner.lastClaimedBatch.map(_.workflowInstanceKey), Vector("p1"))
+      assertEquals(wakeupRow(poison.id, "p1").get._2, 1)
+      // Cycle 2 must claim h1 — created after the poison, but before its
+      // restore — so the failing instance defers to all pre-existing work.
+      runner.testRunWrapper = run => run()
       runner.runDriverCycle()
-      assertEquals(instanceRow(wf.id, "k2").get._1, Some("completed"))
+      assertEquals(runner.lastClaimedBatch.map(_.workflowInstanceKey), Vector("h1"))
+      assertEquals(instanceRow(healthy.id, "h1").get._1, Some("completed"))
+      // Cycle 3 finally retries the poison, which now completes.
+      runner.runDriverCycle()
+      assertEquals(runner.lastClaimedBatch.map(_.workflowInstanceKey), Vector("p1"))
+      assertEquals(instanceRow(poison.id, "p1").get._1, Some("completed"))
     } finally runner.stop(1.second)
   }
 
-  test("an injected failure releases its permit, so retries are not starved by the cap") {
-    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
-    val rt = newRuntime(clock)
-    val wf = simpleWf("caprel")
-    val settings = JobRunnerSettings.forTests.copy(
-      maxConcurrentInstances = id => if (id == wf.id) 1 else Int.MaxValue,
-      capacityRetryDelay = 5.seconds
-    )
-    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
+  test("a lease left behind by a failed restore is recovered by the recovery sweep") {
+    // Simulates the end state of a technical failure whose restore transaction
+    // could not commit: the lease is still owned and the wakeup is gone. The
+    // lease-expiry recovery sweep is the backstop that re-schedules the instance.
+    val rt = newRuntime
+    val wf = simpleWf("restorerecover")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
     try {
       wf.createAndScheduleForAsyncRun("k", "x")(using rt)
-      runner.testRunWrapper = _ => throw new RuntimeException("boom")
-      runner.runDriverCycle()
-      assertEquals(wakeupRow(wf.id, "k").get._3, 1, "transient failure requeued the wakeup")
-      runner.testRunWrapper = run => run()
-      clock.advanceBy(10.seconds)
+      run(
+        sql"""
+          UPDATE workflow_instances SET lease_expires_at = now() + interval '1 hour'
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
+      )
+      run(sql"DELETE FROM workflow_wakeups WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'".update.run)
+      assert(!wakeupExists(wf.id, "k"))
+      assert(leaseExpiresAt(wf.id, "k").isDefined, "the lease must still be recorded")
+      // Expire the lease; the sweep must revoke it and re-upsert the wakeup.
+      run(
+        sql"""
+          UPDATE workflow_instances SET lease_expires_at = now() - interval '1 hour'
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.update.run
+      )
+      runner.runRecoverySweep()
+      assert(wakeupExists(wf.id, "k"), "the recovery sweep must re-schedule a lease whose restore was lost")
+      assertEquals(leaseExpiresAt(wf.id, "k"), None)
       runner.runDriverCycle()
       assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
     } finally runner.stop(1.second)
   }
 
-  test("a burst from one workflow cannot monopolize a claim batch") {
+  test("a wakeup for a live-leased instance does not block newer healthy wakeups") {
     val rt = newRuntime
-    val wfA = simpleWf("bursta")
-    val wfB = simpleWf("burstb")
-    (1 to 10).foreach(i => wfA.createAndScheduleForAsyncRun(s"a$i", "x")(using rt))
-    (1 to 10).foreach(i => wfB.createAndScheduleForAsyncRun(s"b$i", "x")(using rt))
+    val busy = simpleWf("headbusy")
+    val healthy = simpleWf("headhealthy")
+    // The busy instance holds a live lease and has the oldest wakeup (as an
+    // event-driven upsert during its run would create).
+    busy.createAndScheduleForAsyncRun("b", "x")(using rt)
+    run(
+      sql"""
+        UPDATE workflow_instances SET lease_expires_at = now() + interval '1 hour'
+        WHERE workflow_id = ${busy.id} AND workflow_instance_key = 'b' AND workflow_instance_scope = '{}'
+      """.update.run
+    )
+    healthy.createAndScheduleForAsyncRun("h", "x")(using rt)
     val runner = rt.startJobRunnerForTests(
-      Seq(wfA, wfB),
-      JobRunnerSettings.forTests.copy(perWorkflowBatchShare = 4, wakeupBatchSize = 8)
+      Seq(busy, healthy),
+      JobRunnerSettings.forTests.copy(wakeupBatchSize = 1)
     )
     try {
       runner.runDriverCycle()
-      val claimed = runner.lastClaimedBatch
-      assertEquals(claimed.size, 8)
-      assertEquals(claimed.count(_.workflowId == wfA.id), 4, "workflow A must get at most its share")
-      assertEquals(claimed.count(_.workflowId == wfB.id), 4, "workflow B must get at most its share")
+      assertEquals(
+        runner.lastClaimedBatch.map(_.workflowInstanceKey),
+        Vector("h"),
+        "the live-leased head must be skipped in the candidate selection, not starve the newer healthy wakeup"
+      )
+      assert(wakeupExists(busy.id, "b"), "the busy instance's wakeup must stay for when its lease frees up")
     } finally runner.stop(1.second)
+  }
+
+  test("a run that fails technically after the instance turned terminal leaves no wakeup") {
+    val rt = newRuntime
+    val wf = simpleWf("termafter")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
+      runner.testRunWrapper = { _ =>
+        // Another worker terminalizes the instance while this run is failing.
+        rt.terminate(WorkflowInstanceId(wf.id, "k"))
+        throw new WorkflowTechnicalException(new RuntimeException("db down"))
+      }
+      runner.runDriverCycle()
+      assertEquals(instanceRow(wf.id, "k").get._1, Some("terminated"))
+      assert(!wakeupExists(wf.id, "k"), "the restore must not resurrect a wakeup for a terminal instance")
+    } finally runner.stop(1.second)
+  }
+
+  test("a racing event delivery coalesces with the restored wakeup") {
+    val rt = newRuntime
+    val wf = simpleWf("coalesce")
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try {
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
+      runner.testRunWrapper = _ => throw new WorkflowTechnicalException(new RuntimeException("db down"))
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1, "restored by the technical-failure path")
+      // An event-driven delivery lands after the restore: it must not reset
+      // attempts or duplicate the row.
+      rt.dispatchNewEvents(1000)
+      assertEquals(wakeupCount(wf.id, "k"), 1, "at most one wakeup row per instance")
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1, "the coalesced delivery must not reset attempts")
+    } finally runner.stop(1.second)
+  }
+
+  test("an executor rejection restores the wakeup and releases the lease") {
+    val rt = newRuntime
+    val wf = simpleWf("rejected")
+    val rejecting = new java.util.concurrent.Executor {
+      def execute(r: Runnable): Unit = throw new java.util.concurrent.RejectedExecutionException("down")
+    }
+    val runner = rt.startJobRunnerForTests(
+      Seq(wf),
+      JobRunnerSettings.forTests.copy(executor = Some(rejecting))
+    )
+    try {
+      wf.createAndScheduleForAsyncRun("k", "x")(using rt)
+      runner.runDriverCycle()
+      assertEquals(wakeupRow(wf.id, "k").get._2, 1, "the rejected dispatch must restore the wakeup")
+      assertEquals(leaseExpiresAt(wf.id, "k"), None, "the restore must release the lease")
+    } finally runner.stop(1.second)
+  }
+
+  test("recovery does not clear a lease that was renewed or taken over after expiry selection") {
+    val rt = newRuntime
+    val wf = simpleWf("recerenew")
+    rt.createAndScheduleForAsyncRun(wf, "k", "x")
+    run(
+      sql"""
+        UPDATE workflow_instances SET lease_expires_at = now() + interval '1 hour'
+        WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+      """.update.run
+    )
+    // The sweep would not select this lease (not expired); a racing acquisition
+    // between selection and recovery is guarded by the same expiry predicate
+    // inside recoverLease itself.
+    assertEquals(rt.recoverLease(WorkflowInstanceId(wf.id, "k")), false)
+    assert(leaseExpiresAt(wf.id, "k").exists(_.isAfter(Instant.now())), "a live lease must survive recovery")
   }
 
   test("executor override: dispatched runs execute on the supplied executor and stop does not shut it down") {
@@ -437,18 +540,6 @@ class JobRunnerSuite extends PostgresWorkflowRuntimeSuite {
       executor.execute(() => marker.set(true))
       waitUntil(marker.get())
     } finally executor.shutdownNow()
-  }
-
-  test("caller-thread run bypasses per-workflow caps") {
-    val rt = newRuntime
-    val wf = simpleWf("bypass")
-    val settings = JobRunnerSettings.forTests.copy(maxConcurrentInstances = _ => 0)
-    val runner = rt.startJobRunnerForTests(Seq(wf), settings)
-    try {
-      val inst = wf.createAndScheduleForAsyncRun("k", "x")(using rt)
-      assertEquals(rt.runWorkflowInstance(wf, inst.id), WorkflowRunResult.Result("done-x"))
-      assertEquals(instanceRow(wf.id, "k").get._1, Some("completed"))
-    } finally runner.stop(1.second)
   }
 
   test("duplicate workflow ids in the registry are rejected at start") {

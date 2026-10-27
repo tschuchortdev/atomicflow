@@ -350,7 +350,9 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
     val aId = rt.createWorkflowInstance(aWf, "a2", "in").id
 
     assertEquals(rt.runWorkflowInstance(aWf, aId), WorkflowRunResult.WorkflowSuspended)
-    intercept[RuntimeException] { rt.runWorkflowInstance(bWf, bId) }
+    rt.runWorkflowInstance(bWf, bId) match
+      case WorkflowRunResult.Failed(failure) => assert(failure.toString.contains("boom"))
+      case other                             => fail(s"expected Failed, got $other")
     val failed = rt.runWorkflowInstance(aWf, aId)
     assert(failed.toString.contains("failed:") && failed.toString.contains("boom"), s"decoded failure message: $failed")
   }
@@ -443,29 +445,24 @@ class AwaitRaceSuite extends PostgresWorkflowRuntimeSuite {
   test("awaitRace rejects empty, duplicate, and reserved-prefixed member keys") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
-    def runBody(id: String, members: Seq[(String, Awaitable[String])]): Unit = {
+    def failingCause(id: String, members: Seq[(String, Awaitable[String])]): Throwable =
       val wf = Workflow[String, String](id = id) { in =>
         Step.awaitRace[String]("race")(members*)
         "done"
       }
       val instance = rt.createWorkflowInstance(wf, "k", "in").id
-      rt.runWorkflowInstance(wf, instance)
-    }
+      rt.runWorkflowInstance(wf, instance) match
+        case WorkflowRunResult.Failed(cause) => cause
+        case other                           => fail(s"expected Failed, got $other")
     val sig = Signal[String]("s")
 
-    val empty = intercept[RuntimeException] {
-      runBody("race-invalid-empty", Seq("" -> Awaitable.SignalEvent(sig)))
-    }
+    val empty = failingCause("race-invalid-empty", Seq("" -> Awaitable.SignalEvent(sig)))
     assert(empty.getMessage.contains("non-empty"), empty.getMessage)
 
-    val duplicate = intercept[RuntimeException] {
-      runBody("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
-    }
+    val duplicate = failingCause("race-invalid-duplicate", Seq("dup" -> Awaitable.SignalEvent(sig), "dup" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     assert(duplicate.getMessage.contains("unique"), duplicate.getMessage)
 
-    val reserved = intercept[RuntimeException] {
-      runBody("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
-    }
+    val reserved = failingCause("race-invalid-reserved", Seq("__retry__" -> Awaitable.Timer(clock.instant().plusSeconds(60)).map(_ => "timeout")))
     assert(reserved.getMessage.contains("reserved"), reserved.getMessage)
   }
 }
