@@ -36,9 +36,8 @@ final class PostgresJobRunner private[atomicflow] (
 
   private val isStopped = new AtomicBoolean(false)
 
-  /** Tests can replace this function to fail a claimed run before its body starts.
-    * The lease remains owned and the instance has no terminal state, allowing
-    * tests to verify that the runner schedules another attempt.
+  /** Test hook for failing a claimed run before its body starts, exercising
+    * rescheduling while the lease is still owned and the instance is non-terminal.
     */
   @volatile
   private[atomicflow] var testRunWrapper: (() => Unit) => Unit = run => run()
@@ -82,18 +81,12 @@ final class PostgresJobRunner private[atomicflow] (
       attempts: Int
   )
 
-  /** The claim: FIFO over non-terminal wakeups of registered workflows, oldest
-    * `created_at` first, bounded by `wakeupBatchSize`, locking the selected
-    * wakeup rows with `FOR UPDATE SKIP LOCKED`. Runs in the caller's transaction
-    * so the lease acquire and the wakeup delete are atomic with it. There is no
-    * due-time filter and no per-workflow ranking: every wakeup row means "this
-    * instance needs execution", and a technically failing instance re-enters the
-    * FIFO at the back (its restore records a fresh `created_at`), which is what
-    * throttles it without any per-instance retry state. Instances holding a
-    * live lease are excluded from the candidate selection (an event-driven
-    * wakeup upserted while its instance is running would otherwise sit at the
-    * FIFO head and starve newer work behind it); the conditional lease acquire
-    * below remains the final correctness check against races.
+  /** Claims a FIFO batch for registered, non-terminal instances, atomically
+    * acquiring leases and deleting wakeups. Technical failures rejoin the back
+    * of the queue with a fresh `created_at`.
+    *
+    * Exclude live leases so running instances cannot block the FIFO head.
+    * Conditional lease acquisition still guards against races.
     */
   private def claimDueWakeups(): Vector[ClaimedInstance] = {
     val now = runtime.clock.instant()
@@ -143,8 +136,6 @@ final class PostgresJobRunner private[atomicflow] (
         )(using settings.throwableCacheable)
         result match {
           case WorkflowRunResult.Failed(cause) =>
-            // The workflow reached its durable terminal FAILED outcome (the
-            // cause is the decoded user failure): never re-execute.
             logger.warn(s"Workflow instance ${c.instanceId} failed and will not be rescheduled", cause)
           case WorkflowRunResult.WorkflowSuspended =>
             logger.debug(s"Workflow instance ${c.instanceId} suspended (runner)")
@@ -152,19 +143,14 @@ final class PostgresJobRunner private[atomicflow] (
             logger.debug(s"Workflow instance ${c.instanceId} finished (runner): $other")
         }
       })
-      // Normal outcome (result, suspension, terminal decode — FAILED included):
-      // the lease is ours and the instance is either suspended (subscriptions
-      // cover it) or terminal, so release and move on.
+      // Suspended instances have subscriptions; terminal instances need no wakeup.
       runtime.releaseLeaseIfStillOwned(c.instanceId, c.token)
     } catch {
       case _: WorkflowNotFoundException =>
-        // The instance was deleted between claim and run (e.g. discard-existing):
-        // its lease row is gone with it, nothing to release or restore.
+        // Deletion between claim and run also removed the lease.
         logger.warn(s"Claimed workflow instance ${c.instanceId} was not found; wakeup already consumed")
 
       case _: LeaseLostException =>
-        // Another owner took over (or the instance was terminated): that owner
-        // is responsible for the instance and its scheduling.
         logger.debug(s"Workflow instance ${c.instanceId} lost its lease; the new owner is responsible")
 
       case e: WorkflowTechnicalException =>
@@ -172,20 +158,15 @@ final class PostgresJobRunner private[atomicflow] (
         restoreAfterFailure(c)
 
       case e: Throwable =>
-        // An unknown exception escaping the run is a library bug, not a workflow
-        // failure. It must never be persisted as one; restoring the wakeup keeps
-        // the instance re-executable (and, if deterministic, visibly retried).
+        // Internal errors must remain retryable, never persisted as workflow failures.
         logger.error(s"Workflow instance ${c.instanceId} ended with an unexpected internal error; treating it as technical", e)
         restoreAfterFailure(c)
     }
   }
 
-  /** Restores the wakeup and releases the lease after a technical failure. If
-    * the restore transaction itself cannot commit (the database may still be
-    * down), the lease is deliberately left in place: the lease-expiry recovery
-    * sweep then clears it and upserts the wakeup, so the instance is never left
-    * with neither a wakeup nor an owned lease. A lease that cannot be released
-    * on a terminal outcome likewise expires into the recovery sweep.
+  /** Restores the wakeup and releases the lease after a technical failure.
+    * If restoration fails, retain the lease for expiry recovery so the instance
+    * always has either a wakeup or an owned lease.
     */
   private def restoreAfterFailure(c: ClaimedInstance): Unit =
     try runtime.restoreWakeupAndReleaseLease(c.instanceId, c.token, c.attempts)
@@ -232,14 +213,10 @@ final class PostgresJobRunner private[atomicflow] (
       scope: ScopePath
   )
 
-  /** Background timer firing. Claims due, not-yet-fired timer
-    * subscriptions of non-terminal instances in deadline order, bounded by
-    * `timerBatchSize`, locking the subscription rows with `FOR UPDATE OF s SKIP
-    * LOCKED` (the claim; no delete). Each claimed row is then fired in its own
-    * transaction via the shared [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]]
-    * primitive, which re-checks no event exists under the lock. The subscription
-    * row survives firing. Definition-agnostic: services every workflow in the
-    * shared tables. Returns the number of timers fired.
+  /** Fires a deadline-ordered batch of due timers across all workflow definitions.
+    * Each fires in its own transaction via
+    * [[PostgresWorkflowRuntime.fireTimerSubscriptionQ]], which rechecks for an
+    * existing event under lock and retains the subscription. Returns the fired count.
     */
   private[atomicflow] def runTimerSweep(): Int = {
     val now = runtime.clock.instant()
@@ -297,14 +274,10 @@ final class PostgresJobRunner private[atomicflow] (
     escalated
   }
 
-  /** Lease recovery: revokes every instance whose lease has expired — clearing
-    * the expiry and advancing the fencing token, so the crashed run is fenced out
-    * by the next guarded write — and upserts the non-terminal instance's wakeup
-    * so it is replayed from its Step cache. Terminal instances only get their
-    * stale lease revoked (a failed post-completion release must not linger);
-    * the expiry is re-checked inside the recovery transaction itself, so a lease
-    * renewed or taken over after selection is left alone. Bounded batch of 128.
-    * Idempotent. Returns the number of leases recovered.
+  /** Recovers up to 128 expired leases by clearing expiry and advancing the
+    * fencing token. Non-terminal instances also receive a replay wakeup.
+    * Rechecks expiry transactionally to preserve renewed or replaced leases.
+    * Idempotent; returns the recovered count.
     */
   private[atomicflow] def runRecoverySweep(): Int = {
     val now = runtime.clock.instant()
@@ -325,11 +298,9 @@ final class PostgresJobRunner private[atomicflow] (
     recovered
   }
 
-  /** Child-close delivery: applies pending `ParentClosePolicy` closures
-    * recorded as rows in the dedicated `child_close_requests` table, and
-    * detaches children whose parent rows are gone. Each child is closed in its
-    * own short transaction so no transaction ever locks another instance's
-    * rows. Idempotent. Returns the number of children closed.
+  /** Applies pending `ParentClosePolicy` requests and detaches orphaned children.
+    * Each child closes in its own transaction to avoid cross-instance locks.
+    * Idempotent; returns the closed count.
     */
   private[atomicflow] def runChildCloseSweep(): Int =
     runtime.closePendingChildClosures(128)
@@ -340,21 +311,12 @@ final class PostgresJobRunner private[atomicflow] (
   private var lastChildCloseSweep: Long = 0L
   private var lastFullScan: Long = 0L
 
-  /** Two asynchronous wakeup jobs back the liveness guarantee:
+  /** Writers only append events, avoiding locks on subscribers.
     *
-    * Writers (signal sends and terminal transitions) only append events, so
-    * their transactions stay short and cannot deadlock against subscribers. A
-    * best-effort watermark dispatcher (`dispatchNewEvents`) replays events after
-    * a stored watermark and upserts the wakeups they imply, giving low-latency
-    * wakeups for the common case where the subscription already exists when the
-    * event is appended. A periodic full subscription scan
-    * (`scanAllSubscriptions`) re-examines every pending signal/completion
-    * subscription and wakes every non-terminal instance with a visible,
-    * unconsumed candidate — the correctness guarantee for the rare race where a
-    * subscription and an event commit concurrently, the dispatcher misses the
-    * subscription and advances its watermark past the event, so the next scan
-    * must re-check all subscriptions. The full scan cadence is
-    * `fullSubscriptionScanInterval` (default 1 minute).
+    * `dispatchNewEvents` provides low-latency wakeups using a watermark.
+    * Concurrent event/subscription commits can be missed after the watermark
+    * advances, so `scanAllSubscriptions` periodically rechecks every pending
+    * subscription to guarantee liveness.
     */
   private def runSweepsDue(): Unit = {
     val now = System.nanoTime()
@@ -390,11 +352,8 @@ final class PostgresJobRunner private[atomicflow] (
     dispatchAndAwait(claimed)
   }
 
-  /** The most recent batch of workflow instance ids claimed, either by a
-    * `runDriverCycle` call or by the running driver loop. Package-private test
-    * hook; written by a driver thread and read by test threads, so it is
-    * `@volatile`. Caveat: a concurrently running driver loop can clobber the
-    * value a `runDriverCycle` caller just set.
+  /** Latest claimed batch, shared with test threads. A concurrent driver loop
+    * may overwrite the batch set by `runDriverCycle`.
     */
   @volatile
   private[atomicflow] var lastClaimedBatch: Vector[WorkflowInstanceId] = Vector.empty

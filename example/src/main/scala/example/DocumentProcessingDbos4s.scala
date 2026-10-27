@@ -11,35 +11,17 @@ import java.nio.file.{Files, NoSuchFileException, Path}
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.util.control.NonFatal
 
-/** A document-processing batch workflow: wait for an input file to be announced,
-  * read and archive it, run virus checks and encryption per document, upload
-  * each document to a processing endpoint, poll for the processing outcome, and
-  * report the batch result.
+/** DBOS document-processing workflow: await a file, archive it, check, sign and
+  * upload its documents, then poll for completion and report the batch result.
   *
-  * This is the dbos4s equivalent of [[DocumentProcessingWorkflow4s]] and
-  * [[DocumentProcessingAtomicflow]]. It runs on DBOS Transact (via the dbos4s
-  * Scala bindings): `dbos.workflow` for the durable body, `dbos.step` for the
-  * checkpointed side effects, `dbos.recv`/`dbos.send` for signals and
-  * `dbos.sleep` for durable timers.
-  *
-  * Deviations from the workflows4s variant, forced by the DBOS model:
-  *   - DBOS workflows are no-argument, so the `inputFileFound` start signal
-  *     becomes a `recv` at the top of the workflow body (the idempotency key is
-  *     the file id, and the path is delivered with `send`/[[announceInputFileFound]]).
-  *     DBOS `recv` needs a finite timeout; a year stands in for the indefinite
-  *     await of the workflows4s signal.
-  *   - DBOS has no mid-workflow interruption, so the `userCancelsUploadOfInputFile`
-  *     signal is polled with a zero-timeout `recv` between phases and while
-  *     polling for upload status (an external `dbos.cancel(workflowId)` remains
-  *     available as an operational measure).
-  *   - Steps inside one DBOS workflow are strictly ordered, so the two virus
-  *     checks run sequentially instead of in parallel.
-  *   - Upload retries are bounded per step (`maxAttempts`), where workflows4s
-  *     retried the whole sign-and-upload block indefinitely; the signature
-  *     validity period is still enforced by restarting sign-and-upload when the
-  *     upload missed it.
-  *   - Step outputs must round-trip through the DBOS serializer, so steps return
-  *     JSON strings that the workflow body decodes.
+  * Differences from [[DocumentProcessingWorkflow4s]]:
+  *   - No-argument workflows receive the file path via [[announceInputFileFound]],
+  *     using the file id as the idempotency key. A one-year receive timeout
+  *     approximates an indefinite wait.
+  *   - Cancellation is polled between phases and during status polling.
+  *   - Ordered steps require sequential virus checks.
+  *   - Upload retries are bounded per step; expired signatures trigger re-signing.
+  *   - Step results use JSON strings to round-trip through the DBOS serializer.
   *
   * Production wiring:
   * {{{
@@ -69,14 +51,11 @@ class DocumentProcessingDbos4s(
     * short outcome summary ("processed ...", "cancelled by user", "failed: ...").
     */
   lazy val batchWorkflow: Workflow[String] = dbos.workflow("document-batch-processing") {
-    // The durable equivalent of the workflows4s `inputFileFound` start signal.
     val inputFilePath: Option[Path] =
       dbos.recv[String](Topic.inputFileFound, WaitForInputFile).map(Path.of(_))
 
     inputFilePath match {
       case None =>
-        // The (practically unreachable) start-signal timeout. workflows4s
-        // would wait forever; DBOS recv needs a finite deadline.
         "failed: no input file was announced"
       case Some(path) =>
         try processInputFile(path)
@@ -91,12 +70,8 @@ class DocumentProcessingDbos4s(
     }
   }
 
-  /** Read and parse the input file, archive it, process every document, and
-    * report the batch result. Durably restartable at every step boundary.
-    */
   private def processInputFile(inputFilePath: Path): String = {
-    // Parse inside the step so the recorded JSON output survives the archive
-    // move; replay never needs the original file again.
+    // Persist the parsed batch so replay no longer needs the archived file.
     val batchJson = dbos.step("read-input-file") {
       val fileContent =
         try Files.readString(inputFilePath)
@@ -109,9 +84,7 @@ class DocumentProcessingDbos4s(
 
     throwIfCancelledByUser()
 
-    // On a replay after a crash between move and step commit, the file is
-    // already gone; that counts as archived. A failed archive attempt is
-    // retried once after 30 seconds, mirroring the workflows4s retryOnce.
+    // A crash after the move but before step commit leaves the file already archived.
     dbos.step("archive-input-file", maxAttempts = 2, retryInterval = ArchiveRetryInterval) {
       try {
         Files.createDirectories(archiveDir)
@@ -125,7 +98,6 @@ class DocumentProcessingDbos4s(
 
     throwIfCancelledByUser()
 
-    // Process documents sequentially, with separate step records per document id.
     batch.documents.foreach { document =>
       throwIfCancelledByUser()
       processIndividualDocument(document)
@@ -151,11 +123,7 @@ class DocumentProcessingDbos4s(
     pollUploadStatus(documentId)
   }
 
-  /** Sign the document and upload it. If the upload did not complete within
-    * the signature validity period, sign again (the workflows4s timeout
-    * interruption that restarts sign-and-upload, expressed as a loop over
-    * recorded step outputs).
-    */
+  /** Re-sign and upload until the upload completes within signature validity. */
   private def signAndUploadWithinSignatureValidity(document: DocumentFromInputFile): Unit = {
     val validityMs = EncryptionService.signatureValidityPeriod.toMillis
     var uploadedWithinValidity = false
@@ -184,17 +152,11 @@ class DocumentProcessingDbos4s(
     }
   }
 
-  /** Poll the processing status of an upload, at most [[MaxPollAttempts]] times
-    * with a durable 15-minute wait in between, until it is acknowledged as
-    * error free.
-    */
   private def pollUploadStatus(documentId: String): Unit = {
     var attempts = 0
     var processed = false
     while !processed do {
       val outcome = dbos.step(s"check-upload-status-$documentId") {
-        // A transient status-check failure counts as "no info", as in the
-        // workflows4s variant.
         val status =
           try documentUploadEndpoint.checkUploadProcessingStatus(documentId).unsafeRunSync()
           catch { case NonFatal(_) => DocumentUploadEndpoint.ProcessingStatus.NoInfo }
@@ -217,14 +179,10 @@ class DocumentProcessingDbos4s(
     }
   }
 
-  /** Poll for the user-cancellation signal with a zero-timeout recv. */
   private def throwIfCancelledByUser(): Unit =
     if dbos.recv[String](Topic.userCancelsUploadOfInputFile, 0.seconds).isDefined then
       throw Error.CancelledByUser
 
-  /** Report the batch outcome as a durable step: on a replay the report is
-    * never re-executed.
-    */
   private def reportResult(report: Report): Unit = dbos.step("report-result") {
     report match {
       case Report.Success(filePath)    => resultReporter.reportResultSuccess(filePath).unsafeRunSync()
@@ -248,9 +206,7 @@ object DocumentProcessingDbos4s {
     val userCancelsUploadOfInputFile: String = "userCancelsUploadOfInputFile"
   }
 
-  /** Signed content as recorded by the sign-document step. JSON (Base64 for
-    * the signature) so the output round-trips through the DBOS serializer.
-    */
+  /** JSON step result with a Base64-encoded signature for DBOS serialization. */
   private[example] case class SignedDocument(signedAtEpochMs: Long, signature: Array[Byte]) derives Codec.AsObject
 
   sealed trait Report
@@ -276,17 +232,11 @@ object DocumentProcessingDbos4s {
   def fileIdFrom(inputFilePath: Path): String =
     FileWithDocumentBatch.idFromFileName(inputFilePath.getFileName.toString)
 
-  /** Announce an input file. Replaces the workflows4s `inputFileFound` start
-    * signal: the batch workflow for that file id picks the path up from its
-    * first `recv`.
-    */
+  /** Deliver the input path to the batch workflow's initial receive. */
   def announceInputFileFound(dbos: Dbos, inputFilePath: Path): Unit =
     dbos.send(fileIdFrom(inputFilePath), inputFilePath.toString, Topic.inputFileFound)
 
-  /** Ask a running batch workflow to cancel. Replaces the workflows4s
-    * `userCancelsUploadOfInputFile` interruption signal with a message the
-    * workflow polls for between phases.
-    */
+  /** Send a cancellation request, polled by the workflow between phases. */
   def requestCancellation(dbos: Dbos, inputFilePath: Path): Unit =
     dbos.send(fileIdFrom(inputFilePath), "cancel", Topic.userCancelsUploadOfInputFile)
 }

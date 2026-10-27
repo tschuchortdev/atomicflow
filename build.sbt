@@ -62,9 +62,8 @@ lazy val example = project
   .settings(
     name := "atomicflow-examples",
     libraryDependencies ++= Seq(
-      // dbos4s pins (and pulls in) the dev.dbos:transact Java library
+      // dbos4s pins the transitive dev.dbos:transact version.
       "xyz.matthieucourt" %% "dbos4s-transact0.9" % "0.1.0",
-      // The official Temporal Java SDK, used from Scala
       "io.temporal" % "temporal-sdk" % "1.40.0",
       "org.business4s" %% "workflows4s-core" % "0.4.0",
       "org.business4s" %% "workflows4s-bpmn" % "0.4.0",
@@ -81,7 +80,6 @@ lazy val example = project
       "io.circe" %% "circe-parser" % dependencyVersions.circe,
       "io.circe" %% "circe-generic" % dependencyVersions.circe,
     ),
-    // Test dependencies
     libraryDependencies ++= Seq(
       "xyz.matthieucourt" %% "dbos4s-testkit-transact0.9" % "0.1.0",
       "io.temporal" % "temporal-testing" % "1.40.0",

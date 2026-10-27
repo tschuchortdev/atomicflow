@@ -34,18 +34,12 @@ object PostgresWorkflowRuntime {
     new PostgresWorkflowRuntime(dataSource, clock, leaseDuration, leaseAcquireTimeout, durableRetryThreshold)
 }
 
-/** PostgreSQL backend for [[WorkflowRuntime]]. Applies the Flyway migrations on
-  * construction, then serves create/instance operations against the shared
-  * tables.
+/** PostgreSQL backend for [[WorkflowRuntime]]; applies Flyway migrations on construction.
   *
-  * The execution lease is a conditional update on the instance row, fenced by a
-  * monotonic `fencing_token` drawn from a database sequence (so it never
-  * repeats, not even across an instance's deletion and recreation). The token
-  * is the ownership identity: every acquisition and every revocation advances
-  * it, and only the run holding the current token may write.
-  * `lease_expires_at` is the liveness signal — the recovery sweep revokes
-  * expired leases by clearing the expiry and advancing the token, fencing out a
-  * crashed run before a new one can claim the instance.
+  * Lease acquisition and revocation advance a sequence-backed `fencing_token`.
+  * Only its current owner may write; tokens never repeat, even after instance
+  * recreation. Recovery clears expired leases and advances the token to fence
+  * out stale runs.
   */
 class PostgresWorkflowRuntime private[atomicflow] (
     dataSource: DataSource,
@@ -68,28 +62,17 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   private def clearInterrupt(): Unit = Thread.interrupted()
 
-  /** Carries an exception thrown by the `decide` callback of `evaluateWait` —
-    * user code (signal filters, `Awaitable.map` functions) — out of the
-    * transaction that runs it, so the runtime's technical-failure wrapping
-    * cannot reclassify a workflow-code failure as infrastructure. It carries
-    * [[WorkflowException]] so the transaction boundary passes it through
-    * untouched; `evaluateWait` unwraps it immediately outside the transaction
-    * and rethrows the user's original exception.
+  /** Carries user callback failures through a transaction as [[WorkflowException]]
+    * so they are not classified as technical failures. `evaluateWait` unwraps
+    * and rethrows the original exception outside the transaction.
     */
   private final class AwaitDecisionFailure(cause: Throwable)
       extends RuntimeException(cause.toString, cause)
       with WorkflowException
 
-  /** The exceptions escaping a transaction split by type, not by a predicate:
-    * anything the library itself raised deliberately carries
-    * [[WorkflowException]] — its public API contracts, its sealed control flow
-    * (reclassifying a suspension as technical would break the run), and its
-    * runtime-internal markers — and passes through unwrapped. Everything else is
-    * a failure of the runtime's own infrastructure: connection loss,
-    * serialization failure, timeout, an unexpected internal error, or a
-    * violated internal invariant. Those are wrapped in
-    * [[WorkflowTechnicalException]] so no layer can mistake them for a workflow
-    * failure and persist it as one.
+  /** Passes deliberate [[WorkflowException]]s through, including control flow.
+    * Wraps all other transaction failures in [[WorkflowTechnicalException]] to
+    * prevent infrastructure errors from being persisted as workflow failures.
     */
   private[atomicflow] def runTransaction[A](transaction: ConnectionIO[A]): A = {
     clearInterrupt()
@@ -194,22 +177,14 @@ class PostgresWorkflowRuntime private[atomicflow] (
     val serializedInput = cacheable.write(in)
     val deleted = runTransaction {
       for {
-        // Lock the instance row FIRST, in the same order as sendSignal and the
-        // terminal transition: a concurrent sender holds this lock across its
-        // event append, so either its signal is already committed and visible
-        // to the delete below, or the sender blocks and finds the row gone.
-        // Deleting the events before taking the lock would let a signal
-        // committed in between survive and leak into the re-created identity.
+        // Lock before deleting events, matching sendSignal and terminal transitions.
+        // Otherwise a concurrent signal could survive into the recreated instance.
         _ <- sql"""
           SELECT 1 FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = '{}'
           FOR UPDATE
         """.query[Int].option
-        // Events have no FK to workflow_instances, so the instance delete does not
-        // cascade to them: they are removed explicitly, exactly as
-        // `deleteWorkflowInstancesByPrefix` does. Without this, the re-created
-        // identity would start with a reset cursor and immediately consume the
-        // previous incarnation's `Signal` events.
+        // Events have no instance FK; delete explicitly to prevent stale-signal replay.
         _ <- sql"""
           DELETE FROM workflow_events
           WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = '{}'
