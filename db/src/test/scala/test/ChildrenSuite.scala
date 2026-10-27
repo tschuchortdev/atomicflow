@@ -275,7 +275,7 @@ class ChildrenSuite extends PostgresWorkflowRuntimeSuite {
     val row = childRow(childWf.id, "worker-1", scope).get
     assertEquals(row.terminalState, None, "a RUNNING child is not finalized immediately")
     assertEquals(row.cancelRequestedAt.isDefined, true, "cancel_requested_at is set on the running child")
-    assert(!hasWakeup(childWf.id, "worker-1", scope), "no wakeup is added while a live lease exists")
+    assert(hasWakeup(childWf.id, "worker-1", scope), "the sweep schedules a wakeup even while the child is leased")
   }
 
   test("ParentClosePolicy.Abandon leaves the child untouched and clears only the active-parent pointer") {

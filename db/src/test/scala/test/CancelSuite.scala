@@ -66,7 +66,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(terminalRow(wf.id, "k").get._1, None,
                  "cancel does not finalize in place; delivery happens at the checkpoint")
     assertEquals(cancelRequestedAt(wf.id, "k").isDefined, true)
-    assertEquals(hasWakeup(wf.id, "k"), true, "cancel with no live owner upserts a wakeup")
+    assertEquals(hasWakeup(wf.id, "k"), true, "cancel upserts a wakeup")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
     assertEquals(counter.get(), 0, "the step body never runs: the first checkpoint throws before it")
@@ -132,7 +132,7 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.cancel(id)
     assertEquals(cancelRequestedAt(wf.id, "k").isDefined, true)
-    assertEquals(hasWakeup(wf.id, "k"), true, "cancel with no live owner upserts a wakeup to schedule the resume")
+    assertEquals(hasWakeup(wf.id, "k"), true, "cancel upserts a wakeup to schedule the resume")
 
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
     assertEquals(counter.get(), 1, "step A's cached result must NOT be re-executed")
@@ -153,6 +153,31 @@ class CancelSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowCancelled)
     assertEquals(counter.get(), 1, "step A ran; step B's checkpoint threw before its body executed")
     assertEquals(terminalRow(wf.id, "k").get._1, Some("cancelled"))
+  }
+
+  test("cancel while a live lease exists still upserts a wakeup so delivery survives the run") {
+    val rt = newRuntime
+    val sig = Signal[String]("approve")
+    val wf = Workflow[String, String](id = "live-lease-cancel") { in =>
+      Step.await[String]("wait", Awaitable.SignalEvent(sig))
+      "done"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+
+    run(sql"""
+      UPDATE workflow_instances SET lease_expires_at = ${Instant.now().plusSeconds(3600)}
+      WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+    """.update.run)
+
+    rt.cancel(id)
+
+    assertEquals(cancelRequestedAt(wf.id, "k").isDefined, true)
+    assertEquals(
+      hasWakeup(wf.id, "k"),
+      true,
+      "the wakeup is scheduled even with a live lease, so the cancel is not lost when the run's last flag read races the cancel"
+    )
   }
 
   test("sticky redelivery: catching WorkflowCancelledException and continuing throws again at the next new-work checkpoint") {

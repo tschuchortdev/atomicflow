@@ -149,7 +149,8 @@ The executor holds only a `workflowInstanceId` from the wakeup row. The code it 
 | Best-effort watermark dispatch | it processes an appended `Signal` past the stored watermark and a direct subscriber or eligible descendant subscription exists (its key matches), or a `WorkflowCompleted` past the watermark and completion subscribers exist (their wakeups — not the completing instance's) |
 | Full subscription scan | (periodic liveness pass) a non-terminal instance holds a pending signal or completion subscription with a visible, unconsumed candidate |
 | Timer firing | the sweep appended a `TimerFired` event for a due, not-yet-fired timer subscription |
-| `cancel` | cancellation is requested while the instance has no live lease owner |
+| `cancel` | cancellation is requested (always, even with a live owner; a live owner observes the flag at its next checkpoint, and the wakeup remains if the run's last flag read raced the cancel) |
+| Parent-close `Cancel` | the child-close sweep delivers a `ParentClosePolicy.Cancel` request (always, even with a live owner); the run-start self-check sets the flag without a wakeup because its own live run is the delivery vehicle |
 | `createAndScheduleForAsyncRun` / `startAsChild` | schedules the first execution of a new instance |
 | Lease recovery sweep | a non-terminal instance's lease expired while held (worker crash, or a failed post-run release) |
 | Technical-failure restore | a claimed run failed with a technical error: the wakeup is re-inserted with a fresh `created_at` (re-entering the claim FIFO at the back) and `attempts + 1`, and the lease is released in the same transaction |
@@ -538,15 +539,20 @@ Two operations stop a running or suspended workflow instance; they differ fundam
 
 Cancellation is a **level, not an edge**: `cancel_requested_at` stays set forever, and delivery repeats at every checkpoint that is about to perform new work — and at every explicit `Workflow.heartbeat()` call — until the instance reaches a terminal state. A **checkpoint** is any point where execution is about to touch durable state — invoking a Step (before its body runs), evaluating or resolving an await, or parking on and resuming from a suspension. Heartbeat is not a checkpoint (it performs no new durable work) but is an additional delivery point: a long-running Step body that heartbeats observes a pending cancel at its next heartbeat instead of only when the Step returns.
 
-1. **Request.** In one transaction, set `cancel_requested_at` and ensure
-   delivery: schedule a resume if the instance has no live owner; a live owner
-   observes the flag at its next checkpoint. If the instance is already
-   terminal, `cancel` is a no-op (the guarded terminal transition keeps this
-   idempotent). Delivery is uniform across all instance states — an instance
-   that has never started is not finalized in place; it delivers at its first
-   checkpoint like any other, so a body whose first action is a checkpoint-free
-   completion may complete despite the pending cancel (rule 6 and the
-   first-terminal-event rule).
+1. **Request.** In one transaction, set `cancel_requested_at` and schedule a
+   resume unconditionally by upserting the instance's wakeup. A live owner
+   observes the flag at its next checkpoint; if that run ends without observing
+   it, the wakeup survives and resumes the now-suspended instance — closing the
+   race where a run parks after its last checkpoint and then releases its
+   lease. A wakeup left behind by a run that finishes first is deleted by the
+   terminal transition; while a lease is live the claim query excludes the
+   instance. If the instance is already terminal,
+   `cancel` is a no-op (the guarded terminal transition keeps this idempotent).
+   Delivery is uniform across all instance states — an instance that has never
+   started is not finalized in place; it delivers at its first checkpoint like
+   any other, so a body whose first action is a checkpoint-free completion may
+   complete despite the pending cancel (rule 6 and the first-terminal-event
+   rule).
 2. If the instance is currently **suspended** (no thread): Instance is scheduled for execution. When execution reaches the next checkpoint — a pending await or a new step — the runtime throws `WorkflowCancelledException`. User code may catch this to run compensating code and then re-throw (or let it propagate).
 3. If the instance is currently **running**: Instance is scheduled for execution. The owner re-reads the durable flag around every Step and Await boundary — and at every explicit `Workflow.heartbeat()` call — and, when set, throws the same `WorkflowCancelledException` at that point. If the currently executing run already notices the cancellation and finishes the workflow, the job runner will notice in the future that the scheduled workflow is already finished and skip it. No thread is ever interrupted; delivery is a runtime throw, uniform with the suspended path.
 4. **Sticky redelivery.** If user code catches the `WorkflowCancelledException` and continues, the flag remains set and every subsequent cached checkpoint throws again. Catching it is for compensation, not for declining the cancel. The only way past it is to reach a terminal state — and if the workflow completes normally despite the pending cancel, the first-terminal-event rule applies: its `WorkflowCompleted` event wins and the instance is `COMPLETED`.

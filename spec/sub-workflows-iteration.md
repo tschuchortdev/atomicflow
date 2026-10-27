@@ -268,13 +268,16 @@ Application rules:
   never cancelled, matching the inheritance walk, which also stops at a missing
   parent.
 - Per child state, `Cancel` follows the standard per-state cancel semantics
-  (see `running-workflows.md`): the child gets `cancel_requested_at` set and —
-  when it has no live lease — a wakeup scheduled, and it delivers the
-  cancellation itself at its next checkpoint, exactly like `runtime.cancel`. A
-  `CREATED` child therefore executes its body up to its first checkpoint before
-  cancelling; because a checkpoint precedes every Step body and await
-  evaluation, no durable step effect runs. A `RUNNING` child delivers at its
-  next checkpoint. `Abandon` clears the pointer only.
+  (see `running-workflows.md`): the child gets `cancel_requested_at` set and a
+  wakeup scheduled — the sweep does so whether or not a run is in flight — and
+  it delivers the cancellation itself at its next checkpoint, exactly like
+  `runtime.cancel`. A `CREATED` child therefore executes its body up to its
+  first checkpoint before cancelling; because a checkpoint precedes every Step
+  body and await evaluation, no durable step effect runs. A `RUNNING` child
+  delivers at its next checkpoint. The run-start self-check schedules no
+  wakeup: it sets the flag inside the child's own live run, before any
+  checkpoint, so that run is the delivery vehicle. `Abandon` clears the
+  pointer only.
 - **Inherited-signal visibility cuts off at the closure event, not at
   delivery.** The inheritance walk treats a parent as unusable — terminating the
   walk exactly as a detached pointer does — when it is terminal or holds a

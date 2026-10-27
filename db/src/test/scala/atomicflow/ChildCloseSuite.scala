@@ -213,6 +213,43 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row.parentWf, None, "the self-check clears the pointer")
   }
 
+  test("the self-check schedules no wakeup, so a run parked in uncancellable keeps only the flag") {
+    val parentGate = Signal[String]("pgate-park")
+    val childGate  = Signal[String]("cgate-park")
+    val childWf = Workflow[String, String]("worker-park") { in =>
+      Workflow.uncancellable {
+        Step.await[String]("cwait-park", Awaitable.SignalEvent(childGate))
+      }
+      "done"
+    }
+    val parentWf = Workflow[String, String]("orders-park") { in =>
+      childWf.startAsChild("worker-1", "hi", parentClosePolicy = ParentClosePolicy.Cancel)
+      Step.await[String]("pwait-park", Awaitable.SignalEvent(parentGate))
+      "done"
+    }
+    val parentId = rt.createWorkflowInstance(parentWf, "order-42", "in").id
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.WorkflowSuspended)
+    val scope   = ScopePath("orders-park", "order-42@0")
+    val childId = WorkflowInstanceId("worker-park", "worker-1", scope)
+
+    parentGate.send(parentId, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(parentWf, parentId), WorkflowRunResult.Result("done"))
+
+    run(sql"""
+      DELETE FROM workflow_wakeups
+      WHERE workflow_id = 'worker-park' AND workflow_instance_key = 'worker-1' AND workflow_instance_scope = ${scope.segments}
+    """.update.run)
+    assert(!hasWakeup("worker-park", "worker-1", scope), "the child's creation wakeup is cleared")
+
+    assertEquals(rt.runWorkflowInstance(childWf, childId), WorkflowRunResult.WorkflowSuspended)
+
+    val row = childRow("worker-park", "worker-1", scope).get
+    assertEquals(row.terminalState, None, "the parked child is not terminal")
+    assertEquals(row.cancelRequestedAt.isDefined, true, "the self-check set the flag")
+    assert(!hasWakeup("worker-park", "worker-1", scope),
+           "the self-check schedules no wakeup: its own live run is the delivery vehicle")
+  }
+
   test("continueAsNew closes only the children of the continuing generation") {
     val parentGate = Signal[String]("pgate")
     val childGate  = Signal[String]("cgate")
