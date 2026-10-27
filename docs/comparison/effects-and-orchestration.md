@@ -440,12 +440,15 @@ runtime.terminate(instanceId)                      // force stop + fencing revok
 **Implementation.** AtomicFlow never interrupts a thread. `cancel` durably sets
 `cancel_requested_at` (once, never reset); the flag is delivered at **new-work
 checkpoints** — a step body about to execute, or a wait site about to be evaluated
-— as `WorkflowCancelledException`; cached replays never deliver. A `CREATED`
+— as `WorkflowCancelledException`; cached replays never deliver. An explicit
+`Workflow.heartbeat()` inside a long-running step body also delivers, so the body
+can act on a pending cancel without waiting for the step to return. A `CREATED`
 instance with no execution state is finalized `CANCELLED` immediately. `terminate`
 runs one transaction: guarded terminal transition to `TERMINATED` (+ completion
 event), a **fencing-token bump that revokes the lease** (fencing out any orphan
 run), and terminal cleanup of wakeups/subscriptions. `uncancellable` is a lexical,
-re-entrant depth on the context that suppresses *delivery* (not heartbeats), so a
+re-entrant depth on the context that suppresses *delivery* (not heartbeats — an
+in-region heartbeat renews the lease even while a cancel is pending), so a
 long Saga compensation keeps its lease while the `cancelTimeout` escalation still
 bounds it; on replay, completed compensation steps are served from cache. DBOS
 preempts at the start of the next step (or immediately for a step marked

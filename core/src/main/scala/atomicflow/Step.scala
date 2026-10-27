@@ -167,17 +167,6 @@ object Step {
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
     runSimpleStep(atMostOnce = true, key, stepVersion = 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
-  /** The cancellation checkpoint for new work (a Step body about to execute, or
-    * an await about to be evaluated): unless the `Workflow.uncancellable` depth
-    * of the call site's context is non-zero, re-reads the durable
-    * `cancel_requested_at` flag via the runtime and throws
-    * [[WorkflowCancelledException]] when set. Cached replays never call it, so
-    * they never deliver.
-    */
-  private def throwIfCancelled(using ctx: WorkflowContext): Unit =
-    if (ctx.uncancellableDepth == 0 && ctx.internals.isCancellationRequested(ctx.instanceId))
-      throw WorkflowCancelledException()
-
   /** The shared machinery for both execution guarantees. Both persist a
     * `Started` record before the body executes and replace it with a durable
     * outcome; the guarantees differ only in how an unresolved `Started` record
@@ -252,7 +241,7 @@ object Step {
       * unbounded policy with tiny delays cannot grow the stack.
       */
     def runBody(resumed: Option[RetryState]): A = {
-      throwIfCancelled
+      ctx.throwIfCancelled()
       var bookkeeping = resumed.getOrElse {
         internals.writeStep(
           stepId,
@@ -561,7 +550,7 @@ object Step {
       base.appended(scopedStepId.key).appended(key)
 
     def evaluate(): R = {
-      throwIfCancelled
+      ctx.throwIfCancelled()
       val branchPaths = branches.map((key, _) => branchPath(ctx.currentScope, key))
       val branchContexts = branches.map((key, _) =>
         ctx.copy(scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key)))
@@ -660,7 +649,7 @@ object Step {
         decodeStored(valueCodec, stepKey)(payload.raw)
 
       case None =>
-        throwIfCancelled
+        ctx.throwIfCancelled()
         val waitSite = WaitSite(stepId, 0L, InputFingerprints.of(fingerprints), expiresAt)
         internals.evaluateWait(waitSite, raceBranches.map(_.subscriber))(pickRaceWinner(valueCodec, raceBranches)) match {
           case Some(payload) => decodeStored(valueCodec, stepKey)(payload.raw)
