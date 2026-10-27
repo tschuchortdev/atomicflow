@@ -15,6 +15,8 @@ class StepBodyControlFlowSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
+  private final class BoundaryBreak extends scala.util.control.ControlThrowable
+
   private def stepStateKinds(workflowId: WorkflowId, key: WorkflowInstanceKey): Seq[(String, String)] =
     run(
       sql"""
@@ -71,5 +73,32 @@ class StepBodyControlFlowSuite extends PostgresWorkflowRuntimeSuite {
     )
 
     assertEquals(rt.runWorkflowInstance(wf, instance.id), WorkflowRunResult.Result("done-b"))
+  }
+
+  test("a user-thrown ControlThrowable inside a step body is an ordinary, cached step failure") {
+    val rt = newRuntime
+    var executions = 0
+    val wf = Workflow[String, String](id = "user-ct-in-body") { in =>
+      Step.atLeastOnce[String]("boom") {
+        executions += 1
+        throw new BoundaryBreak
+      }
+      "unreachable"
+    }
+    val instance = rt.createWorkflowInstance(wf, "k", "a")
+
+    // The run boundary replays failures through the throwable codec, so both the
+    // initial run and replay expose the decoded, StepFailed-wrapped form.
+    val failure = intercept[RuntimeException](rt.runWorkflowInstance(wf, instance.id))
+    assert(failure.toString.contains("StepFailed") && failure.toString.contains("BoundaryBreak"))
+    assertEquals(executions, 1)
+    assertEquals(
+      stepStateKinds(wf.id, "k"),
+      Seq(("boom", "Failed")),
+      "a user-thrown ControlThrowable is not library control flow and is cached as the step's failure"
+    )
+
+    intercept[RuntimeException](rt.runWorkflowInstance(wf, instance.id))
+    assertEquals(executions, 1, "replay must not re-execute the failed step body")
   }
 }
