@@ -8,9 +8,11 @@ import scala.util.control.ControlThrowable
   * or region boundary. Workflow code must let them propagate to that boundary.
   *
   * Extends [[ControlThrowable]], so both [[scala.util.control.NonFatal]] and
-  * [[WorkflowNonFatal]] exclude them.
+  * [[WorkflowNonFatal]] exclude them; and [[WorkflowException]], so the
+  * runtime's transaction boundary passes them through instead of reclassifying
+  * them as technical failures.
   */
-sealed trait WorkflowControlFlowException extends ControlThrowable
+sealed trait WorkflowControlFlowException extends ControlThrowable with WorkflowException
 
 /** Thrown when an await cannot be satisfied and the instance durably suspends.
   * The pending subscriptions are committed by the await evaluation before this
@@ -66,6 +68,10 @@ final class RegionBreakException[R] private[atomicflow] (val result: R) extends 
 object WorkflowNonFatal {
   def unapply(t: Throwable): Option[Throwable] = t match {
     case _: VirtualMachineError | _: LinkageError | _: ControlThrowable => None
+    // A technical failure aborts the run for re-execution; it must never be
+    // handled as a workflow failure (persisted, terminalized) by any broad
+    // engine-side catch.
+    case _: WorkflowTechnicalException => None
     case _ => Some(t)
   }
 }

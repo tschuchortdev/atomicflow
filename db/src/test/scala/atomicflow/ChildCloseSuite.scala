@@ -426,7 +426,7 @@ class ChildCloseSuite extends PostgresWorkflowRuntimeSuite {
         None,
         0
       )
-      new rt.PostgresCurrentExecution("test", 0L, parentId.workflowId, parentId.workflowInstanceKey, parentId.scope, generation, instance)
+      new rt.PostgresCurrentExecution(0L, parentId.workflowId, parentId.workflowInstanceKey, parentId.scope, generation, instance)
     }
 
     // A stale run watches a generation the parent has moved past.

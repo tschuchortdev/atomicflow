@@ -308,7 +308,7 @@ class ContinueAsNewSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""
         UPDATE workflow_instances
-        SET lease_owner = 'owner', fencing_token = 5, lease_expires_at = ${clock.instant().plus(java.time.Duration.ofSeconds(30))}
+        SET fencing_token = 5, lease_expires_at = ${clock.instant().plus(java.time.Duration.ofSeconds(30))}
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )

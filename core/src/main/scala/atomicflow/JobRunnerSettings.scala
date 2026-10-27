@@ -11,12 +11,6 @@ import scala.concurrent.duration.*
   *   runtime-owned daemon worker pool size; ignored when `executor` is set
   * @param executor
   *   user-supplied pool override; when set, the runner never shuts it down
-  * @param maxConcurrentInstances
-  *   per-process cap on concurrently executing instances per workflowId
-  * @param capacityRetryDelay
-  *   in-place wakeup defer when a per-workflow cap is reached
-  * @param perWorkflowBatchShare
-  *   fairness: max claimed wakeups per workflowId per batch
   * @param pollInterval
   *   wakeup poll cadence; jittered per process
   * @param wakeupBatchSize
@@ -37,20 +31,12 @@ import scala.concurrent.duration.*
   *   bound an external run waits for a leased instance
   * @param cancelTimeout
   *   how long a cancellation may run before escalation to TERMINATED
-  * @param throwableCacheable
-  *   codec used to encode runner-driven terminal failure outcomes
-  * @param workerId
-  *   worker identity recorded under `workflow_instances.lease_owner` for this
-  *   runner's claims and leases; any stable string, and each concurrently
-  *   running runner should have its own so lease holders stay attributable.
-  *   `None` (the default) means the runner generates a unique id
-  */
+ * @param throwableCacheable
+ *   codec used to encode runner-driven terminal failure outcomes
+ */
 final case class JobRunnerSettings(
     workerThreads: Int = 8,
     executor: Option[Executor] = None,
-    maxConcurrentInstances: WorkflowId => Int = _ => Int.MaxValue,
-    capacityRetryDelay: FiniteDuration = 1.second,
-    perWorkflowBatchShare: Int = 8,
     pollInterval: FiniteDuration = 250.millis,
     wakeupBatchSize: Int = 32,
     timerSweepInterval: FiniteDuration = 250.millis,
@@ -61,8 +47,7 @@ final case class JobRunnerSettings(
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeout: FiniteDuration = 30.seconds,
     cancelTimeout: FiniteDuration = 5.minutes,
-    throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer,
-    workerId: Option[String] = None
+    throwableCacheable: Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 )
 
 object JobRunnerSettings {

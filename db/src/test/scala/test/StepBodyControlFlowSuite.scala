@@ -88,8 +88,9 @@ class StepBodyControlFlowSuite extends PostgresWorkflowRuntimeSuite {
     val instance = rt.createWorkflowInstance(wf, "k", "a")
 
     // The run boundary replays failures through the throwable codec, so both the
-    // initial run and replay expose the decoded, StepFailed-wrapped form.
-    val failure = intercept[RuntimeException](rt.runWorkflowInstance(wf, instance.id))
+    // initial run and replay expose the decoded, StepFailed-wrapped form as the
+    // Failed outcome.
+    val WorkflowRunResult.Failed(failure) = rt.runWorkflowInstance(wf, instance.id)
     assert(failure.toString.contains("StepFailed") && failure.toString.contains("BoundaryBreak"))
     assertEquals(executions, 1)
     assertEquals(
@@ -98,7 +99,9 @@ class StepBodyControlFlowSuite extends PostgresWorkflowRuntimeSuite {
       "a user-thrown ControlThrowable is not library control flow and is cached as the step's failure"
     )
 
-    intercept[RuntimeException](rt.runWorkflowInstance(wf, instance.id))
+    rt.runWorkflowInstance(wf, instance.id) match
+      case WorkflowRunResult.Failed(_) => ()
+      case other                       => fail(s"expected Failed, got $other")
     assertEquals(executions, 1, "replay must not re-execute the failed step body")
   }
 }

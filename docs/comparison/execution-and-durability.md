@@ -183,15 +183,19 @@ preserved by a **fencing token** on every subsequent state write.
 **Acquire the execution lease** (sole concurrency arbiter):
 ```sql
 UPDATE workflow_instances
-SET lease_owner = :worker,
-    fencing_token = fencing_token + 1,
+SET fencing_token = nextval('workflow_fencing_token_seq'),
     lease_expires_at = :now + :leaseDuration
 WHERE workflow_id = :wf AND ...
   AND terminal_state IS NULL
-  AND (lease_owner IS NULL OR lease_expires_at <= :now)
+  AND (lease_expires_at IS NULL OR lease_expires_at <= :now)
 ```
 Zero rows updated → a live owner or a terminal instance; the acquirer backs off
-(an external `run` polls up to `leaseAcquireTimeout`).
+(an external `run` polls up to `leaseAcquireTimeout`). The fencing token doubles
+as the ownership identity: it is unique per claim, and every ownership change —
+each acquisition, and each revocation by lease recovery or termination — advances
+it, so the token-only guard below always detects a superseded writer. The token
+is drawn from a database sequence rather than incremented in place, so it never
+repeats across an instance's deletion and recreation.
 
 **Every state write is fenced** — step rows, subscription rows, cursor moves, and
 the guarded terminal transition all carry:

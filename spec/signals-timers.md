@@ -481,7 +481,7 @@ workflow_timer_subscriptions (
 workflow_completion_subscriptions (
   workflowInstanceId, stepId, subscriberKey, completedWorkflowInstanceId
 )
-workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, scheduledAt, attempts)
+workflow_wakeups (workflowInstanceId PRIMARY KEY, createdAt, attempts)
 workflow_event_dispatch (id, dispatched_through)
 ```
 

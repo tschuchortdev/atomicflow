@@ -20,10 +20,10 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
         .query[String].option
     )
 
-  private def wakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Instant, Instant, Int)] =
+  private def wakeup(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Instant, Int)] =
     run(
-      sql"SELECT created_at, scheduled_at, attempts FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'"
-        .query[(Instant, Instant, Int)].option
+      sql"SELECT created_at, attempts FROM workflow_wakeups WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'"
+        .query[(Instant, Int)].option
     )
 
   test("create inserts the instance row with serialized input, version_at_creation, empty scope, NULL terminal") {
@@ -91,23 +91,23 @@ class CreationSuite extends PostgresWorkflowRuntimeSuite {
     rt.createAndScheduleForAsyncRun(wf, "key-6", "a")
 
     val before = wakeup(wf.id, "key-6")
-    assertEquals(before.map(_._3), Some(0))
+    assertEquals(before.map(_._2), Some(0))
 
     Thread.sleep(30)
     rt.createAndScheduleForAsyncRun(wf, "key-6", "a")
     val after = wakeup(wf.id, "key-6")
 
     assertEquals(after.map(_._1), before.map(_._1))
-    assertEquals(after.map(_._3), Some(0))
+    assertEquals(after.map(_._2), Some(0))
   }
 
-  test("createAndScheduleForAsyncRun derives scheduled_at from the injected clock") {
+  test("createAndScheduleForAsyncRun derives created_at from the injected clock") {
     val fixed = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC)
     val rt = newRuntime(fixed)
     val wf = workflow("wf-8")
     rt.createAndScheduleForAsyncRun(wf, "key-8", "a")
 
-    assertEquals(wakeup(wf.id, "key-8").map(_._2), Some(Instant.parse("2026-01-01T00:00:00Z")))
+    assertEquals(wakeup(wf.id, "key-8").map(_._1), Some(Instant.parse("2026-01-01T00:00:00Z")))
   }
 
   test("plain create schedules nothing (no wakeup row)") {

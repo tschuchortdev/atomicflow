@@ -172,8 +172,8 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
 
   /** Force-stop an instance. In one transaction: a guarded terminal transition to
     * `TERMINATED` (appending the `WorkflowCompleted` event with a `Terminated`
-    * outcome), a lease revocation (fencing-token bump plus clearing the lease
-    * owner/expiry, fencing out any running orphan), and terminal cleanup of this
+    * outcome), a lease revocation (clearing the lease expiry and advancing the
+    * fencing token, fencing out any running orphan), and terminal cleanup of this
     * instance's wakeup and subscription rows. The instance is never scheduled
     * again, no resume is scheduled, and no [[WorkflowCancelledException]] is
     * delivered — the body gets no chance to run.
@@ -188,7 +188,9 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
   @throws[WorkflowNotFoundException]
   def terminate(instanceId: WorkflowInstanceId): Unit
 
-  /** Execute a created instance on the caller thread. */
+  /** Execute a created instance on the caller thread. A workflow whose body
+    * failed returns [[WorkflowRunResult.Failed]] carrying the decoded failure.
+    */
   @throws[WorkflowNotFoundException]
   final def runWorkflowInstance[In, Out](
       workflow: Workflow[In, Out],
@@ -248,7 +250,12 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
         val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
         completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload)))
         log.info(s"Workflow instance $instanceId failed", t)
-        throw cacheableThrowable.read(cacheableThrowable.write(t))
+        // The failure is durably recorded; surface it as the runner-facing
+        // Failed outcome so the job runner can distinguish "already terminal,
+        // never re-execute" from an unknown internal error. Public entry
+        // points rethrow the cause.
+        val decoded = cacheableThrowable.read(cacheableThrowable.write(t))
+        return WorkflowRunResult.Failed(decoded)
     }
 
     if (suspended)
@@ -295,7 +302,10 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
 
       case Some(WorkflowTerminalState.Failed) =>
         decode() match {
-          case WorkflowCompletionResult.Failed(t) => throw t
+          case WorkflowCompletionResult.Failed(t) =>
+            // Runner-facing Failed outcome; public entry points rethrow the
+            // user failure unchanged.
+            WorkflowRunResult.Failed(t)
 
           case _ =>
             throw new StepSerializationFailed(s"Terminal instance ${record.instanceId} stored a non-failed outcome as failed")
@@ -316,7 +326,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       in: In
   ): WorkflowInstance[In, Out] = {
     val instance = createWorkflowInstance(workflow, instanceKey, in)(using workflow.inputCacheable)
-    upsertWakeup(instance.id, Duration.Zero)
+    upsertWakeup(instance.id)
     instance
   }
 

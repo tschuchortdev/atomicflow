@@ -86,8 +86,9 @@ class TerminalOutcomeSuite extends PostgresWorkflowRuntimeSuite {
     val failing = Workflow[String, String](id = "term-mismatch-failure") { _ =>
       throw new RuntimeException("boom")
     }
-    intercept[RuntimeException] {
-      rt.createAndRun(failing, "f", "x")
+    rt.createAndRun(failing, "f", "x") match {
+      case WorkflowRunResult.Failed(_) => ()
+      case other                       => fail(s"expected Failed, got $other")
     }
 
     setTerminal(completed.id, "k", "completed", terminalOutcome(failing.id, "f"))
@@ -106,8 +107,9 @@ class TerminalOutcomeSuite extends PostgresWorkflowRuntimeSuite {
     val failing = Workflow[String, String](id = "term-mismatch-failed") { _ =>
       throw new RuntimeException("boom")
     }
-    intercept[RuntimeException] {
-      rt.createAndRun(failing, "f", "x")
+    rt.createAndRun(failing, "f", "x") match {
+      case WorkflowRunResult.Failed(_) => ()
+      case other                       => fail(s"expected Failed, got $other")
     }
 
     setTerminal(failing.id, "f", "failed", terminalOutcome(completed.id, "k"))

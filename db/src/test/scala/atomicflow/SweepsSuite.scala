@@ -47,13 +47,13 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
   private def leaseRow(
       workflowId: WorkflowId,
       key: WorkflowInstanceKey
-  ): Option[(Option[String], Option[Instant], Long)] =
+  ): Option[(Option[Instant], Long)] =
     run(
       sql"""
-        SELECT lease_owner, lease_expires_at, fencing_token FROM workflow_instances
+        SELECT lease_expires_at, fencing_token FROM workflow_instances
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
       """.query[
-          (Option[String], Option[Instant], Long)
+          (Option[Instant], Long)
         ].option
     )
 
@@ -296,7 +296,7 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     } finally runner.stop(1.second)
   }
 
-  test("recovery sweep clears an expired lease, upserts a wakeup, and does not bump the fencing token") {
+  test("recovery sweep revokes an expired lease, advances the fencing token, and upserts a wakeup") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock)
     val sig = Signal[String]("approve")
@@ -308,13 +308,13 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
     try {
       val id = rt.createWorkflowInstance(wf, "k", "in").id
       assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-      val before = leaseRow(wf.id, "k").get._3
+      val before = leaseRow(wf.id, "k").get._2
 
       clock.advanceBy(1.hour)
       run(
         sql"""
           UPDATE workflow_instances
-          SET lease_owner = 'orphaned-worker', lease_expires_at = '2026-01-02T00:30:00Z'
+          SET lease_expires_at = '2026-01-02T00:30:00Z'
           WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
         """.update.run
       )
@@ -322,13 +322,75 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       assertEquals(runner.runRecoverySweep(), 1)
 
       val row = leaseRow(wf.id, "k").get
-      assertEquals(row._1, None, "the expired lease owner must be cleared")
-      assertEquals(row._3, before, "recovery must not bump the fencing token")
+      assertEquals(row._1, None, "the expired lease must be revoked (expiry cleared)")
+      assert(row._2 > before, "recovery must advance the fencing token to fence the crashed run")
       assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
     } finally runner.stop(1.second)
   }
 
-  test("recovery sweep ignores live leases and terminal instances") {
+  test("recovery fences a stale in-flight run: its heartbeat throws LeaseLostException and the instance is re-scheduled") {
+    val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
+    val rt = newRuntime(clock)
+    val bodyStarted = new java.util.concurrent.CountDownLatch(1)
+    val releaseBody = new java.util.concurrent.CountDownLatch(1)
+    val captured = new java.util.concurrent.atomic.AtomicReference[Option[Throwable]](None)
+    val done = new java.util.concurrent.CountDownLatch(1)
+    val wf = Workflow[String, String](id = "recover-fence") { in =>
+      Step.atLeastOnce[String]("step") {
+        bodyStarted.countDown()
+        releaseBody.await(10, java.util.concurrent.TimeUnit.SECONDS)
+        Workflow.heartbeat()
+        s"out-$in"
+      }
+    }
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    val thread = new Thread(() => {
+      try {
+        rt.createAndRun(wf, "k", "in")
+        captured.set(None)
+      } catch { case t: Throwable => captured.set(Some(t)) } finally done.countDown()
+    })
+    try {
+      thread.start()
+      waitUntil(bodyStarted.getCount == 0)
+
+      // The run's lease expires while the body is paused; recovery revokes it.
+      clock.advanceBy(1.hour)
+      assertEquals(runner.runRecoverySweep(), 1)
+      assert(wakeupExists(wf.id, "k"), "recovery must upsert the instance's wakeup")
+
+      // The stale run resumes: its next fenced write (the heartbeat) must be
+      // fenced out by the recovery's token advance.
+      releaseBody.countDown()
+      waitUntil(done.getCount == 0)
+      assert(captured.get().exists(_.isInstanceOf[LeaseLostException]),
+        s"the stale run must lose its lease, got ${captured.get()}")
+
+      // The aborted run left no durable effect: not terminal, no cached step
+      // result, and the recovery's wakeup still re-schedules the instance.
+      val row = run(
+        sql"""
+          SELECT terminal_state FROM workflow_instances
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
+        """.query[Option[String]].unique
+      )
+      assertEquals(row, None, "the fenced run must not terminalize the instance")
+      val stepState = run(
+        sql"""
+          SELECT state_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step'
+        """.query[String].option
+      )
+      assertEquals(stepState, Some("Started"), "the fenced run must not cache a step result")
+      assert(wakeupExists(wf.id, "k"), "the recovery's wakeup must survive the fenced run")
+    } finally {
+      releaseBody.countDown()
+      thread.join(10.seconds.toMillis)
+      runner.stop(1.second)
+    }
+  }
+
+  test("recovery sweep ignores live leases, clears stale terminal leases, and re-enqueues non-terminal ones") {
     val rt = newRuntime
     val sig = Signal[String]("approve")
     val wf = Workflow[String, String](id = "recover-live") { in =>
@@ -342,14 +404,14 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       run(
         sql"""
           UPDATE workflow_instances
-          SET lease_owner = 'live-worker', lease_expires_at = now() + interval '1 hour'
+          SET lease_expires_at = now() + interval '1 hour'
           WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
         """.update.run
       )
 
       assertEquals(runner.runRecoverySweep(), 0)
       val row = leaseRow(wf.id, "k").get
-      assertEquals(row._1, Some("live-worker"), "a live lease must be untouched")
+      assert(row._1.exists(_.isAfter(Instant.now())), "a live lease must be untouched")
 
       val wf2 = Workflow[String, String](id = "recover-terminal") { in => s"out-$in" }
       val id2 = rt.createWorkflowInstance(wf2, "t", "in").id
@@ -357,12 +419,14 @@ class SweepsSuite extends PostgresWorkflowRuntimeSuite {
       run(
         sql"""
           UPDATE workflow_instances
-          SET lease_owner = 'orphan', lease_expires_at = now() - interval '1 hour'
+          SET lease_expires_at = now() - interval '1 hour'
           WHERE workflow_id = ${wf2.id} AND workflow_instance_key = 't' AND workflow_instance_scope = '{}'
         """.update.run
       )
-      assertEquals(runner.runRecoverySweep(), 0)
-      assertEquals(leaseRow(wf2.id, "t").get._1, Some("orphan"), "a terminal instance's lease must be untouched")
+      assertEquals(runner.runRecoverySweep(), 1)
+      val terminalRow = leaseRow(wf2.id, "t").get
+      assertEquals(terminalRow._1, None, "a terminal instance's stale lease is revoked (a failed post-completion release must not linger)")
+      assert(!wakeupExists(wf2.id, "t"), "but the terminal instance is never re-scheduled")
     } finally runner.stop(1.second)
   }
 

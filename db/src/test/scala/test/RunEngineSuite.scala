@@ -13,13 +13,13 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
 
   given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
-  private def instanceRow(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Option[String], Option[String], Int, Option[java.time.Instant], Option[String], Long, Option[java.time.Instant])] =
+  private def instanceRow(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[(Option[String], Option[String], Int, Option[java.time.Instant], Long, Option[java.time.Instant])] =
     run(
       sql"""
-        SELECT terminal_state, terminal_outcome, times_executed, last_run_at, lease_owner, fencing_token, lease_expires_at
+        SELECT terminal_state, terminal_outcome, times_executed, last_run_at, fencing_token, lease_expires_at
         FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'
       """.query[
-          (Option[String], Option[String], Int, Option[java.time.Instant], Option[String], Long, Option[java.time.Instant])
+          (Option[String], Option[String], Int, Option[java.time.Instant], Long, Option[java.time.Instant])
         ].option
     )
 
@@ -74,7 +74,7 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(instanceRow(wf.id, "k").get._3, 1)
   }
 
-  test("failing body: exception propagates, terminal failed, re-run throws the same decoded failure without executing") {
+  test("failing body: Failed outcome, terminal failed, re-run returns the same decoded failure without executing") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "fail") { in =>
@@ -82,16 +82,12 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
       throw new RuntimeException(s"boom-$in")
     }
 
-    val first = intercept[RuntimeException] {
-      rt.createAndRun(wf, "k", "x")
-    }
+    val WorkflowRunResult.Failed(first) = rt.createAndRun(wf, "k", "x")
     assert(first.getMessage.contains("boom-x"))
     assertEquals(counter.get(), 1)
     assertEquals(instanceRow(wf.id, "k").get._1, Some("failed"))
 
-    val second = intercept[RuntimeException] {
-      rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-    }
+    val WorkflowRunResult.Failed(second) = rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     assertEquals(second.getMessage, first.getMessage)
     assertEquals(counter.get(), 1)
   }
@@ -102,7 +98,7 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
     rt.createWorkflowInstance(wf, "k", "a")
     run(
       sql"""
-        UPDATE workflow_instances SET lease_owner = 'someone-else', lease_expires_at = now() + interval '1 hour'
+        UPDATE workflow_instances SET lease_expires_at = now() + interval '1 hour'
         WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}'
       """.update.run
     )
@@ -177,7 +173,6 @@ class RunEngineSuite extends PostgresWorkflowRuntimeSuite {
 
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     val row = instanceRow(wf.id, "k").get
-    assertEquals(row._5, None)
-    assertEquals(row._7, None)
+    assertEquals(row._6, None, "the released lease must leave no expiry")
   }
 }

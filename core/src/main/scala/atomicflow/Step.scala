@@ -747,14 +747,19 @@ object Step {
     * state rather than being persisted and retried as a Step outcome.
     *
     * The cacheable set is `WorkflowNonFatal`'s matches plus user-thrown
-    * `ControlThrowable`; the runtime's own are its complement plus lease loss
-    * and cancellation, which `WorkflowNonFatal` deliberately matches so user
-    * cleanup can run.
+    * `ControlThrowable`; the runtime's own are its complement plus lease loss,
+    * cancellation, and technical failures, which `WorkflowNonFatal` deliberately
+    * matches so user cleanup can run — except the technical ones, which abort
+    * the run for re-execution instead of being cached.
     */
   private object CacheableStepException {
     def unapply(t: Throwable): Option[Throwable] = t match {
       case _: VirtualMachineError | _: LinkageError | _: WorkflowControlFlowException
-           | _: LeaseLostException | _: WorkflowCancelledException => None
+           | _: LeaseLostException | _: WorkflowCancelledException
+           // A technical failure of the runtime aborts the run for re-execution;
+           // it must never be persisted as a durable Step outcome (which would
+           // turn an infrastructure problem into a permanent step failure).
+           | _: WorkflowTechnicalException => None
       case _ => Some(t)
     }
   }

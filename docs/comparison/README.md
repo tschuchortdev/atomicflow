@@ -49,7 +49,7 @@ Use these terms throughout; the third column lists each library's local name.
 | **cached result** | The persisted outcome of a step | `workflow_steps` row | activity result in Event History | `dbos.operation_outputs` row |
 | **step identity** | What addresses a step's cached result | `StepId` + `version` | type at command position | ordinal `function_id` |
 | **input fingerprint** | Hash of a step's inputs used for drift detection | `input_fingerprints` | — (positional) | — (positional) |
-| **execution lease / ownership** | Exclusive right to run an instance | `lease_owner` + `fencing_token` | server-owned workflow task | `owner_xid` token |
+| **execution lease / ownership** | Exclusive right to run an instance | `fencing_token` + `lease_expires_at` | server-owned workflow task | `owner_xid` token |
 | **fencing token** | Monotonic value that invalidates stale writers | `fencing_token` | mutable-state version (server) | ownership token |
 | **event log / history** | Durable ordered record of facts | `workflow_events` (global) | Event History (per execution) | `dbos.workflow_events` |
 | **signal event** | Async message to an instance | `Signal` | Signal | message (`send`/`recv`) |
@@ -120,8 +120,8 @@ Where each system serializes access to one instance:
 AtomicFlow one-run lifecycle              Temporal one-step lifecycle            DBOS one-checkpoint lifecycle
 ──────────────────────────────           ──────────────────────────────         ──────────────────────────────
 BEGIN                                     Worker polls frontend/history          BEGIN
-  UPDATE instance SET lease_owner=me,     History builds Workflow Task           write step output
-    fencing_token=fencing_token+1,        (new events since last task)           check owner_xid still == me
+  UPDATE instance SET                     History builds Workflow Task           write step output
+    fencing_token=nextval(seq),           (new events since last task)           check owner_xid still == me
     lease_expires_at=now+lease   ◄─┐      ─────────────────────────────          COMMIT
   WHERE lease free / expired    │         Worker replays full history,           (or: co-commit app DB write
 COMMIT                           │         emits Commands                        for a transaction step)

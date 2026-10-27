@@ -12,7 +12,6 @@ CREATE TABLE workflow_instances (
   terminal_state VARCHAR,
   terminal_outcome VARCHAR,
   cancel_requested_at TIMESTAMPTZ,
-  lease_owner VARCHAR,
   fencing_token BIGINT NOT NULL DEFAULT 0,
   lease_expires_at TIMESTAMPTZ,
   parent_workflow_id VARCHAR,
@@ -24,6 +23,15 @@ CREATE TABLE workflow_instances (
   inherited_events_start_sequence_id BIGINT,
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope)
 );
+
+COMMENT ON COLUMN workflow_instances.fencing_token IS
+  'The lease ownership identity, drawn from workflow_fencing_token_seq (never reset): every lease acquisition and every revocation (lease recovery, termination) advances it, so a token-only guard fences out any superseded run — including one paused across an instance''s deletion and recreation.';
+
+-- Ownership tokens must never repeat, not even across an instance's deletion
+-- and recreation (which resets the row to its defaults): a paused run of a
+-- previous incarnation whose token equaled the new incarnation's acquired
+-- token would otherwise pass the token-only fence again.
+CREATE SEQUENCE workflow_fencing_token_seq AS BIGINT;
 
 COMMENT ON COLUMN workflow_instances.inherited_signal_prefixes IS
   'Which signal keys this instance inherits from its parent, as a set of permitted prefixes: an empty array inherits nothing; a single empty-string element inherits every key; any other array inherits a key when it starts with one of the listed prefixes.';
@@ -160,7 +168,6 @@ CREATE TABLE workflow_wakeups (
   workflow_instance_key VARCHAR NOT NULL,
   workflow_instance_scope VARCHAR[] NOT NULL,
   created_at TIMESTAMPTZ NOT NULL,
-  scheduled_at TIMESTAMPTZ NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
   PRIMARY KEY (workflow_id, workflow_instance_key, workflow_instance_scope),
   FOREIGN KEY (workflow_id, workflow_instance_key, workflow_instance_scope)

@@ -18,8 +18,9 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
 ) {
 
   /** Run the instance on the caller thread (no input parameter — the input is
-    * already persisted at creation). Terminal instances return/throw their stored
-    * outcome without re-executing the body.
+    * already persisted at creation). Terminal instances return their stored
+    * outcome without re-executing the body — including [[WorkflowRunResult.Failed]]
+    * for a workflow whose body failed.
     */
   @throws[WorkflowNotFoundException]
   def run()(using
@@ -442,13 +443,16 @@ object Workflow {
     * can be joined to completion before `parallel` decides what to propagate.
     * Because every branch outcome is returned as a value (never thrown), Ox never
     * interrupts a sibling mid-branch, so a DB-working branch is never cut off by
-    * another branch's control-flow exception.
+    * another branch's control-flow exception — nor by a technical failure, which
+    * would otherwise deliver an interrupt a sibling Step could persist as a
+    * durable failure.
     */
   private sealed trait BranchOutcome[+R]
   private final case class BranchResult[R](value: R) extends BranchOutcome[R]
   private final case class BranchSuspended(suspension: WorkflowSuspendedException) extends BranchOutcome[Nothing]
   private final case class BranchControlFlow(c: WorkflowControlFlowException) extends BranchOutcome[Nothing]
   private final case class BranchFailed(t: Throwable) extends BranchOutcome[Nothing]
+  private final case class BranchThrewTechnicalException(t: WorkflowTechnicalException) extends BranchOutcome[Nothing]
 
   /** Runs several branches concurrently (via Ox `par`), waiting for ALL of
     * them. When some complete and others suspend, all results are collected
@@ -462,11 +466,16 @@ object Workflow {
     * with the context of the `parallel` call site: its scope path and
     * `uncancellable` depth travel with the context value, so work inside a
     * branch carries the enclosing `scoped`/region identity on any thread.
+    *
+    * A technical failure in any branch wins over every other outcome: the run
+    * aborts for re-execution, and this run's other branch results are discarded.
     */
   def parallel[R](branches: Seq[WorkflowContext ?=> R])(using ctx: WorkflowContext): Seq[R] = {
     val outcomes: Seq[BranchOutcome[R]] = ox.par(
       branches.map(branch => () => runBranch(branch))
     )
+    val technicals = outcomes.collect { case BranchThrewTechnicalException(t) => t }
+    if (technicals.nonEmpty) throw technicals.head
     val controlFlows = outcomes.collect { case BranchControlFlow(c) => c }
     if (controlFlows.nonEmpty) throw controlFlows.head
     val failures = outcomes.collect { case BranchFailed(t) => t }
@@ -486,6 +495,10 @@ object Workflow {
     catch {
       case e: WorkflowSuspendedException => BranchSuspended(e)
       case e: WorkflowControlFlowException   => BranchControlFlow(e)
+      // Returned as a value, never rethrown here: escaping into Ox would
+      // interrupt the sibling branches, and an interrupted sibling Step could
+      // persist an infrastructure abort as a durable failure.
+      case e: WorkflowTechnicalException => BranchThrewTechnicalException(e)
       case e if NonFatal(e)              => BranchFailed(e)
     }
 
