@@ -788,13 +788,20 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   /** Requests cooperative cancellation of an instance. In one transaction:
     * row-lock the instance; a missing instance throws, a terminal one is a no-op.
-    * Otherwise `cancel_requested_at` is set once (never reset) and, when there
-    * is no live lease owner, a wakeup is upserted so the instance resumes and
-    * its next cancellation checkpoint throws. Delivery is uniform across all
-    * instance states: a never-started instance is not finalized in place — it
-    * delivers at its first checkpoint like any other, so a body whose first
-    * action is a checkpoint-free completion may complete despite the pending
-    * cancel (the first-terminal-event rule).
+    * Otherwise `cancel_requested_at` is set once (never reset) and a wakeup is
+    * always upserted so the instance resumes and its next cancellation
+    * checkpoint throws. Scheduling unconditionally closes the race where a run
+    * parks after its last checkpoint and then releases its lease: the wakeup is
+    * then the only thing that resumes a suspended instance whose pending await
+    * never fires. If a live owner finishes the run first, the terminal
+    * transition deletes the wakeup; otherwise the wakeup is claimed once the
+    * lease frees (the claim query excludes live leases) and the resumed run
+    * delivers at its next checkpoint (a park inside `uncancellable` is left to
+    * `cancelTimeout`). Delivery is uniform across all instance states: a
+    * never-started instance is not finalized in place — it delivers at its
+    * first checkpoint like any other, so a body whose first action is a
+    * checkpoint-free completion may complete despite the pending cancel (the
+    * first-terminal-event rule).
     */
   override def cancel(instanceId: WorkflowInstanceId): Unit = {
     val workflowId = instanceId.workflowId
@@ -804,44 +811,32 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runTransaction {
       for {
         row <- sql"""
-          SELECT terminal_state, lease_expires_at
+          SELECT terminal_state
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
-        """.query[(Option[String], Option[java.time.Instant])].option
+        """.query[Option[String]].option
         _ <- row match {
           case None =>
             throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
 
-          case Some((Some(_), _)) =>
+          case Some(Some(_)) =>
             ().pure[ConnectionIO]
 
-          case Some((None, leaseExpiresAt)) =>
+          case Some(None) =>
             for {
               _ <- sql"""
                 UPDATE workflow_instances SET cancel_requested_at = $now
                 WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                   AND cancel_requested_at IS NULL
               """.update.run
-              _ <- if (noLiveLease(leaseExpiresAt, now))
-                  upsertWakeupQ(workflowId, key, scope, now)
-                else
-                  ().pure[ConnectionIO]
+              _ <- upsertWakeupQ(workflowId, key, scope, now)
             } yield ()
         }
       } yield ()
     }
     ()
   }
-
-  /** Whether the instance row has no live lease at `now`: no expiry recorded
-    * (never leased or released), or an expiry that has passed.
-    */
-  private def noLiveLease(
-      expiresAt: Option[java.time.Instant],
-      now: java.time.Instant
-  ): Boolean =
-    expiresAt.forall(!_.isAfter(now))
 
   /** Upserts a coalesced wakeup row due immediately, within the caller's
     * transaction.
@@ -968,13 +963,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * already locked (the sweep's per-child transaction and the run-start
     * self-check). For every child whose active parent pointer still points at
     * the closing parent, the pointer is cleared (both policies). `Cancel`
-    * additionally sets `cancel_requested_at` and, when no live lease exists, a
-    * wakeup — the child then delivers the cancellation itself at its next
+    * additionally sets `cancel_requested_at` and, when `scheduleWakeup` is set,
+    * a wakeup — the child then delivers the cancellation itself at its next
     * checkpoint, exactly like `runtime.cancel`; a never-started child runs its
-    * body up to that first checkpoint before cancelling. `Abandon` clears the
-    * pointer only. Idempotent: after the first application the pointer is
-    * cleared, so a re-trigger is a no-op, and an already-terminal child is a
-    * delivery no-op.
+    * body up to that first checkpoint before cancelling. The sweep schedules
+    * unconditionally; the run-start self-check passes `false` because its own
+    * live run sets the flag before any checkpoint and is itself the delivery
+    * vehicle (a lost run is re-enqueued by lease recovery; an `uncancellable`
+    * park falls to `cancelTimeout`). `Abandon` clears the pointer only.
+    * Idempotent: after the first application the pointer is cleared, so a
+    * re-trigger is a no-op, and an already-terminal child is a delivery no-op.
     */
   private def applyCloseToChildQ(
       workflowId: WorkflowId,
@@ -982,7 +980,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: ScopePath,
       policy: Option[String],
       terminalState: Option[String],
-      leaseExpiresAt: Option[java.time.Instant]
+      scheduleWakeup: Boolean
   ): ConnectionIO[Unit] = {
     val now = clock.instant()
 
@@ -1005,7 +1003,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
               WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
                 AND cancel_requested_at IS NULL
             """.update.run
-            _ <- if (noLiveLease(leaseExpiresAt, now))
+            _ <- if (scheduleWakeup)
                 upsertWakeupQ(workflowId, key, scope, now)
               else
                 ().pure[ConnectionIO]
@@ -1113,16 +1111,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
   ): ConnectionIO[Boolean] =
     for {
       row <- sql"""
-        SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state, lease_expires_at
+        SELECT parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, terminal_state
         FROM workflow_instances
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
         FOR UPDATE
       """.query[
-              (Option[String], Option[String], Option[ScopePath], Option[String], Option[String], Option[java.time.Instant])
+              (Option[String], Option[String], Option[ScopePath], Option[String], Option[String])
             ].option
 
       done <- row match {
-        case Some((Some(pwf), Some(pkey), Some(pscope), policy, terminal, leaseExpiresAt)) =>
+        case Some((Some(pwf), Some(pkey), Some(pscope), policy, terminal)) =>
           for {
             parentUsable <- sql"""
               SELECT 1 FROM workflow_instances
@@ -1139,7 +1137,7 @@ class PostgresWorkflowRuntime private[atomicflow] (
                 """.update.run.map(_ => true)
 
               case Some(_) if !orphan =>
-                applyCloseToChildQ(workflowId, key, scope, policy, terminal, leaseExpiresAt)
+                applyCloseToChildQ(workflowId, key, scope, policy, terminal, scheduleWakeup = true)
                   .map(_ => true)
 
               // An orphan whose parent row reappeared: the instance was
@@ -1162,7 +1160,9 @@ class PostgresWorkflowRuntime private[atomicflow] (
     * checkpoint throw — uniform with `runtime.cancel`, so a never-started child
     * executes its body up to that first checkpoint before cancelling — and
     * `Abandon` merely detaches. No wakeup is scheduled: this run is live and is
-    * itself the delivery vehicle.
+    * itself the delivery vehicle. If the run dies first, lease recovery
+    * re-enqueues the instance; a park inside an `uncancellable` region is left
+    * to `cancelTimeout` escalation.
     */
   private def parentClosureSelfCheck(
       workflowId: WorkflowId,
@@ -1172,16 +1172,16 @@ class PostgresWorkflowRuntime private[atomicflow] (
     runTransaction {
       for {
         row <- sql"""
-          SELECT terminal_state, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy, lease_expires_at
+          SELECT terminal_state, parent_workflow_id, parent_instance_key, parent_instance_scope, parent_close_policy
           FROM workflow_instances
           WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
           FOR UPDATE
         """.query[
-                (Option[String], Option[String], Option[String], Option[ScopePath], Option[String], Option[java.time.Instant])
+                (Option[String], Option[String], Option[String], Option[ScopePath], Option[String])
               ].option
 
         _ <- row match {
-          case Some((None, Some(pwf), Some(pkey), Some(pscope), policy, leaseExpiresAt)) =>
+          case Some((None, Some(pwf), Some(pkey), Some(pscope), policy)) =>
             for {
               parentUsable <- sql"""
                 SELECT 1 FROM workflow_instances p
@@ -1207,12 +1207,13 @@ class PostgresWorkflowRuntime private[atomicflow] (
                     """.query[Int].option
 
                     _ <- if (matched.isDefined)
-                        // The lease fields are this run's own (live) lease, so
-                        // the shared helper detaches and sets the flag without
-                        // scheduling a wakeup — this run is the delivery
-                        // vehicle.
+                        // This run sets the flag before any checkpoint, so it
+                        // observes the cancellation in this run (or finishes);
+                        // no wakeup is needed. A run that dies is re-enqueued by
+                        // lease recovery, and a park inside `uncancellable` is
+                        // left to `cancelTimeout` escalation.
                         applyCloseToChildQ(workflowId, key, scope, policy, terminalState = None,
-                          leaseExpiresAt)
+                          scheduleWakeup = false)
                       else ().pure[ConnectionIO]
                   } yield ()
                 }

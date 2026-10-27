@@ -153,12 +153,14 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
   ): SignalSendResult
 
   /** Request cooperative cancellation of an instance. Durably sets
-    * `cancel_requested_at` once and never resets it. If the instance has never
-    * started and has no execution state, it is finalized `CANCELLED` immediately
-    * (the body never runs). Otherwise the flag is delivered at the next new-work
-    * checkpoint (a Step body about to execute, or an await about to be
-    * evaluated), where the runtime throws [[WorkflowCancelledException]]. A
-    * terminal instance is a no-op.
+    * `cancel_requested_at` once and never resets it. Delivery is uniform across
+    * all instance states: an instance that has never started is not finalized in
+    * place; it delivers at its first checkpoint like any other, so a body whose
+    * first action is a checkpoint-free completion may complete despite the
+    * pending cancel (the first-terminal-event rule). Otherwise the flag is
+    * delivered at the next new-work checkpoint (a Step body about to execute, or
+    * an await about to be evaluated), where the runtime throws
+    * [[WorkflowCancelledException]]. A terminal instance is a no-op.
     *
     * Does not acquire the execution lease; delivery is by checkpoint, never by
     * thread interruption.
