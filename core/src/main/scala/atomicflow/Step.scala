@@ -267,7 +267,7 @@ object Step {
           )
           return decoded
         } catch {
-          case t if isNonCacheable(t) => throw t
+          case NotAStepOutcome(t) => throw t
           case t =>
             retry.nextDelay(
               t,
@@ -737,18 +737,26 @@ object Step {
         }
   }
 
-  /** Throwables that abort the run without durable step state: fatal JVM errors,
-    * the library's control-flow exceptions (suspension, continue-as-new), lease
-    * loss, and cancellation delivered at a checkpoint.
+  /** The counterpart of [[WorkflowNonFatal]] for Step bodies: the exceptions that
+    * must never become a Step's durable outcome. Workflow and Step functions
+    * callable inside a Step body (`Step.await`, `Workflow.continueAsNew`,
+    * `Workflow.heartbeat`, restartable-region control) throw them, and they are
+    * the runtime's own — aborting the run without durable effect rather than
+    * being cached and retried as a Step failure.
+    *
+    * The set is the complement of `WorkflowNonFatal` (fatal JVM errors and the
+    * control-flow exceptions, which `WorkflowNonFatal` excludes so user cleanup
+    * cannot swallow them) plus the two runtime-owned catchable exceptions,
+    * cancellation and lease loss: `WorkflowNonFatal` matches them so cleanup can
+    * run, but they are runtime state, not a step result to persist and retry.
     */
-  private def isNonCacheable(t: Throwable): Boolean = t match {
-    case _: VirtualMachineError | _: ThreadDeath | _: LinkageError => true
-    case _: WorkflowControlFlowException                                => true
-    case _: LeaseLostException                                      => true
-    case _: WorkflowCancelledException                              => true
-    case _                                                          => false
+  private object NotAStepOutcome {
+    def unapply(t: Throwable): Option[Throwable] = t match {
+      case _: LeaseLostException | _: WorkflowCancelledException => Some(t)
+      case WorkflowNonFatal(_)                                   => None
+      case _                                                     => Some(t)
+    }
   }
-
   /** Deterministic, order-insensitive encoding of the named inputs. Each line is
     * `<hex(name)>|<base64fingerprint>`; lines are sorted by name and joined with
     * `\n`. Empty when there are no named inputs; step identity and version still

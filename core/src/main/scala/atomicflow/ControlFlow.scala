@@ -65,7 +65,7 @@ final class RegionBreakException[R] private[atomicflow] (val result: R) extends 
   */
 object WorkflowNonFatal {
   def unapply(t: Throwable): Option[Throwable] = t match {
-    case _: VirtualMachineError | _: ThreadDeath | _: LinkageError | _: ControlThrowable => None
+    case _: VirtualMachineError | _: LinkageError | _: ControlThrowable => None
     case _ => Some(t)
   }
 }

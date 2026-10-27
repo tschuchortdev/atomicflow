@@ -80,6 +80,16 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
       before,
       "heartbeat must not renew the lease when it delivers a pending cancel"
     )
+    assertEquals(
+      run(
+        sql"""
+          SELECT state_kind FROM workflow_steps
+          WHERE workflow_id = 'hb-cancel' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step'
+        """.query[String].option
+      ),
+      Some("Started"),
+      "the delivered cancellation must not be cached as a step failure"
+    )
   }
 
   test("Workflow.heartbeat after a SQL fencing-token bump throws LeaseLostException") {
