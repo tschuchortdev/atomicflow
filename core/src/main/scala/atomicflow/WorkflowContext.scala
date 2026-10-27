@@ -47,10 +47,21 @@ final class WorkflowContext(
     /** The depth of enclosing `Workflow.uncancellable` regions at this context's
       * lexical position; `0` outside any region. Transient per-run state carried
       * immutably through derived contexts; a non-zero depth suppresses
-      * cancellation delivery at checkpoints (`Step.throwIfCancelled`).
+      * cancellation delivery ([[throwIfCancelled]]).
       */
     private[atomicflow] val uncancellableDepth: Int = 0
 ) {
+
+  /** The shared cancellation-delivery check behind every delivery point (the
+    * new-work checkpoints in `Step` and the explicit `Workflow.heartbeat`):
+    * unless the `Workflow.uncancellable` depth of this context is non-zero,
+    * re-reads the durable `cancel_requested_at` flag via the runtime and throws
+    * [[WorkflowCancelledException]] when set. Cached checkpoint replays never
+    * call it, so they never deliver.
+    */
+  private[atomicflow] def throwIfCancelled(): Unit =
+    if (uncancellableDepth == 0 && internals.isCancellationRequested(instanceId))
+      throw WorkflowCancelledException()
 
   /** The current step scope path: [[scopePath]] itself, the raw segment array
     * ([[ScopePath.empty]] at the top level). Step/Await IDs and derived child

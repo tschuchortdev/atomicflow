@@ -198,13 +198,22 @@ object Workflow {
     * long-running Step bodies, and ensure `leaseDuration` exceeds the longest
     * gap between calls.
     *
-    * Not a cancellation checkpoint, and available only inside an executing
-    * workflow through its `WorkflowContext`.
+    * Heartbeat also observes cancellation: when `cancel_requested_at` is set, it
+    * throws [[WorkflowCancelledException]] instead of renewing, giving a
+    * long-running Step body a delivery point that does not wait for the next
+    * new-work checkpoint. [[uncancellable]] suppresses this delivery; inside the
+    * region a heartbeat renews even while a cancel is pending, so a long
+    * compensation keeps its lease.
     *
+    * Available only inside an executing workflow through its `WorkflowContext`.
+    *
+    * @throws WorkflowCancelledException when cancellation has been requested and the call is not inside [[uncancellable]]
     * @throws LeaseLostException when the lease was taken over or the instance is terminal
     */
-  def heartbeat()(using ctx: WorkflowContext): Unit =
+  def heartbeat()(using ctx: WorkflowContext): Unit = {
+    ctx.throwIfCancelled()
     ctx.internals.renewLease()(using ctx.currentExecution)
+  }
 
   /** The `Workflow.version` recorded when the instance was created. The current
     * body may branch on it internally to adapt to the definition version that

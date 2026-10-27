@@ -56,6 +56,32 @@ class LeaseSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(after, Some(clock.instant().plus(java.time.Duration.ofMinutes(5))))
   }
 
+  test("Workflow.heartbeat delivers a pending cancellation instead of renewing the lease") {
+    val clock = new MutableClock(Instant.parse("2024-01-01T00:00:00Z"))
+    val rt = newRuntime(clock)
+    var before: Option[Instant] = None
+    var after: Option[Instant] = None
+    val wf = Workflow[String, String](id = "hb-cancel") { in =>
+      Step.atLeastOnce[String]("step") {
+        before = leaseExpiry("hb-cancel", "k")
+        clock.advance(1.minute)
+        rt.cancel(WorkflowInstanceId("hb-cancel", "k"))
+        try {
+          Workflow.heartbeat()
+          "not-reached"
+        } finally after = leaseExpiry("hb-cancel", "k")
+      }
+    }
+
+    assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.WorkflowCancelled)
+    assert(before.isDefined, "the lease should be held when the step body starts")
+    assertEquals(
+      after,
+      before,
+      "heartbeat must not renew the lease when it delivers a pending cancel"
+    )
+  }
+
   test("Workflow.heartbeat after a SQL fencing-token bump throws LeaseLostException") {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "hb-fenced") { in =>
