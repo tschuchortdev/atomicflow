@@ -167,18 +167,12 @@ object Step {
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
     runSimpleStep(atMostOnce = true, key, stepVersion = 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
-  /** The shared machinery for both execution guarantees. Both persist a
-    * `Started` record before the body executes and replace it with a durable
-    * outcome; the guarantees differ only in how an unresolved `Started` record
-    * is replayed (at-least-once re-executes, at-most-once returns `None`).
+  /** Persists `Started` before execution, then replaces it with a durable outcome.
+    * On replay, at-least-once re-executes unresolved work; at-most-once returns `None`.
     *
-    * A thrown body failure is always handed to `retry`; at-most-once passes
-    * [[Step.RetryPolicy.never]] (as does the at-least-once default), so both
-    * guarantees share a single execution path. A retry delay at or below the
-    * runtime's durable-retry threshold sleeps inline inside the run; a delay
-    * above it durably suspends the step as a `RetryPending` row carrying the
-    * retry bookkeeping and the deadline at which the body may run again and
-    * resumes once that deadline is due.
+    * Body failures go through `retry` (always `never` for at-most-once).
+    * Short delays sleep inline; delays above the durable-retry threshold persist
+    * `RetryPending` with bookkeeping and a deadline, then suspend.
     */
   private def runSimpleStep[A: Cacheable as valueCodec](
       atMostOnce: Boolean,
@@ -228,17 +222,11 @@ object Step {
       }
     }
 
-    /** Runs the body until the retry policy stops retrying. `resumed` carries the
-      * bookkeeping of a durable retry being resumed, or `None` for a fresh
-      * execution (which writes the `Started` row first). This is the step's
-      * single cancellation checkpoint, taken once before any body execution or
-      * `Started` write.
+    /** Resumes retry bookkeeping or writes `Started` for a fresh execution.
+      * Checks cancellation once, before any body execution or `Started` write.
       *
-      * On success the `succeeded` row is persisted; on a terminal failure the
-      * `failed` row is persisted; otherwise the policy decides between an inline
-      * sleep-and-retry and a durable suspension. The body is re-evaluated (the
-      * by-name `body`) per attempt; inline retries loop rather than recurse so an
-      * unbounded policy with tiny delays cannot grow the stack.
+      * Persists success or terminal failure; otherwise retries inline or suspends.
+      * Inline retries loop to keep unbounded policies stack-safe.
       */
     def runBody(resumed: Option[RetryState]): A = {
       ctx.throwIfCancelled()

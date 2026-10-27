@@ -2,16 +2,11 @@ package atomicflow
 
 import scala.concurrent.duration.FiniteDuration
 
-/** A started background job runner returned by
-  * [[WorkflowRuntime.startJobRunner]]. It claims due wakeups from the shared
-  * tables and executes the corresponding instances on its worker pool, driving
-  * unattended workflows to completion.
+/** A running background worker returned by [[WorkflowRuntime.startJobRunner]].
+  * Claims wakeups and executes workflow instances on its worker pool.
   *
-  * A runner is created already started and cooperates with every other runner —
-  * in this process or another — through storage alone. Lifecycle: any number of
-  * runners may be started on the same runtime, each with its own settings and
-  * registry, and each stops independently; [[stop]] is idempotent and after
-  * `stop` the runner is inert while others keep running.
+  * Runners coordinate through storage, including across processes. Each has
+  * independent settings, a workflow registry, and lifecycle.
   */
 trait JobRunner {
 

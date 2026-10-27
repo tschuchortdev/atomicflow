@@ -7,10 +7,8 @@ import scala.annotation.targetName
 import scala.concurrent.duration.*
 import scala.util.control.NonFatal
 
-/** The typed handle of a workflow instance, obtained only from the runtime. It
-  * captures the [[Workflow]] definition it came from plus the instance's stable
-  * identity. Methods requiring execution take a contextual `(using
-  * WorkflowRuntime)`.
+/** A runtime-created handle pairing a [[Workflow]] definition with its instance's
+  * stable identity. Operations use a contextual [[WorkflowRuntime]].
   */
 final class WorkflowInstance[In, Out] private[atomicflow] (
     val workflow: Workflow[In, Out],
@@ -48,9 +46,7 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
   def getInfo()(using runtime: WorkflowRuntime): WorkflowInstance.Info =
     runtime.getWorkflowInstanceInfo(this)
 
-  /** Append a `Signal` event addressed to this instance. Forwarder for the
-    * runtime's `sendSignal`, resolving the signal's own [[Cacheable]].
-    */
+  /** Append a signal to this instance using the signal's codec. */
   @throws[WorkflowNotFoundException]
   def sendSignal[A](signal: Signal[A], value: A)(using runtime: WorkflowRuntime): SignalSendResult =
     runtime.sendSignal(id, signal.key, value)(using signal.cacheable)
@@ -68,9 +64,7 @@ final class WorkflowInstance[In, Out] private[atomicflow] (
 
 object WorkflowInstance {
 
-  /** Persisted instance state: the data view of an instance ("a row"), returned
-    * by key-based queries that don't have the workflow code, and by
-    * `getInfo()`. Fresh from the database.
+  /** Freshly queried instance state, available without the workflow definition.
     */
   final case class Info(
       id: WorkflowInstanceId,
@@ -86,10 +80,8 @@ object WorkflowInstance {
 
 /** A workflow definition, including its identity, description, body, and codecs.
   *
-  * `Cacheable[In]` and `Cacheable[Out]` are captured at construction (the
-  * companion's `[In: Cacheable, Out: Cacheable]` context bounds) and are the
-  * definition's codecs; only `Cacheable[Throwable]` is resolved at run call
-  * sites.
+  * Input and output codecs are captured at construction; only
+  * `Cacheable[Throwable]` is resolved at run call sites.
   */
 final class Workflow[In, Out] private[atomicflow] (
     val id: WorkflowId,
@@ -273,13 +265,10 @@ object Workflow {
       body(state, scope)
     }
 
-  /** Runs a stored loop. Return the next state to continue, or call `break` to finish.
-    * The body returns the next state `S` to continue, or calls
-    * `loop.break(result)` to complete the region with `R`. It has exactly the
-    * same durable transitions, region semantics, and `restartCount` metadata as
-    * [[restartable]]; a normal return starts the next generation and `break`
-    * completes the region. `initialState` is a by-name pure seed evaluated only
-    * on first creation.
+  /** Runs a stored loop: return the next state `S` to continue, or call
+    * `loop.break(result)` to finish with `R`. Uses [[restartable]]'s durable
+    * transitions, region semantics, and `restartCount`. `initialState` is a
+    * by-name pure seed evaluated only on first creation.
     */
   def loop[S: Cacheable, R](id: String, initialState: => S)(
       body: (S, LoopScope[R]) => WorkflowContext ?=> S
@@ -298,12 +287,8 @@ object Workflow {
   private def regionSegment(id: String, count: Long): String =
     s"$id@$count"
 
-  /** The single shared implementation behind [[restartable]] and [[loop]]. The
-    * body uses a [[RestartableScope]]: a normal return completes the region with
-    * `R`; `scope.restart` throws [[RegionRestartException]] to start the next
-    * generation. [[loop]] adapts its body to this rule (a normal return
-    * becomes a restart, `break` throws [[RegionBreakException]]). Both control
-    * exceptions are caught here and unwound to the region boundary.
+  /** Shared region boundary for [[restartable]] and [[loop]]; catches restart
+    * and break control flow. A normal return completes the region.
     */
   private def runRestartableRegion[S, R](id: String, initialState: => S)(
       body: (S, RestartableScope[S]) => WorkflowContext ?=> R
@@ -350,8 +335,6 @@ object Workflow {
           case StepState.Region(RegionState(count, encodedState)) =>
             (count, cacheable.read(encodedState.raw))
           case other =>
-            // A step key belongs to exactly one step kind; a foreign row at the
-            // region's key means the key was reused for a different step kind.
             throw new StepKeyConflictException(
               s"Step key '$id' is already stored as a '${other.rowKindText}' row and cannot be redefined as a restartable region; a step key belongs to exactly one step kind"
             )
@@ -379,10 +362,8 @@ object Workflow {
         done = true
       } catch {
         case e: RegionRestartException =>
-          // Commit the next generation's row first. The previous generation's
-          // rows, subscriptions, and children are discarded at the top of the
-          // next iteration, and re-discarded idempotently on replay, so a
-          // crash in between delays but never skips the cleanup.
+          // Commit before cleanup; the next iteration or replay repairs any
+          // cleanup interrupted by a crash.
           writeRegionRow(count + 1, e.serializedState)
           count += 1
           state = cacheable.read(e.serializedState.raw)
@@ -409,10 +390,8 @@ object Workflow {
   def uncancellable[R](f: WorkflowContext ?=> R)(using ctx: WorkflowContext): R =
     f(using ctx.copy(uncancellableDepth = ctx.uncancellableDepth + 1))
 
-  /** Wraps a body in an ID namespace: every Step/Await ID inside is prefixed
-    * with `scopeKey`, so
-    * the same step definitions can execute independently per element. Scopes
-    * nest arbitrarily; the full scope is the array of enclosing segment keys.
+  /** Prefixes Step/Await IDs with `scopeKey` so step definitions can execute
+    * independently per element. Nested scopes form an array of segment keys.
     */
   def scoped[R](scopeKey: String)(body: WorkflowContext ?=> R)(using ctx: WorkflowContext): R = {
     ScopePath.requireValidKey("scope key", scopeKey)
@@ -439,13 +418,8 @@ object Workflow {
     try Right(body(using ctx))
     catch { case e: WorkflowSuspendedException => Left(e) }
 
-  /** The terminal outcome of one parallel branch, collected so that ALL branches
-    * can be joined to completion before `parallel` decides what to propagate.
-    * Because every branch outcome is returned as a value (never thrown), Ox never
-    * interrupts a sibling mid-branch, so a DB-working branch is never cut off by
-    * another branch's control-flow exception — nor by a technical failure, which
-    * would otherwise deliver an interrupt a sibling Step could persist as a
-    * durable failure.
+  /** Collect outcomes as values so Ox joins every branch without interrupting
+    * siblings. An interrupted Step could persist a technical abort as a durable failure.
     */
   private sealed trait BranchOutcome[+R]
   private final case class BranchResult[R](value: R) extends BranchOutcome[R]
@@ -495,9 +469,6 @@ object Workflow {
     catch {
       case e: WorkflowSuspendedException => BranchSuspended(e)
       case e: WorkflowControlFlowException   => BranchControlFlow(e)
-      // Returned as a value, never rethrown here: escaping into Ox would
-      // interrupt the sibling branches, and an interrupted sibling Step could
-      // persist an infrastructure abort as a durable failure.
       case e: WorkflowTechnicalException => BranchThrewTechnicalException(e)
       case e if NonFatal(e)              => BranchFailed(e)
     }

@@ -15,39 +15,19 @@ import scala.concurrent.duration.{DurationInt, FiniteDuration}
 import scala.jdk.DurationConverters.*
 import scala.util.control.NonFatal
 
-/** A document-processing batch workflow: wait for an input file to be announced,
-  * read and archive it, run virus checks and encryption per document, upload
-  * each document to a processing endpoint, poll for the processing outcome, and
-  * report the batch result.
+/** Temporal document-processing workflow: await a file, archive it, check, sign
+  * and upload its documents, then poll for completion and report the batch result.
   *
-  * This is the Temporal equivalent of [[DocumentProcessingWorkflow4s]],
-  * [[DocumentProcessingAtomicflow]] and [[DocumentProcessingDbos4s]], using the
-  * official Temporal Java SDK from Scala: the annotated `@WorkflowInterface`
-  * below defines the durable workflow (plus its signals), all side effects are
-  * `@ActivityInterface` methods, `Workflow.await`/`Workflow.sleep` are the
-  * durable waits and timers, and `Async.function`/`Async.procedure` run the
-  * two virus checks in parallel again.
-  *
-  * How this maps to the workflows4s variant:
-  *   - The `inputFileFound` start signal is kept as a `@SignalMethod` awaited
-  *     with `Workflow.await` (the more idiomatic Temporal style would pass the
-  *     path as a `@WorkflowMethod` argument; the signal is kept for
-  *     equivalence, at the cost of a start-then-signal dance, see
-  *     [[DocumentProcessingTemporal.startForInputFile]]).
-  *   - There is no mid-workflow interruption, so the
-  *     `userCancelsUploadOfInputFile` signal sets a flag polled at phase
-  *     boundaries and in the status-polling loop (an externally cancelled
-  *     workflow plus a `CancellationScope` is the idiomatic Temporal
-  *     alternative, and `WorkflowStub.cancel()` remains available).
-  *   - The two virus checks run in parallel via `Async.procedure` (the dbos4s
-  *     variant had to run them sequentially).
-  *   - The sign-and-upload block is retried with a constant 15-minute interval
-  *     via `Workflow.retry`, and the signature validity period is enforced by
-  *     re-signing when the upload missed it (times read with the
-  *     replay-deterministic `Workflow.currentTimeMillis`).
-  *   - Status polling uses a `Workflow.sleep` timer, at most ten times.
-  *   - Exceptions crossing the workflow/activity boundary are wrapped in
-  *     `ActivityFailure`, so the error report uses the root cause's message.
+  * Uses the Java SDK with activities for side effects and durable waits/timers.
+  * Mapping from [[DocumentProcessingWorkflow4s]]:
+  *   - Keeps the file-found start signal for equivalence; see
+  *     [[DocumentProcessingTemporal.startForInputFile]].
+  *   - Cancellation sets a flag polled between phases and during status polling.
+  *   - Virus checks run in parallel via `Async.procedure`.
+  *   - Sign-and-upload retries every 15 minutes; expired signatures trigger
+  *     re-signing using replay-deterministic `Workflow.currentTimeMillis`.
+  *   - Status polling uses durable timers, with at most ten waits.
+  *   - Error reports unwrap `ActivityFailure` to the root cause's message.
   *
   * Production wiring:
   * {{{
@@ -66,18 +46,14 @@ trait DocumentProcessingTemporalWorkflow {
   @WorkflowMethod(name = "document-batch-processing")
   def processBatch(): String
 
-  /** The workflows4s `inputFileFound` start signal. */
   @SignalMethod
   def inputFileFound(path: String): Unit
 
-  /** The workflows4s `userCancelsUploadOfInputFile` interruption signal. */
   @SignalMethod
   def userCancelsUploadOfInputFile(): Unit
 }
 
-/** All durable side effects of the batch workflow. Activities are where
-  * collaborators run; the workflow body stays deterministic.
-  */
+/** Side effects run as activities to keep the workflow body deterministic. */
 @ActivityInterface
 trait DocumentProcessingTemporalActivities {
   def readInputFile(path: String): String
@@ -112,7 +88,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
   }
 
   override def processBatch(): String = {
-    // Durable wait for the start signal (or an early cancellation).
     Workflow.await(() => inputFilePath != null || cancelRequested)
     if inputFilePath == null then "cancelled by user" // cancelled before the file was announced
     else {
@@ -130,9 +105,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
     }
   }
 
-  /** Read and parse the input file, archive it, process every document, and
-    * report the batch result.
-    */
   private def processInputFile(path: String): String = {
     val batchJson = activities.readInputFile(path)
     val batch = decode[FileWithDocumentBatch](batchJson)
@@ -142,7 +114,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
 
     activities.archiveInputFile(path)
 
-    // Process documents sequentially, with separate activity records per document id.
     batch.documents.foreach { document =>
       throwIfCancelled()
       processIndividualDocument(document)
@@ -155,7 +126,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
   private def processIndividualDocument(document: DocumentFromInputFile): Unit = {
     val documentId = document.documentId
 
-    // The two virus checks run in parallel, as in the workflows4s variant.
     val virusCheck1 = Async.procedure(() => activities.checkForVirus1(documentId, document.content))
     val virusCheck2 = Async.procedure(() => activities.checkForVirus2(documentId, document.content))
     virusCheck1.get()
@@ -165,11 +135,7 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
     pollUploadStatus(documentId)
   }
 
-  /** Sign the document and upload it. The whole sign-and-upload block is
-    * retried with a constant 15-minute interval (the workflows4s `retryIn`),
-    * and if the upload missed the signature validity period it is signed
-    * again (the workflows4s timeout interruption that restarts the block).
-    */
+  /** Retry sign-and-upload every 15 minutes, re-signing if validity expires. */
   private def signAndUploadWithinSignatureValidity(document: DocumentFromInputFile): Unit = {
     val validityMs = EncryptionService.signatureValidityPeriod.toMillis
     var uploadedWithinValidity = false
@@ -178,7 +144,7 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
         RetryOptions.newBuilder()
           .setInitialInterval(UploadRetryInterval.toJava)
           .setBackoffCoefficient(1.0)
-          .setMaximumAttempts(0) // unlimited, as in the workflows4s variant
+          .setMaximumAttempts(0) // unlimited
           .build(),
         Optional.empty(),
         () => {
@@ -193,10 +159,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
     }
   }
 
-  /** Poll the processing status of an upload, at most [[MaxPollAttempts]] times
-    * with a durable 15-minute timer in between, until it is acknowledged as
-    * error free.
-    */
   private def pollUploadStatus(documentId: String): Unit = {
     var attempts  = 0
     var processed = false
@@ -215,9 +177,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
     }
   }
 
-  /** Check the cancellation flag set by the `userCancelsUploadOfInputFile`
-    * signal.
-    */
   private def throwIfCancelled(): Unit =
     if cancelRequested then throw Error.CancelledByUser
 
@@ -231,7 +190,6 @@ class DocumentProcessingTemporal extends DocumentProcessingTemporalWorkflow {
   }
 }
 
-/** Activity implementations: where the collaborators' side effects run. */
 class DocumentProcessingTemporalActivitiesImpl(
     archiveDir: Path,
     virusCheckService: VirusCheckService,
@@ -280,8 +238,6 @@ class DocumentProcessingTemporalActivitiesImpl(
     }
 
   override def checkUploadProcessingStatus(documentId: String): String = {
-    // A transient status-check failure counts as "no info", as in the
-    // workflows4s variant.
     val status =
       try documentUploadEndpoint.checkUploadProcessingStatus(documentId).unsafeRunSync()
       catch { case NonFatal(_) => DocumentUploadEndpoint.ProcessingStatus.NoInfo }
@@ -324,10 +280,8 @@ object DocumentProcessingTemporal {
   def fileIdFrom(inputFilePath: Path): String =
     FileWithDocumentBatch.idFromFileName(inputFilePath.getFileName.toString)
 
-  /** Start a batch workflow for an input file: starts the workflow under the
-    * file id and delivers the `inputFileFound` start signal (Temporal workflows
-    * take arguments, so passing the path to `processBatch` would be more
-    * idiomatic; the signal is kept to match the workflows4s variant).
+  /** Start under the file id and signal the input path. Keeps signal-based
+    * startup to match workflows4s rather than passing a workflow argument.
     */
   def startForInputFile(client: WorkflowClient, inputFilePath: Path): WorkflowStub = {
     val workflow = newWorkflowStub(client, inputFilePath)
@@ -336,10 +290,7 @@ object DocumentProcessingTemporal {
     WorkflowStub.fromTyped(workflow)
   }
 
-  /** Ask a running batch workflow to cancel: delivers the
-    * `userCancelsUploadOfInputFile` signal the workflow polls for between
-    * phases.
-    */
+  /** Signal cancellation, polled by the workflow between phases. */
   def requestCancellation(client: WorkflowClient, inputFilePath: Path): Unit =
     client
       .newWorkflowStub(classOf[DocumentProcessingTemporalWorkflow], fileIdFrom(inputFilePath))

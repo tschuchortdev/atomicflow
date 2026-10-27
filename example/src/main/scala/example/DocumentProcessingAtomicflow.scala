@@ -13,10 +13,8 @@ import javax.sql.DataSource
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.*
 
-/** A document-processing batch workflow: read and
-  * archive an input file, run virus checks and encryption per document, upload
-  * each document to a processing endpoint, poll for the processing outcome, and
-  * report the batch result.
+/** Atomicflow document-processing workflow: archive a file, check, sign and
+  * upload its documents, then poll for completion and report the batch result.
   *
   * The workflow is defined with the durable step primitives (`atLeastOnce` for
   * retryable work, `atMostOnce` for the external upload effect, `Workflow.loop`
@@ -45,9 +43,7 @@ class DocumentProcessingAtomicflow(
 
   lazy val runtime: PostgresWorkflowRuntime = PostgresWorkflowRuntime(dataSource, clock)
 
-  /** The batch workflow. Input is the input file path; output is the number of
-    * documents successfully processed.
-    */
+  /** Takes an input file path and returns the number of processed documents. */
   val batchWorkflow: Workflow[String, Int] =
     Workflow[String, Int](
       id = "document-batch-processing",
@@ -56,7 +52,6 @@ class DocumentProcessingAtomicflow(
     ) { inputFilePath =>
       val batch = readInputFile(inputFilePath)
       archiveInputFile(inputFilePath)
-      // Process documents sequentially, with separate step records per document id.
       batch.documents.foreach { document =>
         Workflow.scoped(document.documentId) {
           processIndividualDocument(document)

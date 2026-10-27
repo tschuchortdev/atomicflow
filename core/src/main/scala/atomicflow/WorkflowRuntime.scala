@@ -6,13 +6,9 @@ import java.util.concurrent.{TimeUnit, TimeoutException}
 import scala.annotation.implicitNotFound
 import scala.concurrent.duration.*
 
-/** The application-facing view of a workflow runtime: creates, runs, and
-  * manages workflow instances. Some methods are final and composed here from
-  * the storage/execution engine operations; the rest are abstract and
-  * implemented by the storage backend. The engine operations themselves live on
-  * [[WorkflowRuntimeInternals]], which this trait requires as a self-type (a
-  * backend implements both), so application code holding a `WorkflowRuntime`
-  * cannot reach them.
+/** Application-facing operations to create, run, and manage workflow instances.
+  * Backends also implement [[WorkflowRuntimeInternals]], whose engine operations
+  * are hidden from callers holding this interface.
   */
 @implicitNotFound("No WorkflowRuntime available. Add a using clause (using WorkflowRuntime).")
 trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
@@ -250,10 +246,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
         val payload = completionCodec.write(WorkflowCompletionResult.Failed(t))
         completeInstance(TerminalOutcome.Failed(SerializedValue.of(payload)))
         log.info(s"Workflow instance $instanceId failed", t)
-        // The failure is durably recorded; surface it as the runner-facing
-        // Failed outcome so the job runner can distinguish "already terminal,
-        // never re-execute" from an unknown internal error. Public entry
-        // points rethrow the cause.
+        // A durable Failed outcome tells the runner not to reschedule.
         val decoded = cacheableThrowable.read(cacheableThrowable.write(t))
         return WorkflowRunResult.Failed(decoded)
     }
