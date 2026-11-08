@@ -315,7 +315,7 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
   }
 
   /** Register and schedule the instance's first wakeup (due immediately). */
-  final def createAndScheduleForAsyncRun[In, Out](
+  def createAndScheduleForAsyncRun[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       in: In

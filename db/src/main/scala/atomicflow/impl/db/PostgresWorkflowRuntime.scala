@@ -46,7 +46,8 @@ class PostgresWorkflowRuntime private[atomicflow] (
     override val clock: Clock,
     leaseDuration: FiniteDuration = 5.minutes,
     leaseAcquireTimeoutSetting: FiniteDuration = 30.seconds,
-    durableRetryThresholdSetting: FiniteDuration = 30.seconds
+    durableRetryThresholdSetting: FiniteDuration = 30.seconds,
+    faultInjector: FaultInjector = FaultInjector.Noop
 )(using executionContext: ExecutionContext)
     extends WorkflowRuntime
     with WorkflowRuntimeInternals {
@@ -136,36 +137,72 @@ class PostgresWorkflowRuntime private[atomicflow] (
 
   def leaseAcquireTimeout: FiniteDuration = leaseAcquireTimeoutSetting
 
-  override def createWorkflowInstance[In, Out](
+  /** The create-if-absent instance registration as one `ConnectionIO`: the
+    * `ON CONFLICT DO NOTHING` insert, the read-back of existing input when a row
+    * already exists, and the [[WorkflowInputConflictException]] check. Shared by
+    * `createWorkflowInstance` and `createAndScheduleForAsyncRun` so the latter
+    * registers the instance and its wakeup in a single transaction — a differing
+    * input aborts here, before the wakeup insert.
+    */
+  private def createWorkflowInstanceQ[In, Out](
       workflow: Workflow[In, Out],
       instanceKey: WorkflowInstanceKey,
       in: In
-  )(using cacheable: Cacheable[In]): WorkflowInstance[In, Out] = {
+  )(using cacheable: Cacheable[In]): ConnectionIO[WorkflowInstance[In, Out]] = {
     val workflowId = workflow.id
     val instanceId = WorkflowInstanceId(workflowId, instanceKey)
     val serializedInput = cacheable.write(in)
 
-    val (inserted, existing) = runTransaction {
-      for {
-        inserted <- sql"""
-          INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation)
-          VALUES ($workflowId, $instanceKey, '{}', $serializedInput, ${workflow.version})
-          ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
-        """.update.run
-        existing <- if (inserted == 0)
-          sql"SELECT input FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = '{}'"
-            .query[String]
-            .option
-        else Option.empty[String].pure[ConnectionIO]
-      } yield (inserted, existing)
-    }
+    for {
+      inserted <- sql"""
+        INSERT INTO workflow_instances (workflow_id, workflow_instance_key, workflow_instance_scope, input, workflow_version_at_creation)
+        VALUES ($workflowId, $instanceKey, '{}', $serializedInput, ${workflow.version})
+        ON CONFLICT (workflow_id, workflow_instance_key, workflow_instance_scope) DO NOTHING
+      """.update.run
+      _ <- if (inserted == 1)
+        doobie.free.connection.delay(faultInjector.afterCreateInsert())
+      else ().pure[ConnectionIO]
+      existing <- if (inserted == 0)
+        sql"SELECT input FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $instanceKey AND workflow_instance_scope = '{}'"
+          .query[String]
+          .option
+      else Option.empty[String].pure[ConnectionIO]
+      _ <- existing match {
+        case Some(stored) if stored != serializedInput =>
+          doobie.free.connection.raiseError(WorkflowInputConflictException(instanceId))
+        case _ => ().pure[ConnectionIO]
+      }
+    } yield WorkflowInstance(workflow, instanceId)
+  }
 
-    existing match {
-      case Some(stored) if stored != serializedInput =>
-        throw WorkflowInputConflictException(instanceId)
-      case _ =>
-        WorkflowInstance(workflow, instanceId)
+  override def createWorkflowInstance[In, Out](
+      workflow: Workflow[In, Out],
+      instanceKey: WorkflowInstanceKey,
+      in: In
+  )(using cacheable: Cacheable[In]): WorkflowInstance[In, Out] =
+    runTransaction(createWorkflowInstanceQ(workflow, instanceKey, in))
+
+  /** Registers the instance and its first wakeup (due immediately) in ONE
+    * transaction, so a crash between registration and scheduling can never leave
+    * a created instance without its wakeup. Idempotent for equal input; a
+    * differing input aborts before the wakeup insert
+    * ([[WorkflowInputConflictException]]).
+    */
+  override def createAndScheduleForAsyncRun[In, Out](
+      workflow: Workflow[In, Out],
+      instanceKey: WorkflowInstanceKey,
+      in: In
+  ): WorkflowInstance[In, Out] = {
+    val now = clock.instant()
+    val instance = runTransaction {
+      for {
+        created <- createWorkflowInstanceQ(workflow, instanceKey, in)(using workflow.inputCacheable)
+        _ <- upsertWakeupQ(created.id.workflowId, created.id.workflowInstanceKey, created.id.scope, now)
+        _ <- doobie.free.connection.delay(faultInjector.afterWakeupInsert())
+      } yield created
     }
+    faultInjector.afterCreateAndScheduleCommit()
+    instance
   }
 
   override def createWorkflowInstanceDiscardExisting[In, Out](

@@ -29,6 +29,12 @@ abstract class PostgresWorkflowRuntimeSuite extends FunSuite {
 
   private def newDataSource: PGSimpleDataSource = dataSource
 
+  /** The suite's data source, so a test in package `atomicflow` can construct
+    * the package-private `PostgresWorkflowRuntime` directly (e.g. with a
+    * fault-injecting constructor argument).
+    */
+  protected def dataSourceForTests: PGSimpleDataSource = dataSource
+
   private lazy val xa: Transactor[IO] =
     Transactor.fromDataSource[IO](newDataSource, ExecutionContext.global)
 
