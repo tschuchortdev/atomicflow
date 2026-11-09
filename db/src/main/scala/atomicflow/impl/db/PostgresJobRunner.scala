@@ -104,7 +104,7 @@ final class PostgresJobRunner private[atomicflow] (
         LIMIT ${settings.wakeupBatchSize}
         FOR UPDATE OF w SKIP LOCKED
       """
-    runtime.runTransaction {
+    val claimed = runtime.runTransaction {
       for {
         rows <- query.query[DueWakeupRow].to[Vector]
         claimed <- rows.foldLeftM(Vector.empty[ClaimedInstance]) { (acc, row) =>
@@ -123,6 +123,9 @@ final class PostgresJobRunner private[atomicflow] (
         }
       } yield claimed
     }
+    if (claimed.nonEmpty)
+      runtime.notifyAfterLeaseAcquire()
+    claimed
   }
 
   private def dispatchRun(c: ClaimedInstance): Unit = {
@@ -241,7 +244,7 @@ final class PostgresJobRunner private[atomicflow] (
     }
     var fired = 0
     rows.foreach { row =>
-      if (runtime.runTransaction(runtime.fireTimerSubscriptionQ(row.timerId, row.workflowId, row.instanceKey, row.scope)))
+      if (runtime.fireTimerSubscription(row.timerId, row.workflowId, row.instanceKey, row.scope))
         fired += 1
     }
     if (fired > 0) logger.debug(s"Timer sweep fired $fired due timers")
