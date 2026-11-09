@@ -10,6 +10,7 @@ import test.PostgresWorkflowRuntimeSuite
 
 import java.time.Clock
 import scala.concurrent.ExecutionContext
+import scala.concurrent.duration.*
 
 /** Atomicity of the Postgres create-and-schedule transaction: every injected
   * failure inside the transaction must leave neither the instance row nor the
@@ -33,6 +34,8 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
       ExecutionContext.global
     )
 
+  private def cleanRuntime: PostgresWorkflowRuntime = runtimeWith(FaultInjector.Noop)
+
   private def workflow(id: WorkflowId): Workflow[String, String] =
     Workflow[String, String](id = id)(body = in => in)
 
@@ -48,6 +51,23 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
         .query[Long].unique
     )
 
+  private def terminalState(workflowId: WorkflowId, key: WorkflowInstanceKey): Option[String] =
+    run(
+      sql"SELECT terminal_state FROM workflow_instances WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = '{}'"
+        .query[Option[String]].unique
+    )
+
+  private def runScheduledToCompletion(
+      rt: PostgresWorkflowRuntime,
+      wf: Workflow[String, String],
+      key: WorkflowInstanceKey
+  ): Option[String] = {
+    val runner = rt.startJobRunnerForTests(Seq(wf), JobRunnerSettings.forTests)
+    try runner.runDriverCycle()
+    finally runner.stop(1.second)
+    terminalState(wf.id, key)
+  }
+
   /** Whether `t`'s cause chain contains the locally defined `InjectedFault`. */
   private def causeChainContains(t: Throwable): Boolean = {
     @annotation.tailrec
@@ -60,7 +80,7 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
     loop(t)
   }
 
-  test("failure at afterCreateInsert rolls back instance and wakeup; surfaces WorkflowTechnicalException") {
+  test("failure at afterCreateInsert rolls back instance and wakeup; a retry runs the instance") {
     val wf = workflow("wf-atomic-1")
     val rt = runtimeWith(FailingInjector("afterCreateInsert"))
 
@@ -71,9 +91,15 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(instanceRows(wf.id, "key-1"), 0L)
     assertEquals(wakeupRows(wf.id, "key-1"), 0L)
+
+    val clean = cleanRuntime
+    clean.createAndScheduleForAsyncRun(wf, "key-1", "hello")
+    assertEquals(instanceRows(wf.id, "key-1"), 1L)
+    assertEquals(wakeupRows(wf.id, "key-1"), 1L)
+    assertEquals(runScheduledToCompletion(clean, wf, "key-1"), Some("completed"))
   }
 
-  test("failure at afterWakeupInsert rolls back instance and wakeup") {
+  test("failure at afterWakeupInsert rolls back instance and wakeup; a retry runs the instance") {
     val wf = workflow("wf-atomic-2")
     val rt = runtimeWith(FailingInjector("afterWakeupInsert"))
 
@@ -84,9 +110,15 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(instanceRows(wf.id, "key-2"), 0L)
     assertEquals(wakeupRows(wf.id, "key-2"), 0L)
+
+    val clean = cleanRuntime
+    clean.createAndScheduleForAsyncRun(wf, "key-2", "hello")
+    assertEquals(instanceRows(wf.id, "key-2"), 1L)
+    assertEquals(wakeupRows(wf.id, "key-2"), 1L)
+    assertEquals(runScheduledToCompletion(clean, wf, "key-2"), Some("completed"))
   }
 
-  test("failure at afterCreateAndScheduleCommit leaves both rows committed") {
+  test("failure at afterCreateAndScheduleCommit leaves both rows committed; a clean run completes the instance") {
     val wf = workflow("wf-atomic-3")
     val rt = runtimeWith(FailingInjector("afterCreateAndScheduleCommit"))
 
@@ -96,6 +128,8 @@ class CreateAndScheduleAtomicitySuite extends PostgresWorkflowRuntimeSuite {
 
     assertEquals(instanceRows(wf.id, "key-3"), 1L)
     assertEquals(wakeupRows(wf.id, "key-3"), 1L)
+
+    assertEquals(runScheduledToCompletion(cleanRuntime, wf, "key-3"), Some("completed"))
   }
 
   test("normal run creates both rows") {
