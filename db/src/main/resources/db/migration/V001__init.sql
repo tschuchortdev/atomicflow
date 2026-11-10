@@ -93,7 +93,7 @@ CREATE TABLE workflow_steps (
 );
 
 COMMENT ON COLUMN workflow_steps.step_kind IS
-  'The step kind that wrote the row: Step, Await, FirstToRun, or RestartableRegion. A step key (step_id, scope, version) belongs to exactly one step kind.';
+  'The step kind that wrote the row: Step, Await, FirstCompleted, or RestartableRegion. A step key (step_id, scope, version) belongs to exactly one step kind.';
 
 CREATE TABLE signal_cursor (
   workflow_id VARCHAR NOT NULL,

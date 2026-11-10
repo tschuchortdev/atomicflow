@@ -147,7 +147,7 @@ trait WorkflowRuntimeInternals {
     * of `scopePaths` or lies beneath one (a longer array with one of `scopePaths`
     * as a prefix), across all three subscription tables (signal, timer,
     * completion), fenced. Used by
-    * `Step.firstToRunWithoutSuspension` to retire every branch's pending
+    * `Step.firstCompletedWithoutSuspension` to retire every branch's pending
     * subscriptions — including nested subscopes — before the winner's step row
     * is written. The winner row is the stored
     * first-wins marker, so deleting first means a crash in between leaves no

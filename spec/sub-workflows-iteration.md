@@ -66,16 +66,16 @@ val results: Seq[R] = Workflow.parallel(
 )
 ```
 
-### `Step.firstToRunWithoutSuspension`
+### `Step.firstCompletedWithoutSuspension`
 
-Runs multiple branches concurrently. Waits either until all branches complete or suspend. If all branches suspended, it rethrows one combined `WorkflowSuspendedException` like `Workflow.parallel`. If at least one completes normally, it discards the other suspensions and returns the first result. 
+Runs multiple branches concurrently. The first branch to reach a terminal outcome decides the race. A branch that completes normally wins: its result is returned and stored, and the remaining branches are cancelled — their next runtime checkpoint throws `WorkflowCancelledException`, the same exception instance-wide cancellation uses. Losing branches are never interrupted; a branch inside a blocking body without checkpoints runs until its next checkpoint. A losing branch may catch that cancellation for cleanup, but any outcome it produces afterwards is ignored; durable cleanup must run inside `Workflow.uncancellable`. A failure or control-flow exception that is the first terminal outcome propagates without storing a winner. When a cancellation from outside the race (instance-wide, or from an enclosing race) is observed and no branch of this race reached a terminal outcome of its own, the race propagates it. If every branch suspends, it rethrows one combined `WorkflowSuspendedException` like `Workflow.parallel`. Inside `Workflow.uncancellable`, cancellation delivery is suppressed for race-local cancellation as well as for the instance-wide flag, so a race started there neither stops its losing branches early nor propagates an external cancellation after its branches suspend.
 
 TODO: how does it handle cancellation of child workflows started from a branch?
 
 ```scala
 object Step {
     @experimental
-    def firstToRunWithoutSuspension[R](
+    def firstCompletedWithoutSuspension[R](
         stepId: String,
         invalidateOn: Seq[StepInput[?]] = Seq.empty,
         ensureUnchanged: Seq[StepInput[?]] = Seq.empty
@@ -94,7 +94,7 @@ The winner row persists only the winning branch's public returned value (the win
 This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
 
 ```scala
-val result: R = Step.firstToRunWithoutSuspension("race-branches",
+val result: R = Step.firstCompletedWithoutSuspension("race-branches",
     "sleep" -> { () => Thread.sleep(10.minutes) },
     "timer" -> { () => Step.await("timer", Awaitable.Timer(1.minute)) }
 )
@@ -204,7 +204,7 @@ val children = items.map(i => workerWf.startAsChild(key(i), i))
 val results = Workflow.parallel(children.map { child => () => Step.await("complete-" + child.id.key, child.completion) })
 
 // first to finish wins
-val result = Step.firstToRunWithoutSuspension("race-children",
+val result = Step.firstCompletedWithoutSuspension("race-children",
   children.map { child => child.id.key -> { () => Step.await("complete-" + child.id.key, child.completion) } }
 )
 
@@ -429,7 +429,7 @@ val processorWf = Workflow("processor") { (state: State) =>
    `running-workflows.md` ("Cancellation and termination"); parent-close
    application rules are specified above.
 
-2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstToRunWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
+2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstCompletedWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
 3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
    race resolves, every branch's pending subscriptions — including those

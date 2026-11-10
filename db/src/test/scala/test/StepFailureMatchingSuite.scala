@@ -163,14 +163,14 @@ class StepFailureMatchingSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(caughtKey, "stepkey")
   }
 
-  test("a StepFailed catch matches a failing step inside a firstToRun race branch (the branch occupies two scope segments)") {
+  test("a StepFailed catch matches a failing step inside a firstCompleted race branch (the branch occupies two scope segments)") {
     val rt = newRuntime
     val s2 = Signal[String]("s2")
     var caughtScope = Vector.empty[String]
     var caughtKey = ""
     val wf = Workflow[String, String](id = "sfm-race") { in =>
       try {
-        val result = Step.firstToRunWithoutSuspension[Int]("raceid")(
+        val result = Step.firstCompletedWithoutSuspension[Int]("raceid")(
           "loser" -> { () => Step.atLeastOnce[Int]("boom") { throw new RuntimeException("boom-race") } },
           "wait"  -> { () => Step.await[String]("wait", Awaitable.SignalEvent(s2)); 2 }
         )

@@ -130,7 +130,7 @@ class StepInputConflictException(message: String)
 
 /** Thrown when a step key is reused for a different step kind. A step key (id,
   * scope, and version) belongs to exactly one step kind — `Step`, `Await`,
-  * `FirstToRun`, or `RestartableRegion` — and writing a row of another kind at
+  * `FirstCompleted`, or `RestartableRegion` — and writing a row of another kind at
   * the same key fails the run instead of overwriting the existing row.
   */
 class StepKeyConflictException(message: String)

@@ -351,7 +351,7 @@ writer exist.**
 
 ```text
 workflow_instances        -- identity + input + generation + terminal_* + lease_* / fencing_token + inheritance
-workflow_steps            -- user steps, wait sites, first-to-run, restartable regions (one table)
+workflow_steps            -- user steps, wait sites, first-completed, restartable regions (one table)
 workflow_events           -- global append-only log: Signal | TimerFired | WorkflowCompleted
 signal_cursor             -- per (instance, signal key) cursor into the global sequence
 workflow_signal_subscriptions / _timer_subscriptions / _completion_subscriptions

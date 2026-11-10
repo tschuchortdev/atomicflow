@@ -83,7 +83,7 @@ progress = DBOS.get_event("order-123", "progress", timeout_seconds=30)
 | Single wait | `Step.await` | `Await` / channel receive | `recv` / `get_event` |
 | Select/race | `Step.awaitRace` | `Selector` | `asyncio_wait` |
 | Cross-source ordering | one global `sequenceId` | history order | per-mechanism |
-| Race arbitrary code | `Step.firstToRunWithoutSuspension` (documented pitfalls) | selectors over futures | — |
+| Race arbitrary code | `Step.firstCompletedWithoutSuspension` (documented pitfalls) | selectors over futures | — |
 
 **Implementation.** Every AtomicFlow wait site is a **runtime-computed step**
 evaluated by one protocol, `evaluateWait`:

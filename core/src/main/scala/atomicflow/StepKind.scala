@@ -18,8 +18,8 @@ object StepKind:
   /** A runtime-computed wait: `Step.await` and `Step.awaitRace`. */
   val Await: StepKind = "Await"
 
-  /** A `Step.firstToRunWithoutSuspension` winner row. */
-  val FirstToRun: StepKind = "FirstToRun"
+  /** A `Step.firstCompletedWithoutSuspension` winner row. */
+  val FirstCompleted: StepKind = "FirstCompleted"
 
   /** A `Workflow.restartable` / `Workflow.loop` region row. */
   val RestartableRegion: StepKind = "RestartableRegion"

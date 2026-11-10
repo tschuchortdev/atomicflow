@@ -5,6 +5,8 @@ import atomicflow.impl.Sha256Fingerprinter
 
 import java.nio.charset.StandardCharsets
 import java.time.Instant
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import scala.annotation.experimental
 import scala.annotation.targetName
 import scala.concurrent.duration.*
@@ -443,13 +445,13 @@ object Step {
   }
 
   /** Validates user-supplied race branch keys (an [[awaitRace]] member key or a
-    * [[firstToRunWithoutSuspension]] branch key). The `""` key is reserved for
-    * single-subscriber sites (plain awaits), and the `"__"` prefix for
+    * [[firstCompletedWithoutSuspension]] branch key). The `""` key is reserved
+    * for single-subscriber sites (plain awaits), and the `"__"` prefix for
     * engine-internal subscribers (such as step retries).
     *
-    * A `firstToRun` branch key is also a scope-path segment (each branch runs
-    * one scope level below the race's key), so it must satisfy the key rules of
-    * [[ScopePath.requireValidKey]].
+    * A `firstCompletedWithoutSuspension` branch key is also a scope-path segment (each branch
+    * runs one scope level below the race's key), so it must satisfy the key
+    * rules of [[ScopePath.requireValidKey]].
     */
   private def validateBranchKeys(stepKey: String, branchKeys: Seq[String], keysArePathSegments: Boolean = false): Unit = {
     branchKeys.foreach { branchKey =>
@@ -476,10 +478,24 @@ object Step {
       tryOrThrowStepSerializationFailed(s"Signal '${signal.key}' payload could not be decoded")(signal.cacheable.read(candidate.payload.raw))
     }
 
-  /** Runs branches concurrently and waits for them to finish or suspend.
-    * Returns and stores the result of the first declared branch that completed
-    * normally. If all branches suspend, throws their combined suspension. A
-    * non-suspension failure propagates without storing a winner.
+  /** Runs branches concurrently. The first branch to reach a terminal outcome
+    * decides the race: a normal completion wins, is stored, and the remaining
+    * branches are cancelled — their next runtime checkpoint throws
+    * [[WorkflowCancelledException]], the same exception instance-wide
+    * cancellation uses. Branches are never interrupted: a branch in a blocking
+    * body without checkpoints runs until its next checkpoint. A losing branch
+    * may catch that cancellation for cleanup, but any outcome it produces
+    * afterwards is ignored; durable cleanup must run inside
+    * `Workflow.uncancellable`. A failure or control-flow exception that is the
+    * first terminal outcome propagates without storing a winner. A cancellation
+    * raised outside the race (instance-wide or by an enclosing race) propagates
+    * when no branch of this race reached a terminal outcome of its own. If
+    * every branch suspends, their combined suspension is thrown.
+    *
+    * Inside `Workflow.uncancellable`, cancellation delivery is suppressed for
+    * race-local cancellation as well as for the instance-wide flag, so a race
+    * started inside such a region neither stops its losing branches early nor
+    * propagates an external cancellation after its branches suspend.
     *
     * Replay returns the stored result without running branches again, unless
     * `invalidateOn` inputs change. `ensureUnchanged` inputs must remain equal.
@@ -488,9 +504,8 @@ object Step {
     * before that write can rerun branches and select a different result.
     *
     * This operation does not select by event time. A blocking branch can finish
-    * while another branch suspends on a wait. When several branches complete
-    * during one run, declaration order selects the result. Use [[awaitRace]]
-    * when the earliest stored event must win.
+    * while another branch suspends on a wait. Use [[awaitRace]] when the
+    * earliest stored event must win.
     *
     * @param stepId
     *   the step's stable identity within the workflow
@@ -501,20 +516,28 @@ object Step {
     * @param branches
     *   the `key -> branch` pairs to race; keys are non-empty, unique within the
     *   race, and must not start with `"__"` (reserved for engine-internal
-    *   subscribers); the first branch to complete normally wins. Each branch
-    *   body is wrapped in a `() => WorkflowContext ?=> R` lambda
-    *   (`"key" -> { () => ... }`) so it stays lazy: constructing the lambda has
-    *   no side effects and the body runs only when the race applies it with
-    *   the branch's own context. A bare `("key", { ... })` context function
-    *   would be typed eagerly and evaluated at the call site.
+    *   subscribers); the first branch to reach a terminal outcome decides the
+    *   race. Each branch body is wrapped in a `() => WorkflowContext ?=> R`
+    *   lambda (`"key" -> { () => ... }`) so it stays lazy: constructing the
+    *   lambda has no side effects and the body runs only when the race applies
+    *   it with the branch's own context. A bare `("key", { ... })` context
+    *   function would be typed eagerly and evaluated at the call site.
     */
   @experimental
-  def firstToRunWithoutSuspension[R: Cacheable](
+  def firstCompletedWithoutSuspension[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       ensureUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, () => WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
     evaluateFirstCompletedBranch(stepId, invalidateOn, ensureUnchanged, branches.toVector)
+
+  private sealed trait RaceOutcome[+R]
+  private object RaceOutcome {
+    final case class Completed[R](value: R)                       extends RaceOutcome[R]
+    final case class Failed(error: Throwable)                     extends RaceOutcome[Nothing]
+    final case class ControlFlow(c: WorkflowControlFlowException) extends RaceOutcome[Nothing]
+    case object Cancelled                                         extends RaceOutcome[Nothing]
+  }
 
   private def evaluateFirstCompletedBranch[R](
       stepKey: String,
@@ -522,7 +545,7 @@ object Step {
       ensureUnchanged: Seq[StepInput[?]],
       branches: Vector[(String, () => WorkflowContext ?=> R)]
   )(using ctx: WorkflowContext, valueCodec: Cacheable[R], throwableCodec: Cacheable[Throwable]): R = {
-    require(branches.nonEmpty, s"firstToRunWithoutSuspension('$stepKey') requires at least one branch")
+    require(branches.nonEmpty, s"firstCompletedWithoutSuspension('$stepKey') requires at least one branch")
     validateBranchKeys(stepKey, branches.map(_._1), keysArePathSegments = true)
     ScopePath.requireValidKey("step key", stepKey)
     val internals: ctx.internals.type = ctx.internals
@@ -539,39 +562,65 @@ object Step {
     def evaluate(): R = {
       ctx.throwIfCancelled()
       val branchPaths = branches.map((key, _) => branchPath(ctx.currentScope, key))
+      val stopLosers = new AtomicBoolean(false)
       val branchContexts = branches.map((key, _) =>
-        ctx.copy(scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key)))
-      val outcomes: Seq[Either[WorkflowSuspendedException, R]] =
-        ox.par(branches.indices.map { i =>
-          () =>
-            try Right(branches(i)._2()(using branchContexts(i)))
-            catch { case e: WorkflowSuspendedException => Left(e) }
-        })
-      val suspensions = outcomes.collect { case Left(s) => s }
-      if (suspensions.size == outcomes.size) {
-        throw new WorkflowSuspendedException(suspensions)
-      } else {
-        val winnerResult = outcomes.collect { case Right(r) => r }.head
-        val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(winnerResult)
-        // Delete-first: retire every branch's subscriptions (including nested
-        // subscopes) before persisting the winner. The winner row is the durable
-        // first-wins marker, so a crash in between leaves no marker and the next
-        // run re-evaluates from scratch and re-deletes.
-        internals.deleteSubscriptionsUnderScopePaths(branchPaths)
-        internals.writeStep(
-          scopedStepId, 0L,
-          StoredStep(
-            StepState.FirstToRun(SerializedValue.of(serialized)),
-            InputFingerprints.of(fingerprints),
+        ctx.copy(
+          scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key),
+          localCancellation = Some(stopLosers)
+        ))
+
+      // The first terminal outcome decides the race; only then are the losing
+      // branches cancelled at their next checkpoint.
+      val decision = new AtomicReference[RaceOutcome[R]](null)
+      def record(outcome: RaceOutcome[R]): Unit =
+        if (decision.compareAndSet(null, outcome)) stopLosers.set(true)
+
+      val suspensions: Seq[WorkflowSuspendedException] = ox.par(branches.indices.map { i =>
+        () =>
+          try {
+            record(RaceOutcome.Completed(branches(i)._2()(using branchContexts(i))))
             None
+          } catch {
+            case _: WorkflowCancelledException =>
+              record(RaceOutcome.Cancelled)
+              None
+            case e: WorkflowSuspendedException => Some(e)
+            case e: WorkflowControlFlowException =>
+              record(RaceOutcome.ControlFlow(e))
+              None
+            case e: WorkflowTechnicalException =>
+              record(RaceOutcome.Failed(e))
+              None
+            case WorkflowNonFatal(t) =>
+              record(RaceOutcome.Failed(t))
+              None
+          }
+      }).flatten
+
+      decision.get match {
+        case RaceOutcome.Completed(winner) =>
+          val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(winner)
+          internals.deleteSubscriptionsUnderScopePaths(branchPaths)
+          internals.writeStep(
+            scopedStepId, 0L,
+            StoredStep(
+              StepState.FirstCompleted(SerializedValue.of(serialized)),
+              InputFingerprints.of(fingerprints),
+              None
+            )
           )
-        )
-        decoded
+          decoded
+        case RaceOutcome.Failed(t)      => throw t
+        case RaceOutcome.ControlFlow(c) => throw c
+        case RaceOutcome.Cancelled      => throw WorkflowCancelledException()
+        case null =>
+          if (ctx.uncancellableDepth == 0 && ctx.isCancellationRequested) throw WorkflowCancelledException()
+          else throw new WorkflowSuspendedException(suspensions)
       }
     }
 
-    loadStepStateOrDeleteIfInvalid[StepState.FirstToRun](stepKey, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
-      case Some(StepState.FirstToRun(result)) => decodeStored(valueCodec, stepKey)(result.raw)
+    loadStepStateOrDeleteIfInvalid[StepState.FirstCompleted](stepKey, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
+      case Some(StepState.FirstCompleted(result)) => decodeStored(valueCodec, stepKey)(result.raw)
       case None                               => evaluate()
     }
   }
@@ -814,7 +863,7 @@ object Step {
 
   /** Enforces the `ensureUnchanged` pin (throwing [[StepInputConflictException]]
     * when a pinned input changed) and reports whether any `invalidateOn` input
-    * differs from what the stored row recorded. Shared by steps, first-to-run
+    * differs from what the stored row recorded. Shared by steps, first-completed
     * races, and cached awaits.
     */
   private def haveInputsChanged(

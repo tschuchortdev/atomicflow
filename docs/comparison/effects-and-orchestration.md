@@ -218,7 +218,7 @@ results = await asyncio.gather(step1(a), step2(b), return_exceptions=True)  # de
 | | AtomicFlow | Temporal | DBOS |
 |---|---|---|---|
 | Fan-out | `Workflow.parallel` (Ox) | futures, selectors | `gather` (deterministic start order), child workflows |
-| Race | `awaitRace`, `firstToRunWithoutSuspension` | `Selector` | `asyncio_wait` |
+| Race | `awaitRace`, `firstCompletedWithoutSuspension` | `Selector` | `asyncio_wait` |
 | Partial collection | `Workflow.runToSuspension` per branch | futures + selectors | `gather(..., return_exceptions=True)` |
 
 **Implementation.** AtomicFlow's `Workflow.parallel` uses **join-then-propagate**
