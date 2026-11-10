@@ -7,7 +7,7 @@ import doobie.implicits.*
 import doobie.postgres.implicits.*
 
 /** Pins the propagate-vs-cache boundary for exceptions originating inside a
-  * Step body: the runtime's own exceptions (`NotAStepOutcome`) abort the run
+  * Step body: the runtime's own exceptions abort the run
   * without durable effect, while ordinary failures are the Step's durable
   * outcome.
   */

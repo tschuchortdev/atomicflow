@@ -76,7 +76,7 @@ class DocumentProcessingAtomicflow(
     * crash between `Files.move` and step commit, the file is already gone; that
     * is treated as already archived.
     */
-  private def archiveInputFile(inputFilePath: String)(using ctx: WorkflowContext): Unit =
+  private def archiveInputFile(inputFilePath: String)(using ctx: WorkflowContext): Unit = {
     Step.atLeastOnce[Unit]("archive-input-file") {
       val path = Path.of(inputFilePath)
       try {
@@ -87,12 +87,13 @@ class DocumentProcessingAtomicflow(
         case e: java.io.IOException               => throw Error.ArchivingFileFailed(e.getMessage)
       }
     }
+  }
 
   /** Report the batch result as a durable at-most-once external effect: on a
     * replay the report is never re-executed.
     */
   private def reportResult(inputFilePath: String)(using ctx: WorkflowContext): Unit =
-    Step.atMostOnce[Unit]("report-input-file-processing-status", ensureUnchanged = Seq("filePath" -> inputFilePath)) {
+    Step.atMostOnce[Unit]("report-input-file-processing-status", invalidateOn = Seq("filePath" -> inputFilePath)) {
       resultReporter.reportResultSuccess(Path.of(inputFilePath)).unsafeRunSync()
     }
 
