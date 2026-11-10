@@ -1,5 +1,7 @@
 package atomicflow
 
+import java.util.concurrent.atomic.AtomicBoolean
+
 /** The context created for each workflow run. It carries
   * the instance identity, the version of the definition captured at creation, the
   * runtime services, and (via [[currentExecution]]) the runtime's per-run
@@ -7,12 +9,17 @@ package atomicflow
   *
   * A new context is created for every run and is not retained between runs.
   * The context is immutable: the transient lexical state of the run — the
-  * enclosing `Workflow.scoped` path ([[scopePath]]) and the `Workflow.uncancellable`
-  * depth ([[uncancellableDepth]]) — lives on the context, and every region
-  * function (`Workflow.scoped`, `Workflow.uncancellable`, `Workflow.restartable` /
-  * `Workflow.loop`, `Workflow.parallel`, `Step.firstToRunWithoutSuspension`)
-  * passes a copy with updated scope or cancellation settings to its body. The state
-  * therefore travels with the context value, not with the executing thread.
+  * enclosing `Workflow.scoped` path ([[scopePath]]), the `Workflow.uncancellable`
+  * depth ([[uncancellableDepth]]), and the local cancellation flag used by a
+  * `Step.firstCompletedWithoutSuspension` race — lives on the context, and every
+  * region function (`Workflow.scoped`, `Workflow.uncancellable`,
+  * `Workflow.restartable` / `Workflow.loop`, `Workflow.parallel`,
+  * `Step.firstCompletedWithoutSuspension`) passes a copy with updated scope or
+  * cancellation settings to its body. Derived contexts form a parent chain: the
+  * copy records its creator as [[parent]], so cancellation checks can resolve
+  * enclosing local flags in memory and, at the root, the instance's durable flag.
+  * The state therefore travels with the context value, not with the executing
+  * thread.
   */
 final class WorkflowContext(
     val instanceId: WorkflowInstanceId,
@@ -49,18 +56,42 @@ final class WorkflowContext(
       * immutably through derived contexts; a non-zero depth suppresses
       * cancellation delivery ([[throwIfCancelled]]).
       */
-    private[atomicflow] val uncancellableDepth: Int = 0
+    private[atomicflow] val uncancellableDepth: Int = 0,
+    /** The context this one was derived from, or [[None]] at the run's root.
+      * Cancellation checks walk this chain to find enclosing local cancellation
+      * flags and, at the root, to consult the instance's durable flag.
+      */
+    private[atomicflow] val parent: Option[WorkflowContext] = None,
+    /** The local cancellation flag of an enclosing race scope, shared by every
+      * branch of that race; [[None]] outside a race.
+      */
+    private[atomicflow] val localCancellation: Option[AtomicBoolean] = None
 ) {
+
+  /** True when cancellation is requested for this context: a local cancellation
+    * flag of an enclosing race scope, or — at the run's root context — the
+    * instance's durable cancellation flag. Contexts form a parent chain;
+    * local flags are in-memory and checked first.
+    */
+  private[atomicflow] def isCancellationRequested: Boolean =
+    localCancellation.exists(_.get()) ||
+      (parent match {
+        case Some(p) => p.isCancellationRequested
+        case None    => internals.isCancellationRequested(instanceId)
+      })
 
   /** The shared cancellation-delivery check behind every delivery point (the
     * new-work checkpoints in `Step` and the explicit `Workflow.heartbeat`):
-    * unless the `Workflow.uncancellable` depth of this context is non-zero,
-    * re-reads the durable `cancel_requested_at` flag via the runtime and throws
-    * [[WorkflowCancelledException]] when set. Cached checkpoint replays never
-    * call it, so they never deliver.
+    * walks the parent chain and, unless the `Workflow.uncancellable` depth of
+    * this context is non-zero, throws [[WorkflowCancelledException]] when
+    * cancellation is requested. Local cancellation flags set by a
+    * `Step.firstCompletedWithoutSuspension` race are checked in memory first;
+    * the run's root context (parent-less) consults the instance's durable flag
+    * via the runtime. `uncancellableDepth > 0` suppresses both. Cached
+    * checkpoint replays never call it, so they never deliver.
     */
   private[atomicflow] def throwIfCancelled(): Unit =
-    if (uncancellableDepth == 0 && internals.isCancellationRequested(instanceId))
+    if (uncancellableDepth == 0 && isCancellationRequested)
       throw WorkflowCancelledException()
 
   /** The current step scope path: [[scopePath]] itself, the raw segment array
@@ -71,7 +102,14 @@ final class WorkflowContext(
 
   private[atomicflow] def copy(
       scopePath: ScopePath = scopePath,
-      uncancellableDepth: Int = uncancellableDepth
+      uncancellableDepth: Int = uncancellableDepth,
+      localCancellation: Option[AtomicBoolean] = localCancellation
   ): WorkflowContext =
-    new WorkflowContext(instanceId, versionAtCreation, runtime, internals)(currentExecution, scopePath, uncancellableDepth)
+    new WorkflowContext(instanceId, versionAtCreation, runtime, internals)(
+      currentExecution,
+      scopePath,
+      uncancellableDepth,
+      Some(this),
+      localCancellation
+    )
 }

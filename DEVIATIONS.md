@@ -55,7 +55,10 @@ adds detail to, the documents in `spec/`.
   therefore gone.
 - `WorkflowContext` holds the enclosing step scope and cancellation-suppression
   depth. Nested scopes pass an immutable copy to their bodies, so a captured
-  context works on another thread without thread-local state.
+  context works on another thread without thread-local state. Contexts form a
+  parent chain; a cancellation checkpoint resolves local cancellation flags
+  (one per `firstCompletedWithoutSuspension` race) in memory and, at the run's
+  root context, the instance's durable flag.
 - Runtime settings include `leaseDuration` (5 minutes), `leaseAcquireTimeout`
   (30 seconds), and `durableRetryThreshold` (30 seconds). Caller-thread runs
   need these settings as well as job-runner executions.
@@ -90,10 +93,21 @@ adds detail to, the documents in `spec/`.
   replacement timer gets a fresh id, so its old firing event cannot satisfy it.
 - Timer firing commits before wait evaluation. Its event remains stored if
   registration, filtering, mapping, or result storage subsequently fails.
-- `firstToRunWithoutSuspension` waits for its concurrent branches to settle.
-  If several complete, the first declared completed branch wins. Branch
-  subscriptions are deleted before storing the winner; a crash before that
-  write can cause branches to run again and choose a different winner.
+- `firstCompletedWithoutSuspension` waits for its concurrent branches to settle.
+  The first branch to reach a terminal outcome decides the race: a normal
+  completion wins and the losing branches are cancelled with the same
+  `WorkflowCancelledException` as instance-wide cancellation, delivered at their
+  next runtime checkpoint, so no thread is ever interrupted. A losing branch may
+  catch that cancellation for cleanup, but any later outcome from it is ignored;
+  durable cleanup must run inside `Workflow.uncancellable` — inside which
+  cancellation delivery is suppressed for race-local cancellation as well as for
+  the instance-wide flag, so a race started there neither stops its losing
+  branches early nor propagates an external cancellation after its branches
+  suspend. A failure or
+  control-flow exception that is the first terminal outcome propagates without a
+  winner. Branch subscriptions are deleted before storing the winner; a crash
+  before that write can cause branches to run again and choose a different
+  winner.
 
 ## Scheduling and cancellation
 

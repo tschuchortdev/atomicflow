@@ -183,7 +183,7 @@ raw body exception. Failures decoded by other codecs are rethrown unchanged.
 
 `StepFailed` is matched with the `stepId` string interpolator, whose pattern
 addresses the failing step by its scope path and key — the same path
-`Workflow.scoped`, `Workflow.loop`, and `firstToRun` branches build:
+`Workflow.scoped`, `Workflow.loop`, and `firstCompletedWithoutSuspension` branches build:
 
 ```scala
 try {
@@ -206,7 +206,7 @@ try {
 ### Step keys and scope keys
 
 Keys that become scope-path segments or step keys — step keys, `Workflow.scoped`
-keys, region ids (`loop`/`restartable`), and `firstToRun` branch keys — must not
+keys, region ids (`loop`/`restartable`), and `firstCompletedWithoutSuspension` branch keys — must not
 be empty, must not start with `_`, and must not contain `/`, `*`, `@`, `[`, `]`,
 `{`, `}`. These characters are the selector pattern syntax, so a key containing
 them could never be addressed by a selector. Violations throw
@@ -266,7 +266,7 @@ Temporal follows the portable-wrapper approach: terminal Activity failures are r
 ## Internal storage model
 
 One `workflow_steps` table stores the durable runtime state for ordinary user
-Steps, runtime-computed awaits, `Step.firstToRunWithoutSuspension`, and
+Steps, runtime-computed awaits, `Step.firstCompletedWithoutSuspension`, and
 `Workflow.restartable` / `Workflow.loop` regions:
 
 ```text
@@ -283,15 +283,15 @@ workflow_steps (
   error; the runtime fails the run with a `StepKeyConflictException` instead of
   overwriting the stored row.
 - `stepKind` records which step kind wrote the row: `Step` (both
-  `atLeastOnce` and `atMostOnce` rows), `Await`, `FirstToRun` (a
-  `firstToRunWithoutSuspension` winner row), or `RestartableRegion` (a
+  `atLeastOnce` and `atMostOnce` rows), `Await`, `FirstCompleted` (a
+  `firstCompletedWithoutSuspension` winner row), or `RestartableRegion` (a
   `Workflow.restartable`/`Workflow.loop` region row).
 - `stateKind` is legal only for the step kinds that actually write it, and
   a state kind that is not legal for its row's kind is a parse error:
   - kind `Step`: `Started`, `RetryPending`, `Succeeded`, `Failed`
   - kind `Await`: `Succeeded` only (a suspended await persists no row at all;
     its subscriptions carry the waiting)
-  - kind `FirstToRun`: `Succeeded` only (the winner marker)
+  - kind `FirstCompleted`: `Succeeded` only (the winner marker)
   - kind `RestartableRegion`: `RestartableRegion` only
 - `RestartableRegion` state rows carry the region's committed `restartCount`
   and its encoded user state; the runtime replaces them in place on each
@@ -303,7 +303,7 @@ workflow_steps (
 - `statePayload` is a runtime-owned encoded value, so it
   can carry a returned value, failure, retry bookkeeping, or a region's
   `(restartCount, currentState)` without kind-specific nullable columns.
-- Awaits and `firstToRunWithoutSuspension` persist only their public returned
+- Awaits and `firstCompletedWithoutSuspension` persist only their public returned
   value. Their selected event and winning branch are used while committing the
   result, cursor movement, and subscription cleanup but are not retained.
 - A restartable region replaces its own row on each generation boundary

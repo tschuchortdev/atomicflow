@@ -84,7 +84,7 @@ Legend: ✅ supported · ◑ partial or different behavior · ❌ absent or out 
 | Cached-result invalidation | fingerprint drift + TTL | none (positional) | none (positional) |
 | Retries | per at-least-once step; delay durable above threshold | per step | per step |
 | Signal events | global event log + per-key cursor | per-instance history | per-instance messages |
-| Wait sites | `await`, `awaitRace` (global order), first-to-run | `Await`, selectors | `recv`, `get_event` |
+| Wait sites | `await`, `awaitRace` (global order), first-completed | `Await`, selectors | `recv`, `get_event` |
 | Timers | durable subscription, two firing paths | durable timer Event | durable sleep |
 | Updates (sync) | await-site scoped (unimplemented; signals today) | always-on handlers | event/message pattern |
 | Queries | ❌ | ✅ (+ stack trace) | ✅ events |

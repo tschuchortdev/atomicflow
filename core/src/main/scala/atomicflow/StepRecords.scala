@@ -54,11 +54,11 @@ object StepState {
     */
   final case class Await(payload: SerializedValue) extends StepState
 
-  /** The stored state of a first-to-run row (`StepKind.FirstToRun`, the
-    * `Step.firstToRunWithoutSuspension` winner marker): the result is the
+  /** The stored state of a first-completed row (`StepKind.FirstCompleted`, the
+    * `Step.firstCompletedWithoutSuspension` winner marker): the result is the
     * serialized winning branch value.
     */
-  final case class FirstToRun(result: SerializedValue) extends StepState
+  final case class FirstCompleted(result: SerializedValue) extends StepState
 
   /** The stored state of a restartable-region row (`StepKind.RestartableRegion`):
     * the current generation's committed restart count and encoded user state.
@@ -115,9 +115,9 @@ object StepState {
           case other         => illegalRowState(rowKindText, other)
         }
 
-      case StepKind.FirstToRun =>
+      case StepKind.FirstCompleted =>
         stateKindText match {
-          case SucceededText => FirstToRun(SerializedValue.of(payload))
+          case SucceededText => FirstCompleted(SerializedValue.of(payload))
           case other         => illegalRowState(rowKindText, other)
         }
 
@@ -138,10 +138,10 @@ object StepState {
 
     /** The stored `step_kind` text of the row this state belongs to. */
     def rowKindText: String = state match {
-      case _: SimpleStep => StepKind.Step
-      case _: Await      => StepKind.Await
-      case _: FirstToRun => StepKind.FirstToRun
-      case _: Region     => StepKind.RestartableRegion
+      case _: SimpleStep     => StepKind.Step
+      case _: Await          => StepKind.Await
+      case _: FirstCompleted => StepKind.FirstCompleted
+      case _: Region         => StepKind.RestartableRegion
     }
 
     /** The stored `(state_kind, state_payload, retry_deadline)` columns of the
@@ -163,7 +163,7 @@ object StepState {
       case Await(payload) =>
         (SucceededText, payload.raw, None)
 
-      case FirstToRun(result) =>
+      case FirstCompleted(result) =>
         (SucceededText, result.raw, None)
 
       case Region(snapshot) =>

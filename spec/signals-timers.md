@@ -275,7 +275,7 @@ object Step {
 
 ## Racing signals/timers
 
-`Step.awaitRace` allows racing multiple signals and timers. This is less flexible than racing arbitrary code but much safer: `Step.awaitRace` guarantees that whatever event/timer occured first will definitely win the race, whereas the result of racing arbitrary code with `Step.firstToRunWithoutSuspension` literally depends on when the code is run. 
+`Step.awaitRace` allows racing multiple signals and timers. This is less flexible than racing arbitrary code but much safer: `Step.awaitRace` guarantees that whatever event/timer occured first will definitely win the race, whereas the result of racing arbitrary code with `Step.firstCompletedWithoutSuspension` literally depends on when the code is run. 
 
 ```scala
 object Step {
@@ -524,12 +524,12 @@ workflow_event_dispatch (id, dispatched_through)
   `inheritedEventsStartSequenceId`: events appended after the relationship
   commits have a greater `sequenceId`.
 - `workflow_steps` is the shared durable record for user Steps, awaits,
-  `firstToRunWithoutSuspension`, and restartable regions. `stepKind` records
+  `firstCompletedWithoutSuspension`, and restartable regions. `stepKind` records
   which step kind wrote the row (a step key belongs to exactly one
   step kind) and `stateKind` selects the runtime interpretation of the
   always-present `statePayload`; see `steps.md` and
   `restartable-regions-loops.md`.
-- Awaits and `firstToRunWithoutSuspension` persist only their public returned
+- Awaits and `firstCompletedWithoutSuspension` persist only their public returned
   value. Await event selection and the winning branch are transaction-local:
   they are used to advance signal cursors and clean up subscriptions, then are
   not retained.
@@ -539,7 +539,7 @@ workflow_event_dispatch (id, dispatched_through)
   by await evaluation — appends a `TimerFired` event keyed by that ID, guarded
   by the partial unique index on `(workflowInstanceId, eventKey) WHERE
   eventKind = 'TimerFired'`. The subscription row survives firing and is
-  deleted only when its await resolves. A first-to-run race additionally
+  deleted only when its await resolves. A first-completed race additionally
   retires every branch's subscriptions — including nested subscopes, via
   `deleteSubscriptionsUnderScopePaths` — BEFORE the winner's step row is
   written, so a committed winner row never coexists with branch subscriptions.

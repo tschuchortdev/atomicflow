@@ -15,7 +15,7 @@ class StepStateSuite extends FunSuite {
     StepState.SimpleStep.Succeeded(SerializedValue.of("result")),
     StepState.SimpleStep.Failed(SerializedValue.of("failure")),
     StepState.Await(SerializedValue.of("await-result")),
-    StepState.FirstToRun(SerializedValue.of("winner")),
+    StepState.FirstCompleted(SerializedValue.of("winner")),
     StepState.Region(RegionState(3, SerializedValue.of("region-state")))
   )
 
@@ -32,7 +32,7 @@ class StepStateSuite extends FunSuite {
   test("rowKindText records the step kind that wrote the row") {
     assertEquals(StepState.SimpleStep.Started.rowKindText, StepKind.Step)
     assertEquals(StepState.Await(SerializedValue.of("x")).rowKindText, StepKind.Await)
-    assertEquals(StepState.FirstToRun(SerializedValue.of("x")).rowKindText, StepKind.FirstToRun)
+    assertEquals(StepState.FirstCompleted(SerializedValue.of("x")).rowKindText, StepKind.FirstCompleted)
     assertEquals(
       StepState.Region(RegionState(0, SerializedValue.of("x"))).rowKindText,
       StepKind.RestartableRegion
@@ -61,7 +61,7 @@ class StepStateSuite extends FunSuite {
       StepKind.Step -> "Bogus",
       StepKind.Await -> "Started",
       StepKind.Await -> "Failed",
-      StepKind.FirstToRun -> "Failed",
+      StepKind.FirstCompleted -> "Failed",
       StepKind.RestartableRegion -> "Succeeded"
     )
     illegal.foreach { (rowKind, stateKind) =>
