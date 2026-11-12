@@ -15,7 +15,8 @@ class StepStateSuite extends FunSuite {
     StepState.SimpleStep.Succeeded(SerializedValue.of("result")),
     StepState.SimpleStep.Failed(SerializedValue.of("failure")),
     StepState.Await(SerializedValue.of("await-result")),
-    StepState.FirstCompleted(SerializedValue.of("winner")),
+    StepState.FirstCompleted("branch", SerializedValue.of("winner"), hasUnfinishedBranches = true),
+    StepState.FirstCompleted("branch", SerializedValue.of("winner"), hasUnfinishedBranches = false),
     StepState.Region(RegionState(3, SerializedValue.of("region-state")))
   )
 
@@ -29,10 +30,26 @@ class StepStateSuite extends FunSuite {
     }
   }
 
+  test("FirstCompleted persists its branch key, value, and unfinished flag") {
+    List(true, false).foreach { hasUnfinishedBranches =>
+      val state = StepState.FirstCompleted("branch", SerializedValue.of("winner"), hasUnfinishedBranches)
+      val (stateKind, payload, retryDeadline) = state.persistedColumns
+      val decoded = StepState.fromPersisted(state.rowKindText, stateKind, payload, retryDeadline)
+      assertEquals(decoded, state)
+      decoded match {
+        case StepState.FirstCompleted(branch, result, unfinished) =>
+          assertEquals(branch, "branch")
+          assertEquals(result, SerializedValue.of("winner"))
+          assertEquals(unfinished, hasUnfinishedBranches)
+        case other => fail(s"expected FirstCompleted, got $other")
+      }
+    }
+  }
+
   test("rowKindText records the step kind that wrote the row") {
     assertEquals(StepState.SimpleStep.Started.rowKindText, StepKind.Step)
     assertEquals(StepState.Await(SerializedValue.of("x")).rowKindText, StepKind.Await)
-    assertEquals(StepState.FirstCompleted(SerializedValue.of("x")).rowKindText, StepKind.FirstCompleted)
+    assertEquals(StepState.FirstCompleted("branch", SerializedValue.of("x"), hasUnfinishedBranches = false).rowKindText, StepKind.FirstCompleted)
     assertEquals(
       StepState.Region(RegionState(0, SerializedValue.of("x"))).rowKindText,
       StepKind.RestartableRegion

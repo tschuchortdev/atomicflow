@@ -97,17 +97,24 @@ adds detail to, the documents in `spec/`.
   The first branch to reach a terminal outcome decides the race: a normal
   completion wins and the losing branches are cancelled with the same
   `WorkflowCancelledException` as instance-wide cancellation, delivered at their
-  next runtime checkpoint, so no thread is ever interrupted. A losing branch may
-  catch that cancellation for cleanup, but any later outcome from it is ignored;
-  durable cleanup must run inside `Workflow.uncancellable` — inside which
-  cancellation delivery is suppressed for race-local cancellation as well as for
-  the instance-wide flag, so a race started there neither stops its losing
-  branches early nor propagates an external cancellation after its branches
-  suspend. A failure or
-  control-flow exception that is the first terminal outcome propagates without a
-  winner. Branch subscriptions are deleted before storing the winner; a crash
-  before that write can cause branches to run again and choose a different
-  winner.
+  next runtime checkpoint, so no thread is ever interrupted. The winner row
+  stores the winning branch key and value plus a `hasUnfinishedBranches` flag.
+  A losing branch may catch that cancellation for cleanup, but any later outcome
+  from it is ignored: cleanup failures persist as step rows and cleanup control
+  flow is ignored. Durable cleanup must run inside `Workflow.uncancellable`,
+  where cancellation delivery is suppressed for race-local cancellation as well
+  as for the instance-wide flag, so a race started there neither stops its
+  losing branches early nor propagates an external cancellation after its
+  branches suspend; losers there are not cancelled and the race waits for them.
+  Losing branches are re-run with local cancellation pre-set until every one is
+  finished, so `Workflow.uncancellable` cleanup may suspend across runs; the
+  race returns the winner only when all losing branches are finished and
+  suspends the workflow while any is unfinished. A failure or control-flow
+  exception that is the first terminal outcome propagates without a winner. The
+  winner's branch subscriptions are deleted before the row; losing branches keep
+  their subscriptions while unfinished and are re-run until finished. A crash
+  before the winning write can cause branches to run again and choose a
+  different winner.
 
 ## Scheduling and cancellation
 

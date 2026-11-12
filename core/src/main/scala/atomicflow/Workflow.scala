@@ -379,7 +379,8 @@ object Workflow {
     * `f` runs, checkpoints do not throw [[WorkflowCancelledException]], so Step
     * bodies execute and awaits resolve normally. This is the mechanism for
     * durable compensation (the Saga pattern) and for finishing a unit of work
-    * before stopping.
+    * before stopping. A cancelled losing `firstCompletedWithoutSuspension`
+    * branch can run durable cleanup here, and the race waits for it.
     *
     * The region is lexical and re-entrant. It does not clear `cancel_requested_at`;
     * after it exits, the next new-work checkpoint throws again. Heartbeats are

@@ -55,10 +55,15 @@ object StepState {
   final case class Await(payload: SerializedValue) extends StepState
 
   /** The stored state of a first-completed row (`StepKind.FirstCompleted`, the
-    * `Step.firstCompletedWithoutSuspension` winner marker): the result is the
-    * serialized winning branch value.
+    * `Step.firstCompletedWithoutSuspension` winner marker): the winning branch
+    * key, the serialized winning value, and whether any losing branch still has
+    * unfinished work.
     */
-  final case class FirstCompleted(result: SerializedValue) extends StepState
+  final case class FirstCompleted(
+      winnerBranch: String,
+      result: SerializedValue,
+      hasUnfinishedBranches: Boolean
+  ) extends StepState
 
   /** The stored state of a restartable-region row (`StepKind.RestartableRegion`):
     * the current generation's committed restart count and encoded user state.
@@ -74,6 +79,17 @@ object StepState {
   private val SucceededText: String      = "Succeeded"
   private val FailedText: String         = "Failed"
   private val RegionStateText: String    = "RestartableRegion"
+
+  private def encodeFirstCompleted(winnerBranch: String, result: SerializedValue, hasUnfinishedBranches: Boolean): String =
+    s"${if hasUnfinishedBranches then '1' else '0'}${winnerBranch.length}:$winnerBranch${result.raw}"
+
+  private def decodeFirstCompleted(payload: String): FirstCompleted = {
+    val hasUnfinishedBranches = payload.charAt(0) == '1'
+    val colon = payload.indexOf(':', 1)
+    val length = payload.substring(1, colon).toInt
+    val branch = payload.substring(colon + 1, colon + 1 + length)
+    FirstCompleted(branch, SerializedValue.of(payload.substring(colon + 1 + length)), hasUnfinishedBranches)
+  }
 
   /** Rejects a stored state whose kind is not legal for its row's kind. */
   private def illegalRowState(rowKindText: String, stateKindText: String): Nothing =
@@ -117,7 +133,7 @@ object StepState {
 
       case StepKind.FirstCompleted =>
         stateKindText match {
-          case SucceededText => FirstCompleted(SerializedValue.of(payload))
+          case SucceededText => decodeFirstCompleted(payload)
           case other         => illegalRowState(rowKindText, other)
         }
 
@@ -163,8 +179,8 @@ object StepState {
       case Await(payload) =>
         (SucceededText, payload.raw, None)
 
-      case FirstCompleted(result) =>
-        (SucceededText, result.raw, None)
+      case FirstCompleted(winnerBranch, result, hasUnfinishedBranches) =>
+        (SucceededText, encodeFirstCompleted(winnerBranch, result, hasUnfinishedBranches), None)
 
       case Region(snapshot) =>
         (RegionStateText, RegionState.encode(snapshot), None)
