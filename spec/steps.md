@@ -17,13 +17,13 @@ Both guarantees persist a `Started` record before the body executes, then replac
 
 When a step has been cached and is replayed:
 
-- **ensureUnchanged**: The values provided for these keys must not change between runs. If a key's value differs, `StepInputConflictException` is thrown, blocking the workflow and requiring manual intervention. Used for inputs that *must* be invariant (e.g., "which customer?" is locked, but "how much?" can be retried safely).
+- **assertUnchanged**: The values provided for these keys must not change between runs. If a key's value differs, `StepInputConflictException` is thrown, blocking the workflow and requiring manual intervention. Used for inputs that *must* be invariant (e.g., "which customer?" is locked, but "how much?" can be retried safely).
 - **invalidateOn**: If any of these keys' values change, the previous result is discarded and the step body re-executes. Used for inputs that may legitimately change (e.g., retry with different parameters).
 - **invalidateAfter**: A TTL duration. The cached result expires after this time and re-executes automatically. Applied to the entire step, not per-key.
 
 The policies can be combined:
 
-| | ensureUnchanged | invalidateOn |
+| | assertUnchanged | invalidateOn |
 |---|---|---|
 | **at-least-once** | "must never change" + auto-retry on crash | "expected to change" + auto-retry |
 | **at-most-once** | "must never change" + no crash-retry | "intentional re-run" + no crash-retry |
@@ -35,7 +35,7 @@ import atomicflow.Step.*
 
 // at-least-once, drift policies optional; empty = instance id is implicit key
 Step.atLeastOnce("fetch-rates", version = 1, 
-  ensureUnchanged = Seq("date" -> date),
+  assertUnchanged = Seq("date" -> date),
   invalidateOn = Seq("market" -> market),
   invalidateAfter = 12.hours
 ) {
@@ -44,7 +44,7 @@ Step.atLeastOnce("fetch-rates", version = 1,
 
 // at-most-once, some keys frozen
 Step.atMostOnce("charge-payment",
-  ensureUnchanged = Seq("orderId" -> orderId, "amount" -> amount)
+  assertUnchanged = Seq("orderId" -> orderId, "amount" -> amount)
 ) {
   paymentProvider.charge(orderId, amount)
 }: Option[Receipt]
@@ -62,10 +62,10 @@ Step.atLeastOnce("check-results", retry = Step.RetryPolicy.exponentialBackoff(in
 
 - Choose `Step.atLeastOnce` or `Step.atMostOnce` to set the crash-recovery policy.
 - `version` exists only on `Step.atLeastOnce`. Increasing it creates new retryable work and stops reusing the previous version's cached result. `Step.atMostOnce` deliberately has no version because a new version could execute after the old operation possibly produced its effect; use a new step ID and explicit workflow-version gating for a genuinely new operation.
-- Named parameters: `ensureUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty. Each `"key" -> value` pair is converted to a `StepInput` by an implicit conversion; see the `StepInput` Scaladoc.
-- **Named parameters are mandatory** — if you write `ensureUnchanged = Seq(...)`, the reader sees immediately what the policy is; positional ambiguity is impossible.
+- Named parameters: `assertUnchanged` and `invalidateOn` are lists of key-value pairs; both optional and can be empty. Each `"key" -> value` pair is converted to a `StepInput` by an implicit conversion; see the `StepInput` Scaladoc.
+- **Named parameters are mandatory** — if you write `assertUnchanged = Seq(...)`, the reader sees immediately what the policy is; positional ambiguity is impossible.
 - `invalidateAfter`: optional TTL applied to the entire cached result (independent of drift policy).
-- **No implicit key list**: if neither `ensureUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., ensureUnchanged = Seq("instance" -> instanceId)) { ... }`).
+- **No implicit key list**: if neither `assertUnchanged` nor `invalidateOn` is provided, the instance id is the sole cache key (equivalent to `.atLeastOnce(..., assertUnchanged = Seq("instance" -> instanceId)) { ... }`).
 - Return type for `at-most-once`: `Option[R]`; `None` means "started but not completed, unsafe to retry." Caller must handle.
 
 ### Built-in retries
@@ -312,7 +312,7 @@ workflow_steps (
   row is committed, closing that generation's children per their
   `ParentClosePolicy`. It never caches the region's final return value.
 - `inputFingerprints` is comparison data, not part of the natural key. An
-  `ensureUnchanged` difference finds the existing row and raises
+  `assertUnchanged` difference finds the existing row and raises
   `StepInputConflictException`; an `invalidateOn` difference replaces the
   existing state.
 - Manual intervention directly resets, deletes, or replaces the row addressed
@@ -337,7 +337,7 @@ be fingerprinted without requiring a `Fingerprintable[Any]`; it is never
 constructed directly by callers.
 
 **Rationale:**
-- **Self-documenting**: `ensureUnchanged("orderId" -> orderId)` is instantly clear; bare values require inference from context.
+- **Self-documenting**: `assertUnchanged("orderId" -> orderId)` is instantly clear; bare values require inference from context.
 - **Evolution-resilient**: When workflow definitions change and keys are reordered, named pairs remain clear (supports your design goal "maintainable workflow definitions over time"); bare positional lists become ambiguous.
 - **Diff clarity**: Changes to keyed lists are obvious in version control; positional changes are harder to track.
 - **Future tooling**: Per-key overrides, debugging, and documentation generation are easier with names attached to each value.

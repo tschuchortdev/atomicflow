@@ -237,7 +237,7 @@ object Step {
     stepKey: String, 
     awaitable: Awaitable[A],
     invalidateOn: Seq[StepInput[?]] = Seq.empty,
-    ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+    assertUnchanged: Seq[StepInput[?]] = Seq.empty,
     invalidateAfter: Duration = Duration.Inf,
   ): A = ???
 }
@@ -282,7 +282,7 @@ object Step {
     def awaitRace[A](
         stepKey: String,
         invalidateOn: Seq[StepInput[?]] = Seq.empty,
-        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+        assertUnchanged: Seq[StepInput[?]] = Seq.empty
     )(members: (String, Awaitable[A])*): A = ???
 }
 ```

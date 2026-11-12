@@ -280,14 +280,14 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(row._1, None, "the run must not become terminal after lease loss")
   }
 
-  test("ensureUnchanged: same inputs hit the cache; a changed input raises StepInputConflictException") {
+  test("assertUnchanged: same inputs hit the cache; a changed input raises StepInputConflictException") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     var date = "2024-01-01"
     var conflict: Option[String] = None
     val wf = Workflow[String, String](id = "ensure") { in =>
       try {
-        Step.atLeastOnce[String]("step", ensureUnchanged = Seq("date" -> date)) {
+        Step.atLeastOnce[String]("step", assertUnchanged = Seq("date" -> date)) {
           counter.incrementAndGet()
           "result"
         }
@@ -305,7 +305,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     date = "2024-02-01"
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-    assertEquals(counter.get(), 1, "ensureUnchanged conflict must not re-execute")
+    assertEquals(counter.get(), 1, "assertUnchanged conflict must not re-execute")
     assert(conflict.isDefined)
   }
 
@@ -402,13 +402,13 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("a changed ensureUnchanged input against a Started row raises StepInputConflictException") {
+  test("a changed assertUnchanged input against a Started row raises StepInputConflictException") {
     val rt = newRuntime
     var date = "2024-01-01"
     var conflict: Option[String] = None
     val wf = Workflow[String, String](id = "started-conflict") { in =>
       try {
-        Step.atLeastOnce[String]("step", ensureUnchanged = Seq("date" -> date)) {
+        Step.atLeastOnce[String]("step", assertUnchanged = Seq("date" -> date)) {
           TestControlFlow.suspend()
           "never"
         }
@@ -424,7 +424,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
 
     date = "2024-02-01"
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-    assert(conflict.isDefined, "a changed ensureUnchanged input must conflict even against a Started row")
+    assert(conflict.isDefined, "a changed assertUnchanged input must conflict even against a Started row")
   }
 
   test("when the throwable codec cannot encode a failure, a StepSerializationFailed is persisted and replayed") {

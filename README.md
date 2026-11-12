@@ -46,7 +46,7 @@ given WorkflowRuntime = PostgresWorkflowRuntime(dataSource)
 given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
 val normalizeAddress = Workflow[String, String](id = "normalize-address") { address =>
-  Step.atLeastOnce[String]("normalize", ensureUnchanged = Seq("address" -> address)) {
+  Step.atLeastOnce[String]("normalize", assertUnchanged = Seq("address" -> address)) {
     address.trim.toLowerCase(java.util.Locale.ROOT)
   }
 }
@@ -109,7 +109,7 @@ for completion; it does not execute the workflow.
 
 ## Other operations
 
-- **Input changes:** `ensureUnchanged` rejects changed named inputs;
+- **Input changes:** `assertUnchanged` rejects changed named inputs;
   `invalidateOn` discards the cached result when a named input changes;
   `invalidateAfter` sets cache expiry.
 - **Retries:** `Step.RetryPolicy` retries failures in at-least-once steps.

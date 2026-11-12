@@ -15,7 +15,7 @@ Terminology follows [`README.md`](README.md) §1. Companion documents:
 **AtomicFlow**
 ```scala
 Step.atLeastOnce("charge", version = 1,
-  ensureUnchanged = Seq("orderId" -> orderId),
+  assertUnchanged = Seq("orderId" -> orderId),
   invalidateOn    = Seq("amount"  -> amount),
   invalidateAfter = 12.hours
 ) { payment.charge(orderId, amount) }
@@ -58,7 +58,7 @@ workflow. Both positional schemes are why determinism is mandatory.
 AtomicFlow separates two policies (see [`steps.md`](../../spec/steps.md)):
 
 - **Crash recovery:** `atLeastOnce` or `atMostOnce`.
-- **Cached-result reuse:** `ensureUnchanged`, `invalidateOn`, `invalidateAfter` (TTL).
+- **Cached-result reuse:** `assertUnchanged`, `invalidateOn`, `invalidateAfter` (TTL).
 
 Both guarantees persist a `Started` row before the body and differ only for an
 unresolved `Started` row on replay:
@@ -75,7 +75,7 @@ Step.atMostOnce("charge")  { charge() }       // unresolved Started → return N
 
 Four patterns:
 
-| | `ensureUnchanged` | `invalidateOn` |
+| | `assertUnchanged` | `invalidateOn` |
 |---|---|---|
 | **at-least-once** | "must never change" + auto-retry on crash | "expected to change" + auto-retry |
 | **at-most-once** | "must never change" + no crash-retry | "intentional re-run" + no crash-retry |
@@ -110,7 +110,7 @@ Four patterns:
 **AtomicFlow**
 ```scala
 Step.atLeastOnce("quote", version = 2,
-  ensureUnchanged = Seq("customer" -> id),
+  assertUnchanged = Seq("customer" -> id),
   invalidateOn    = Seq("market" -> market),
   invalidateAfter = 12.hours
 ) { quoteApi(id, market) }
@@ -130,7 +130,7 @@ command, not a cache miss (no snippet needed).
 `"key" -> value` pairs, sorted by name for order-insensitivity) **separately from
 the natural key**, so a replay *finds* the row and then judges it:
 
-- `ensureUnchanged` difference → `StepInputConflictException`, workflow blocked
+- `assertUnchanged` difference → `StepInputConflictException`, workflow blocked
   for manual intervention (no re-execution);
 - `invalidateOn` difference → the existing row is replaced and the body re-runs;
 - `invalidateAfter` → the row expires and re-runs; it also invalidates ongoing
