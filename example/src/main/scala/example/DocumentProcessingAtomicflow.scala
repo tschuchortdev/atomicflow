@@ -106,7 +106,7 @@ class DocumentProcessingAtomicflow(
     val signed =
       Step.atLeastOnce[Array[Byte]](
         "sign-document",
-        ensureUnchanged = Seq("documentId" -> document.documentId),
+        assertUnchanged = Seq("documentId" -> document.documentId),
         invalidateOn = Seq("documentContent" -> document.content),
         invalidateAfter = EncryptionService.signatureValidityPeriod - 2.seconds
       ) {

@@ -34,7 +34,7 @@ import atomicflow.Cacheable.Simple.given
 given Cacheable[Throwable] = Cacheable.forThrowable.genericStringMessageSerializer
 
 val normalizeCustomer = Workflow[String, String](id = "normalize-customer") { name =>
-  Step.atLeastOnce[String]("normalize-name", ensureUnchanged = Seq("name" -> name)) {
+  Step.atLeastOnce[String]("normalize-name", assertUnchanged = Seq("name" -> name)) {
     name.trim
   }
 }

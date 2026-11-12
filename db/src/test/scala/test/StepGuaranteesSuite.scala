@@ -65,14 +65,14 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(observed, None, "a lost effect is assumed over a double execution")
   }
 
-  test("atMostOnce: a changed ensureUnchanged input raises StepInputConflictException") {
+  test("atMostOnce: a changed assertUnchanged input raises StepInputConflictException") {
     val rt = newRuntime
     val counter = new AtomicInteger(0)
     var date = "2024-01-01"
     var conflict: Option[String] = None
     val wf = Workflow[String, String](id = "mo-ensure") { in =>
       try {
-        Step.atMostOnce[String]("step", ensureUnchanged = Seq("date" -> date)) {
+        Step.atMostOnce[String]("step", assertUnchanged = Seq("date" -> date)) {
           counter.incrementAndGet()
           "result"
         }
@@ -90,7 +90,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
 
     date = "2024-02-01"
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
-    assertEquals(counter.get(), 1, "ensureUnchanged conflict must not re-execute")
+    assertEquals(counter.get(), 1, "assertUnchanged conflict must not re-execute")
     assert(conflict.isDefined)
   }
 

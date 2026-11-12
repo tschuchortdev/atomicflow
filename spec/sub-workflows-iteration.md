@@ -78,7 +78,7 @@ object Step {
     def firstCompletedWithoutSuspension[R](
         stepId: String,
         invalidateOn: Seq[StepInput[?]] = Seq.empty,
-        ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+        assertUnchanged: Seq[StepInput[?]] = Seq.empty
     )(branches: (String, () => WorkflowContext ?=> R)*): R
 }
 ```

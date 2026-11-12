@@ -240,14 +240,14 @@ class AwaitSignalSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(last, "e2")
   }
 
-  test("ensureUnchanged conflict on an await raises StepInputConflictException") {
+  test("assertUnchanged conflict on an await raises StepInputConflictException") {
     val rt = newRuntime
     val signal = Signal[String]("s")
     var ctx = "A"
     var conflict: Option[String] = None
     val wf = Workflow[String, String](id = "await-conflict") { in =>
       try {
-        Step.await[String]("a", Awaitable.SignalEvent(signal), ensureUnchanged = Seq("ctx" -> ctx))
+        Step.await[String]("a", Awaitable.SignalEvent(signal), assertUnchanged = Seq("ctx" -> ctx))
       } catch {
         case e: StepInputConflictException => conflict = Some(e.getMessage)
       }

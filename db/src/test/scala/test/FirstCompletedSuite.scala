@@ -530,14 +530,14 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(loserRuns.get(), 2, "a replay with finished losing branches does not re-run them")
   }
 
-  test("ensureUnchanged conflict raises StepInputConflictException") {
+  test("assertUnchanged conflict raises StepInputConflictException") {
     val rt = newRuntime
     val holder = new AtomicInteger(1)
     val counter = new AtomicInteger(0)
     var conflict = false
     val wf = Workflow[String, String](id = "ftr-ensure") { in =>
       try {
-        Step.firstCompletedWithoutSuspension[Int]("race", ensureUnchanged = Seq(StepInput("v", holder.get())))(
+        Step.firstCompletedWithoutSuspension[Int]("race", assertUnchanged = Seq(StepInput("v", holder.get())))(
           "only" -> { () => counter.incrementAndGet(); holder.get() * 10 }
         )
       } catch {
@@ -551,6 +551,6 @@ val empty = attempt("" -> { () => 1 })
     assertEquals(counter.get(), 1)
     holder.set(2)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
-    assert(conflict, "a changed ensureUnchanged input must raise StepInputConflictException")
+    assert(conflict, "a changed assertUnchanged input must raise StepInputConflictException")
   }
 }

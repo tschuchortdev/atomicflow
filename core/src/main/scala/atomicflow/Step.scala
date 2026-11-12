@@ -129,7 +129,7 @@ object Step {
     * @param version
     *   positive at-least-once version; bumping it creates new retryable work and
     *   stops reusing the previous version's cached result
-    * @param ensureUnchanged
+    * @param assertUnchanged
     *   named inputs that must be invariant between runs
     * @param invalidateOn
     *   named inputs that invalidate the cached result when they change
@@ -142,19 +142,19 @@ object Step {
   def atLeastOnce[A: Cacheable](
       key: String,
       version: Long = 1L,
-      ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+      assertUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf,
       retry: Step.RetryPolicy = Step.RetryPolicy.never
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    runSimpleStep(atMostOnce = false, key, version, ensureUnchanged, invalidateOn, invalidateAfter, retry)(body).get
+    runSimpleStep(atMostOnce = false, key, version, assertUnchanged, invalidateOn, invalidateAfter, retry)(body).get
 
   /** An at-most-once step: A step that was started but did not persist a result is not re-executed and
    * instead returns [[None]].
     *
     * @param key
     *   the step's stable identity within the workflow
-    * @param ensureUnchanged
+    * @param assertUnchanged
     *   named inputs that must be invariant between runs
     * @param invalidateOn
     *   named inputs that invalidate the cached result when they change
@@ -163,11 +163,11 @@ object Step {
     */
   def atMostOnce[A: Cacheable](
       key: String,
-      ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+      assertUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runSimpleStep(atMostOnce = true, key, stepVersion = 0L, ensureUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
+    runSimpleStep(atMostOnce = true, key, stepVersion = 0L, assertUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** Persists `Started` before execution, then replaces it with a durable outcome.
     * On replay, at-least-once re-executes unresolved work; at-most-once returns `None`.
@@ -180,7 +180,7 @@ object Step {
       atMostOnce: Boolean,
       stepKey: String,
       stepVersion: Long,
-      ensureUnchanged: Seq[StepInput[?]],
+      assertUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]],
       invalidateAfter: Duration,
       retry: Step.RetryPolicy
@@ -189,7 +189,7 @@ object Step {
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
-    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val fingerprints = encodeFingerprints(assertUnchanged ++ invalidateOn)
     val now = internals.clock.instant()
     val expiresAt = expiryOf(invalidateAfter, now)
 
@@ -298,7 +298,7 @@ object Step {
       throw new IllegalStateException("unreachable: the retry loop returns or throws")
     }
 
-    loadStepStateOrDeleteIfInvalid[StepState.SimpleStep](stepKey, stepId, stepVersion, now, ensureUnchanged, invalidateOn) match {
+    loadStepStateOrDeleteIfInvalid[StepState.SimpleStep](stepKey, stepId, stepVersion, now, assertUnchanged, invalidateOn) match {
       case None => Some(runBody(None))
 
       case Some(row) =>
@@ -372,7 +372,7 @@ object Step {
     * become permanently unavailable to later awaits of that key in this
     * workflow (the shared exact-key cursor advances past them).
     *
-    * Drift policies apply exactly as for ordinary steps: `ensureUnchanged`
+    * Drift policies apply exactly as for ordinary steps: `assertUnchanged`
     * values must be invariant between runs, `invalidateOn` changes discard the
     * cached result and re-evaluate from scratch, and `invalidateAfter` sets a
     * TTL over the cached result.
@@ -383,7 +383,7 @@ object Step {
     *   the condition to await
     * @param invalidateOn
     *   named inputs that invalidate the cached await result when they change
-    * @param ensureUnchanged
+    * @param assertUnchanged
     *   named inputs that must be invariant between runs
     * @param invalidateAfter
     *   TTL after which the cached await result expires; `Duration.Inf` disables it
@@ -392,10 +392,10 @@ object Step {
       stepKey: String,
       awaitable: Awaitable[A],
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
-      ensureUnchanged: Seq[StepInput[?]] = Seq.empty,
+      assertUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A =
-    awaitRaceImpl(stepKey, Seq(("", awaitable)), invalidateOn, ensureUnchanged, invalidateAfter)
+    awaitRaceImpl(stepKey, Seq(("", awaitable)), invalidateOn, assertUnchanged, invalidateAfter)
 
   /** Race several awaitables and resolve with the earliest satisfying durable
     * event, compared by global `sequenceId` so signals, timers, and workflow
@@ -418,7 +418,7 @@ object Step {
     * Due timer branches of the race are fired at evaluation in deadline
     * order, so the earliest due timer wins deterministically among timers.
     *
-    * Drift policies apply exactly as for [[await]]: `ensureUnchanged` values must
+    * Drift policies apply exactly as for [[await]]: `assertUnchanged` values must
     * be invariant between runs, and `invalidateOn` changes discard the cached
     * result and re-evaluate from scratch (re-registering subscriptions).
     *
@@ -429,7 +429,7 @@ object Step {
     *   the race's stable identity within the workflow
     * @param invalidateOn
     *   named inputs that invalidate the cached race result when they change
-    * @param ensureUnchanged
+    * @param assertUnchanged
     *   named inputs that must be invariant between runs
     * @param branches
     *   the `key -> awaitable` branches to race, all of result type `A`
@@ -437,11 +437,11 @@ object Step {
   def awaitRace[A: Cacheable](
       stepKey: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
-      ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+      assertUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, Awaitable[A])*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): A = {
     require(branches.nonEmpty, s"awaitRace('$stepKey') requires at least one branch")
     validateBranchKeys(stepKey, branches.map(_._1))
-    awaitRaceImpl(stepKey, branches.toVector, invalidateOn, ensureUnchanged, Duration.Inf)
+    awaitRaceImpl(stepKey, branches.toVector, invalidateOn, assertUnchanged, Duration.Inf)
   }
 
   /** Validates user-supplied race branch keys (an [[awaitRace]] member key or a
@@ -508,7 +508,7 @@ object Step {
     *
     * Replay returns the stored result without running branches again, unless
     * `invalidateOn` inputs change, except that unfinished losing branches are
-    * re-run until they finish. `ensureUnchanged` inputs must remain equal.
+    * re-run until they finish. `assertUnchanged` inputs must remain equal.
     * Each branch has its own step scope. The winner's branch subscriptions,
     * including nested scopes, are deleted before the winning result is stored;
     * losing branches keep their subscriptions while unfinished. A crash before
@@ -522,7 +522,7 @@ object Step {
     *   the step's stable identity within the workflow
     * @param invalidateOn
     *   named inputs that invalidate the cached result when they change
-    * @param ensureUnchanged
+    * @param assertUnchanged
     *   named inputs that must be invariant between runs
     * @param branches
     *   the `key -> branch` pairs to race; keys are non-empty, unique within the
@@ -538,9 +538,9 @@ object Step {
   def firstCompletedWithoutSuspension[R: Cacheable](
       stepId: String,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
-      ensureUnchanged: Seq[StepInput[?]] = Seq.empty
+      assertUnchanged: Seq[StepInput[?]] = Seq.empty
   )(branches: (String, () => WorkflowContext ?=> R)*)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): R =
-    evaluateFirstCompletedBranch(stepId, invalidateOn, ensureUnchanged, branches.toVector)
+    evaluateFirstCompletedBranch(stepId, invalidateOn, assertUnchanged, branches.toVector)
 
   private sealed trait RaceOutcome[+R]
   private object RaceOutcome {
@@ -553,7 +553,7 @@ object Step {
   private def evaluateFirstCompletedBranch[R](
       stepKey: String,
       invalidateOn: Seq[StepInput[?]],
-      ensureUnchanged: Seq[StepInput[?]],
+      assertUnchanged: Seq[StepInput[?]],
       branches: Vector[(String, () => WorkflowContext ?=> R)]
   )(using ctx: WorkflowContext, valueCodec: Cacheable[R], throwableCodec: Cacheable[Throwable]): R = {
     require(branches.nonEmpty, s"firstCompletedWithoutSuspension('$stepKey') requires at least one branch")
@@ -562,7 +562,7 @@ object Step {
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
     val scopedStepId = StepId(stepKey, ctx.currentScope)
-    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val fingerprints = encodeFingerprints(assertUnchanged ++ invalidateOn)
     val now = internals.clock.instant()
 
     // Each race branch runs one scope level below the race's key, so sibling
@@ -660,7 +660,7 @@ object Step {
       }
     }
 
-    loadStepStateOrDeleteIfInvalid[StepState.FirstCompleted](stepKey, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
+    loadStepStateOrDeleteIfInvalid[StepState.FirstCompleted](stepKey, scopedStepId, stepVersion = 0L, now, assertUnchanged, invalidateOn) match {
       case Some(StepState.FirstCompleted(winnerBranch, result, false)) =>
         decodeStored(valueCodec, stepKey)(result.raw)
 
@@ -677,7 +677,7 @@ object Step {
 
   /** Reads the step row stored at `stepId` and returns it only when it is still
     * replayable: not expired, with no changed `invalidateOn` input, and with the
-    * `ensureUnchanged` pin satisfied. A row of a different step kind fails the
+    * `assertUnchanged` pin satisfied. A row of a different step kind fails the
     * run with [[StepKeyConflictException]] before any invalidation logic could
     * delete it. A present but non-replayable row is deleted (together with the
     * site's subscriptions) so the site re-evaluates from scratch.
@@ -687,7 +687,7 @@ object Step {
       stepId: StepId,
       stepVersion: Long,
       now: java.time.Instant,
-      ensureUnchanged: Seq[StepInput[?]],
+      assertUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]]
   )(using ctx: WorkflowContext, tt: TypeTest[StepState, S])(using ctx.internals.Lease): Option[S] = {
     val internals: ctx.internals.type = ctx.internals
@@ -695,7 +695,7 @@ object Step {
     // Reject a row of a different step kind before invalidation logic could delete it.
     rawExisting.foreach(expectStepState[S](stepKey, _))
     val replayable =
-      rawExisting.filterNot(row => isExpired(row, now) || haveInputsChanged(stepKey, row, ensureUnchanged, invalidateOn))
+      rawExisting.filterNot(row => isExpired(row, now) || haveInputsChanged(stepKey, row, assertUnchanged, invalidateOn))
 
     if (rawExisting.isDefined && replayable.isEmpty)
       internals.deleteSteps(Seq((stepId = stepId, version = stepVersion)))
@@ -708,7 +708,7 @@ object Step {
     * plain await is a single-member race carrying the reserved `""` subscriber
     * key.
     *
-    * An existing non-expired row replays; `ensureUnchanged` conflicts throw; an
+    * An existing non-expired row replays; `assertUnchanged` conflicts throw; an
     * `invalidateOn` change or an expired row discards the site (`deleteStep`:
     * its step row plus every subscription) and re-evaluates from scratch, so no
     * stale registration can satisfy the new registration.
@@ -717,20 +717,20 @@ object Step {
       stepKey: String,
       branches: Seq[(String, Awaitable[A])],
       invalidateOn: Seq[StepInput[?]],
-      ensureUnchanged: Seq[StepInput[?]],
+      assertUnchanged: Seq[StepInput[?]],
       invalidateAfter: Duration
   )(using ctx: WorkflowContext, valueCodec: Cacheable[A], throwableCodec: Cacheable[Throwable]): A = {
     ScopePath.requireValidKey("step key", stepKey)
     val internals: ctx.internals.type = ctx.internals
     given ctx.internals.Lease = ctx.currentExecution
     val stepId = StepId(stepKey, ctx.currentScope)
-    val fingerprints = encodeFingerprints(ensureUnchanged ++ invalidateOn)
+    val fingerprints = encodeFingerprints(assertUnchanged ++ invalidateOn)
     val now = internals.clock.instant()
     val expiresAt = expiryOf(invalidateAfter, now)
 
     val raceBranches = branches.map((branchKey, a) => branchOf(branchKey, a, now)).toVector
 
-    loadStepStateOrDeleteIfInvalid[StepState.Await](stepKey, stepId, 0L, now, ensureUnchanged, invalidateOn) match {
+    loadStepStateOrDeleteIfInvalid[StepState.Await](stepKey, stepId, 0L, now, assertUnchanged, invalidateOn) match {
       case Some(StepState.Await(payload)) =>
         decodeStored(valueCodec, stepKey)(payload.raw)
 
@@ -911,7 +911,7 @@ object Step {
       case _                                         => decoded
     }
 
-  /** Enforces the `ensureUnchanged` pin (throwing [[StepInputConflictException]]
+  /** Enforces the `assertUnchanged` pin (throwing [[StepInputConflictException]]
     * when a pinned input changed) and reports whether any `invalidateOn` input
     * differs from what the stored row recorded. Shared by steps, first-completed
     * races, and cached awaits.
@@ -919,14 +919,14 @@ object Step {
   private def haveInputsChanged(
       key: String,
       row: StoredStep,
-      ensureUnchanged: Seq[StepInput[?]],
+      assertUnchanged: Seq[StepInput[?]],
       invalidateOn: Seq[StepInput[?]]
   ): Boolean = {
     val stored = parseFingerprints(row.inputFingerprints.raw)
-    for (input <- ensureUnchanged) {
+    for (input <- assertUnchanged) {
       if (stored.get(input.name) != Some(fingerprintOf(input)))
         throw new StepInputConflictException(
-          s"'$key': input '${input.name}' changed between runs but is pinned with ensureUnchanged"
+          s"'$key': input '${input.name}' changed between runs but is pinned with assertUnchanged"
         )
     }
     invalidateOn.exists(input => stored.get(input.name) != Some(fingerprintOf(input)))
