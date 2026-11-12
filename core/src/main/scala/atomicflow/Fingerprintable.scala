@@ -1,15 +1,15 @@
 package atomicflow
 
 import atomicflow.Fingerprintable.{Fingerprint, Fingerprinter}
-import cats.Contravariant
-import cats.syntax.all.*
-import io.circe.Codec
 
 import java.util
 import java.util.Base64
 import scala.compiletime.*
 import scala.deriving.Mirror
 
+/** Converts values to a deterministic representation for input-change detection.
+  * Implementations must produce the same representation for equal values across runs.
+  */
 trait Fingerprintable[-A] {
   def fingerprintRep(value: A, fp: Fingerprinter): fp.Rep
 
@@ -20,16 +20,19 @@ trait Fingerprintable[-A] {
 object Fingerprintable {
   inline def apply[A](using f: Fingerprintable[A]): Fingerprintable[A] = f
 
-  given Contravariant[Fingerprintable] = new {
-    override def contramap[A, B](fa: Fingerprintable[A])(f: B => A): Fingerprintable[B] = new Fingerprintable[B] {
-      override def fingerprintRep(value: B, fp: Fingerprinter): fp.Rep =
-        fa.fingerprintRep(f(value), fp)
-    }
+  /** Hash a value of type `B` by first converting it to `A`. */
+  def contramap[A, B](fa: Fingerprintable[A])(f: B => A): Fingerprintable[B] = new Fingerprintable[B] {
+    override def fingerprintRep(value: B, fp: Fingerprinter): fp.Rep =
+      fa.fingerprintRep(f(value), fp)
   }
 
+  /** Hash bytes, encoded as unpadded Base64url by `toString`. The url-safe
+    * alphabet keeps fingerprint segments free of `/`, so scope paths stay
+    * printable and addressable by step selectors.
+    */
   case class Fingerprint(bytes: IArray[Byte]) {
     override lazy val toString: String =
-      Base64.getEncoder.encodeToString(bytes.asInstanceOf[Array[Byte]])
+      Base64.getUrlEncoder.withoutPadding.encodeToString(bytes.asInstanceOf[Array[Byte]])
 
     override def equals(obj: Any): Boolean = obj match {
       case other: Fingerprint if util.Arrays.equals(
@@ -42,11 +45,10 @@ object Fingerprintable {
 
   object Fingerprint {
     def fromString(string: String): Fingerprint =
-      Fingerprint(Base64.getDecoder.decode(string).asInstanceOf[IArray[Byte]])
-
-    given Codec[Fingerprint] = Codec.implied[String].imap(fromString)(_.toString)
+      Fingerprint(Base64.getUrlDecoder.decode(string).asInstanceOf[IArray[Byte]])
   }
 
+  /** Builds type-specific representations and combines them into a hash. */
   trait Fingerprinter {
     self =>
 
@@ -71,10 +73,6 @@ object Fingerprintable {
 
     def bigDecimalRep(bigDecimal: BigDecimal): Rep
   }
-
-  /*object Fingerprinter {
-    type Aux[R] = Fingerprinter {type Rep = R}
-  }*/
 
   given Fingerprintable[Int] with
     def fingerprintRep(value: Int, fp: Fingerprinter): fp.Rep =

@@ -1,0 +1,5 @@
+-Xms1g
+-Xmx4g
+-XX:+UseG1GC
+-XX:MaxMetaspaceSize=1g
+-Dsbt.supershell=false

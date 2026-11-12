@@ -53,7 +53,7 @@ class DocumentUploadEndpoint {
 }
 object DocumentUploadEndpoint {
   object SignatureError
-  
+
   sealed trait ProcessingStatus
   object ProcessingStatus {
     object NoInfo extends ProcessingStatus
