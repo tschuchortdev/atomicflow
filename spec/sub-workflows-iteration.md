@@ -68,7 +68,7 @@ val results: Seq[R] = Workflow.parallel(
 
 ### `Step.firstCompletedWithoutSuspension`
 
-Runs multiple branches concurrently. The first branch to reach a terminal outcome decides the race. A branch that completes normally wins: its result is returned and stored, and the remaining branches are cancelled — their next runtime checkpoint throws `WorkflowCancelledException`, the same exception instance-wide cancellation uses. Losing branches are never interrupted; a branch inside a blocking body without checkpoints runs until its next checkpoint. A losing branch may catch that cancellation for cleanup, but any outcome it produces afterwards is ignored; durable cleanup must run inside `Workflow.uncancellable`. A failure or control-flow exception that is the first terminal outcome propagates without storing a winner. When a cancellation from outside the race (instance-wide, or from an enclosing race) is observed and no branch of this race reached a terminal outcome of its own, the race propagates it. If every branch suspends, it rethrows one combined `WorkflowSuspendedException` like `Workflow.parallel`. Inside `Workflow.uncancellable`, cancellation delivery is suppressed for race-local cancellation as well as for the instance-wide flag, so a race started there neither stops its losing branches early nor propagates an external cancellation after its branches suspend.
+Runs multiple branches concurrently. The first branch to reach a terminal outcome decides the race. A branch that completes normally wins: its result is returned and stored, and the remaining branches are cancelled — their next runtime checkpoint throws `WorkflowCancelledException`, the same exception instance-wide cancellation uses. Losing branches are never interrupted; a branch inside a blocking body without checkpoints runs until its next checkpoint. A losing branch may catch that cancellation for cleanup, but any outcome it produces afterwards is ignored; durable cleanup must run inside `Workflow.uncancellable`. A failure or control-flow exception that is the first terminal outcome propagates without storing a winner. When a cancellation from outside the race (instance-wide, or from an enclosing race) is observed and no branch of this race reached a terminal outcome of its own, the race propagates it. If every branch suspends, it rethrows one combined `WorkflowSuspendedException` like `Workflow.parallel`. Inside `Workflow.uncancellable`, cancellation delivery is suppressed for race-local cancellation as well as for the instance-wide flag, so a race started there neither stops its losing branches early nor propagates an external cancellation after its branches suspend; losers there are not cancelled and the race waits for them. The winner row stores the winning branch key and value and records `hasUnfinishedBranches`. Losing branches are re-run with local cancellation pre-set until every one is finished, so `Workflow.uncancellable` cleanup may suspend across runs. The race returns the winner only when all losing branches are finished and suspends the workflow while any is unfinished. Loser outcomes cannot change the result: cleanup failures persist as step rows and cleanup control flow is ignored.
 
 TODO: how does it handle cancellation of child workflows started from a branch?
 
@@ -89,7 +89,7 @@ Note the `() => WorkflowContext ?=> R` branch type. The extra `() =>` layer is r
 
 Because it is edge-triggered (not level-triggered like `Workflow.parallel`), this function must save its own state in the database to avoid losing track of which branch was the first ever to complete (in future reruns, more branches may become unblocked and the completion order won't be the same). Because the function caches its own state, it is found under `Step` and not under `Workflow`.
 
-The winner row persists only the winning branch's public returned value (the winning branch's identity is transaction-local and not retained, like an await's event selection). When the race resolves, every branch's pending subscriptions — including those of nested subscopes — are deleted BEFORE the winner row is written, so a committed winner row never coexists with branch subscriptions. The ordering is deliberate: the winner row is the durable first-wins marker, so a crash in between leaves no marker and the step's next run re-evaluates from scratch and re-deletes (the deletion runs at most twice).
+The winner row persists the winning branch key and public returned value plus a `hasUnfinishedBranches` flag. The winner's branch subscriptions — including those of nested subscopes — are deleted BEFORE the winner row is written; losing branches keep their subscriptions while unfinished and are re-run until finished. A crash before the winning write can cause branches to run again and choose a different winner.
 
 This function can be used to race arbitrary sub functions, but it has a lot of dangerous pitfalls because of the way that suspensions work. Example:
 
@@ -432,10 +432,11 @@ val processorWf = Workflow("processor") { (state: State) =>
 2. **Parallel branch child cleanup** — **TODO**: Define how `Workflow.parallel` and `Step.firstCompletedWithoutSuspension` clean up child workflows started inside a branch when that branch exits early or is cancelled because another branch completed with an exception or library control-flow exception.
 
 3. **Race awaits cleanup** — **Resolved**: when a branch completes and the
-   race resolves, every branch's pending subscriptions — including those
+   race resolves, the winner's pending subscriptions — including those
    of nested subscopes — are deleted (a subtree delete over all three
-   subscription tables) BEFORE the winner's step row is written, so a losing
-   await can never wake the workflow later and a committed winner row never
-   coexists with branch subscriptions. The runtime primitive is
+   subscription tables) BEFORE the winner's step row is written; losing
+   branches keep their subscriptions while unfinished and are re-run until
+   they finish. A committed winner row with `hasUnfinishedBranches = false`
+   never coexists with branch subscriptions. The runtime primitive is
    `WorkflowRuntime.deleteSubscriptionsUnderScopePaths`. Child-workflow
    lifecycle on early branch exit remains the open TODO (2) above.

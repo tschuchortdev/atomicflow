@@ -25,6 +25,17 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
       """.query[(String, String, String)].option
     )
 
+  private def winnerFields(payload: String): (String, String, Boolean) = {
+    val hasUnfinishedBranches = payload.charAt(0) == '1'
+    val colon = payload.indexOf(':', 1)
+    val length = payload.substring(1, colon).toInt
+    (
+      payload.substring(colon + 1, colon + 1 + length),
+      payload.substring(colon + 1 + length),
+      hasUnfinishedBranches
+    )
+  }
+
   private def signalSubscriptions(workflowId: WorkflowId, key: WorkflowInstanceKey): Vector[(Vector[String], String)] =
     run(
       sql"""
@@ -88,7 +99,7 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
     val Some((kind, state, payload)) = winnerRow(wf.id, "k"): @unchecked
     assertEquals(kind, "FirstCompleted")
     assertEquals(state, "Succeeded")
-    assertEquals(payload, "42", "the winner row persists only the winning branch's result")
+    assertEquals(winnerFields(payload)._2, "42", "the winner row persists only the winning branch's result")
     assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty, "the losing branch's subscription is cleaned up")
   }
 
@@ -130,7 +141,7 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
     s1.send(id, "x")(using rt)
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"), "the signaled branch (a) wins")
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
-    assertEquals(payload, "1", "the winner row is written once with only the result")
+    assertEquals(winnerFields(payload)._2, "1", "the winner row is written once with only the result")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
       Vector.empty,
@@ -181,7 +192,7 @@ class FirstCompletedSuite extends PostgresWorkflowRuntimeSuite {
     val id = rt.createWorkflowInstance(wf, "k", "in").id
     assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("3"))
     val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
-    assertEquals(payload, "3", "the completing branch (fast) wins")
+    assertEquals(winnerFields(payload)._2, "3", "the completing branch (fast) wins")
     assertEquals(
       signalSubscriptions(wf.id, "k"),
       Vector.empty,
@@ -365,9 +376,158 @@ val empty = attempt("" -> { () => 1 })
     sA.send(id, "go")(using rt)
     assertEquals(
       rt.runWorkflowInstance(wf, id),
+      WorkflowRunResult.WorkflowSuspended,
+      "the race waits for the still-suspended losing branch"
+    )
+    val Some((_, _, pendingPayload)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(pendingPayload)._3, true)
+    sB.send(id, "go")(using rt)
+    assertEquals(
+      rt.runWorkflowInstance(wf, id),
       WorkflowRunResult.Result("done"),
       "a pending cancel must not interrupt the awaiting branches inside an enclosing uncancellable region"
     )
+    val Some((_, _, finishedPayload)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(finishedPayload)._3, false)
+  }
+
+  test("a losing branch's uncancellable cleanup that suspends keeps the race pending and resumes") {
+    val rt = newRuntime
+    val never = Signal[String]("never")
+    val confirm = Signal[String]("confirm")
+    val cleanupRan = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "ftr-cleanup-suspend") { in =>
+      val result = Step.firstCompletedWithoutSuspension[Int]("race")(
+        "winner" -> { () => Step.atLeastOnce[Int]("winner-step") { 1 } },
+        "loser" -> { () =>
+          try Step.await[String]("loser-wait", Awaitable.SignalEvent(never))
+          finally {
+            Workflow.uncancellable {
+              Step.atLeastOnce[Unit]("cleanup-effect") { cleanupRan.incrementAndGet() }
+              Step.await[String]("cleanup-confirm", Awaitable.SignalEvent(confirm))
+            }
+          }
+          2
+        }
+      )
+      result.toString
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(payload)._3, true, "the winner row records unfinished losing branches")
+    assertEquals(cleanupRan.get(), 1)
+    assert(signalSubscriptions(wf.id, "k").exists(_._2 == "confirm"), "the cleanup await keeps the race pending")
+    confirm.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))
+    val Some((_, _, payload2)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(payload2)._3, false, "the winner row records finished losing branches")
+    assertEquals(cleanupRan.get(), 1)
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty)
+  }
+
+  test("a pre-suspended losing branch receives cancellation and runs its cleanup in the same run") {
+    val rt = newRuntime
+    val win = Signal[String]("win")
+    val never = Signal[String]("never")
+    val cleanupRan = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "ftr-cleanup-same-run") { _ =>
+      val result = Step.firstCompletedWithoutSuspension[Int]("race")(
+        "winner" -> { () =>
+          Step.await[String]("winner-wait", Awaitable.SignalEvent(win))
+          1
+        },
+        "loser" -> { () =>
+          try {
+            Step.await[String]("loser-wait", Awaitable.SignalEvent(never))
+            2
+          } catch {
+            case _: WorkflowCancelledException =>
+              Workflow.uncancellable {
+                Step.atLeastOnce[Unit]("cleanup-effect") { cleanupRan.incrementAndGet() }
+              }
+              2
+          }
+        }
+      )
+      result.toString
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(cleanupRan.get(), 0, "cleanup only runs once cancellation is delivered")
+    assertEquals(winnerRow(wf.id, "k"), None)
+    win.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))
+    assertEquals(cleanupRan.get(), 1)
+    assertEquals(signalSubscriptions(wf.id, "k"), Vector.empty)
+    val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(payload)._3, false)
+  }
+
+  test("a losing branch's cleanup failure does not change the race result") {
+    val rt = newRuntime
+    val never = Signal[String]("never")
+    val confirm = Signal[String]("confirm")
+    val wf = Workflow[String, String](id = "ftr-cleanup-failure") { _ =>
+      val result = Step.firstCompletedWithoutSuspension[Int]("race")(
+        "winner" -> { () => Step.atLeastOnce[Int]("winner-step") { 1 } },
+        "loser" -> { () =>
+          try Step.await[String]("loser-wait", Awaitable.SignalEvent(never))
+          finally {
+            Workflow.uncancellable {
+              Step.await[String]("cleanup-gate", Awaitable.SignalEvent(confirm))
+              Step.atLeastOnce[Unit]("cleanup-fails") { throw new RuntimeException("cleanup") }
+            }
+          }
+          2
+        }
+      )
+      result.toString
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    val Some((_, _, payload)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(payload)._3, true)
+    val cleanupState =
+      sql"""SELECT state_kind FROM workflow_steps WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND step_id = 'cleanup-fails'"""
+        .query[String]
+        .option
+    assertEquals(run(cleanupState), None, "cleanup has not run yet")
+    confirm.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))
+    assertEquals(
+      run(cleanupState),
+      Some("Failed"),
+      "the cleanup failure is visible as a step row but does not fail the race"
+    )
+    val Some((_, _, payload2)) = winnerRow(wf.id, "k"): @unchecked
+    assertEquals(winnerFields(payload2)._3, false)
+  }
+
+  test("the race does not re-run losing branches after its cleanup finished") {
+    val rt = newRuntime
+    val never = Signal[String]("never")
+    val wake = Signal[String]("wake")
+    val loserRuns = new AtomicInteger(0)
+    val wf = Workflow[String, String](id = "ftr-cleanup-fast-path") { _ =>
+      val result = Step.firstCompletedWithoutSuspension[Int]("race")(
+        "winner" -> { () => Step.atLeastOnce[Int]("winner-step") { 1 } },
+        "loser" -> { () =>
+          loserRuns.incrementAndGet()
+          try Step.await[String]("loser-wait", Awaitable.SignalEvent(never))
+          finally Workflow.uncancellable { () }
+          2
+        }
+      )
+      Step.await[String]("after", Awaitable.SignalEvent(wake))
+      result.toString
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(loserRuns.get(), 2, "the first run executes the loser once in the race and once in the loser pass")
+    wake.send(id, "go")(using rt)
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.Result("1"))
+    assertEquals(loserRuns.get(), 2, "a replay with finished losing branches does not re-run them")
   }
 
   test("ensureUnchanged conflict raises StepInputConflictException") {

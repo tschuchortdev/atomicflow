@@ -492,16 +492,27 @@ object Step {
     * when no branch of this race reached a terminal outcome of its own. If
     * every branch suspends, their combined suspension is thrown.
     *
+    * The winner's branch key and value are stored, and the row records
+    * `hasUnfinishedBranches`. Losing branches are re-run with local cancellation
+    * pre-set until every one is finished, so `Workflow.uncancellable` cleanup may
+    * suspend across runs. The race returns the winner only when all losing
+    * branches are finished and suspends the workflow while any is unfinished.
+    * Loser outcomes cannot change the result: cleanup failures persist as step
+    * rows and cleanup control flow is ignored.
+    *
     * Inside `Workflow.uncancellable`, cancellation delivery is suppressed for
     * race-local cancellation as well as for the instance-wide flag, so a race
     * started inside such a region neither stops its losing branches early nor
-    * propagates an external cancellation after its branches suspend.
+    * propagates an external cancellation after its branches suspend; losers
+    * there are not cancelled and the race waits for them.
     *
     * Replay returns the stored result without running branches again, unless
-    * `invalidateOn` inputs change. `ensureUnchanged` inputs must remain equal.
-    * Each branch has its own step scope. All branch subscriptions, including
-    * nested scopes, are deleted before the winning result is stored. A crash
-    * before that write can rerun branches and select a different result.
+    * `invalidateOn` inputs change, except that unfinished losing branches are
+    * re-run until they finish. `ensureUnchanged` inputs must remain equal.
+    * Each branch has its own step scope. The winner's branch subscriptions,
+    * including nested scopes, are deleted before the winning result is stored;
+    * losing branches keep their subscriptions while unfinished. A crash before
+    * that write can rerun branches and select a different result.
     *
     * This operation does not select by event time. A blocking branch can finish
     * while another branch suspends on a wait. Use [[awaitRace]] when the
@@ -533,7 +544,7 @@ object Step {
 
   private sealed trait RaceOutcome[+R]
   private object RaceOutcome {
-    final case class Completed[R](value: R)                       extends RaceOutcome[R]
+    final case class Completed[R](branchKey: String, value: R)    extends RaceOutcome[R]
     final case class Failed(error: Throwable)                     extends RaceOutcome[Nothing]
     final case class ControlFlow(c: WorkflowControlFlowException) extends RaceOutcome[Nothing]
     case object Cancelled                                         extends RaceOutcome[Nothing]
@@ -559,9 +570,42 @@ object Step {
     def branchPath(base: ScopePath, key: String): ScopePath =
       base.appended(scopedStepId.key).appended(key)
 
+    def writeWinner(winnerBranch: String, result: SerializedValue, hasUnfinishedBranches: Boolean): Unit =
+      internals.writeStep(
+        scopedStepId,
+        0L,
+        StoredStep(
+          StepState.FirstCompleted(winnerBranch, result, hasUnfinishedBranches),
+          InputFingerprints.of(fingerprints),
+          None
+        )
+      )
+
+    def runLosers(losers: Seq[(String, () => WorkflowContext ?=> R)]): Seq[WorkflowSuspendedException] = {
+      val cancelled = new AtomicBoolean(true)
+      losers.flatMap { (key, body) =>
+        val path = branchPath(ctx.currentScope, key)
+        val branchContext = ctx.copy(
+          scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key),
+          localCancellation = Some(cancelled)
+        )
+        var suspension: Option[WorkflowSuspendedException] = None
+        try body()(using branchContext)
+        catch {
+          case e: WorkflowSuspendedException => suspension = Some(e)
+          case e: LeaseLostException         => throw e
+          case e: WorkflowTechnicalException => throw e
+          case _                             => ()
+        }
+        if (suspension.isEmpty) internals.deleteSubscriptionsUnderScopePaths(Seq(path))
+        suspension
+      }
+    }
+
     def evaluate(): R = {
       ctx.throwIfCancelled()
       val branchPaths = branches.map((key, _) => branchPath(ctx.currentScope, key))
+      internals.deleteSubscriptionsUnderScopePaths(branchPaths)
       val stopLosers = new AtomicBoolean(false)
       val branchContexts = branches.map((key, _) =>
         ctx.copy(
@@ -578,7 +622,7 @@ object Step {
       val suspensions: Seq[WorkflowSuspendedException] = ox.par(branches.indices.map { i =>
         () =>
           try {
-            record(RaceOutcome.Completed(branches(i)._2()(using branchContexts(i))))
+            record(RaceOutcome.Completed(branches(i)._1, branches(i)._2()(using branchContexts(i))))
             None
           } catch {
             case _: WorkflowCancelledException =>
@@ -598,17 +642,14 @@ object Step {
       }).flatten
 
       decision.get match {
-        case RaceOutcome.Completed(winner) =>
+        case RaceOutcome.Completed(winnerBranch, winner) =>
           val (serialized, decoded) = encodeAndDecode(valueCodec, stepKey)(winner)
-          internals.deleteSubscriptionsUnderScopePaths(branchPaths)
-          internals.writeStep(
-            scopedStepId, 0L,
-            StoredStep(
-              StepState.FirstCompleted(SerializedValue.of(serialized)),
-              InputFingerprints.of(fingerprints),
-              None
-            )
-          )
+          internals.deleteSubscriptionsUnderScopePaths(Seq(branchPath(ctx.currentScope, winnerBranch)))
+          val losers = branches.filterNot(_._1 == winnerBranch)
+          writeWinner(winnerBranch, SerializedValue.of(serialized), hasUnfinishedBranches = losers.nonEmpty)
+          val pending = runLosers(losers)
+          if (pending.nonEmpty) throw new WorkflowSuspendedException(pending)
+          if (losers.nonEmpty) writeWinner(winnerBranch, SerializedValue.of(serialized), hasUnfinishedBranches = false)
           decoded
         case RaceOutcome.Failed(t)      => throw t
         case RaceOutcome.ControlFlow(c) => throw c
@@ -620,8 +661,17 @@ object Step {
     }
 
     loadStepStateOrDeleteIfInvalid[StepState.FirstCompleted](stepKey, scopedStepId, stepVersion = 0L, now, ensureUnchanged, invalidateOn) match {
-      case Some(StepState.FirstCompleted(result)) => decodeStored(valueCodec, stepKey)(result.raw)
-      case None                               => evaluate()
+      case Some(StepState.FirstCompleted(winnerBranch, result, false)) =>
+        decodeStored(valueCodec, stepKey)(result.raw)
+
+      case Some(StepState.FirstCompleted(winnerBranch, result, true)) =>
+        val pending = runLosers(branches.filterNot(_._1 == winnerBranch))
+        if (pending.nonEmpty) throw new WorkflowSuspendedException(pending)
+        writeWinner(winnerBranch, result, hasUnfinishedBranches = false)
+        decodeStored(valueCodec, stepKey)(result.raw)
+
+      case None =>
+        evaluate()
     }
   }
 
