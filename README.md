@@ -1,23 +1,40 @@
 # AtomicFlow
 
-AtomicFlow is a Scala 3 library for durable workflows. It stores step results,
-signals, timers, and execution state in PostgreSQL. After a crash or a suspended
-wait, the workflow body runs again and completed steps return their stored results.
+AtomicFlow is a Scala 3 library for durable workflows. Workflows are multistep programs that are characterized by being failure proof and very long-running. For example, in an e-commerce purchasing workflow, days or weeks can pass between order, payment and shipping. The workflow must be able to handle failures like unavailable third-party systems, application crashes, etc. and resume execution in reaction to external events. A durable workflow library allows you to write a workflow just like regular procedural code without worrying about state persistence, retries, event handling and so on. 
 
-## Execution guarantees
+AtomicFlow achieves durability by wrapping side effects in `Step` functions which persist their results in a database. If the application crashes between steps, the workflow runtime will re-execute the code of unfinished workflows from the beginning and immediately return the cached results for steps that have already happened instead of re-executing side effects:
 
-- `Step.atLeastOnce` runs again after a crash if its result was not stored. Use
-  idempotent operations or pass an idempotency key to the external service.
-- `Step.atMostOnce` does not run again when an earlier attempt has no stored
-  outcome. It returns `None` in that case: the external operation may or may not
-  have completed.
-- Completed steps replay their stored success or failure. Named input hashes
-  and cache expiry control when results can be reused.
-- A workflow is not one database transaction. Completed external effects are
-  not rolled back when a later step fails.
+```scala
+Workflow[Unit, Int](id = "example-wf") {
+  val x = Step.atLeastOnce("step-1") {
+    Random.nextInt()
+  }
+  
+  // if crash here -> x result will be loaded from cache. Side-effect does not re-execute.
 
-PostgreSQL is the implemented runtime. The in-memory runtime file contains
-disabled prototype code.
+  val y = Step.atLeastOnce("step-1") {
+    Random.nextInt()
+  }
+
+  x + y
+}
+```
+
+To enable workflows to wait or react on external events, some step functions can register a _subscription_ and then _suspend_ the workflow by throwing an internal `WorkflowSuspendedException`. The code execution will stop at that point and the runtime will replay the workflow code when the subscribed event occurs.
+
+```scala
+val resumeSignal = Signal[Unit]("resume")
+
+Workflow[Unit, Int](id = "example-wf") {
+  Step.await(Awaitable.Timer(7.days)) // Wait for 7 days to pass
+
+  Step.await(Awaitable.SignalEvent(resumeSignal)) // Wait until user sends the resume signal
+}
+```
+
+## Comparison to other durable workflow libraries
+
+
 
 ## Dependencies
 
@@ -133,27 +150,6 @@ for completion; it does not execute the workflow.
   stops further durable execution but cannot interrupt an external operation
   already running on a JVM thread.
 
-## Build and test
-
-Use JDK 21 or later. Database and example tests require Docker for PostgreSQL
-Testcontainers.
-
-```sh
-sbt test
-```
-
-For repeated invocations, connect to a persistent sbt server instead of
-starting a new JVM each time — this skips the JVM startup on every run:
-
-```sh
-sbt --client test
-```
-
-The `example` module contains equivalent document-processing workflows using
-AtomicFlow, workflows4s, dbos4s (DBOS Transact), and Temporal (Java SDK). API and storage details are in [`spec/`](spec/).
-Runtime design notes are in [`docs/design/`](docs/design/).
-[`DEVIATIONS.md`](DEVIATIONS.md) records implementation decisions and differences
-from the design. System comparisons are in [`docs/comparison/`](docs/comparison/).
 
 ## License
 

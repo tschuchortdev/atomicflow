@@ -152,6 +152,10 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       value: A
   ): SignalSendResult
 
+  @throws[WorkflowNotFoundException]
+  final def sendSignal[A](workflowInstanceId: WorkflowInstanceId, signal: Signal[A], value: A): SignalSendResult =
+    sendSignal(workflowInstanceId, signal.key, value)(using signal.cacheable)
+
   /** Request cooperative cancellation of an instance. Durably sets
     * `cancel_requested_at` once and never resets it. Delivery is uniform across
     * all instance states: an instance that has never started is not finalized in
