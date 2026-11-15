@@ -544,10 +544,8 @@ object Step {
 
   private sealed trait RaceOutcome[+R]
   private object RaceOutcome {
-    final case class Completed[R](branchKey: String, value: R)    extends RaceOutcome[R]
-    final case class Failed(error: Throwable)                     extends RaceOutcome[Nothing]
-    final case class ControlFlow(c: WorkflowControlFlowException) extends RaceOutcome[Nothing]
-    case object Cancelled                                         extends RaceOutcome[Nothing]
+    final case class Completed[R](branchKey: String, value: R) extends RaceOutcome[R]
+    final case class Threw(error: Throwable)                   extends RaceOutcome[Nothing]
   }
 
   private def evaluateFirstCompletedBranch[R](
@@ -585,10 +583,7 @@ object Step {
       val cancelled = new AtomicBoolean(true)
       losers.flatMap { (key, body) =>
         val path = branchPath(ctx.currentScope, key)
-        val branchContext = ctx.copy(
-          scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key),
-          localCancellation = Some(cancelled)
-        )
+        val branchContext = ctx.copy(scopePath = path, localCancellation = Some(cancelled))
         var suspension: Option[WorkflowSuspendedException] = None
         try body()(using branchContext)
         catch {
@@ -608,10 +603,7 @@ object Step {
       internals.deleteSubscriptionsUnderScopePaths(branchPaths)
       val stopLosers = new AtomicBoolean(false)
       val branchContexts = branches.map((key, _) =>
-        ctx.copy(
-          scopePath = ctx.currentScope.appended(scopedStepId.key).appended(key),
-          localCancellation = Some(stopLosers)
-        ))
+        ctx.copy(scopePath = branchPath(ctx.currentScope, key), localCancellation = Some(stopLosers)))
 
       // The first terminal outcome decides the race; only then are the losing
       // branches cancelled at their next checkpoint.
@@ -625,18 +617,12 @@ object Step {
             record(RaceOutcome.Completed(branches(i)._1, branches(i)._2()(using branchContexts(i))))
             None
           } catch {
-            case _: WorkflowCancelledException =>
-              record(RaceOutcome.Cancelled)
-              None
             case e: WorkflowSuspendedException => Some(e)
-            case e: WorkflowControlFlowException =>
-              record(RaceOutcome.ControlFlow(e))
+            case e @ (_: WorkflowControlFlowException | _: WorkflowTechnicalException) =>
+              record(RaceOutcome.Threw(e))
               None
-            case e: WorkflowTechnicalException =>
-              record(RaceOutcome.Failed(e))
-              None
-            case WorkflowNonFatal(t) =>
-              record(RaceOutcome.Failed(t))
+            case WorkflowNonFatal(e) =>
+              record(RaceOutcome.Threw(e))
               None
           }
       }).flatten
@@ -651,9 +637,7 @@ object Step {
           if (pending.nonEmpty) throw new WorkflowSuspendedException(pending)
           if (losers.nonEmpty) writeWinner(winnerBranch, SerializedValue.of(serialized), hasUnfinishedBranches = false)
           decoded
-        case RaceOutcome.Failed(t)      => throw t
-        case RaceOutcome.ControlFlow(c) => throw c
-        case RaceOutcome.Cancelled      => throw WorkflowCancelledException()
+        case RaceOutcome.Threw(t) => throw t
         case null =>
           if (ctx.uncancellableDepth == 0 && ctx.isCancellationRequested) throw WorkflowCancelledException()
           else throw new WorkflowSuspendedException(suspensions)
