@@ -255,4 +255,49 @@ class QueriesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(h.blockUntilCompleted(5.seconds), WorkflowRunResult.Result("out-a"))
     assertEquals(Workflow.blockUntilCompleted(w, "k", 5.seconds), WorkflowRunResult.Result("out-a"))
   }
+
+  test("getStepState reads step state from outside the workflow body") {
+    val rt = newRuntime
+    val w = Workflow[String, String](id = "wf-step-state") { in =>
+      Step.atLeastOnce[String]("quote") { s"quote-$in" }
+      Step.atMostOnce[String]("charge") { s"charge-$in" }
+      s"out-$in"
+    }
+    val id = rt.createWorkflowInstance(w, "k", "a").id
+
+    assertEquals(
+      rt.getStepState[String](id, "quote", 1),
+      StepExecutionState.NeverStarted,
+      "no row exists before the first run"
+    )
+    assertEquals(
+      rt.getStepState[String](id, "charge"),
+      StepExecutionState.NeverStarted,
+      "the version-less overload reads the (absent) latest version"
+    )
+
+    rt.runWorkflowInstance(w, id)
+
+    assertEquals(rt.getStepState[String](id, "quote", 1), StepExecutionState.Completed("quote-a"))
+    assertEquals(
+      rt.getStepState[String](id, "charge", 1),
+      StepExecutionState.Completed("charge-a"),
+      "at-most-once rows are stored at the shared initial version 1"
+    )
+    assertEquals(
+      rt.getStepState[String](id, "charge"),
+      StepExecutionState.Completed("charge-a"),
+      "the version-less overload reads that same latest version"
+    )
+  }
+
+  test("getStepState throws WorkflowNotFoundException for a missing instance") {
+    val rt = newRuntime
+    intercept[WorkflowNotFoundException] {
+      rt.getStepState[String](WorkflowInstanceId("wf-missing", "k"), "step", 1)
+    }
+    intercept[WorkflowNotFoundException] {
+      rt.getStepState[String](WorkflowInstanceId("wf-missing", "k"), "step")
+    }
+  }
 }

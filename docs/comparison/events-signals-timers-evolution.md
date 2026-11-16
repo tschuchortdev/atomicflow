@@ -204,7 +204,7 @@ generally recommends events/messages instead of synchronous updates.
 **Implementation.** AtomicFlow's rationale: all state lives in local variables
 inside the body and there is no ambient object to read, so a query API has no
 substrate. It offers only `Step.peekSignal` (a durable read of visible signal
-events without advancing the cursor) and `Step.getExecutionState` (a durable read
+events without advancing the cursor) and `Step.getStepState` (a durable read
 of a step row's state). Temporal runs query handlers against reconstructed
 workflow state (with a built-in stack-trace query). DBOS reads its own tables:
 `set_event`/`get_event` for named values (with history) and `streams` for
@@ -286,7 +286,7 @@ change can be gated to newly created instances. Step rows carry a `version`; an
 after the old one possibly produced its effect — a genuinely new operation uses a
 new step ID and a creation-version gate). There are no positional patches because
 AtomicFlow "cannot reliably determine whether an instance is 'past' a patch" given
-ID-addressed caching, invalidation, and parallelism. `Step.getExecutionState`
+ID-addressed caching, invalidation, and parallelism. `Step.getStepState`
 gives an exact view (`NeverStarted`/`Started`/`Failed`/`Completed`).
 
 Temporal requires determinism, so evolution uses Worker Versioning (keep workers

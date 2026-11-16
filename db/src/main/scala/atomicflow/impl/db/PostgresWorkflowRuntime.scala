@@ -2233,7 +2233,20 @@ class PostgresWorkflowRuntime private[atomicflow] (
       instanceId.scope,
       stepId.key,
       stepId.scope,
-      stepVersion
+      Some(stepVersion)
+    )
+
+  override def readLatestStep(
+      instanceId: WorkflowInstanceId,
+      stepId: StepId
+  ): Option[StoredStep] =
+    readStoredStep(
+      instanceId.workflowId,
+      instanceId.workflowInstanceKey,
+      instanceId.scope,
+      stepId.key,
+      stepId.scope,
+      None
     )
 
   private def readStoredStep(
@@ -2242,14 +2255,19 @@ class PostgresWorkflowRuntime private[atomicflow] (
       scope: ScopePath,
       stepId: String,
       stepScopePath: ScopePath,
-      stepVersion: Long
+      stepVersion: Option[Long]
   ): Option[StoredStep] =
     runTransaction {
-      sql"""
+      val versionFilter = stepVersion match {
+        case Some(version) => fr"AND step_version = $version"
+        case None          => fr"ORDER BY step_version DESC LIMIT 1"
+      }
+      (sql"""
         SELECT step_kind, state_kind, state_payload, retry_deadline, input_fingerprints, expires_at FROM workflow_steps
         WHERE workflow_id = $workflowId AND workflow_instance_key = $key AND workflow_instance_scope = $scope
-          AND step_id = $stepId AND step_scope_within_instance = $stepScopePath AND step_version = $stepVersion
-      """.query[(String, String, String, Option[java.time.Instant], String, Option[java.time.Instant])]
+          AND step_id = $stepId AND step_scope_within_instance = $stepScopePath
+      """ ++ versionFilter)
+        .query[(String, String, String, Option[java.time.Instant], String, Option[java.time.Instant])]
         .option
     }.map { case (rowKind, stateKind, payload, retryDeadline, fingerprints, expiresAt) =>
       StoredStep(

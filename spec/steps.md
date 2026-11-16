@@ -276,9 +276,14 @@ workflow_steps (
 )
 ```
 
-- The natural key is `(workflowInstanceId, stepId, stepVersion, stepScopeWithinInstance)`. Unversioned
-  step kinds use internal `stepVersion = 0`; public at-least-once versions are
-  positive. A step key belongs to exactly one step kind: declaring the same key
+- The natural key is `(workflowInstanceId, stepId, stepVersion, stepScopeWithinInstance)`. Step versions
+  are shared by both guarantees: at-least-once and at-most-once steps store
+  their rows at the same initial version `1` (at-most-once has no public
+  version parameter, but its rows still use version `1`); bumping an
+  at-least-once version stores new work at `2`, `3`, .... Only internal step
+  kinds (awaits, first-completed winners, restartable regions) use the internal
+  sentinel `stepVersion = 0`. A step key belongs to exactly one step kind:
+  declaring the same key
   for two different step kinds — e.g. an await and a step — is a definition
   error; the runtime fails the run with a `StepKeyConflictException` instead of
   overwriting the stored row.

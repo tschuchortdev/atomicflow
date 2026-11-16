@@ -56,7 +56,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     run(
       sql"""
         UPDATE workflow_steps SET state_kind = 'Started', state_payload = ''
-        WHERE workflow_id = 'mo-crash' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 0
+        WHERE workflow_id = 'mo-crash' AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'step' AND step_version = 1
       """.update.run
     )
 
@@ -170,11 +170,11 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(caught.get, firstMessage, "replay throws the identical decoded failure")
   }
 
-  test("getExecutionState reads AtMostOnce rows via the shared state_kind") {
+  test("getStepState reads AtMostOnce rows via the shared state_kind") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "mo-state") { in =>
-      state = Step.getExecutionState[String]("step")
+      state = Step.getStepState[String]("step", stepVersion = 1)
       Step.atMostOnce[String]("step") {
         TestControlFlow.suspend()
         "never"
@@ -187,7 +187,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.Started)
   }
 
-  test("atMostOnce rows use step_version 0 and step_kind Step") {
+  test("atMostOnce rows use the shared initial step_version 1 and step_kind Step") {
     val rt = newRuntime
     val wf = Workflow[String, String](id = "mo-kind") { in =>
       Step.atMostOnce[String]("step") {
@@ -206,7 +206,7 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
           (String, Long, String)
         ].option
     )
-    assertEquals(row, Some(("Step", 0L, "Succeeded")))
+    assertEquals(row, Some(("Step", 1L, "Succeeded")))
   }
 
   test("atMostOnce: no named inputs — instance id is the sole cache key") {
@@ -259,6 +259,66 @@ class StepGuaranteesSuite extends PostgresWorkflowRuntimeSuite {
       ),
       Some("Await"),
       "the foreign row is preserved, not deleted by the invalidation path"
+    )
+  }
+
+  test("a key stored as a step is rejected when its site reads a different version as an await") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "cross-version-await-conflict") { _ =>
+      Step.await[Unit]("shared", Awaitable.Timer(1.hour))
+      "unreachable"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    // A step row of the initial version 1: the await site reads version 0, so
+    // only the cross-version guard can detect the foreign row.
+    run(
+      sql"""
+        INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints)
+        VALUES (${wf.id}, 'k', '{}', 'shared', 1, 'Step', 'Succeeded', 'step', '')
+      """.update.run
+    )
+
+    val WorkflowRunResult.Failed(failure) = rt.runWorkflowInstance(wf, id)
+    assert(failure.toString.contains("StepKeyConflictException"), failure.toString)
+    assertEquals(
+      run(
+        sql"""
+          SELECT step_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'shared'
+        """.query[String].option
+      ),
+      Some("Step"),
+      "the foreign row is preserved, not deleted by the await's invalidation path"
+    )
+  }
+
+  test("a key stored as an await is rejected when a step site reads a different version") {
+    val rt = newRuntime
+    val wf = Workflow[String, String](id = "cross-version-step-conflict") { _ =>
+      Step.atMostOnce[String]("shared") { "step" }
+      "unreachable"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "in").id
+    // An await row at the internal version 0: the at-most-once step site reads
+    // version 1, so only the cross-version guard can detect the foreign row.
+    run(
+      sql"""
+        INSERT INTO workflow_steps (workflow_id, workflow_instance_key, workflow_instance_scope, step_id, step_version, step_kind, state_kind, state_payload, input_fingerprints)
+        VALUES (${wf.id}, 'k', '{}', 'shared', 0, 'Await', 'Succeeded', 'go', '')
+      """.update.run
+    )
+
+    val WorkflowRunResult.Failed(failure) = rt.runWorkflowInstance(wf, id)
+    assert(failure.toString.contains("StepKeyConflictException"), failure.toString)
+    assertEquals(
+      run(
+        sql"""
+          SELECT step_kind FROM workflow_steps
+          WHERE workflow_id = ${wf.id} AND workflow_instance_key = 'k' AND workflow_instance_scope = '{}' AND step_id = 'shared'
+        """.query[String].option
+      ),
+      Some("Await"),
+      "the foreign row is preserved, not overwritten by the step's Started write"
     )
   }
 }

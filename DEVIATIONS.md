@@ -62,8 +62,12 @@ adds detail to, the documents in `spec/`.
 - Runtime settings include `leaseDuration` (5 minutes), `leaseAcquireTimeout`
   (30 seconds), and `durableRetryThreshold` (30 seconds). Caller-thread runs
   need these settings as well as job-runner executions.
-- `Step.getExecutionState` requires `Cacheable[Throwable]` to decode a stored
-  failure, and reports records even when their cache expiry has passed.
+- `Step.getStepState` (and its runtime-level counterpart
+  `WorkflowRuntime.getStepState`) requires `Cacheable[Throwable]` to decode a
+  stored failure, and reports records even when their cache expiry has passed.
+- The initial step version is `1` for both guarantees: at-most-once rows are
+  stored at `step_version = 1` (previously the internal `0`, now reserved for
+  internal step kinds), so the query API's required `stepVersion` is uniform.
 
 ## Steps and waits
 

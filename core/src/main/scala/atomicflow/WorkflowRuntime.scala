@@ -444,6 +444,45 @@ trait WorkflowRuntime { this: WorkflowRuntimeInternals =>
       .map(_.info)
       .getOrElse(throw new WorkflowNotFoundException(s"Workflow instance not found: ${instance.id}"))
 
+  /** Read the durable execution state of a step of an instance from outside the
+    * workflow body — the runtime-level counterpart of `Step.getStepState`. No
+    * execution lease or fence is involved; the stored row is reported even if
+    * it has expired. Addresses top-level steps (nested steps are addressable
+    * only from inside the workflow body).
+    *
+    * @param instanceId
+    *   identity of the instance whose step is inspected
+    * @param key
+    *   the step's stable identity within the workflow
+    * @param stepVersion
+    *   the exact step version to inspect; the initial version is `1` for both
+    *   at-least-once and at-most-once steps
+    */
+  @throws[WorkflowNotFoundException]
+  final def getStepState[A](instanceId: WorkflowInstanceId, key: String, stepVersion: Long)(using
+      valueCodec: Cacheable[A],
+      throwableCodec: Cacheable[Throwable]
+  ): StepExecutionState[A] = {
+    requireInstanceExists(instanceId)
+    Step.stepStateFromRow(key, readStep(instanceId, StepId(key), stepVersion))
+  }
+
+  /** Same as [[getStepState]], but reads the latest stored version of the step
+    * instead of one exact version.
+    */
+  @throws[WorkflowNotFoundException]
+  final def getStepState[A](instanceId: WorkflowInstanceId, key: String)(using
+      valueCodec: Cacheable[A],
+      throwableCodec: Cacheable[Throwable]
+  ): StepExecutionState[A] = {
+    requireInstanceExists(instanceId)
+    Step.stepStateFromRow(key, readLatestStep(instanceId, StepId(key)))
+  }
+
+  private def requireInstanceExists(instanceId: WorkflowInstanceId): Unit =
+    if readInstance(instanceId).isEmpty then
+      throw new WorkflowNotFoundException(s"Workflow instance not found: $instanceId")
+
   /** Creates and starts a job runner over the given definition registry.
     * Implemented per backend: the runner executes backend-internal operations
     * (wakeup claiming, conditional lease acquisition, sweeps) and is bound to

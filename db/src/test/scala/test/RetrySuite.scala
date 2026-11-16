@@ -287,12 +287,12 @@ class RetrySuite extends PostgresWorkflowRuntimeSuite {
     assertNotEquals(sub2.head._1, sub1.head._1, "the new retry creates a new subscription id")
   }
 
-  test("getExecutionState reports Started while a durable retry is suspended") {
+  test("getStepState reports Started while a durable retry is suspended") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
     var observed: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "retrystate") { in =>
-      observed = Step.getExecutionState[String]("step", stepVersion = 1)
+      observed = Step.getStepState[String]("step", stepVersion = 1)
       Step.atLeastOnce[String]("step", retry = Step.RetryPolicy.fixedDelay(2, 1.hour)) {
         throw new RuntimeException("boom")
       }

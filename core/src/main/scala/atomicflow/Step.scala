@@ -151,23 +151,23 @@ object Step {
 
   /** An at-most-once step: A step that was started but did not persist a result is not re-executed and
    * instead returns [[None]].
-    *
-    * @param key
-    *   the step's stable identity within the workflow
-    * @param assertUnchanged
-    *   named inputs that must be invariant between runs
-    * @param invalidateOn
-    *   named inputs that invalidate the cached result when they change
-    * @param invalidateAfter
-    *   TTL after which the cached result expires; `Duration.Inf` disables it
-    */
+   *
+   * @param key
+   *   the step's stable identity within the workflow
+   * @param assertUnchanged
+   *   named inputs that must be invariant between runs
+   * @param invalidateOn
+   *   named inputs that invalidate the cached result when they change
+   * @param invalidateAfter
+   *   TTL after which the cached result expires; `Duration.Inf` disables it
+   */
   def atMostOnce[A: Cacheable](
       key: String,
       assertUnchanged: Seq[StepInput[?]] = Seq.empty,
       invalidateOn: Seq[StepInput[?]] = Seq.empty,
       invalidateAfter: Duration = Duration.Inf
   )(body: => A)(using ctx: WorkflowContext, throwableCodec: Cacheable[Throwable]): Option[A] =
-    runSimpleStep(atMostOnce = true, key, stepVersion = 0L, assertUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
+    runSimpleStep(atMostOnce = true, key, stepVersion = 1L, assertUnchanged, invalidateOn, invalidateAfter, Step.RetryPolicy.never)(body)
 
   /** Persists `Started` before execution, then replaces it with a durable outcome.
     * On replay, at-least-once re-executes unresolved work; at-most-once returns `None`.
@@ -334,28 +334,29 @@ object Step {
     * @param key
     *   the step's stable identity within the workflow
     * @param stepVersion
-    *   the exact step version to inspect (`0` is the internal version for
-    *   unversioned step kinds)
+    *   the exact step version to inspect; the initial version is `1` for both
+    *   at-least-once and at-most-once steps
     */
-  def getExecutionState[A](key: String, stepVersion: Long = 0)(using
+  def getStepState[A](key: String, stepVersion: Long)(using
       ctx: WorkflowContext,
       valueCodec: Cacheable[A],
       throwableCodec: Cacheable[Throwable]
-  ): StepExecutionState[A] = {
-    val stepId = StepId(key, ctx.currentScope)
-    ctx.internals.readStep(ctx.instanceId, stepId, stepVersion) match {
-      case None => StepExecutionState.NeverStarted
-      case Some(row) =>
-        expectStepState[StepState.SimpleStep](key, row) match {
-          case StepState.SimpleStep.Succeeded(payload) =>
-            StepExecutionState.Completed(decodeStored(valueCodec, key)(payload.raw))
-          case StepState.SimpleStep.Failed(payload) =>
-            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(payload.raw))
-          case StepState.SimpleStep.Started | StepState.SimpleStep.RetryPending(_, _) =>
-            StepExecutionState.Started
-        }
-    }
-  }
+  ): StepExecutionState[A] =
+    stepStateFromRow(key, ctx.internals.readStep(ctx.instanceId, StepId(key, ctx.currentScope), stepVersion))
+
+  /** Read the durable execution state of the latest stored version of a step
+    * without executing it (no lease or fence is involved). Reports the stored
+    * row even if it has expired.
+    *
+    * @param key
+    *   the step's stable identity within the workflow
+    */
+  def getStepState[A](key: String)(using
+      ctx: WorkflowContext,
+      valueCodec: Cacheable[A],
+      throwableCodec: Cacheable[Throwable]
+  ): StepExecutionState[A] =
+    stepStateFromRow(key, ctx.internals.readLatestStep(ctx.instanceId, StepId(key, ctx.currentScope)))
 
   /** Await a runtime-computed condition: an event on a [[Signal]], a timer, or a
     * workflow completion. The await behaves like a step — its resolved result is
@@ -678,6 +679,11 @@ object Step {
     val rawExisting = internals.readStep(ctx.instanceId, stepId, stepVersion)
     // Reject a row of a different step kind before invalidation logic could delete it.
     rawExisting.foreach(expectStepState[S](stepKey, _))
+    // A site that has no row at its own version may still collide with another
+    // step kind at a different version of the same key (e.g. a step row stored
+    // at the initial version 1 while an internal site reads version 0).
+    if (rawExisting.isEmpty)
+      internals.readLatestStep(ctx.instanceId, stepId).foreach(expectStepState[S](stepKey, _))
     val replayable =
       rawExisting.filterNot(row => isExpired(row, now) || haveInputsChanged(stepKey, row, assertUnchanged, invalidateOn))
 
@@ -918,6 +924,28 @@ object Step {
 
   private def isExpired(row: StoredStep, now: java.time.Instant): Boolean =
     row.expiresAt.exists(!_.isAfter(now))
+
+  /** Maps a stored step row to its inspectable [[StepExecutionState]]; shared by
+    * the in-body `Step.getStepState` and the runtime-level query. `row` is
+    * `None` when the addressed step version (or the whole instance) has no
+    * stored row.
+    */
+  private[atomicflow] def stepStateFromRow[A](key: String, row: Option[StoredStep])(using
+      valueCodec: Cacheable[A],
+      throwableCodec: Cacheable[Throwable]
+  ): StepExecutionState[A] =
+    row match {
+      case None => StepExecutionState.NeverStarted
+      case Some(row) =>
+        expectStepState[StepState.SimpleStep](key, row) match {
+          case StepState.SimpleStep.Succeeded(payload) =>
+            StepExecutionState.Completed(decodeStored(valueCodec, key)(payload.raw))
+          case StepState.SimpleStep.Failed(payload) =>
+            StepExecutionState.Failed(decodeStoredFailure(throwableCodec, key)(payload.raw))
+          case StepState.SimpleStep.Started | StepState.SimpleStep.RetryPending(_, _) =>
+            StepExecutionState.Started
+        }
+    }
 
   /** A step key belongs to exactly one step kind: the row stored at a
     * step's key must have been written by the step kind that reads it. Anything

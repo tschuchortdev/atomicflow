@@ -55,7 +55,9 @@ Step.atMostOnce("charge") { charge(order) }
 
 ## Inspecting old steps
 
-One API exposes the durable state known for either guarantee:
+One API exposes the durable state known for either guarantee, both from inside
+the workflow body (`Step.getStepState`) and from application code
+(`WorkflowRuntime.getStepState`, which addresses top-level steps):
 
 ```scala
 enum StepExecutionState[+A]:
@@ -64,11 +66,15 @@ enum StepExecutionState[+A]:
   case Failed(failure: Throwable)
   case Completed(value: A)
 
-Step.getExecutionState[QuoteV1]("quote", stepVersion = 1)
-Step.getExecutionState[Receipt]("charge")
+Step.getStepState[QuoteV1]("quote", stepVersion = 1)
+Step.getStepState[Receipt]("charge")          // latest stored version
+runtime.getStepState[Receipt](instanceId, "charge")
 ```
 
-- Both overloads return the same states because both guarantees persist a
+- The initial step version is the same for both guarantees, so the required
+  `stepVersion` is uniform: `1` for a fresh step of either kind. The
+  version-less overload reads the latest stored version of the step key.
+- Both guarantees return the same states because both persist a
   `Started` record before executing their bodies. `NeverStarted` means no such
   record exists; `Started` means the body began but no completed result was
   persisted.
@@ -76,9 +82,12 @@ Step.getExecutionState[Receipt]("charge")
   from `Started`, while an at-most-once step returns `None` rather than retry.
 - `Completed` is returned only after the persisted result is decoded using the
   required `Cacheable[A]` instance.
-- Step versions evolve independently of workflow versions. Lookup is by one
-  exact step version and does not mix the two version dimensions.
-- Steps that are currently retrying with the built-in step retry functionality are stored as a `RetryPending` row but reported as `Started` by `getExecutionState`.
+- Step versions evolve independently of workflow versions. The explicit-version
+  overload looks up one exact step version and does not mix the two version
+  dimensions; the version-less overload reports the highest stored version.
+- Steps that are currently retrying with the built-in step retry functionality are stored as a `RetryPending` row but reported as `Started` by `getStepState`.
+- The runtime-level query throws `WorkflowNotFoundException` when the addressed
+  instance does not exist.
 
 ## Evolving cached formats
 

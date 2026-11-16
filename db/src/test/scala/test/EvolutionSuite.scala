@@ -104,8 +104,8 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     var stateV1: StepExecutionState[String] = null
     var stateV2: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "evo-version") { in =>
-      stateV1 = Step.getExecutionState[String]("quote", stepVersion = 1)
-      stateV2 = Step.getExecutionState[String]("quote", stepVersion = 2)
+      stateV1 = Step.getStepState[String]("quote", stepVersion = 1)
+      stateV2 = Step.getStepState[String]("quote", stepVersion = 2)
       Step.atLeastOnce[String]("quote", version = stepVersion) { counter.incrementAndGet(); s"v-$stepVersion" }
       TestControlFlow.suspend()
       "unreachable"
@@ -133,29 +133,29 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(stateV2, StepExecutionState.Completed("v-2"))
   }
 
-  test("atMostOnce has no version: exercised as an unversioned step and read back by getExecutionState") {
+  test("atMostOnce has no version parameter but stores at the shared initial version 1; read back by getStepState") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "evo-mo") { in =>
-      state = Step.getExecutionState[String]("charge")
+      state = Step.getStepState[String]("charge", stepVersion = 1)
       Step.atMostOnce[String]("charge") { "charged-" + in }
       TestControlFlow.suspend()
       "unreachable"
     }
     assertEquals(rt.createAndRun(wf, "k", "a"), WorkflowRunResult.WorkflowSuspended)
     assertEquals(state, StepExecutionState.NeverStarted)
-    assertEquals(stepPayload(wf.id, "k", "charge", 0), Some("charged-a"))
+    assertEquals(stepPayload(wf.id, "k", "charge", 1), Some("charged-a"))
 
     rt.runWorkflowInstance(wf, WorkflowInstanceId(wf.id, "k"))
     assertEquals(state, StepExecutionState.Completed("charged-a"))
   }
 
-  test("getExecutionState matrix: NeverStarted, at-least-once Started mid-retry, Failed on exhaustion") {
+  test("getStepState matrix: NeverStarted, at-least-once Started mid-retry, Failed on exhaustion") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
     var observed: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "evo-retry-matrix") { in =>
-      observed = Step.getExecutionState[String]("quote", stepVersion = 1)
+      observed = Step.getStepState[String]("quote", stepVersion = 1)
       Step.atLeastOnce[String]("quote", retry = Step.RetryPolicy.fixedDelay(2, 1.hour)) {
         throw new RuntimeException("boom")
       }
@@ -172,7 +172,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(observed, StepExecutionState.Started, "a step mid-durable-retry is Started")
   }
 
-  test("getExecutionState reports Failed once the retry budget is exhausted (durable failure)") {
+  test("getStepState reports Failed once the retry budget is exhausted (durable failure)") {
     val clock = new TestClock(Instant.parse("2026-01-02T00:00:00Z"))
     val rt = newRuntime(clock, durableRetryThreshold = 10.millis)
     var observed: StepExecutionState[String] = null
@@ -182,7 +182,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
           throw new RuntimeException("fatal-boom")
         }
       } catch { case _: Throwable => () }
-      observed = Step.getExecutionState[String]("quote", stepVersion = 1)
+      observed = Step.getStepState[String]("quote", stepVersion = 1)
       TestControlFlow.suspend()
       "unreachable"
     }
@@ -197,13 +197,13 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     }
   }
 
-  test("getExecutionState reports Started for an at-most-once body that crashed after the Started row") {
+  test("getStepState reports Started for an at-most-once body that crashed after the Started row") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     var replayed: Option[String] = null
     val counter = new AtomicInteger(0)
     val wf = Workflow[String, String](id = "evo-mo-crash") { in =>
-      state = Step.getExecutionState[String]("charge")
+      state = Step.getStepState[String]("charge", stepVersion = 1)
       replayed = Step.atMostOnce[String]("charge") {
         counter.incrementAndGet()
         throw new FatalMarker("fatal")
@@ -220,17 +220,45 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.Started)
   }
 
-  test("getExecutionState decodes a Completed value via the required Cacheable") {
+  test("getStepState decodes a Completed value via the required Cacheable") {
     val rt = newRuntime
     var state: StepExecutionState[QuoteV1] = null
     val wf = Workflow[String, QuoteV1](id = "evo-completed") { in =>
       Step.atLeastOnce[QuoteV1]("quote") { QuoteV1(in, 1.5) }
-      state = Step.getExecutionState[QuoteV1]("quote", stepVersion = 1)
+      state = Step.getStepState[QuoteV1]("quote", stepVersion = 1)
       TestControlFlow.suspend()
       QuoteV1("unreachable", -1.0)
     }
     rt.createAndRun(wf, "k", "AAPL")
     assertEquals(state, StepExecutionState.Completed(QuoteV1("AAPL", 1.5)))
+  }
+
+  test("the version-less getStepState overload reads the latest stored version") {
+    val rt = newRuntime
+    val counter = new AtomicInteger(0)
+    var stepVersion = 1L
+    var latest: StepExecutionState[String] = null
+    val wf = Workflow[String, String](id = "evo-latest") { in =>
+      latest = Step.getStepState[String]("quote")
+      Step.atLeastOnce[String]("quote", version = stepVersion) { counter.incrementAndGet(); s"v-$stepVersion" }
+      TestControlFlow.suspend()
+      "unreachable"
+    }
+    val id = rt.createWorkflowInstance(wf, "k", "a").id
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(latest, StepExecutionState.NeverStarted, "no version is stored yet at body start")
+
+    stepVersion = 2
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(
+      latest,
+      StepExecutionState.Completed("v-1"),
+      "the highest stored version's state is reported (v1, read before v2 executed)"
+    )
+
+    assertEquals(rt.runWorkflowInstance(wf, id), WorkflowRunResult.WorkflowSuspended)
+    assertEquals(latest, StepExecutionState.Completed("v-2"))
   }
 
   test("cacheable evolution end-to-end: fallback decodes a v1-format result; new writes use the current serializer") {
@@ -259,7 +287,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     {
       given Cacheable[QuoteV1] = currentCodec
       val wfRead = Workflow[String, QuoteV1](id = "evo-cache") { in =>
-        state = Step.getExecutionState[QuoteV1]("quote", stepVersion = 1)
+        state = Step.getStepState[QuoteV1]("quote", stepVersion = 1)
         Step.atLeastOnce[QuoteV1]("quote") { QuoteV1("must-not-run", 1.0) }
         Step.atLeastOnce[QuoteV1]("quote2") { QuoteV1("fresh", 42.0) }
         TestControlFlow.suspend()
@@ -306,7 +334,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     {
       given Cacheable[QuoteChain] = currentCodec
       val wfRead = Workflow[String, QuoteChain](id = "evo-chain") { in =>
-        state1 = Step.getExecutionState[QuoteChain]("q", stepVersion = 1)
+        state1 = Step.getStepState[QuoteChain]("q", stepVersion = 1)
         TestControlFlow.suspend()
         QuoteChain("unreachable", -1)
       }
@@ -334,7 +362,7 @@ class EvolutionSuite extends PostgresWorkflowRuntimeSuite {
     {
       given Cacheable[QuoteChain] = currentCodec
       val wfRead = Workflow[String, QuoteChain](id = "evo-chain") { in =>
-        state2 = Step.getExecutionState[QuoteChain]("q", stepVersion = 1)
+        state2 = Step.getStepState[QuoteChain]("q", stepVersion = 1)
         TestControlFlow.suspend()
         QuoteChain("unreachable", -1)
       }

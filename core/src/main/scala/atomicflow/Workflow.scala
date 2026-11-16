@@ -328,7 +328,10 @@ object Workflow {
       internals.requestChildCloseUnderScopePath(base)
     }
 
-    val stored = internals.readStep(ctx.instanceId, regionId, 0L)
+    // The key-conflict check must see rows of other step kinds at any version
+    // (a step row is stored at the initial version 1 while regions read
+    // version 0), so it reads the latest row at the key.
+    val stored = internals.readLatestStep(ctx.instanceId, regionId)
     val (startCount: Long, firstState: S) = stored match {
       case Some(row) =>
         row.state match {

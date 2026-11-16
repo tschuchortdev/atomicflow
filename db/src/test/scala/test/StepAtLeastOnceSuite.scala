@@ -193,11 +193,11 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(stepRow(wf.id, "k", "step", 2).map(_._1), Some("Succeeded"))
   }
 
-  test("getExecutionState reports NeverStarted") {
+  test("getStepState reports NeverStarted") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "state-never") { in =>
-      state = Step.getExecutionState[String]("ghost")
+      state = Step.getStepState[String]("ghost", stepVersion = 1)
       TestControlFlow.suspend()
       "unreachable"
     }
@@ -205,11 +205,11 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.NeverStarted)
   }
 
-  test("getExecutionState reports Started after a crash leaves a Started row") {
+  test("getStepState reports Started after a crash leaves a Started row") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "state-started") { in =>
-      state = Step.getExecutionState[String]("step", stepVersion = 1)
+      state = Step.getStepState[String]("step", stepVersion = 1)
       Step.atLeastOnce[String]("step") {
         TestControlFlow.suspend()
         "never"
@@ -222,14 +222,14 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.Started)
   }
 
-  test("getExecutionState reports Completed with the decoded value after success") {
+  test("getStepState reports Completed with the decoded value after success") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "state-completed") { in =>
       Step.atLeastOnce[String]("step") {
         "cached-value"
       }
-      state = Step.getExecutionState[String]("step", stepVersion = 1)
+      state = Step.getStepState[String]("step", stepVersion = 1)
       TestControlFlow.suspend()
       "unreachable"
     }
@@ -237,7 +237,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(state, StepExecutionState.Completed("cached-value"))
   }
 
-  test("getExecutionState reports Failed with the decoded failure") {
+  test("getStepState reports Failed with the decoded failure") {
     val rt = newRuntime
     var state: StepExecutionState[String] = null
     val wf = Workflow[String, String](id = "state-failed") { in =>
@@ -248,7 +248,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       } catch {
         case _: Throwable => ()
       }
-      state = Step.getExecutionState[String]("step", stepVersion = 1)
+      state = Step.getStepState[String]("step", stepVersion = 1)
       TestControlFlow.suspend()
       "unreachable"
     }
@@ -378,7 +378,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
     assertEquals(counter.get(), 2, "a different instance re-executes")
   }
 
-  test("getExecutionState decodes a Failed row with the contextual throwable codec") {
+  test("getStepState decodes a Failed row with the contextual throwable codec") {
     val rt = newRuntime
     given Cacheable[Throwable] = Cacheable.forThrowable.javaSerializable
     var state: StepExecutionState[String] = null
@@ -390,7 +390,7 @@ class StepAtLeastOnceSuite extends PostgresWorkflowRuntimeSuite {
       } catch {
         case _: Throwable => ()
       }
-      state = Step.getExecutionState[String]("step", stepVersion = 1)
+      state = Step.getStepState[String]("step", stepVersion = 1)
       TestControlFlow.suspend()
       "unreachable"
     }

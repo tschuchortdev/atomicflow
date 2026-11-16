@@ -63,14 +63,25 @@ trait WorkflowRuntimeInternals {
   /** Read a stored step row, or `None` when absent. A step key (step id, scope,
     * and version) belongs to exactly one step kind, so the returned row is the
     * only row at that key, whichever step kind wrote it. The row is
-    * reported even if it has expired. This is the single read path for step
-    * rows; it is used by `Step.runStep`, `Step.getExecutionState`, and the
-    * restartable-region machinery. No execution lease is required.
+    * reported even if it has expired. This is the exact-version read path for
+    * step rows; it is used by `Step.runStep`, `Step.getStepState`, and the
+    * restartable-region machinery (whose cross-version key-conflict check
+    * additionally uses [[readLatestStep]]). No execution lease is required.
     */
   def readStep(
       instanceId: WorkflowInstanceId,
       stepId: StepId,
       stepVersion: Long
+  ): Option[StoredStep]
+
+  /** Read the stored step row of the highest stored version at the step's
+    * `(step id, scope)` key, or `None` when no version is stored. Like
+    * [[readStep]], the row is reported even if it has expired, and no execution
+    * lease is required. Serves the version-less `getStepState` overloads.
+    */
+  def readLatestStep(
+      instanceId: WorkflowInstanceId,
+      stepId: StepId
   ): Option[StoredStep]
 
   /** Replace (or create) the step row, fenced. The row's [[StepState]] selects
